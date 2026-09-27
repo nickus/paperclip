@@ -76,6 +76,7 @@ Common optional fields:
 | `podActivityDeadlineSec` | `3600` | Hard ceiling on a single run's wall-clock time. |
 | `execKeepaliveIntervalSec` | `15` | Seconds between WebSocket pings on a pod exec connection. `0` disables the keepalive (close/error events are still honored). |
 | `execLivenessTimeoutSec` | `60` | Fail an exec whose connection shows no sign of life (no output, pong or send progress) for this long, instead of waiting out `podActivityDeadlineSec`. Quiet but connected commands keep answering pings and are unaffected. Floored at two keepalive intervals. |
+| `reuseLease` | `false` | Keep one sandbox per task between runs; see [Reusable sandboxes](#reusable-sandboxes-reuselease). |
 
 Full JSON Schema in `src/manifest.ts`.
 
@@ -95,6 +96,53 @@ Keep provider-level egress defaults narrow, then grant only the destinations a t
 ```
 
 The provider creates a workload-owned policy selected by the task run label, so the additional destinations do not become reachable from other concurrent agent pods. Cilium mode enforces FQDNs directly. Standard NetworkPolicy mode cannot express FQDNs, so an FQDN grant permits public IPv4 TCP 80/443 for that run while excluding private, loopback, link-local, CGNAT, and multicast ranges. Network failures that look policy-related include the grant path in stderr, and the sandbox exposes the effective policy through `PAPERCLIP_NETWORK_EGRESS_*` environment variables.
+
+### Reusable sandboxes (`reuseLease`)
+
+By default every run gets a fresh sandbox that is deleted when the run ends, so an agent re-clones its repositories and starts a new harness session on every follow-up run. With `reuseLease: true` (sandbox-cr backend only) the plugin keeps **one sandbox per task** instead: per reuse scope of company, environment, execution workspace, agent and adapter. With `isolated_workspace` execution workspaces that is one sandbox per issue and agent. The next run on the same task resumes the same pod, so both of these carry over:
+
+- the harness session: the OpenCode session store and Claude's config/session directory live under `/workspace/.paperclip-runtime/<adapter>/` (the harness `HOME`), and the session resumes because the run keeps the same provider lease and the same working directory (`/workspace`);
+- the environment: `$HOME` caches (`~/.cache`, `~/.npm`, `~/.cargo`, ...) under `.paperclip-runtime`, `/tmp`, and `/home/paperclip`.
+
+The repository tree in `/workspace` is re-extracted from the host execution workspace at the start of each run (the host copy is the durable one and is synced back at the end of each run), so build outputs inside the tree are not kept. Clone extra repositories under `$HOME` or `/tmp` to keep them.
+
+| Field | Default | Purpose |
+|---|---|---|
+| `reuseLease` | `false` | Keep one sandbox per task between runs. Rejected with `backend: "job"`. |
+| `reuseIdleTtlSec` | `runnerIdleTimeoutMs`/1000, else `86400` | How long an idle sandbox is kept (60s–7d). |
+| `reuseMaxSandboxes` | `8` | Reusable sandboxes per tenant namespace. At the cap, the least recently used idle sandbox is removed to make room. |
+| `reuseResources` | requests `100m`/`256Mi`, limits as `defaultResources` (else `2`/`4Gi`) | Resources of reusable sandboxes. |
+
+Enable it on an existing environment (the config is merged shallowly, secret references are kept):
+
+```json
+{ "config": { "reuseLease": true, "runnerIdleTimeoutMs": 86400000, "reuseMaxSandboxes": 8 } }
+```
+
+**Lifecycle.** A run's release stops every process the run left in the pod (the keepalive is kept), verifies nothing is left, and marks the sandbox idle; only then does it return a `stopped` receipt. If that cannot be verified, if the run was cancelled, or if reuse was turned off, the sandbox is deleted as before (`destroyed`). Resume checks that the Sandbox, its pod and its spec are unchanged and marks it busy; a sandbox that is gone, failing, built from a different image/config (pod spec hash, including the adapter credentials), or whose pod was replaced is reported expired, and the host provisions a fresh one (with a fresh harness session). Temporary API errors fail the resume instead, so the task's sandbox is kept for the next attempt. Any change to the environment config recycles idle sandboxes on their next use.
+
+**Idle expiry.** All reuse state lives in labels (`paperclip.io/reuse`, `paperclip.io/reuse-key`, `paperclip.io/execution-workspace-id`, `paperclip.io/issue-id`) and annotations (`paperclip.io/lease-state`, `paperclip.io/last-used-at`, `paperclip.io/idle-ttl-seconds`, ...) on the Sandbox CR. The plugin worker sweeps every namespace it has served a reusable lease in every 5 minutes (and on acquire/release): idle sandboxes past their TTL, sandboxes left busy for longer than `podActivityDeadlineSec` + TTL (their run never released them), and the least recently used idle ones over the cap are deleted. Deletes carry a `resourceVersion` precondition, so a sandbox a run is resuming at that moment is never removed. After a restart, a namespace is swept again from its first reusable-lease call on.
+
+**Quota.** Idle sandboxes keep their requests and count against the tenant `ResourceQuota`. With the default quota (`pods 20`, `requests 10 CPU / 20Gi`, `limits 20 CPU / 40Gi`) and default reuse resources, at most
+
+```
+min(pods, ⌊limits.cpu / 2⌋, ⌊limits.memory / 4Gi⌋, ⌊requests.cpu / 100m⌋, ⌊requests.memory / 256Mi⌋)
+  = min(20, 10, 10, 100, 80) = 10
+```
+
+sandboxes fit per company namespace; `reuseMaxSandboxes: 8` leaves room for two ordinary sandboxes. `paperclip-quota` is only created when missing, so raise it in place (`kubectl edit resourcequota paperclip-quota -n paperclip-<company>`) for more concurrent tasks. `validateConfig` warns when the cap does not fit the default quota.
+
+**Operations.**
+
+```bash
+# Reusable sandboxes and their state
+kubectl get sandboxes.agents.x-k8s.io -n paperclip-<company> -l paperclip.io/reuse=true \
+  -o custom-columns=NAME:.metadata.name,STATE:.metadata.annotations.paperclip\\.io/lease-state,LAST_USED:.metadata.annotations.paperclip\\.io/last-used-at
+# Drop one (its next run starts fresh)
+kubectl delete sandboxes.agents.x-k8s.io -n paperclip-<company> <name>
+```
+
+**Limitations.** A task-scoped egress grant (`executionWorkspaceSettings.networkEgress`) changed between runs only applies to the next fresh sandbox. A mutable image tag cannot be detected as a change; pin images by digest. A workspace larger than the 8Gi `/workspace` volume gets the pod evicted, which starts a fresh sandbox. The process reset relies on `/proc`, `tr` and `sleep` in the runtime image. The host removes a task's sandbox when the issue reaches a terminal state or its execution workspace is closed; deleting an environment that still has kept sandboxes needs `?destroyReusableSandboxLeases=true`.
 
 ## What gets created in your cluster
 
@@ -179,4 +227,5 @@ To run the kind-cluster integration test (requires `kubectl --context kind-paper
 
 ```bash
 RUN_K8S_INTEGRATION_TESTS=1 pnpm test test/integration/end-to-end-run.test.ts
+RUN_K8S_INTEGRATION_TESTS=1 pnpm test test/integration/reusable-sandbox.test.ts
 ```
