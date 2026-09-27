@@ -37,7 +37,13 @@ import {
   sandboxCrOrchestrator,
   SandboxCrTimeoutError,
 } from "./sandbox-cr-orchestrator.js";
-import { execInPod, execInPodStreaming, wrapCommandWithEnv } from "./pod-exec.js";
+import {
+  execInPod,
+  execInPodStreaming,
+  PodExecTransportError,
+  wrapCommandWithEnv,
+  type ExecLivenessOptions,
+} from "./pod-exec.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
 import { checkLeaseResumable, terminateLeaseResources } from "./lease-lifecycle.js";
 import {
@@ -187,6 +193,15 @@ function resolveSyncRemoteDir(lease: PluginEnvironmentLease): string {
  * Ready (cached per lease), and find the pod name. The `job` backend carries no
  * file path and is out of scope — file sync is only supported on `sandbox-cr`.
  */
+// Pod-exec keepalive settings from the provider config (see types.ts). Every exec
+// path uses the same settings so a dropped WebSocket fails fast everywhere.
+function execLivenessFromConfig(config: KubernetesProviderConfig): ExecLivenessOptions {
+  return {
+    keepaliveIntervalMs: config.execKeepaliveIntervalSec * 1000,
+    timeoutMs: config.execLivenessTimeoutSec * 1000,
+  };
+}
+
 async function resolveSyncPodExec(
   params:
     | PluginEnvironmentSyncInParams
@@ -246,6 +261,7 @@ async function resolveSyncPodExec(
     execInPodStreaming(kc, namespace, podName, "agent", command, {
       ...io,
       timeoutMs: io.timeoutMs ?? timeoutMs,
+      liveness: execLivenessFromConfig(config),
     });
   return { exec, timeoutMs };
 }
@@ -814,13 +830,23 @@ const plugin = definePlugin({
               ["/bin/sh", "-c", script],
               base64Body,
               flushTimeoutMs,
+              undefined,
+              undefined,
+              execLivenessFromConfig(config),
             );
           } catch (err) {
+            // Same transport-failure contract as the main exec path below:
+            // tag the failure kind and keep whatever output arrived.
+            const transport = err instanceof PodExecTransportError ? err : null;
+            const reason = `fast-upload flush failed: ${err instanceof Error ? err.message : String(err)}`;
             return {
               exitCode: null,
-              timedOut: true,
-              stdout: "",
-              stderr: `fast-upload flush failed: ${err instanceof Error ? err.message : String(err)}`,
+              // A dropped exec connection is a transport failure, not a timeout.
+              timedOut: !transport || transport.kind === "timeout",
+              stdout: transport?.partialStdout ?? "",
+              stderr: transport && transport.partialStderr.length > 0
+                ? `${reason}\n${transport.partialStderr}`
+                : reason,
               metadata: {
                 provider: "kubernetes",
                 backend: "sandbox-cr",
@@ -828,6 +854,7 @@ const plugin = definePlugin({
                 sandboxName: lease.providerLeaseId,
                 podName,
                 fastUpload: "flush",
+                ...(transport ? { execTransportFailure: transport.kind } : {}),
               },
             };
           }
@@ -882,8 +909,37 @@ const plugin = definePlugin({
           execCommand,
           typeof params.stdin === "string" ? params.stdin : undefined,
           remainingTimeoutMs,
+          undefined,
+          undefined,
+          execLivenessFromConfig(config),
         );
       } catch (err) {
+        if (err instanceof PodExecTransportError) {
+          // Only the watchdog is a real timeout. A dropped connection is a
+          // transport failure detected within ~execLivenessTimeoutSec, so it
+          // must not be reported as "timed out after <budget>". The command is
+          // NOT re-run here: an agent run is not idempotent and may still be
+          // running in the pod (see PodExecTransportError). Partial output is
+          // kept so the adapter can still parse e.g. the session id; our
+          // diagnosis goes first so it becomes the run's error line.
+          const stderr = err.partialStderr.length > 0
+            ? `${err.message}\n${err.partialStderr}`
+            : err.message;
+          return {
+            exitCode: null,
+            timedOut: err.kind === "timeout",
+            stdout: err.partialStdout,
+            stderr: appendNetworkEgressDenyHint(stderr, scopedNetworkEgress),
+            metadata: {
+              provider: "kubernetes",
+              backend: "sandbox-cr",
+              namespace,
+              sandboxName: lease.providerLeaseId,
+              podName,
+              execTransportFailure: err.kind,
+            },
+          };
+        }
         // Watchdog-fired or WebSocket-setup error. Surface as a timeout so
         // the caller can retry instead of hanging forever.
         return {

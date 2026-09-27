@@ -97,6 +97,18 @@ const manifest: PaperclipPluginManifestV1 = {
             minimum: 1,
             description: "Hard ceiling on a single run's wall-clock time (default: 3600).",
           },
+          execKeepaliveIntervalSec: {
+            type: "integer",
+            minimum: 0,
+            description:
+              "Seconds between WebSocket pings on a pod exec connection, used to detect a dropped connection quickly (default: 15; 0 disables the keepalive).",
+          },
+          execLivenessTimeoutSec: {
+            type: "integer",
+            minimum: 1,
+            description:
+              "Fail a pod exec whose connection shows no sign of life (no output, pong or send progress) for this many seconds (default: 60; floored at two keepalive intervals). Quiet but connected commands keep answering pings and are not affected.",
+          },
           adapterType: {
             type: "string",
             description:

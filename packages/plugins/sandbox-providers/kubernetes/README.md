@@ -74,6 +74,8 @@ Common optional fields:
 | `serviceAccountAnnotations` | `{}` | Annotations applied to per-tenant ServiceAccount (e.g. IRSA `eks.amazonaws.com/role-arn`). |
 | `jobTtlSecondsAfterFinished` | `900` | Seconds after a Job completes before garbage-collection. |
 | `podActivityDeadlineSec` | `3600` | Hard ceiling on a single run's wall-clock time. |
+| `execKeepaliveIntervalSec` | `15` | Seconds between WebSocket pings on a pod exec connection. `0` disables the keepalive (close/error events are still honored). |
+| `execLivenessTimeoutSec` | `60` | Fail an exec whose connection shows no sign of life (no output, pong or send progress) for this long, instead of waiting out `podActivityDeadlineSec`. Quiet but connected commands keep answering pings and are unaffected. Floored at two keepalive intervals. |
 
 Full JSON Schema in `src/manifest.ts`.
 
