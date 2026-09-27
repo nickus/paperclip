@@ -95,6 +95,52 @@ describe("onEnvironmentExecute exec transport failures", () => {
     expect(h.execInPod.mock.calls[1]?.[9]).toEqual({ keepaliveIntervalMs: 0, timeoutMs: 300_000 });
   });
 
+  it("tags a dropped fast-upload flush the same way (execTransportFailure + partial stderr)", async () => {
+    // Drive the chunked-upload protocol (INIT, CHUNK, FINALIZE) on one lease so
+    // the interceptor collapses it into a single flush exec, which then drops.
+    h.execInPod.mockRejectedValue(
+      new PodExecTransportError(
+        "execInPod lost its exec connection before the command reported an exit status (keepalive_timeout: no frame, pong or send progress for 60000ms).",
+        "keepalive_timeout",
+        "",
+        "base64: truncated input\n",
+      ),
+    );
+    const base = executeParams();
+    const run = (script: string) =>
+      plugin.definition.onEnvironmentExecute!({ ...(base as object), command: "sh", args: ["-c", script] } as never);
+    const target = "/workspace/f.bin";
+    const b64 = `${target}.paperclip-upload.b64`;
+    expect((await run(`mkdir -p '/workspace' && rm -f '${b64}' && : > '${b64}'`)).metadata)
+      .toEqual(expect.objectContaining({ fastUpload: "ack" }));
+    await run(`printf '%s' '${Buffer.from("hello").toString("base64")}' >> '${b64}'`);
+    const result = await run(`base64 -d < '${b64}' > '${target}' && rm -f '${b64}'`);
+
+    expect(h.execInPod).toHaveBeenCalledTimes(1); // the single flush exec
+    expect(result.exitCode).toBeNull();
+    expect(result.timedOut).toBe(false);
+    expect(result.stderr.split("\n")[0]).toMatch(/^fast-upload flush failed: .*lost its exec connection/);
+    expect(result.stderr).toContain("base64: truncated input");
+    expect(result.metadata).toEqual(
+      expect.objectContaining({ fastUpload: "flush", execTransportFailure: "keepalive_timeout" }),
+    );
+  });
+
+  it("keeps timedOut=true and no transport tag for a non-transport flush error", async () => {
+    h.execInPod.mockRejectedValue(new Error("Unexpected server response: 403"));
+    const base = executeParams();
+    const run = (script: string) =>
+      plugin.definition.onEnvironmentExecute!({ ...(base as object), command: "sh", args: ["-c", script] } as never);
+    const target = "/workspace/g.bin";
+    const b64 = `${target}.paperclip-upload.b64`;
+    await run(`mkdir -p '/workspace' && rm -f '${b64}' && : > '${b64}'`);
+    await run(`printf '%s' '${Buffer.from("x").toString("base64")}' >> '${b64}'`);
+    const result = await run(`base64 -d < '${b64}' > '${target}' && rm -f '${b64}'`);
+    expect(result.timedOut).toBe(true);
+    expect(result.stderr).toBe("fast-upload flush failed: Unexpected server response: 403");
+    expect(result.metadata).not.toHaveProperty("execTransportFailure");
+  });
+
   it("validateConfig normalizes the keepalive defaults", async () => {
     const result = await plugin.definition.onEnvironmentValidateConfig!({
       driverKey: "kubernetes",

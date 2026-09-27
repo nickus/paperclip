@@ -851,12 +851,18 @@ const plugin = definePlugin({
               execLivenessFromConfig(config),
             );
           } catch (err) {
+            // Same transport-failure contract as the main exec path below:
+            // tag the failure kind and keep whatever output arrived.
+            const transport = err instanceof PodExecTransportError ? err : null;
+            const reason = `fast-upload flush failed: ${err instanceof Error ? err.message : String(err)}`;
             return {
               exitCode: null,
               // A dropped exec connection is a transport failure, not a timeout.
-              timedOut: !(err instanceof PodExecTransportError) || err.kind === "timeout",
-              stdout: "",
-              stderr: `fast-upload flush failed: ${err instanceof Error ? err.message : String(err)}`,
+              timedOut: !transport || transport.kind === "timeout",
+              stdout: transport?.partialStdout ?? "",
+              stderr: transport && transport.partialStderr.length > 0
+                ? `${reason}\n${transport.partialStderr}`
+                : reason,
               metadata: {
                 provider: "kubernetes",
                 backend: "sandbox-cr",
@@ -864,6 +870,7 @@ const plugin = definePlugin({
                 sandboxName: lease.providerLeaseId,
                 podName,
                 fastUpload: "flush",
+                ...(transport ? { execTransportFailure: transport.kind } : {}),
               },
             };
           }
