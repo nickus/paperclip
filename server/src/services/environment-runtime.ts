@@ -3093,11 +3093,23 @@ function createSandboxEnvironmentDriver(
     // reaper, which would destroy the resource the retain policy wants to keep.
     const retained =
       input.lease.leasePolicy === "retain_on_failure" && input.status === "failed";
+    // A reusable provider resource that the provider confirmed stopped (not
+    // destroyed) stays eligible for resume whatever the run's outcome, so a
+    // follow-up run after a failed or timed-out run continues in the same
+    // sandbox. Only `released`/`retained` leases are resume candidates; the
+    // failure reason is still recorded below.
+    const stoppedReusable =
+      input.lease.leasePolicy === "reuse_by_environment" &&
+      input.status === "failed" &&
+      cleanupStatus === "success" &&
+      termination?.state === "stopped";
     const releaseStatus = retained
       ? ("retained" as const)
       : cleanupStatus === "failed"
         ? ("pending_cleanup" as const)
-        : input.status;
+        : stoppedReusable
+          ? ("released" as const)
+          : input.status;
     const failureReason =
       input.status === "failed"
         ? "adapter_or_run_failure"
