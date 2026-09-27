@@ -1472,6 +1472,91 @@ export function secretService(db: Db | DbTransaction) {
     return (await resolveSecretValueInternal(companyId, secretId, version, options)).value;
   }
 
+  /**
+   * Cheap, read-only fingerprint of everything a bound runtime resolution of
+   * `secretId` depends on: the secret status/scope/provider config, the selected
+   * version's value hash and provider ref, and the consumer binding. It performs
+   * ONE indexed select, no decrypt, no writes and records no access event, so a
+   * caller can revalidate a cached resolved value on every use. Returns null
+   * when a full resolution would not succeed (deleted/inactive secret, missing
+   * binding, inactive version, ...) — the caller must then run the full,
+   * audited `resolveSecretValue`, which raises the precise error.
+   */
+  async function readRuntimeSecretFingerprint(
+    companyId: string,
+    secretId: string,
+    version: number | "latest",
+    binding: { consumerType: SecretBindingTargetType; consumerId: string; configPath: string },
+  ): Promise<string | null> {
+    const row = await db
+      .select({
+        companyId: companySecrets.companyId,
+        scope: companySecrets.scope,
+        status: companySecrets.status,
+        provider: companySecrets.provider,
+        providerConfigId: companySecrets.providerConfigId,
+        externalRef: companySecrets.externalRef,
+        latestVersion: companySecrets.latestVersion,
+        versionNumber: companySecretVersions.version,
+        versionStatus: companySecretVersions.status,
+        versionRevokedAt: companySecretVersions.revokedAt,
+        valueSha256: companySecretVersions.valueSha256,
+        providerVersionRef: companySecretVersions.providerVersionRef,
+        bindingId: companySecretBindings.id,
+        bindingUpdatedAt: companySecretBindings.updatedAt,
+        providerConfigStatus: companySecretProviderConfigs.status,
+        providerConfigUpdatedAt: companySecretProviderConfigs.updatedAt,
+      })
+      .from(companySecrets)
+      .leftJoin(
+        companySecretVersions,
+        and(
+          eq(companySecretVersions.secretId, companySecrets.id),
+          // "latest" follows the secret's latest_version pointer, so a rotation
+          // changes the joined row (and thus the fingerprint) immediately.
+          version === "latest"
+            ? eq(companySecretVersions.version, companySecrets.latestVersion)
+            : eq(companySecretVersions.version, version),
+        ),
+      )
+      .leftJoin(
+        companySecretBindings,
+        and(
+          eq(companySecretBindings.secretId, companySecrets.id),
+          eq(companySecretBindings.companyId, companyId),
+          eq(companySecretBindings.targetType, binding.consumerType),
+          eq(companySecretBindings.targetId, binding.consumerId),
+          eq(companySecretBindings.configPath, binding.configPath),
+        ),
+      )
+      // Provider vault config edits (disable, credential change) bump updatedAt.
+      .leftJoin(
+        companySecretProviderConfigs,
+        eq(companySecretProviderConfigs.id, companySecrets.providerConfigId),
+      )
+      .where(eq(companySecrets.id, secretId))
+      .then((rows) => rows[0] ?? null);
+    if (!row) return null;
+    if (row.companyId !== companyId || row.scope !== "company" || row.status !== "active") return null;
+    if (!row.bindingId || row.versionNumber === null) return null;
+    if (row.versionStatus === "disabled" || row.versionStatus === "destroyed" || row.versionRevokedAt) {
+      return null;
+    }
+    return JSON.stringify([
+      row.provider,
+      row.providerConfigId,
+      row.externalRef,
+      row.latestVersion,
+      row.versionNumber,
+      row.valueSha256,
+      row.providerVersionRef,
+      row.bindingId,
+      row.bindingUpdatedAt?.toISOString() ?? null,
+      row.providerConfigStatus,
+      row.providerConfigUpdatedAt?.toISOString() ?? null,
+    ]);
+  }
+
   async function resolveSecretValueForEphemeralAccess(
     companyId: string,
     secretId: string,
@@ -4528,6 +4613,7 @@ export function secretService(db: Db | DbTransaction) {
     getByName,
     getByKey,
     resolveSecretValue,
+    readRuntimeSecretFingerprint,
     resolveSecretVersion,
     resolveSecretValueForAgentAccess,
     listAgentSecretAccess,

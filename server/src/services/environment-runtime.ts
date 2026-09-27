@@ -233,6 +233,32 @@ export {
   type EnvironmentDriverCapabilitySupport,
 } from "./environment-driver-traits.js";
 import { ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT } from "./environment-driver-traits.js";
+import {
+  environmentRuntimeSecretCache,
+  isCredentialRejectionError,
+} from "./runtime-secret-value-cache.js";
+
+/**
+ * Run a plugin sandbox RPC and, if the provider rejects the credential it was
+ * handed (401/403), drop this environment's cached runtime secret values so the
+ * next call re-resolves them in full. The cache is already revalidated against
+ * the secret's version/binding fingerprint on every use; this covers credentials
+ * that changed outside Paperclip (e.g. an external vault value under the same
+ * version, or a kubeconfig token revoked in the cluster).
+ */
+async function evictRuntimeSecretsOnCredentialRejection<T>(
+  environmentId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (isCredentialRejectionError(error)) {
+      environmentRuntimeSecretCache.invalidateConsumer(environmentId);
+    }
+    throw error;
+  }
+}
 
 /**
  * The one general capability classifier. It resolves each of the eight effective
@@ -1733,7 +1759,7 @@ function createSandboxEnvironmentDriver(
       provider: providerKey,
     });
     const sanitizedConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
-    return await pluginWorkerManager.call(pluginId, method, {
+    return await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(pluginId, method, {
       driverKey: providerKey,
       companyId: input.lease.companyId,
       environmentId: input.environment.id,
@@ -1745,7 +1771,7 @@ function createSandboxEnvironmentDriver(
         expiresAt: input.lease.expiresAt?.toISOString() ?? null,
       },
       operations: input.operations,
-    }, resolvePluginSandboxRpcTimeoutMs(sanitizedConfig));
+    }, resolvePluginSandboxRpcTimeoutMs(sanitizedConfig)));
   }
 
   return {
@@ -2690,7 +2716,7 @@ function createSandboxEnvironmentDriver(
             provider: providerKey,
           });
           const sanitizedConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
-          return await pluginWorkerManager.call(pluginId, "environmentExecute", {
+          return await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(pluginId, "environmentExecute", {
             driverKey: providerKey,
             companyId: input.lease.companyId,
             environmentId: input.environment.id,
@@ -2717,7 +2743,7 @@ function createSandboxEnvironmentDriver(
           }, resolvePluginExecuteRpcTimeoutMs({
             requestedTimeoutMs: input.timeoutMs,
             config: sanitizedConfig,
-          }), input.onLog);
+          }), input.onLog));
         }
       }
       throw new Error("Sandbox driver does not support direct command execution for built-in providers.");
