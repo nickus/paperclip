@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -241,17 +242,52 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   };
 }
 
-/** Managed credentials must never leave host-only homes in a remote process. */
+/**
+ * Stable key of the account behind a managed AI connection: its grant and
+ * responsible user, without the credential generation, so a rotated
+ * credential keeps the same key. Null when the connection carries no identity.
+ */
+function managedConnectionAccountKey(connection: unknown): string | null {
+  if (!connection || typeof connection !== "object") return null;
+  const identity = (connection as { identity?: unknown }).identity;
+  if (typeof identity !== "string") return null;
+  const [grant, user] = identity.split(":");
+  if (!grant) return null;
+  return createHash("sha256").update(`${grant}:${user ?? ""}`).digest("hex").slice(0, 32);
+}
+
+export interface ManagedOpenCodeRemoteHome {
+  /** Directory that holds every managed home of this runtime root. */
+  managedAuthRoot: string;
+  /** Name of this run's home under `managedAuthRoot`. */
+  homeName: string;
+  /** True when the home is shared by the runs of one account (a reused sandbox). */
+  perAccount: boolean;
+}
+
+/**
+ * Managed credentials must never leave host-only homes in a remote process.
+ * Each run gets its own home, except in a sandbox the host keeps for the next
+ * run of the same task (`reusedSandbox`): there the home is per account, so
+ * OpenCode's session store (under XDG_DATA_HOME) is still there on the next
+ * run and the session resumes, while a run with another account gets another
+ * home. Returns where the home is, or null when the agent has no managed
+ * connection.
+ */
 export function prepareManagedOpenCodeRemoteHomes(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
   runtimeRootDir: string | null | undefined;
   runId: string;
   configDir?: string;
-}): void {
-  if (!input.config.managedAiConnection) return;
+  reusedSandbox?: boolean;
+}): ManagedOpenCodeRemoteHome | null {
+  if (!input.config.managedAiConnection) return null;
   if (!input.runtimeRootDir) throw new Error("Managed OpenCode authentication requires an isolated remote runtime directory.");
-  const home = path.posix.join(input.runtimeRootDir, "managed-auth", input.runId);
+  const accountKey = input.reusedSandbox ? managedConnectionAccountKey(input.config.managedAiConnection) : null;
+  const managedAuthRoot = path.posix.join(input.runtimeRootDir, "managed-auth");
+  const homeName = accountKey ? `account-${accountKey}` : input.runId;
+  const home = path.posix.join(managedAuthRoot, homeName);
   Object.assign(input.env, {
     HOME: home,
     XDG_CONFIG_HOME: input.configDir ?? path.posix.join(home, "config"),
@@ -259,4 +295,18 @@ export function prepareManagedOpenCodeRemoteHomes(input: {
     XDG_CACHE_HOME: path.posix.join(home, "cache"),
     XDG_STATE_HOME: path.posix.join(home, "state"),
   });
+  return { managedAuthRoot, homeName, perAccount: accountKey !== null };
+}
+
+/**
+ * Shell command that removes every managed home under `managedAuthRoot` except
+ * the current one: in a reused sandbox, homes of earlier runs and of other
+ * accounts must not pile up or stay readable by later runs.
+ */
+export function buildPruneManagedOpenCodeHomesCommand(home: ManagedOpenCodeRemoteHome): string {
+  const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
+  return (
+    `mkdir -p ${quote(home.managedAuthRoot)} && ` +
+    `find ${quote(home.managedAuthRoot)} -mindepth 1 -maxdepth 1 ! -name ${quote(home.homeName)} -exec rm -rf -- {} +`
+  );
 }

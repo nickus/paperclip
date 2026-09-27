@@ -654,6 +654,14 @@ export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDr
    * lifetime.
    */
   requestedExpiresAt?: string | null;
+  /**
+   * The lease policy the host will record for this lease. The host resumes
+   * only a `reuse_by_environment` lease, so a provider that keeps sandboxes
+   * between runs keeps one only for that policy; for any other policy the
+   * sandbox is never resumed and should go at release. Omitted by hosts that
+   * predate this field.
+   */
+  leasePolicy?: "ephemeral" | "reuse_by_environment" | "reuse_by_execution_workspace" | "retain_on_failure";
 }
 
 export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDriverBaseParams {
@@ -667,6 +675,14 @@ export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDr
   cancelActiveWork?: boolean;
   providerLeaseId: string | null;
   leaseMetadata?: Record<string, unknown>;
+  /**
+   * How the run that held the lease ended (`released` for a completed run,
+   * `failed` for a failed one), when the host releases a lease at the end of
+   * a run. A provider that keeps sandboxes between runs can use it to stop
+   * keeping a sandbox in which run after run fails. Omitted otherwise, and by
+   * hosts that predate this field.
+   */
+  runStatus?: "released" | "failed" | "expired";
 }
 
 /** Returned only after the provider confirms that execution has ended. A queued

@@ -2031,6 +2031,12 @@ function createSandboxEnvironmentDriver(
             });
           }
         }
+        // Ad-hoc test leases are never publishable for reuse: storing them
+        // as `reuse_by_environment` would let a concurrent heartbeat resume
+        // the test's provider lease and lose its sandbox when the test ends.
+        const resolvedLeasePolicy = supportsReusableLeases && parsed.config.reuseLease && input.heartbeatRunId !== null
+          ? "reuse_by_environment"
+          : "ephemeral";
         // workerConfig came through the runtime secret cache: a 401/403 evicts it.
         const acquiredLease = providerLease ?? await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(
           pluginProvider.resolved.plugin.id,
@@ -2061,16 +2067,12 @@ function createSandboxEnvironmentDriver(
             ...(requestedExpiresAtParam(input.requestedExpiresAt) !== undefined
               ? { requestedExpiresAt: requestedExpiresAtParam(input.requestedExpiresAt) }
               : {}),
+            // The policy this lease is recorded with, so a provider that keeps
+            // sandboxes between runs never keeps one the host will not resume.
+            leasePolicy: resolvedLeasePolicy,
           },
           resolvePluginSandboxRpcTimeoutMs(workerConfig),
         ));
-
-        // Ad-hoc test leases are never publishable for reuse: storing them
-        // as `reuse_by_environment` would let a concurrent heartbeat resume
-        // the test's provider lease and lose its sandbox when the test ends.
-        const resolvedLeasePolicy = supportsReusableLeases && parsed.config.reuseLease && input.heartbeatRunId !== null
-          ? "reuse_by_environment"
-          : "ephemeral";
         const sanitizedProviderMetadata = stripSecretRefValuesFromPluginLeaseMetadata({
           metadata: acquiredLease.metadata,
           schema: pluginProvider.resolved.driver.configSchema as Record<string, unknown> | null | undefined,
@@ -3075,6 +3077,9 @@ function createSandboxEnvironmentDriver(
             providerLeaseId: input.lease.providerLeaseId,
             leaseMetadata: metadata,
             ...(input.cancelActiveWork ? { cancelActiveWork: true } : {}),
+            // How the run ended, so a provider that keeps sandboxes between
+            // runs can stop keeping one in which run after run fails.
+            runStatus: input.status,
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)))),
         );
         termination = remoteTerminationReceipt(input.lease, receipt);
@@ -3093,11 +3098,23 @@ function createSandboxEnvironmentDriver(
     // reaper, which would destroy the resource the retain policy wants to keep.
     const retained =
       input.lease.leasePolicy === "retain_on_failure" && input.status === "failed";
+    // A reusable provider resource that the provider confirmed stopped (not
+    // destroyed) stays eligible for resume whatever the run's outcome, so a
+    // follow-up run after a failed or timed-out run continues in the same
+    // sandbox. Only `released`/`retained` leases are resume candidates; the
+    // failure reason is still recorded below.
+    const stoppedReusable =
+      input.lease.leasePolicy === "reuse_by_environment" &&
+      input.status === "failed" &&
+      cleanupStatus === "success" &&
+      termination?.state === "stopped";
     const releaseStatus = retained
       ? ("retained" as const)
       : cleanupStatus === "failed"
         ? ("pending_cleanup" as const)
-        : input.status;
+        : stoppedReusable
+          ? ("released" as const)
+          : input.status;
     const failureReason =
       input.status === "failed"
         ? "adapter_or_run_failure"

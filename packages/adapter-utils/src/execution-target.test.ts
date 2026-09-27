@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as ssh from "./ssh.js";
 import * as serverUtils from "./server-utils.js";
 import {
+  adapterExecutionTargetReusesSandbox,
   cleanupGitHubOperationLaunchers,
   prepareGitHubOperationLaunchers,
   adapterExecutionTargetUsesManagedHome,
@@ -435,5 +436,43 @@ describe("GitHub launcher lifecycle", () => {
       cwd: "/remote/workspace", timeoutMs: 5_000 });
     await expect(cleanupGitHubOperationLaunchers({ runId: "../other", target })).rejects.toThrow("Invalid GitHub launcher run ID");
     expect(runner.execute).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("adapterExecutionTargetReusesSandbox", () => {
+  const sandbox = {
+    kind: "remote" as const,
+    transport: "sandbox" as const,
+    remoteCwd: "/workspace",
+  };
+  const capabilities = (reusableLeases: boolean) => ({
+    reusableLeases,
+    nativeSyncIn: true,
+    nativeSyncOut: true,
+    persistentProcessSessions: false,
+    independentControlCommands: false,
+    incrementalSessionOutput: false,
+    concurrentSyncOperations: false,
+    duplexCommandStream: false,
+    runnerWebSocketIngress: false,
+  });
+
+  it("follows the host's capability snapshot for this lease", () => {
+    expect(adapterExecutionTargetReusesSandbox({ ...sandbox, effectiveCapabilities: capabilities(true) })).toBe(true);
+    // An ephemeral lease in an environment with reuse on is not kept.
+    expect(
+      adapterExecutionTargetReusesSandbox({
+        ...sandbox,
+        reusableLeaseConfigured: true,
+        effectiveCapabilities: capabilities(false),
+      }),
+    ).toBe(false);
+  });
+
+  it("falls back to the environment setting without a snapshot, and is false off sandboxes", () => {
+    expect(adapterExecutionTargetReusesSandbox({ ...sandbox, reusableLeaseConfigured: true })).toBe(true);
+    expect(adapterExecutionTargetReusesSandbox(sandbox)).toBe(false);
+    expect(adapterExecutionTargetReusesSandbox({ kind: "local" })).toBe(false);
+    expect(adapterExecutionTargetReusesSandbox(null)).toBe(false);
   });
 });

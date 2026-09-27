@@ -30,6 +30,11 @@ export interface BuildSandboxCrManifestInput {
   };
   runtimeClassName?: string;
   imagePullSecrets?: string[];
+  /**
+   * Annotations for the Sandbox CR itself (not the pod template). Reusable
+   * sandboxes keep their idle/busy state here; omitted for ordinary leases.
+   */
+  annotations?: Record<string, string>;
 }
 
 export function buildSandboxCrManifest(
@@ -46,6 +51,7 @@ export function buildSandboxCrManifest(
       name: input.sandboxName,
       namespace: input.namespace,
       labels: { ...input.labels },
+      ...(input.annotations ? { annotations: { ...input.annotations } } : {}),
       // No ownerReferences: paperclip-server is out-of-cluster. Release is
       // explicit delete.
     },

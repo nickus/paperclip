@@ -21,6 +21,9 @@ const manifest: PaperclipPluginManifestV1 = {
       driverKey: "kubernetes",
       kind: "sandbox_provider",
       displayName: "Kubernetes",
+      // With `reuseLease` on, one sandbox per reuse scope is kept between runs
+      // and resumed by the next run (sandbox-cr backend only).
+      supportsReusableLeases: true,
       description:
         "Dispatches agent runs in per-tenant Kubernetes namespaces. Default backend (sandbox-cr, alpha) uses kubernetes-sigs/agent-sandbox for multi-command exec; fallback backend (job) uses stable batch/v1 Job for clusters without agent-sandbox installed.",
       configSchema: {
@@ -119,6 +122,40 @@ const manifest: PaperclipPluginManifestV1 = {
             enum: ["sandbox-cr", "job"],
             description:
               "sandbox-cr (default, alpha — requires kubernetes-sigs/agent-sandbox installed) | job (stable fallback — batch/v1 Job, one-shot entrypoint, no multi-command exec)",
+          },
+          reuseLease: {
+            type: "boolean",
+            description:
+              "Keep one sandbox per task (execution workspace + agent) between runs so the next run resumes the same pod, harness session and files (sandbox-cr only; default: false).",
+          },
+          reuseIdleTtlSec: {
+            type: "integer",
+            minimum: 60,
+            maximum: 604800,
+            description:
+              "Seconds an idle reusable sandbox is kept before it is removed (default: the environment's runnerIdleTimeoutMs, else 86400).",
+          },
+          reuseMaxSandboxes: {
+            type: "integer",
+            minimum: 1,
+            maximum: 100,
+            description:
+              "Maximum reusable sandboxes per tenant namespace; at the cap the least recently used idle one is removed (default: 8).",
+          },
+          reuseResources: {
+            type: "object",
+            properties: {
+              requests: {
+                type: "object",
+                properties: { cpu: { type: "string" }, memory: { type: "string" } },
+              },
+              limits: {
+                type: "object",
+                properties: { cpu: { type: "string" }, memory: { type: "string" } },
+              },
+            },
+            description:
+              "Resources for reusable sandboxes (default requests 100m / 256Mi, limits as for other sandboxes). Idle sandboxes hold their requests.",
           },
         },
         anyOf: [

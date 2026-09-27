@@ -6,6 +6,7 @@ import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type Adapter
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
+  adapterExecutionTargetReusesSandbox,
   overrideAdapterExecutionTargetRemoteCwd,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetSessionMatches,
@@ -59,7 +60,11 @@ import {
   requireOpenCodeModelId,
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
-import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
+import {
+  buildPruneManagedOpenCodeHomesCommand,
+  prepareOpenCodeRuntimeConfig,
+  prepareManagedOpenCodeRemoteHomes,
+} from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveOpenCodeSkillsHome } from "./skills.js";
 
@@ -436,13 +441,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (localRuntimeConfigHome && preparedExecutionTargetRuntime.assetDirs.xdgConfig) {
         preparedRuntimeConfig.env.XDG_CONFIG_HOME = preparedExecutionTargetRuntime.assetDirs.xdgConfig;
       }
-      prepareManagedOpenCodeRemoteHomes({
+      const managedRemoteHome = prepareManagedOpenCodeRemoteHomes({
         env: preparedRuntimeConfig.env,
         config,
         runtimeRootDir: preparedExecutionTargetRuntime.runtimeRootDir,
         runId,
         configDir: preparedExecutionTargetRuntime.assetDirs.xdgConfig,
+        reusedSandbox: adapterExecutionTargetReusesSandbox(executionTarget),
       });
+      if (managedRemoteHome?.perAccount) {
+        // A kept sandbox reuses this account's home; drop every other one.
+        await runAdapterExecutionTargetShellCommand(
+          runId,
+          executionTarget,
+          buildPruneManagedOpenCodeHomesCommand(managedRemoteHome),
+          { cwd, env: preparedRuntimeConfig.env, timeoutSec, graceSec, onLog },
+        );
+      }
       const remoteHomeDir = config.managedAiConnection
         ? preparedRuntimeConfig.env.HOME
         : managedHome && preparedExecutionTargetRuntime.runtimeRootDir
