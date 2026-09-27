@@ -129,15 +129,30 @@ export type RuntimeSecretValueCache = ReturnType<typeof createRuntimeSecretValue
 export const environmentRuntimeSecretCache = createRuntimeSecretValueCache();
 
 /**
+ * Status-shaped 401/403 text for errors whose structured status did not survive
+ * (a plugin error crosses the worker RPC as a message, and providers re-wrap):
+ * client-node's `HTTP-Code: 401`, ws's `Unexpected server response: 401`,
+ * `status code 401` / `HTTP 401` / `401 Unauthorized` style HTTP errors. A bare
+ * `401` or a lone "forbidden" is NOT enough: provider messages embed pod names,
+ * command tokens and paths that must not read as a credential rejection.
+ */
+const CREDENTIAL_REJECTION_MESSAGE =
+  /\bHTTP-Code: 40[13]\b|\bUnexpected server response: 40[13]\b|\bstatus(?: code)?[ :=]+40[13]\b|\bHTTP(?:\/[\d.]+)? 40[13]\b|\b40[13] (?:Unauthorized|Forbidden)\b/i;
+
+/**
  * True when an error from a provider call looks like a credential rejection
- * (HTTP 401/403, "Unauthorized", "Forbidden"). Used to evict cached secrets so
- * the next call re-resolves the (possibly rotated) credential.
+ * (HTTP 401/403). Used to evict cached secrets so the next call re-resolves the
+ * (possibly rotated) credential. A false positive only costs one extra audited
+ * read; a false negative leaves an externally changed value cached until the TTL.
  */
 export function isCredentialRejectionError(error: unknown): boolean {
   if (!error) return false;
-  const record = typeof error === "object" ? (error as Record<string, unknown>) : null;
-  const status = record?.statusCode ?? record?.status ?? record?.code;
+  if (typeof error === "string") return CREDENTIAL_REJECTION_MESSAGE.test(error);
+  if (typeof error !== "object") return false;
+  const record = error as Record<string, unknown>;
+  // Structured status first; a plugin's numeric error code (e.g. a Kubernetes
+  // ApiException's 401) is forwarded as the JSON-RPC error code.
+  const status = record.statusCode ?? record.status ?? record.code;
   if (status === 401 || status === 403) return true;
-  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  return /\b(401|403)\b|unauthori[sz]ed|forbidden/i.test(message);
+  return typeof record.message === "string" && CREDENTIAL_REJECTION_MESSAGE.test(record.message);
 }

@@ -2,15 +2,19 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
+  agents,
   companies,
   companySecretBindings,
   companySecretVersions,
   companySecrets,
   createDb,
+  environmentLeases,
   environments,
+  heartbeatRuns,
   plugins,
   secretAccessEvents,
 } from "@paperclipai/db";
+import { JsonRpcCallError } from "@paperclipai/plugin-sdk";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -73,9 +77,22 @@ describe("runtime secret value cache (unit)", () => {
   it("classifies credential rejections", () => {
     expect(isCredentialRejectionError(new Error("HTTP-Code: 401 Message: Unauthorized"))).toBe(true);
     expect(isCredentialRejectionError(Object.assign(new Error("x"), { statusCode: 403 }))).toBe(true);
-    expect(isCredentialRejectionError(new Error("Forbidden"))).toBe(true);
+    // A plugin's ApiException code crosses the worker RPC as the JSON-RPC code.
+    expect(isCredentialRejectionError(new JsonRpcCallError({ code: 401, message: "boom" }))).toBe(true);
+    expect(isCredentialRejectionError(new Error("sync failed: Unexpected server response: 403"))).toBe(true);
+    expect(isCredentialRejectionError(new Error("Request failed with status code 401"))).toBe(true);
+    expect(isCredentialRejectionError(new Error("HTTP 403 Forbidden"))).toBe(true);
     expect(isCredentialRejectionError(new Error("socket hang up"))).toBe(false);
     expect(isCredentialRejectionError(Object.assign(new Error("gone"), { status: 404 }))).toBe(false);
+    expect(isCredentialRejectionError(new JsonRpcCallError({ code: -32002, message: "worker error" }))).toBe(false);
+  });
+
+  it("ignores incidental 401/403/forbidden text in provider messages", () => {
+    expect(isCredentialRejectionError(new Error("Forbidden"))).toBe(false);
+    expect(isCredentialRejectionError(new Error(
+      "execInPod timed out after 30000ms (pod=pc-01j9x-403, container=agent, cmd0=forbidden)",
+    ))).toBe(false);
+    expect(isCredentialRejectionError(new Error("path /workspace/401 is forbidden by the allowlist"))).toBe(false);
   });
 });
 
@@ -104,6 +121,9 @@ describeEmbeddedPostgres("runtime secret resolution for plugin sandbox leases", 
   afterEach(async () => {
     vi.useRealTimers();
     environmentRuntimeSecretCache.clear();
+    await db.delete(environmentLeases);
+    await db.delete(heartbeatRuns);
+    await db.delete(agents);
     await db.delete(secretAccessEvents);
     await db.delete(companySecretBindings);
     await db.delete(environments);
@@ -269,30 +289,30 @@ describeEmbeddedPostgres("runtime secret resolution for plugin sandbox leases", 
     expect(await countAccessEvents(seeded.secretId)).toBe(1);
   });
 
-  describe("through the sandbox runtime execute path", () => {
-    function makeLease(seeded: Awaited<ReturnType<typeof seed>>) {
-      // Plugin sandbox leases record the provider config (with the secret REF)
-      // in their metadata; execute re-resolves it on every call.
-      return {
-        id: randomUUID(),
-        companyId: seeded.companyId,
-        environmentId: seeded.environment.id,
-        issueId: null,
-        heartbeatRunId: null,
-        providerLeaseId: "pc-lease-1",
-        leasePolicy: "ephemeral",
-        status: "active",
-        expiresAt: null,
-        metadata: {
-          ...seeded.config,
-          sandboxProviderPlugin: true,
-          pluginId: seeded.pluginId,
-          pluginKey: PLUGIN_KEY,
-          remoteCwd: "/workspace",
-        },
-      } as any;
-    }
+  function makeLease(seeded: Awaited<ReturnType<typeof seed>>) {
+    // Plugin sandbox leases record the provider config (with the secret REF)
+    // in their metadata; execute re-resolves it on every call.
+    return {
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      environmentId: seeded.environment.id,
+      issueId: null,
+      heartbeatRunId: null,
+      providerLeaseId: "pc-lease-1",
+      leasePolicy: "ephemeral",
+      status: "active",
+      expiresAt: null,
+      metadata: {
+        ...seeded.config,
+        sandboxProviderPlugin: true,
+        pluginId: seeded.pluginId,
+        pluginKey: PLUGIN_KEY,
+        remoteCwd: "/workspace",
+      },
+    } as any;
+  }
 
+  describe("through the sandbox runtime execute path", () => {
     it("sends the resolved kubeconfig on every execute but reads the secret once", async () => {
       const seeded = await seed();
       const seenKubeconfigs: unknown[] = [];
@@ -359,6 +379,193 @@ describeEmbeddedPostgres("runtime secret resolution for plugin sandbox leases", 
       await expect(exec()).rejects.toThrow(/401/);
       await exec(); // cache was evicted → full re-resolution
       expect(await countAccessEvents(seeded.secretId)).toBe(2);
+    });
+  });
+
+  // Every plugin sandbox RPC is handed a config read through the same per-
+  // environment cache entry, so a 401/403 from ANY of them (not only execute /
+  // file sync) must evict it; otherwise the rejected value is replayed to every
+  // RPC on that environment until the TTL.
+  describe("credential rejection on the other plugin sandbox RPCs", () => {
+    const REJECTION = () =>
+      new JsonRpcCallError({ code: 401, message: "HTTP-Code: 401\nMessage: Unknown API Status Code!" });
+
+    async function seedRun(companyId: string) {
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "active",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "manual",
+        status: "running",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      return runId;
+    }
+
+    // A worker that serves every lifecycle verb and fails `failing.method`
+    // with `failing.error` exactly once.
+    function makeWorker(seeded: Awaited<ReturnType<typeof seed>>, failing: { method: string | null; error: unknown }) {
+      return {
+        isRunning: vi.fn((id: string) => id === seeded.pluginId),
+        getWorker: vi.fn(() => ({
+          supportedMethods: [
+            "environmentAcquireLease",
+            "environmentExecute",
+            "environmentRealizeWorkspace",
+            "environmentReleaseLease",
+            "environmentDestroyLease",
+          ],
+        })),
+        call: vi.fn(async (_pluginId: string, method: string) => {
+          if (failing.method === method) {
+            failing.method = null;
+            throw failing.error;
+          }
+          switch (method) {
+            case "environmentAcquireLease":
+              return {
+                providerLeaseId: `pc-${randomUUID()}`,
+                metadata: { provider: PROVIDER, remoteCwd: "/workspace" },
+              };
+            case "environmentExecute":
+              return { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+            case "environmentRealizeWorkspace":
+              return { cwd: "/workspace" };
+            case "environmentReleaseLease":
+            case "environmentDestroyLease":
+              return undefined;
+            default:
+              throw new Error(`Unexpected plugin method: ${method}`);
+          }
+        }),
+      } as unknown as PluginWorkerManager;
+    }
+
+    type Seeded = Awaited<ReturnType<typeof seed>>;
+    type Runtime = ReturnType<typeof environmentRuntimeService>;
+    // Each case triggers one RPC; `rejects` = whether the runtime rethrows
+    // (release/destroy fold the error into a pending_cleanup lease instead).
+    const cases: Array<{
+      method: string;
+      rejects: boolean;
+      trigger: (runtime: Runtime, seeded: Seeded) => Promise<unknown>;
+    }> = [
+      {
+        method: "environmentAcquireLease",
+        rejects: true,
+        trigger: (runtime, seeded) =>
+          runtime.acquireRunLease({
+            companyId: seeded.companyId,
+            environment: seeded.environment as any,
+            issueId: null,
+            heartbeatRunId: null,
+            persistedExecutionWorkspace: null,
+          }),
+      },
+      {
+        method: "environmentRealizeWorkspace",
+        rejects: true,
+        trigger: (runtime, seeded) =>
+          runtime.realizeWorkspace({
+            environment: seeded.environment as any,
+            lease: makeLease(seeded),
+            workspace: { remotePath: "/workspace" },
+          }),
+      },
+      {
+        method: "environmentDestroyLease",
+        rejects: false,
+        trigger: (runtime, seeded) =>
+          runtime.destroyRunLease({ environment: seeded.environment as any, lease: makeLease(seeded) }),
+      },
+      {
+        method: "environmentReleaseLease",
+        rejects: false,
+        trigger: async (runtime, seeded) => {
+          // Release goes through the persisted lease rows of a run.
+          const runId = await seedRun(seeded.companyId);
+          await runtime.acquireRunLease({
+            companyId: seeded.companyId,
+            environment: seeded.environment as any,
+            issueId: null,
+            heartbeatRunId: runId,
+            persistedExecutionWorkspace: null,
+          });
+          return await runtime.releaseRunLeases(runId);
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      it(`evicts after a 401 from ${testCase.method}`, async () => {
+        const seeded = await seed();
+        const failing = { method: null as string | null, error: REJECTION() as unknown };
+        const runtime = environmentRuntimeService(db, { pluginWorkerManager: makeWorker(seeded, failing) });
+        const exec = () =>
+          runtime.execute({
+            environment: seeded.environment as any,
+            lease: makeLease(seeded),
+            command: "true",
+            args: [],
+            cwd: "/workspace",
+            env: {},
+            timeoutMs: 1000,
+          });
+
+        await exec();
+        await exec();
+        const primed = await countAccessEvents(seeded.secretId);
+        failing.method = testCase.method;
+        if (testCase.rejects) {
+          await expect(testCase.trigger(runtime, seeded)).rejects.toThrow(/401/);
+        } else {
+          await testCase.trigger(runtime, seeded);
+        }
+        expect(failing.method).toBeNull(); // the failing RPC really ran
+        const afterTrigger = await countAccessEvents(seeded.secretId);
+        await exec(); // evicted → one full, audited re-resolution
+        await exec(); // …then cached again
+        expect(await countAccessEvents(seeded.secretId)).toBe(afterTrigger + 1);
+        expect(afterTrigger).toBeGreaterThanOrEqual(primed);
+      });
+    }
+
+    it("keeps the cache when a lifecycle RPC fails for a non-credential reason", async () => {
+      const seeded = await seed();
+      const failing = { method: null as string | null, error: new Error("socket hang up") as unknown };
+      const runtime = environmentRuntimeService(db, { pluginWorkerManager: makeWorker(seeded, failing) });
+      const exec = () =>
+        runtime.execute({
+          environment: seeded.environment as any,
+          lease: makeLease(seeded),
+          command: "true",
+          args: [],
+          cwd: "/workspace",
+          env: {},
+          timeoutMs: 1000,
+        });
+      await exec();
+      failing.method = "environmentDestroyLease";
+      await runtime.destroyRunLease({ environment: seeded.environment as any, lease: makeLease(seeded) });
+      expect(failing.method).toBeNull();
+      await exec();
+      expect(await countAccessEvents(seeded.secretId)).toBe(1);
     });
   });
 });

@@ -245,6 +245,12 @@ import {
  * the secret's version/binding fingerprint on every use; this covers credentials
  * that changed outside Paperclip (e.g. an external vault value under the same
  * version, or a kubeconfig token revoked in the cluster).
+ *
+ * Every plugin sandbox RPC whose config came from resolvePluginSandboxRuntimeConfig
+ * or the acquire-path runtime resolution shares that cache, so each such
+ * `pluginWorkerManager.call` must go through here (execute, sync in/out, acquire,
+ * resume, realize, runner ingress, release, destroy). The orphan-cleanup destroy
+ * resolves its secrets uncached and needs no eviction.
  */
 async function evictRuntimeSecretsOnCredentialRejection<T>(
   environmentId: string,
@@ -1942,13 +1948,16 @@ function createSandboxEnvironmentDriver(
           }
           try {
             const resumeDeadline = Date.now() + 60_000;
+            // Captured outside the eviction closure, where the narrowing is lost.
+            const resumeProviderLeaseId = reusableLease.providerLeaseId;
             const configuredResumeTimeoutMs =
               resolvePluginSandboxRpcTimeoutMs(workerConfig) ?? 60_000;
             let retryDelayMs = 250;
             let resumed: PluginEnvironmentLease;
             while (true) {
               try {
-                resumed = await pluginWorkerManager.call(
+                // workerConfig came through the runtime secret cache: a 401/403 evicts it.
+                resumed = await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(
                   pluginProvider.resolved.plugin.id,
                   "environmentResumeLease",
                   {
@@ -1957,14 +1966,14 @@ function createSandboxEnvironmentDriver(
                     environmentId: input.environment.id,
                     issueId: input.issueId,
                     config: workerConfig,
-                    providerLeaseId: reusableLease.providerLeaseId,
+                    providerLeaseId: resumeProviderLeaseId,
                     leaseMetadata: reusableLease.metadata ?? undefined,
                   },
                   Math.min(
                     configuredResumeTimeoutMs,
                     Math.max(1, resumeDeadline - Date.now()),
                   ),
-                );
+                ));
                 break;
               } catch (error) {
                 if (
@@ -2022,7 +2031,8 @@ function createSandboxEnvironmentDriver(
             });
           }
         }
-        const acquiredLease = providerLease ?? await pluginWorkerManager.call(
+        // workerConfig came through the runtime secret cache: a 401/403 evicts it.
+        const acquiredLease = providerLease ?? await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(
           pluginProvider.resolved.plugin.id,
           "environmentAcquireLease",
           {
@@ -2053,7 +2063,7 @@ function createSandboxEnvironmentDriver(
               : {}),
           },
           resolvePluginSandboxRpcTimeoutMs(workerConfig),
-        );
+        ));
 
         // Ad-hoc test leases are never publishable for reuse: storing them
         // as `reuse_by_environment` would let a concurrent heartbeat resume
@@ -2167,7 +2177,8 @@ function createSandboxEnvironmentDriver(
               cause: error,
               canTeardown: pluginWorkerManager.isRunning(pluginProvider.resolved.plugin.id),
               teardown: async () => {
-                return await pluginWorkerManager.call(
+                // Same cached workerConfig as the acquire: a 401/403 evicts it.
+                return await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(
                   pluginProvider.resolved.plugin.id,
                   "environmentDestroyLease",
                   {
@@ -2180,7 +2191,7 @@ function createSandboxEnvironmentDriver(
                     leaseMetadata: acquiredLease.metadata ?? undefined,
                   },
                   resolvePluginSandboxRpcTimeoutMs(workerConfig),
-                );
+                ));
               },
             });
           }
@@ -2626,7 +2637,7 @@ function createSandboxEnvironmentDriver(
             lease: input.lease,
             provider: providerKey,
           });
-          const pluginResult = await pluginWorkerManager.call(pluginId, "environmentRealizeWorkspace", {
+          const pluginResult = await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(pluginId, "environmentRealizeWorkspace", {
             driverKey: providerKey,
             companyId: input.lease.companyId,
             environmentId: input.environment.id,
@@ -2638,7 +2649,7 @@ function createSandboxEnvironmentDriver(
               expiresAt: input.lease.expiresAt?.toISOString() ?? null,
             },
             workspace: input.workspace,
-          }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)));
+          }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig))));
           pluginRealizedCwd =
             typeof pluginResult.cwd === "string" && pluginResult.cwd.trim().length > 0
               ? pluginResult.cwd.trim()
@@ -2837,7 +2848,8 @@ function createSandboxEnvironmentDriver(
         config as SandboxEnvironmentConfig,
       );
       const acquire = async (): Promise<RunnerIngressEndpoint> => {
-        const result = await pluginWorkerManager.call(
+        // sanitizedConfig came through the runtime secret cache: a 401/403 evicts it.
+        const result = await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(
           pluginId,
           "environmentRunnerIngressEndpoint",
           {
@@ -2855,7 +2867,7 @@ function createSandboxEnvironmentDriver(
             path: input.path,
           },
           resolvePluginSandboxRpcTimeoutMs(sanitizedConfig),
-        );
+        ));
         const endpointUrl = new URL(result.websocketUrl);
         if (
           result.kind !== "authenticated_websocket" ||
@@ -3051,8 +3063,10 @@ function createSandboxEnvironmentDriver(
           lease: input.lease,
           provider: providerKey,
         });
+        // The release error is swallowed into cleanupStatus below, so evict the
+        // cached secret here: the reaper's retry then re-resolves it in full.
         const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () =>
-          pluginWorkerManager.call(pluginId, "environmentReleaseLease", {
+          evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(pluginId, "environmentReleaseLease", {
             driverKey: providerKey,
             companyId: input.lease.companyId,
             environmentId: input.environment.id,
@@ -3061,7 +3075,7 @@ function createSandboxEnvironmentDriver(
             providerLeaseId: input.lease.providerLeaseId,
             leaseMetadata: metadata,
             ...(input.cancelActiveWork ? { cancelActiveWork: true } : {}),
-          }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig))),
+          }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)))),
         );
         termination = remoteTerminationReceipt(input.lease, receipt);
         if (input.cancelActiveWork && !termination) cleanupStatus = "failed";
@@ -3123,8 +3137,9 @@ function createSandboxEnvironmentDriver(
             lease: input.lease,
             provider: providerKey,
           });
+          // Swallowed into cleanupStatus below; evict first so the retry re-resolves.
           const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () =>
-            pluginWorkerManager.call(pluginId, "environmentDestroyLease", {
+            evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(pluginId, "environmentDestroyLease", {
               driverKey: providerKey,
               companyId: input.lease.companyId,
               environmentId: input.environment.id,
@@ -3132,7 +3147,7 @@ function createSandboxEnvironmentDriver(
               config: stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig),
               providerLeaseId: input.lease.providerLeaseId,
               leaseMetadata: metadata,
-            }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig))),
+            }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)))),
           );
           termination = remoteTerminationReceipt(input.lease, receipt);
         }
