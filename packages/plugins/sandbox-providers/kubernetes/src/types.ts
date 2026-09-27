@@ -34,6 +34,18 @@ export const kubernetesProviderConfigSchema = z
     podActivityDeadlineSec: z.number().int().positive().default(3600),
 
     /**
+     * Pod-exec WebSocket keepalive. Every `execKeepaliveIntervalSec` the plugin
+     * pings the kube-apiserver over the exec connection; if no frame, pong or
+     * outbound send progress is seen for `execLivenessTimeoutSec` the exec is
+     * declared dead and fails fast instead of waiting out the whole run budget.
+     * A command that is merely quiet still answers pings, so it is not affected.
+     * `execKeepaliveIntervalSec: 0` disables the keepalive (close/error events
+     * are still honored). The liveness timeout is floored at two intervals.
+     */
+    execKeepaliveIntervalSec: z.number().int().nonnegative().default(15),
+    execLivenessTimeoutSec: z.number().int().positive().default(60),
+
+    /**
      * The adapter type that Jobs in this environment will run.
      * Each Kubernetes environment is bound to one adapter; create multiple
      * environments for different adapters.
