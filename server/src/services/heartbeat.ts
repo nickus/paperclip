@@ -9328,6 +9328,8 @@ export function heartbeatService(
   options: HeartbeatServiceOptions = {},
 ) {
   let shutdownInProgress = false;
+  // Single-flight guard for reconcileStaleTerminalRunLeases in this service.
+  let staleTerminalRunLeaseReconciliationInFlight = false;
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -10163,7 +10165,30 @@ export function heartbeatService(
   // release goes through the normal driver path: a confirmed provider stop is
   // recorded as a termination receipt, and a failed release lands in
   // pending_cleanup for the existing retry sweep.
+  //
+  // Unlike the Stop path, this needs no controller-lease check: a legacy
+  // controller lease renews only while its run is "running"
+  // (legacy-controller-lease.ts), so a terminal run's controller lease lapses
+  // at most 60s after the run stopped, long before the grace below ends, and
+  // its executor aborts once renewal fails. An executor elsewhere that is still
+  // tearing down after the grace would only repeat this idempotent release.
   async function reconcileStaleTerminalRunLeases(opts?: {
+    graceMs?: number;
+    now?: Date;
+  }): Promise<{ reconciled: number; runIds: string[] }> {
+    // Each release can wait on a provider teardown RPC, so an overlapping reaper
+    // tick skips the step instead of stacking a second serial teardown loop
+    // (and delaying its own dispatch work behind it).
+    if (staleTerminalRunLeaseReconciliationInFlight) return { reconciled: 0, runIds: [] };
+    staleTerminalRunLeaseReconciliationInFlight = true;
+    try {
+      return await reconcileStaleTerminalRunLeasePage(opts);
+    } finally {
+      staleTerminalRunLeaseReconciliationInFlight = false;
+    }
+  }
+
+  async function reconcileStaleTerminalRunLeasePage(opts?: {
     graceMs?: number;
     now?: Date;
   }): Promise<{ reconciled: number; runIds: string[] }> {
@@ -10196,11 +10221,31 @@ export function heartbeatService(
       .limit(STALE_TERMINAL_RUN_LEASE_PAGE_SIZE);
     const runIds: string[] = [];
     for (const { runId } of candidates) {
+      // A hot restart is draining this process; the next server picks up the rest.
+      if (shutdownInProgress) break;
       // Never touch a lease whose executor is still alive in this process.
       if (activeRunExecutions.has(runId) || adapterExecutionControls.has(runId)) continue;
       try {
         const run = await getRun(runId);
         if (!run || run.runtimeMode === "native" || !isHeartbeatRunTerminalStatus(run.status)) continue;
+        // Atomically claim the run's stale leases before the release, like the
+        // pending_cleanup sweep's attempt claim. Bumping updatedAt drops them
+        // from every other reconciler's candidates (an overlapping tick or
+        // another server process), so only one of them releases the sandbox. A
+        // lease the release leaves "active" is retried only after another grace.
+        const claimed = await db
+          .update(environmentLeases)
+          .set({ updatedAt: new Date() })
+          .where(
+            and(
+              eq(environmentLeases.companyId, run.companyId),
+              eq(environmentLeases.heartbeatRunId, run.id),
+              eq(environmentLeases.status, "active"),
+              lte(environmentLeases.updatedAt, cutoff),
+            ),
+          )
+          .returning({ id: environmentLeases.id });
+        if (claimed.length === 0) continue;
         await releaseEnvironmentLeasesForRun({
           runId: run.id,
           companyId: run.companyId,

@@ -36,7 +36,11 @@ vi.mock("../middleware/logger.js", () => ({
 }));
 
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
-import { heartbeatService, STALE_TERMINAL_RUN_LEASE_GRACE_MS } from "../services/heartbeat.ts";
+import {
+  heartbeatService,
+  STALE_TERMINAL_RUN_LEASE_GRACE_MS,
+  type HeartbeatEnvironmentRuntime,
+} from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -172,6 +176,45 @@ describeEmbeddedPostgres("heartbeat environment lease release for stopped runs",
     return { companyId, agentId, runId, leaseId };
   }
 
+  // A provider-backed runtime whose release blocks on a gate, like a plugin
+  // teardown RPC waiting for the sandbox to go. `entered` resolves once a
+  // release has started; `open()` lets every release finish as "expired".
+  function gatedReleaseRuntime() {
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    let entered!: () => void;
+    const firstEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const releasedRunIds: string[] = [];
+    const releaseRunLeases = vi.fn(async (runId: string) => {
+      releasedRunIds.push(runId);
+      entered();
+      await gate;
+      await db
+        .update(environmentLeases)
+        .set({ status: "expired", releasedAt: new Date(), updatedAt: new Date() })
+        .where(eq(environmentLeases.heartbeatRunId, runId));
+      return [];
+    });
+    return {
+      runtime: { releaseRunLeases } as unknown as HeartbeatEnvironmentRuntime,
+      releasedRunIds,
+      firstEntered,
+      open: () => open(),
+    };
+  }
+
+  // Resolves to "blocked" when the promise is still pending after a short wait.
+  function settledOrBlocked<T>(promise: Promise<T>) {
+    return Promise.race([
+      promise,
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 1_000)),
+    ]);
+  }
+
   async function leaseRow(leaseId: string) {
     return db
       .select()
@@ -284,6 +327,77 @@ describeEmbeddedPostgres("heartbeat environment lease release for stopped runs",
 
     expect(result.reconciled).toBe(0);
     expect((await leaseRow(leaseId)).status).toBe("active");
+  });
+
+  it("releases a stale lease once when two server processes reconcile it at the same time", async () => {
+    const longAgo = new Date(Date.now() - 2 * STALE_TERMINAL_RUN_LEASE_GRACE_MS);
+    const { runId, leaseId } = await seedRunWithActiveLease({
+      runStatus: "cancelled",
+      finishedAt: longAgo,
+      leaseUpdatedAt: longAgo,
+    });
+    const provider = gatedReleaseRuntime();
+    // Two service instances stand in for two server processes sharing the DB.
+    const processA = heartbeatService(db, { environmentRuntime: provider.runtime });
+    const processB = heartbeatService(db, { environmentRuntime: provider.runtime });
+
+    const first = processA.reconcileStaleTerminalRunLeases();
+    await provider.firstEntered;
+    // A is inside the slow provider teardown; B's tick must not start another.
+    const second = await settledOrBlocked(processB.reconcileStaleTerminalRunLeases());
+    provider.open();
+
+    expect(second).toEqual({ reconciled: 0, runIds: [] });
+    expect(await first).toEqual({ reconciled: 1, runIds: [runId] });
+    expect(provider.releasedRunIds).toEqual([runId]);
+    expect((await leaseRow(leaseId)).status).toBe("expired");
+  });
+
+  it("skips an overlapping reconciliation in the same process instead of stacking teardowns", async () => {
+    const longAgo = new Date(Date.now() - 2 * STALE_TERMINAL_RUN_LEASE_GRACE_MS);
+    const a = await seedRunWithActiveLease({ runStatus: "cancelled", finishedAt: longAgo, leaseUpdatedAt: longAgo });
+    const b = await seedRunWithActiveLease({ runStatus: "failed", finishedAt: longAgo, leaseUpdatedAt: longAgo });
+    const provider = gatedReleaseRuntime();
+    const heartbeat = heartbeatService(db, { environmentRuntime: provider.runtime });
+
+    const slowTick = heartbeat.reconcileStaleTerminalRunLeases();
+    await provider.firstEntered;
+    // The next reaper tick returns at once rather than waiting on the teardown.
+    const nextTick = await settledOrBlocked(heartbeat.reconcileStaleTerminalRunLeases());
+    expect(nextTick).toEqual({ reconciled: 0, runIds: [] });
+    expect(provider.releasedRunIds).toHaveLength(1);
+    provider.open();
+
+    const result = await slowTick;
+    expect(result.reconciled).toBe(2);
+    expect([...result.runIds].sort()).toEqual([a.runId, b.runId].sort());
+    expect(provider.releasedRunIds).toHaveLength(2);
+  });
+
+  it("retries a lease the release left active only after another grace period", async () => {
+    const longAgo = new Date(Date.now() - 2 * STALE_TERMINAL_RUN_LEASE_GRACE_MS);
+    const { leaseId } = await seedRunWithActiveLease({
+      runStatus: "cancelled",
+      finishedAt: longAgo,
+      leaseUpdatedAt: longAgo,
+    });
+    // A release that cannot act (e.g. the lease's environment row is gone)
+    // leaves the lease "active".
+    const releaseRunLeases = vi.fn(async () => []);
+    const heartbeat = heartbeatService(db, {
+      environmentRuntime: { releaseRunLeases } as unknown as HeartbeatEnvironmentRuntime,
+    });
+
+    await heartbeat.reconcileStaleTerminalRunLeases();
+    const nextTick = await heartbeat.reconcileStaleTerminalRunLeases();
+
+    // The claim pushed the lease behind the grace, so the next tick neither
+    // repeats the teardown nor keeps the lease at the head of every page.
+    expect(nextTick.reconciled).toBe(0);
+    expect(releaseRunLeases).toHaveBeenCalledTimes(1);
+    const lease = await leaseRow(leaseId);
+    expect(lease.status).toBe("active");
+    expect(lease.updatedAt.getTime()).toBeGreaterThan(longAgo.getTime());
   });
 
   it("leaves native runs to their finalization coordinator", async () => {
