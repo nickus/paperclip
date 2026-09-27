@@ -1308,6 +1308,12 @@ export function adapterExecutionTargetSessionIdentity(
     providerKey: target.providerKey ?? null,
     environmentId: target.environmentId ?? null,
     leaseId: target.leaseId ?? null,
+    // Each run gets a new lease row, so `leaseId` changes even when the host
+    // resumes the same provider sandbox. The provider lease id is the stable
+    // identity of the sandbox itself.
+    ...(target.sandboxLeaseAcquisition?.providerLeaseId
+      ? { providerLeaseId: target.sandboxLeaseAcquisition.providerLeaseId }
+      : {}),
     remoteCwd: target.remoteCwd,
   };
 }
@@ -1326,7 +1332,9 @@ export function adapterExecutionTargetSessionMatches(
     readStringMeta(parsedSaved, "transport") === current?.transport &&
     readStringMeta(parsedSaved, "providerKey") === current?.providerKey &&
     readStringMeta(parsedSaved, "environmentId") === current?.environmentId &&
-    readStringMeta(parsedSaved, "leaseId") === current?.leaseId &&
+    (readStringMeta(parsedSaved, "providerLeaseId")
+      ? readStringMeta(parsedSaved, "providerLeaseId") === current?.providerLeaseId
+      : readStringMeta(parsedSaved, "leaseId") === current?.leaseId) &&
     readStringMeta(parsedSaved, "remoteCwd") === current?.remoteCwd
   );
 }
