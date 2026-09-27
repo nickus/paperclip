@@ -30,6 +30,7 @@ vi.mock("../../src/pod-exec.js", async (importOriginal) => {
 
 import plugin from "../../src/plugin.js";
 import { resetKubeConnectionCache } from "../../src/kube-client-cache.js";
+import { execInPod } from "../../src/pod-exec.js";
 
 const KUBECONFIG = "apiVersion: v1\nkind: Config\n# fake\n";
 
@@ -119,6 +120,33 @@ describe("kube client reuse across RPCs", () => {
         }),
       ),
     ).rejects.toThrow(/socket hang up/);
+    await plugin.definition.onEnvironmentExecute!(executeParams());
+    expect(h.creates).toBe(1);
+  });
+
+  it("rebuilds the client after the exec WebSocket upgrade is rejected (ws ErrorEvent)", async () => {
+    await plugin.definition.onEnvironmentExecute!(executeParams());
+    expect(h.creates).toBe(1);
+    // client-node rejects exec with ws's ErrorEvent, not an Error instance; the
+    // plugin reports it as a timed-out result, so eviction happens in the catch.
+    vi.mocked(execInPod).mockRejectedValueOnce({
+      type: "error",
+      message: "Unexpected server response: 401",
+      error: new Error("Unexpected server response: 401"),
+    });
+    const rejected = await plugin.definition.onEnvironmentExecute!(executeParams());
+    expect(rejected.timedOut).toBe(true);
+    await plugin.definition.onEnvironmentExecute!(executeParams());
+    expect(h.creates).toBe(2);
+  });
+
+  it("keeps the client when an exec watchdog message merely contains 403/forbidden", async () => {
+    await plugin.definition.onEnvironmentExecute!(executeParams());
+    vi.mocked(execInPod).mockRejectedValueOnce(new Error(
+      "execInPod timed out after 5000ms (pod=pc-reuse-403, container=agent, cmd0=forbidden). The WebSocket likely dropped before the command produced a status frame.",
+    ));
+    const timedOut = await plugin.definition.onEnvironmentExecute!(executeParams());
+    expect(timedOut.timedOut).toBe(true);
     await plugin.definition.onEnvironmentExecute!(executeParams());
     expect(h.creates).toBe(1);
   });

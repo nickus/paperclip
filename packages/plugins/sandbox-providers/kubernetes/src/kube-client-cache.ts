@@ -68,18 +68,43 @@ export function evictKubeConnection(input: KubeConnectionInput): void {
 }
 
 /**
+ * Message shapes that carry a 401/403 when no structured status survives:
+ * - `HTTP-Code: 401` — the text of client-node's ApiException (kept when a
+ *   caller re-wraps it in a plain Error);
+ * - `Unexpected server response: 401` — ws's rejected exec/attach upgrade.
+ * Deliberately NOT a bare `401`/`forbidden` match: exec watchdog errors embed
+ * the pod name and the command's first token, which must never look like a
+ * credential rejection.
+ */
+const KUBE_AUTH_ERROR_MESSAGE = /\bHTTP-Code: 40[13]\b|\bUnexpected server response: 40[13]\b/;
+
+/**
  * True for Kubernetes credential rejections: an ApiException / HTTP error with
- * code 401/403, or a WebSocket exec upgrade rejected with 401/403.
+ * code 401/403, or a WebSocket exec upgrade rejected with 401/403. The latter
+ * reaches us as a ws `ErrorEvent` (not an Error instance) carrying `message`
+ * and the underlying `error`, so both are inspected.
  */
 export function isKubeAuthError(err: unknown): boolean {
-  if (!err || typeof err !== "object") {
-    return typeof err === "string" && /\b(401|403)\b|unauthori[sz]ed|forbidden/i.test(err);
-  }
-  const record = err as { code?: unknown; statusCode?: unknown; status?: unknown };
+  return matchesKubeAuthError(err, 0);
+}
+
+function matchesKubeAuthError(err: unknown, depth: number): boolean {
+  if (typeof err === "string") return KUBE_AUTH_ERROR_MESSAGE.test(err);
+  if (!err || typeof err !== "object" || depth > 3) return false; // bounded walk over wrappers
+  const record = err as {
+    code?: unknown;
+    statusCode?: unknown;
+    status?: unknown;
+    message?: unknown;
+    error?: unknown;
+    cause?: unknown;
+  };
+  // Structured status first (ApiException.code, HTTP-style statusCode/status).
   const code = record.code ?? record.statusCode ?? record.status;
   if (code === 401 || code === 403) return true;
-  const message = err instanceof Error ? err.message : "";
-  return /\b(401|403)\b|unauthori[sz]ed|forbidden/i.test(message);
+  if (typeof record.message === "string" && KUBE_AUTH_ERROR_MESSAGE.test(record.message)) return true;
+  // ws ErrorEvent.error / Error.cause wrap the original rejection.
+  return matchesKubeAuthError(record.error, depth + 1) || matchesKubeAuthError(record.cause, depth + 1);
 }
 
 /** Evict the cached connection when `err` is a credential rejection. */

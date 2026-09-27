@@ -116,10 +116,35 @@ describe("auth-error eviction", () => {
     expect(isKubeAuthError(Object.assign(new Error("HTTP-Code: 401"), { code: 401 }))).toBe(true);
     expect(isKubeAuthError({ statusCode: 403 })).toBe(true);
     expect(isKubeAuthError(new Error("Unexpected server response: 401"))).toBe(true);
-    expect(isKubeAuthError(new Error("Unauthorized"))).toBe(true);
+    // A re-wrapped ApiException keeps its "HTTP-Code: 403" text but loses `.code`.
+    expect(isKubeAuthError(new Error("create job failed: HTTP-Code: 403\nMessage: Forbidden"))).toBe(true);
     expect(isKubeAuthError(Object.assign(new Error("not found"), { code: 404 }))).toBe(false);
     expect(isKubeAuthError(new Error("socket hang up"))).toBe(false);
     expect(isKubeAuthError(null)).toBe(false);
+  });
+
+  it("recognizes a rejected exec upgrade delivered as a ws ErrorEvent", () => {
+    // ws hands the exec's onerror an ErrorEvent: NOT an Error instance, with
+    // `message` and the underlying `error` (ws abortHandshake text).
+    const upgradeRejected = {
+      type: "error",
+      message: "Unexpected server response: 401",
+      error: new Error("Unexpected server response: 401"),
+    };
+    expect(upgradeRejected instanceof Error).toBe(false);
+    expect(isKubeAuthError(upgradeRejected)).toBe(true);
+    expect(isKubeAuthError({ type: "error", message: "", error: new Error("Unexpected server response: 403") })).toBe(true);
+    expect(isKubeAuthError(new Error("wrapped", { cause: Object.assign(new Error("x"), { code: 401 }) }))).toBe(true);
+  });
+
+  it("does not treat incidental 401/403/forbidden text as a credential rejection", () => {
+    // execInPod's watchdog message embeds the pod name and cmd0 verbatim.
+    expect(isKubeAuthError(new Error(
+      "execInPod timed out after 30000ms (pod=pc-01j9x-403, container=agent, cmd0=forbidden). The WebSocket likely dropped before the command produced a status frame.",
+    ))).toBe(false);
+    expect(isKubeAuthError(new Error("Unauthorized"))).toBe(false);
+    expect(isKubeAuthError(new Error("exit 401"))).toBe(false);
+    expect(isKubeAuthError("forbidden")).toBe(false);
   });
 
   it("evicts on 401 but keeps the client on other errors", async () => {
