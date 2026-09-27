@@ -31,6 +31,7 @@ import type { KubeConfig } from "@kubernetes/client-node";
 // crashing.
 type WebSocketLike = {
   close(): void;
+  send?(data: unknown, ...rest: unknown[]): unknown;
   terminate?(): void;
   ping?(): void;
   on?(event: string, listener: (...args: unknown[]) => void): unknown;
@@ -55,9 +56,9 @@ const WS_CLOSING = 2;
  *
  * The liveness contract: the connection is considered alive while ANY evidence
  * of a live peer arrives — an inbound frame (stdout/stderr/status data), a pong
- * to our periodic ping, or our outbound send buffer draining (the kernel only
- * frees send-buffer space when the peer ACKs, which matters during a big stdin
- * upload where our ping sits queued behind megabytes of data). RFC 6455 §5.5.2
+ * to our periodic ping, or bytes leaving our outbound send buffer (the kernel
+ * only frees send-buffer space when the peer ACKs, which matters during a big
+ * stdin upload where our ping sits queued behind megabytes of data). RFC 6455 §5.5.2
  * obliges the endpoint (the kube-apiserver, whose websocket servers answer
  * pings automatically) to answer every ping, so a command that is merely QUIET
  * but still connected keeps answering pongs and is never killed — only a
@@ -107,12 +108,22 @@ function describeCloseReason(reason: unknown): string {
   return typeof reason === "string" ? reason : "";
 }
 
+// Byte size of a ws.send() payload. Unknown shapes count as 0, which only makes
+// the outbound-progress estimate more conservative (never a false "alive").
+function byteLengthOf(data: unknown): number {
+  if (typeof data === "string") return Buffer.byteLength(data);
+  if (ArrayBuffer.isView(data)) return data.byteLength; // Buffer / TypedArray / DataView
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  return 0;
+}
+
 /**
  * Attach close/error listeners and a ping/pong liveness monitor to an exec
  * WebSocket. `onDead` is called at most once with the failure kind and a
  * human-readable detail; `hasStatus()` tells the monitor that a status frame
  * already arrived, in which case a close is the normal end of the exec and is
- * ignored. Returns a disposer that stops the timer and removes the listeners.
+ * ignored. Returns a disposer that stops the timer, removes the listeners and
+ * un-wraps `ws.send`.
  */
 export function monitorExecSocket(
   ws: WebSocketLike,
@@ -127,6 +138,20 @@ export function monitorExecSocket(
   let fired = false;
   let lastAliveAt = Date.now();
   let lastBufferedAmount = ws.bufferedAmount ?? 0;
+  // Cumulative bytes handed to ws.send() (the k8s client's stdin frames). Wrap
+  // send on the instance rather than listening on the stdin stream: an extra
+  // `data` listener there could switch the stream to flowing mode early.
+  let sentBytes = 0;
+  let lastSentBytes = 0;
+  const originalSend = typeof ws.send === "function" ? ws.send : null;
+  const hadOwnSend = Object.prototype.hasOwnProperty.call(ws, "send");
+  if (originalSend) {
+    ws.send = (data: unknown, ...rest: unknown[]) => {
+      const result = originalSend.apply(ws, [data, ...rest]);
+      sentBytes += byteLengthOf(data); // only count what send() accepted (it throws if not OPEN)
+      return result;
+    };
+  }
 
   const fire = (kind: Exclude<PodExecTransportFailureKind, "timeout">, detail: string) => {
     if (fired || hasStatus()) return; // status already in hand => close is the normal end
@@ -154,11 +179,20 @@ export function monitorExecSocket(
   let timer: ReturnType<typeof setInterval> | null = null;
   if (intervalMs > 0 && typeof ws.ping === "function") {
     timer = setInterval(() => {
-      // Outbound progress: our send buffer shrank since the last tick, so the
-      // peer is ACKing data (a large stdin upload can queue our ping behind it).
+      // Outbound progress: bytes that LEFT our send buffer since the last tick
+      // mean the peer is ACKing data (a large stdin upload queues our ping, and
+      // so its pong, behind that data). By conservation,
+      //   flushed = (bytes enqueued since last tick) - (growth of bufferedAmount).
+      // Comparing bufferedAmount alone would miss a link that IS draining but
+      // whose buffer still net-grows because the source enqueues faster than it
+      // drains (the k8s client sends stdin with no backpressure). `sentBytes`
+      // counts message payload only, not WebSocket framing or our pings, so
+      // this can only under-estimate progress: a stalled link never reads as
+      // alive.
       const buffered = ws.bufferedAmount ?? 0;
-      if (buffered < lastBufferedAmount) markAlive();
+      if (sentBytes - lastSentBytes - (buffered - lastBufferedAmount) > 0) markAlive();
       lastBufferedAmount = buffered;
+      lastSentBytes = sentBytes;
 
       if (Date.now() - lastAliveAt >= timeoutMs) {
         fire(
@@ -181,6 +215,11 @@ export function monitorExecSocket(
   function dispose() {
     if (timer) clearInterval(timer);
     timer = null;
+    // Stop counting: restore the original send (normally the prototype's).
+    if (originalSend) {
+      if (hadOwnSend) ws.send = originalSend;
+      else delete ws.send;
+    }
     if (canListen && typeof ws.removeListener === "function") {
       ws.removeListener("close", onClose);
       ws.removeListener("error", onError);
@@ -470,6 +509,9 @@ export async function execInPod(
               stderrData,
             ));
           });
+          // The monitor can declare the socket dead synchronously (already
+          // closed at setup); don't feed stdin into a torn-down exec.
+          if (resolved) return;
           if (stdinStream && stdinPayload) {
             // Remove the default `end -> ws.close()` listener that k8s client
             // attaches in handleStandardInput; it tears down the connection
@@ -678,6 +720,9 @@ export async function execInPodStreaming(
             stderrData,
           ));
         });
+        // Already declared dead synchronously (socket closed at setup): don't
+        // start piping the caller's source into a torn-down exec.
+        if (resolved) return;
         if (stdinStream && io.stdin) {
           // Strip the default `end -> ws.close()` listener (see execInPod) so
           // EOF on our stdin only signals the pod, then stream the caller's

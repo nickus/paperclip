@@ -23,6 +23,10 @@ class FakeWs extends EventEmitter {
   autoPong = true;
   closed = false;
   terminated = false;
+  // Like `ws`: a sent message is queued in the send buffer until "flushed".
+  send(data: Buffer) {
+    this.bufferedAmount += data.length;
+  }
   ping() {
     if (this.readyState !== 1) throw new Error("WebSocket is not open");
     this.pings += 1;
@@ -293,6 +297,17 @@ describe("execInPod dead-connection detection", () => {
     expect(err.message).toMatch(/already closed/);
   });
 
+  it("does not feed stdin into an exec whose socket was already closed at setup", async () => {
+    fakeWs.readyState = 3;
+    let execStdin: PassThrough | null = null;
+    scriptedExec = (_stdout, _stderr, _statusCb, stdin) => { execStdin = stdin; };
+    const state = track(execInPod(KC, "ns", "pod", "agent", CMD, "payload", RUN_BUDGET_MS));
+    await flush();
+    expect((state.error as InstanceType<typeof PodExecTransportError>).kind).toBe("connection_closed");
+    // The monitor's synchronous verdict short-circuits the stdin wiring.
+    expect(execStdin!.writableEnded).toBe(false);
+  });
+
   it("reports the overall watchdog as kind=timeout with partial output", async () => {
     scriptedExec = (_stdout, stderr) => {
       stderr.write(Buffer.from("still working"));
@@ -343,6 +358,57 @@ describe("execInPodStreaming dead-connection detection", () => {
     expect(err.kind).toBe("connection_closed");
     expect(err.message).toMatch(/^execInPodStreaming lost its exec connection/);
     expect(err.partialStderr).toBe("tar: partial");
+  });
+
+  it("counts a draining upload as alive even while its send buffer net-grows", async () => {
+    fakeWs.autoPong = false; // our pings (and so the pongs) sit behind the queued upload
+    scriptedExec = (_stdout, _stderr, _statusCb, stdin) => {
+      // Model the k8s client: every stdin chunk is ws.send()-queued, no backpressure.
+      stdin!.on("data", (chunk: Buffer) => { fakeWs.send(Buffer.concat([Buffer.from([0]), chunk])); });
+    };
+    const source = new Readable({ read() {} });
+    const state = track(
+      execInPodStreaming(KC, "ns", "pod", "agent", ["/bin/sh", "-c", "head -c 9 | tar x"], {
+        stdin: source,
+        timeoutMs: RUN_BUDGET_MS,
+      }),
+    );
+    await flush();
+    // 5 minutes: the source enqueues 300KB per tick but the link drains only
+    // 100KB, so bufferedAmount rises at EVERY tick while the peer is ACKing.
+    for (let i = 0; i < 20; i++) {
+      source.push(Buffer.alloc(300_000));
+      await flush();
+      fakeWs.bufferedAmount -= 100_000;
+      await vi.advanceTimersByTimeAsync(15_000);
+    }
+    expect(state.settled).toBe(false);
+    // The link stalls (nothing drains) while the source keeps enqueuing: a
+    // growing buffer alone is not progress, so it dies within the window.
+    for (let i = 0; i < 5; i++) {
+      source.push(Buffer.alloc(300_000));
+      await flush();
+      await vi.advanceTimersByTimeAsync(15_000);
+    }
+    await flush();
+    expect((state.error as InstanceType<typeof PodExecTransportError>).kind).toBe("keepalive_timeout");
+    // The counting send wrapper is removed with the monitor.
+    expect(Object.prototype.hasOwnProperty.call(fakeWs, "send")).toBe(false);
+  });
+
+  it("does not pipe the caller's source into an exec whose socket was already closed", async () => {
+    fakeWs.readyState = 3;
+    scriptedExec = () => undefined;
+    const source = new Readable({ read() {} });
+    const state = track(
+      execInPodStreaming(KC, "ns", "pod", "agent", ["/bin/sh", "-c", "tar x"], {
+        stdin: source,
+        timeoutMs: RUN_BUDGET_MS,
+      }),
+    );
+    await flush();
+    expect((state.error as InstanceType<typeof PodExecTransportError>).kind).toBe("connection_closed");
+    expect(source.readableFlowing).toBeNull(); // never piped
   });
 
   it("detects a half-open connection using the passed liveness options", async () => {

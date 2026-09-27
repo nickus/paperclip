@@ -62,6 +62,24 @@ describe("execInPod over a real WebSocket", () => {
     expect(result).toEqual({ exitCode: 0, stdout: "hello", stderr: "" });
   });
 
+  it("delivers stdin through the monitor's counting ws.send wrapper", async () => {
+    const payload = Buffer.alloc(256 * 1024, 0x61); // one large stdin frame
+    behavior = (socket) => {
+      let got = 0;
+      socket.on("message", (data: Buffer) => {
+        if (data[0] !== 0) return; // stdin channel only
+        got += data.length - 1;
+        if (got === payload.length) {
+          socket.send(frame(1, `got ${got}`));
+          socket.send(frame(3, SUCCESS));
+          socket.close(1000);
+        }
+      });
+    };
+    const result = await execInPod(kc, "ns", "pod", "agent", ["cat"], payload, 10_000, undefined, undefined, FAST);
+    expect(result).toEqual({ exitCode: 0, stdout: `got ${payload.length}`, stderr: "" });
+  });
+
   it("fails fast when the server drops the connection without a status frame", async () => {
     behavior = (socket) => {
       socket.send(frame(1, "partial"));
