@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   checkLeaseResumable,
+  confirmLeaseResourcesGone,
   destroyLeaseResources,
   isKubeNotFoundError,
 } from "../../src/lease-lifecycle.js";
@@ -344,5 +345,87 @@ describe("destroyLeaseResources", () => {
         secretName: null,
       }),
     ).rejects.toThrow("forbidden");
+  });
+});
+
+describe("confirmLeaseResourcesGone", () => {
+  it("confirms once the workload and its pod both read as 404", async () => {
+    const clients = {
+      custom: { getNamespacedCustomObject: vi.fn().mockRejectedValue(notFound()) },
+      core: { readNamespacedPod: vi.fn().mockRejectedValue(notFound()) },
+    };
+    await expect(
+      confirmLeaseResourcesGone(clients as never, {
+        namespace: "ns",
+        name: "pc-abc",
+        backend: "sandbox-cr",
+        podName: "pc-abc-pod",
+        timeoutMs: 100,
+        pollMs: 10,
+      }),
+    ).resolves.toBe(true);
+  });
+
+  it("waits while the Job is still being deleted (Foreground propagation), then confirms", async () => {
+    const readJob = vi.fn()
+      .mockResolvedValueOnce({ metadata: { deletionTimestamp: "now" } })
+      .mockRejectedValue(notFound());
+    const clients = {
+      batch: { readNamespacedJobStatus: readJob },
+      core: { listNamespacedPod: vi.fn().mockResolvedValue({ items: [] }) },
+    };
+    await expect(
+      confirmLeaseResourcesGone(clients as never, {
+        namespace: "ns",
+        name: "pc-job",
+        backend: "job",
+        podName: null,
+        timeoutMs: 1_000,
+        pollMs: 5,
+      }),
+    ).resolves.toBe(true);
+    expect(readJob).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not confirm while a pod labelled for the Job still exists", async () => {
+    const clients = {
+      batch: { readNamespacedJobStatus: vi.fn().mockRejectedValue(notFound()) },
+      core: {
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [{ metadata: { name: "pc-job-x" }, status: { phase: "Running" } }],
+        }),
+      },
+    };
+    await expect(
+      confirmLeaseResourcesGone(clients as never, {
+        namespace: "ns",
+        name: "pc-job",
+        backend: "job",
+        podName: null,
+        timeoutMs: 30,
+        pollMs: 5,
+      }),
+    ).resolves.toBe(false);
+  });
+
+  it("rethrows unexpected (non-404) read errors", async () => {
+    const clients = {
+      custom: {
+        getNamespacedCustomObject: vi
+          .fn()
+          .mockRejectedValue(Object.assign(new Error("forbidden"), { code: 403 })),
+      },
+      core: { readNamespacedPod: vi.fn() },
+    };
+    await expect(
+      confirmLeaseResourcesGone(clients as never, {
+        namespace: "ns",
+        name: "pc-abc",
+        backend: "sandbox-cr",
+        podName: null,
+        timeoutMs: 30,
+        pollMs: 5,
+      }),
+    ).rejects.toThrow(/forbidden/);
   });
 });

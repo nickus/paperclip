@@ -19,6 +19,9 @@
 import type { KubeClients } from "./kube-client.js";
 import { deleteJob, findPodForJob, getJobStatus } from "./job-orchestrator.js";
 import {
+  SANDBOX_GROUP,
+  SANDBOX_PLURAL,
+  SANDBOX_VERSION,
   deleteSandboxCr,
   findPodForSandbox,
   waitForSandboxReady,
@@ -156,6 +159,12 @@ export interface DestroyLeaseInput {
   backend: "sandbox-cr" | "job";
   podName: string | null;
   secretName: string | null;
+  /**
+   * Grace period for the explicit pod delete. The lease's run is over, so the
+   * teardown paths shorten the default 30s (a `sleep infinity` sandbox pod
+   * never exits on SIGTERM) to let the stop be confirmed within one RPC.
+   */
+  podGracePeriodSeconds?: number;
 }
 
 /**
@@ -179,6 +188,9 @@ export async function destroyLeaseResources(
       clients.core.deleteNamespacedPod({
         namespace: input.namespace,
         name: input.podName,
+        ...(input.podGracePeriodSeconds !== undefined
+          ? { gracePeriodSeconds: input.podGracePeriodSeconds }
+          : {}),
       }),
     );
   }
@@ -190,4 +202,134 @@ export async function destroyLeaseResources(
       }),
     );
   }
+}
+
+/** Grace period the release/destroy handlers give the sandbox pod. */
+export const TEARDOWN_POD_GRACE_PERIOD_SECONDS = 5;
+/** Bounded wait for the API server to confirm the resources are gone. Kept
+ * below the host's default 30s plugin RPC timeout. */
+export const TEARDOWN_CONFIRM_TIMEOUT_MS = 20_000;
+
+export interface ConfirmGoneInput {
+  namespace: string;
+  /** Workload resource name (Sandbox CR name or Job name) == providerLeaseId. */
+  name: string;
+  backend: "sandbox-cr" | "job";
+  podName: string | null;
+  timeoutMs?: number;
+  pollMs?: number;
+}
+
+/** Resolve 404 to `true` (gone); any other read result means still present. */
+async function isGone(read: () => Promise<unknown>): Promise<boolean> {
+  try {
+    await read();
+    return false;
+  } catch (err) {
+    if (isKubeNotFoundError(err)) return true;
+    throw err;
+  }
+}
+
+/**
+ * Poll until the API server reports the workload and its pod as gone (404).
+ * Deletion uses Foreground propagation, so the workload object itself only
+ * disappears after the garbage collector removed its pods; an explicit pod
+ * read additionally covers a pod whose ownerReference was broken. The Job
+ * backend also requires that no pod labelled for the Job remains. Returns
+ * false (never throws on "still terminating") when the bounded wait expires.
+ */
+export async function confirmLeaseResourcesGone(
+  clients: KubeClients,
+  input: ConfirmGoneInput,
+): Promise<boolean> {
+  const deadline = Date.now() + (input.timeoutMs ?? TEARDOWN_CONFIRM_TIMEOUT_MS);
+  const pollMs = input.pollMs ?? 1_000;
+  for (;;) {
+    const workloadGone = await isGone(() =>
+      input.backend === "sandbox-cr"
+        ? clients.custom.getNamespacedCustomObject({
+            group: SANDBOX_GROUP,
+            version: SANDBOX_VERSION,
+            namespace: input.namespace,
+            plural: SANDBOX_PLURAL,
+            name: input.name,
+          })
+        : clients.batch.readNamespacedJobStatus({
+            namespace: input.namespace,
+            name: input.name,
+          }),
+    );
+    const podGone = !workloadGone
+      ? false
+      : input.podName
+        ? await isGone(() =>
+            clients.core.readNamespacedPod({ namespace: input.namespace, name: input.podName! }),
+          )
+        : true;
+    // A Job's pods carry the controller-set `job-name` label.
+    const jobPodsGone = !podGone || input.backend !== "job"
+      ? podGone
+      : (await findPodForJob(clients, input.namespace, input.name)) === null;
+    if (jobPodsGone) return true;
+    if (Date.now() + pollMs > deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+}
+
+/** Mirrors the SDK's PluginEnvironmentTerminationReceipt. */
+export interface LeaseTerminationReceipt {
+  providerLeaseId: string;
+  state: "destroyed";
+}
+
+/**
+ * Tear a lease down and confirm it. Deletes every resource acquireLease
+ * created, then waits for the API server to report them gone, and only then
+ * returns a termination receipt. The host treats the receipt as proof that the
+ * run's remote execution has ended (it gates saved-comment continuation after
+ * a Stop), so an unconfirmed teardown throws: the host then keeps the lease in
+ * pending_cleanup and retries through onEnvironmentDestroyLease.
+ */
+export async function terminateLeaseResources(
+  clients: KubeClients,
+  input: Omit<DestroyLeaseInput, "podGracePeriodSeconds"> & {
+    confirmTimeoutMs?: number;
+    confirmPollMs?: number;
+  },
+): Promise<LeaseTerminationReceipt> {
+  let podName = input.podName;
+  if (!podName) {
+    // A lease cancelled while its pod was starting may not have recorded the
+    // pod name yet. Best-effort lookup; a gone workload means no pod to find.
+    try {
+      podName = input.backend === "sandbox-cr"
+        ? await findPodForSandbox(clients, input.namespace, input.name)
+        : await findPodForJob(clients, input.namespace, input.name);
+    } catch (err) {
+      if (!isKubeNotFoundError(err)) throw err;
+    }
+  }
+  await destroyLeaseResources(clients, {
+    namespace: input.namespace,
+    name: input.name,
+    backend: input.backend,
+    podName,
+    secretName: input.secretName,
+    podGracePeriodSeconds: TEARDOWN_POD_GRACE_PERIOD_SECONDS,
+  });
+  const confirmed = await confirmLeaseResourcesGone(clients, {
+    namespace: input.namespace,
+    name: input.name,
+    backend: input.backend,
+    podName,
+    timeoutMs: input.confirmTimeoutMs,
+    pollMs: input.confirmPollMs,
+  });
+  if (!confirmed) {
+    throw new Error(
+      `Kubernetes lease ${input.name} in namespace ${input.namespace} is still terminating; stop not yet confirmed.`,
+    );
+  }
+  return { providerLeaseId: input.name, state: "destroyed" };
 }

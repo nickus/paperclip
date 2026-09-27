@@ -24,9 +24,9 @@
 import type { KubeClients } from "./kube-client.js";
 import type { SandboxOrchestrator, SandboxStatus } from "./sandbox-orchestrator.js";
 
-const SANDBOX_GROUP = "agents.x-k8s.io";
-const SANDBOX_VERSION = "v1alpha1";
-const SANDBOX_PLURAL = "sandboxes";
+export const SANDBOX_GROUP = "agents.x-k8s.io";
+export const SANDBOX_VERSION = "v1alpha1";
+export const SANDBOX_PLURAL = "sandboxes";
 
 export class SandboxCrTimeoutError extends Error {
   constructor(namespace: string, name: string, timeoutMs: number) {

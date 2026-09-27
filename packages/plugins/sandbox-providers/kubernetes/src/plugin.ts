@@ -11,6 +11,7 @@ import type {
   PluginEnvironmentRealizeWorkspaceParams,
   PluginEnvironmentRealizeWorkspaceResult,
   PluginEnvironmentReleaseLeaseParams,
+  PluginEnvironmentTerminationReceipt,
   PluginEnvironmentResumeLeaseParams,
   PluginEnvironmentSyncInParams,
   PluginEnvironmentSyncOutParams,
@@ -38,7 +39,7 @@ import {
 } from "./sandbox-cr-orchestrator.js";
 import { execInPod, execInPodStreaming, wrapCommandWithEnv } from "./pod-exec.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
-import { checkLeaseResumable, destroyLeaseResources } from "./lease-lifecycle.js";
+import { checkLeaseResumable, terminateLeaseResources } from "./lease-lifecycle.js";
 import {
   appendNetworkEgressDenyHint,
   createScopedNetworkEgressPolicyOrReleaseWorkload,
@@ -110,6 +111,54 @@ function getOrCreateUploadInterceptor(leaseId: string): FastUploadInterceptor {
 // On worker restart this resets, which is fine: the first exec on each
 // lease then re-confirms readiness from scratch.
 const readySandboxesByLease = new Set<string>();
+
+// Forcibly delete every resource acquireLease created for a lease (workload,
+// pod, per-run Secret; 404s are success) and confirm the stop. Shared by
+// onEnvironmentReleaseLease and onEnvironmentDestroyLease.
+async function teardownLease(
+  params: PluginEnvironmentReleaseLeaseParams & { providerLeaseId: string },
+): Promise<PluginEnvironmentTerminationReceipt> {
+  const config = kubernetesProviderConfigSchema.parse(params.config);
+  const namespace =
+    typeof params.leaseMetadata?.namespace === "string"
+      ? params.leaseMetadata.namespace
+      : deriveTenantNamespace(config, params.companyId);
+  const leaseBackend =
+    typeof params.leaseMetadata?.backend === "string"
+      ? (params.leaseMetadata.backend as "sandbox-cr" | "job")
+      : config.backend;
+  const secretName =
+    typeof params.leaseMetadata?.secretName === "string"
+      ? params.leaseMetadata.secretName
+      : `${params.providerLeaseId}-env`;
+  const podName =
+    typeof params.leaseMetadata?.podName === "string" &&
+    params.leaseMetadata.podName.length > 0
+      ? params.leaseMetadata.podName
+      : null;
+
+  // Clear per-lease in-memory state up front, regardless of what the cluster
+  // says — the lease is dead either way. Each lease has its own interceptor,
+  // so unrelated concurrent leases keep their in-flight buffers intact.
+  uploadInterceptorsByLease.delete(params.providerLeaseId);
+  readySandboxesByLease.delete(params.providerLeaseId);
+
+  const kc = createKubeConfig({
+    inCluster: config.inCluster,
+    kubeconfig: config.kubeconfig,
+  });
+  const clients = makeKubeClients(kc);
+
+  // Throws (so the host keeps the lease in pending_cleanup and retries) when
+  // the stop cannot be confirmed within the bounded wait.
+  return await terminateLeaseResources(clients, {
+    namespace,
+    name: params.providerLeaseId,
+    backend: leaseBackend,
+    podName,
+    secretName,
+  });
+}
 
 // How long onEnvironmentResumeLease waits for an existing Sandbox pod to
 // report Ready before declaring the lease non-resumable. Deliberately short:
@@ -571,86 +620,21 @@ const plugin = definePlugin({
 
   async onEnvironmentReleaseLease(
     params: PluginEnvironmentReleaseLeaseParams,
-  ): Promise<void> {
+  ): Promise<PluginEnvironmentTerminationReceipt | void> {
     if (!params.providerLeaseId) return;
-    const config = kubernetesProviderConfigSchema.parse(params.config);
-    const namespace =
-      typeof params.leaseMetadata?.namespace === "string"
-        ? params.leaseMetadata.namespace
-        : deriveTenantNamespace(config, params.companyId);
-
-    const kc = createKubeConfig({
-      inCluster: config.inCluster,
-      kubeconfig: config.kubeconfig,
-    });
-    const clients = makeKubeClients(kc);
-
-    const leaseBackend =
-      typeof params.leaseMetadata?.backend === "string"
-        ? (params.leaseMetadata.backend as "sandbox-cr" | "job")
-        : config.backend;
-    const releaseOrchestrator =
-      leaseBackend === "sandbox-cr" ? sandboxCrOrchestrator : jobOrchestrator;
-
-    // Drop the FastUploadInterceptor associated with THIS lease (only).
-    // Each lease has its own interceptor instance via uploadInterceptorsByLease,
-    // so unrelated concurrent leases keep their in-flight buffers intact.
-    uploadInterceptorsByLease.delete(params.providerLeaseId);
-    readySandboxesByLease.delete(params.providerLeaseId);
-
-    try {
-      await releaseOrchestrator.release(clients, namespace, params.providerLeaseId);
-    } catch (err) {
-      // If the resource is already gone (404), that's fine.
-      const code = (err as { code?: number; statusCode?: number }).code
-        ?? (err as { code?: number; statusCode?: number }).statusCode;
-      if (code !== 404) throw err;
-    }
+    // Kubernetes pods cannot be stopped and restarted in place, so releasing a
+    // lease tears down everything acquireLease created, exactly like destroy.
+    // Both return a termination receipt only once the API server confirms the
+    // resources are gone: the host needs that receipt to certify that a
+    // stopped run's remote execution ended (saved comments wait on it).
+    return await teardownLease({ ...params, providerLeaseId: params.providerLeaseId });
   },
 
   async onEnvironmentDestroyLease(
     params: PluginEnvironmentDestroyLeaseParams,
-  ): Promise<void> {
+  ): Promise<PluginEnvironmentTerminationReceipt | void> {
     if (!params.providerLeaseId) return;
-    const config = kubernetesProviderConfigSchema.parse(params.config);
-    const namespace =
-      typeof params.leaseMetadata?.namespace === "string"
-        ? params.leaseMetadata.namespace
-        : deriveTenantNamespace(config, params.companyId);
-    const leaseBackend =
-      typeof params.leaseMetadata?.backend === "string"
-        ? (params.leaseMetadata.backend as "sandbox-cr" | "job")
-        : config.backend;
-    const secretName =
-      typeof params.leaseMetadata?.secretName === "string"
-        ? params.leaseMetadata.secretName
-        : `${params.providerLeaseId}-env`;
-    const podName =
-      typeof params.leaseMetadata?.podName === "string" &&
-      params.leaseMetadata.podName.length > 0
-        ? params.leaseMetadata.podName
-        : null;
-
-    // Clear per-lease in-memory state up front, regardless of what the
-    // cluster says — the lease is dead either way.
-    uploadInterceptorsByLease.delete(params.providerLeaseId);
-    readySandboxesByLease.delete(params.providerLeaseId);
-
-    const kc = createKubeConfig({
-      inCluster: config.inCluster,
-      kubeconfig: config.kubeconfig,
-    });
-    const clients = makeKubeClients(kc);
-
-    // Forcibly delete everything acquireLease created (Sandbox CR / Job, pod,
-    // per-run Secret). 404s are success — destroy must be idempotent.
-    await destroyLeaseResources(clients, {
-      namespace,
-      name: params.providerLeaseId,
-      backend: leaseBackend,
-      podName,
-      secretName,
-    });
+    return await teardownLease({ ...params, providerLeaseId: params.providerLeaseId });
   },
 
   async onEnvironmentExecute(
