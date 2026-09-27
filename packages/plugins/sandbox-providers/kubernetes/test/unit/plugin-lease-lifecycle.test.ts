@@ -10,6 +10,7 @@ vi.mock("../../src/kube-client.js", () => ({
 }));
 
 import plugin from "../../src/plugin.js";
+import { resetKubeConnectionCache } from "../../src/kube-client-cache.js";
 
 const CONFIG = { inCluster: true, backend: "sandbox-cr" };
 
@@ -41,6 +42,9 @@ function readySandboxCr(podName: string): Record<string, unknown> {
 
 beforeEach(() => {
   h.clients = {};
+  // The plugin caches KubeConfig/clients per connection config; drop them so
+  // each test sees its own injected fake clients.
+  resetKubeConnectionCache();
 });
 
 describe("onEnvironmentResumeLease", () => {
