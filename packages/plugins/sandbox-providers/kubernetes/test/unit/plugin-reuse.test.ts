@@ -23,10 +23,10 @@ import plugin from "../../src/plugin.js";
 import manifest from "../../src/manifest.js";
 import { execInPod } from "../../src/pod-exec.js";
 import { resetKubeConnectionCache } from "../../src/kube-client-cache.js";
-import { resetIdleReaper } from "../../src/idle-reaper.js";
+import { idleReaperState, resetIdleReaper, sweepAllRegisteredNamespaces } from "../../src/idle-reaper.js";
 import { PROCESS_RESET_SCRIPT } from "../../src/process-reset.js";
 import { buildSandboxCrManifest } from "../../src/sandbox-cr-builder.js";
-import { REUSE_ANNOTATIONS, computeReuseKey } from "../../src/reuse.js";
+import { REUSE_ANNOTATIONS, REUSE_BUSY_REFRESH_MS, computeReuseKey } from "../../src/reuse.js";
 
 const REUSE_CONFIG = {
   inCluster: true,
@@ -120,6 +120,27 @@ function resume(
     providerLeaseId: lease.providerLeaseId!,
     leaseMetadata: hostLeaseMetadata(lease.metadata),
   });
+}
+
+function execute(
+  lease: { providerLeaseId: string | null; metadata?: Record<string, unknown> },
+  script: string,
+  config: Record<string, unknown> = REUSE_CONFIG,
+) {
+  return plugin.definition.onEnvironmentExecute!({
+    driverKey: "kubernetes",
+    companyId: SCOPE.companyId,
+    environmentId: SCOPE.environmentId,
+    config,
+    lease: { providerLeaseId: lease.providerLeaseId, metadata: lease.metadata },
+    command: "sh",
+    args: ["-c", script],
+    timeoutMs: 60_000,
+  });
+}
+
+function transient(): Error {
+  return Object.assign(new Error("HTTP-Code: 503 Message: service unavailable"), { code: 503 });
 }
 
 function createdSandbox() {
@@ -222,6 +243,15 @@ describe("acquire with reuseLease", () => {
     expect(bounded.metadata).not.toHaveProperty("kubernetesReuse");
   });
 
+  it("keeps no sandbox for a lease the host records as ephemeral", async () => {
+    const ephemeral = await acquire(REUSE_CONFIG, { leasePolicy: "ephemeral" });
+    expect(ephemeral.metadata).not.toHaveProperty("kubernetesReuse");
+    expect(createdSandbox().metadata.labels).not.toHaveProperty("paperclip.io/reuse");
+
+    const reusable = await acquire(REUSE_CONFIG, { leasePolicy: "reuse_by_environment" });
+    expect(reusable.metadata).toHaveProperty("kubernetesReuse");
+  });
+
   it("leaves the manifest and lease metadata unchanged when reuseLease is off", async () => {
     const config = { inCluster: true, backend: "sandbox-cr", adapterType: "opencode_local" };
     const lease = await acquire(config);
@@ -298,11 +328,138 @@ describe("release with reuseLease", () => {
     expect(cluster.sandboxes.has(lease.providerLeaseId!)).toBe(false);
   });
 
-  it("tears the sandbox down on an explicit cancellation", async () => {
+  it("keeps the sandbox on an explicit cancellation once the processes are verified stopped", async () => {
     const lease = await acquire();
+    await expect(release(lease, REUSE_CONFIG, { cancelActiveWork: true })).resolves.toEqual({
+      providerLeaseId: lease.providerLeaseId,
+      state: "stopped",
+    });
+    // The verified stop is the proof a cancellation needs; the task keeps its sandbox.
+    expect(execInPod).toHaveBeenCalledTimes(1);
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations[REUSE_ANNOTATIONS.leaseState]).toBe("idle");
+  });
+
+  it("tears the sandbox down on a cancellation whose processes cannot be verified stopped", async () => {
+    const lease = await acquire();
+    vi.mocked(execInPod).mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "paperclip-process-reset: failed remaining= 7" });
     await expect(release(lease, REUSE_CONFIG, { cancelActiveWork: true })).resolves.toMatchObject({ state: "destroyed" });
-    expect(execInPod).not.toHaveBeenCalled();
     expect(cluster.sandboxes.size).toBe(0);
+  });
+
+  it("refuses commands for a released sandbox until a run resumes it", async () => {
+    const lease = await acquire();
+    await release(lease, REUSE_CONFIG, { cancelActiveWork: true });
+    vi.mocked(execInPod).mockClear();
+
+    // A command from the cancelled startup that arrives after the release.
+    const late = await execute(lease, "echo late");
+    expect(late).toMatchObject({ exitCode: null, timedOut: false, metadata: { leaseReleased: true } });
+    expect(late.stderr).toMatch(/was released/);
+    expect(execInPod).not.toHaveBeenCalled();
+
+    const resumed = await resume(lease);
+    await expect(execute(resumed, "echo next-run")).resolves.toMatchObject({ exitCode: 0 });
+    expect(execInPod).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a temporary API error instead of giving the sandbox up", async () => {
+    const lease = await acquire();
+    cluster.clients.custom.getNamespacedCustomObject.mockRejectedValueOnce(transient());
+    cluster.clients.core.readNamespacedPod.mockRejectedValueOnce(transient());
+
+    await expect(release(lease)).resolves.toEqual({ providerLeaseId: lease.providerLeaseId, state: "stopped" });
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations[REUSE_ANNOTATIONS.leaseState]).toBe("idle");
+  });
+
+  it("keeps a verified-stopped sandbox when only the idle mark keeps failing", async () => {
+    const lease = await acquire();
+    cluster.clients.custom.patchNamespacedCustomObject.mockRejectedValue(transient());
+    try {
+      await expect(release(lease)).resolves.toEqual({ providerLeaseId: lease.providerLeaseId, state: "stopped" });
+    } finally {
+      cluster.clients.custom.patchNamespacedCustomObject.mockReset();
+    }
+    // Still marked busy: the reaper's stale-busy rule covers it.
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations[REUSE_ANNOTATIONS.leaseState]).toBe("busy");
+    expect(cluster.clients.custom.deleteNamespacedCustomObject).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it("removes the sandbox after too many failed runs in a row, and resets the count after a good one", async () => {
+    const lease = await acquire();
+    await expect(release(lease, REUSE_CONFIG, { runStatus: "failed" })).resolves.toMatchObject({ state: "stopped" });
+    const annotations = () => cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations;
+    expect(annotations()[REUSE_ANNOTATIONS.consecutiveFailures]).toBe("1");
+
+    let current = await resume(lease);
+    await expect(release(current, REUSE_CONFIG, { runStatus: "released" })).resolves.toMatchObject({ state: "stopped" });
+    expect(annotations()[REUSE_ANNOTATIONS.consecutiveFailures]).toBe("0");
+
+    current = await resume(current);
+    await release(current, REUSE_CONFIG, { runStatus: "failed" });
+    current = await resume(current);
+    await release(current, REUSE_CONFIG, { runStatus: "failed" });
+    expect(annotations()[REUSE_ANNOTATIONS.consecutiveFailures]).toBe("2");
+    current = await resume(current);
+    await expect(release(current, REUSE_CONFIG, { runStatus: "failed" })).resolves.toMatchObject({ state: "destroyed" });
+    expect(cluster.sandboxes.size).toBe(0);
+  });
+
+  it("tears the sandbox down when its pod was replaced during the run that created it", async () => {
+    const lease = await acquire();
+    // The run's first command records the pod it started on.
+    await expect(execute(lease, "echo first")).resolves.toMatchObject({ exitCode: 0 });
+    const first = cluster.pods.get(lease.providerLeaseId!)!.metadata.uid;
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations[REUSE_ANNOTATIONS.podUid]).toBe(first);
+
+    cluster.replacePod(lease.providerLeaseId!);
+    await expect(release(lease)).resolves.toMatchObject({ state: "destroyed" });
+    expect(cluster.sandboxes.size).toBe(0);
+  });
+
+  it("keeps only the most recently released sandbox of a task", async () => {
+    // Two runs of the same task that each created a sandbox.
+    const older = await acquire();
+    const newer = await acquire(REUSE_CONFIG, { runId: "run-2" });
+    await release(older);
+    await release(newer);
+
+    expect(cluster.sandboxes.has(older.providerLeaseId!)).toBe(false);
+    expect(cluster.sandboxes.has(newer.providerLeaseId!)).toBe(true);
+  });
+
+  it("never removes a busy sandbox of the same task", async () => {
+    const running = await acquire();
+    const other = await acquire(REUSE_CONFIG, { runId: "run-2" });
+    await release(other);
+    expect(cluster.sandboxes.has(running.providerLeaseId!)).toBe(true);
+  });
+
+  it("keeps a run's commands from looking abandoned while they run", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      const lease = await acquire();
+      const name = lease.providerLeaseId!;
+      const busySince = () => cluster.sandboxes.get(name)!.metadata.annotations[REUSE_ANNOTATIONS.busySince];
+      const before = busySince();
+      let finish!: (value: { exitCode: number; stdout: string; stderr: string }) => void;
+      vi.mocked(execInPod).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+
+      const running = execute(lease, "long-running-agent");
+      await vi.waitFor(() => expect(execInPod).toHaveBeenCalled());
+      vi.advanceTimersByTime(REUSE_BUSY_REFRESH_MS + 1);
+      await vi.waitFor(() => expect(busySince()).not.toBe(before));
+      finish({ exitCode: 0, stdout: "", stderr: "" });
+      await expect(running).resolves.toMatchObject({ exitCode: 0 });
+
+      // A refresh after the release never marks the idle sandbox busy again.
+      await release(lease);
+      const patches = cluster.clients.custom.patchNamespacedCustomObject.mock.calls.length;
+      vi.advanceTimersByTime(REUSE_BUSY_REFRESH_MS * 3);
+      expect(cluster.clients.custom.patchNamespacedCustomObject.mock.calls.length).toBe(patches);
+      expect(cluster.sandboxes.get(name)!.metadata.annotations[REUSE_ANNOTATIONS.leaseState]).toBe("idle");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("tears the sandbox down once reuse is turned off for the environment", async () => {
@@ -354,6 +511,28 @@ describe("destroy with reuseLease", () => {
         leaseMetadata: lease.metadata,
       }),
     ).resolves.toMatchObject({ state: "destroyed" });
+  });
+});
+
+describe("teardown of a reusable sandbox", () => {
+  it("does not fail a completed teardown when its egress policy delete fails", async () => {
+    const lease = await acquire(REUSE_CONFIG, {
+      executionWorkspaceSettings: { networkEgress: { allowCidrs: ["203.0.113.0/24"] } },
+    });
+    cluster.clients.networking.deleteNamespacedNetworkPolicy.mockRejectedValueOnce(
+      Object.assign(new Error("HTTP-Code: 500 Message: internal error"), { code: 500 }),
+    );
+    await expect(
+      plugin.definition.onEnvironmentDestroyLease!({
+        driverKey: "kubernetes",
+        companyId: SCOPE.companyId,
+        environmentId: SCOPE.environmentId,
+        config: REUSE_CONFIG,
+        providerLeaseId: lease.providerLeaseId,
+        leaseMetadata: lease.metadata,
+      }),
+    ).resolves.toMatchObject({ state: "destroyed" });
+    expect(cluster.sandboxes.size).toBe(0);
   });
 });
 
@@ -475,6 +654,25 @@ describe("resume with reuseLease", () => {
     await expect(resume(lease)).resolves.toMatchObject({ providerLeaseId: null, metadata: { reason: "not_found" } });
   });
 
+  it("keeps an upload in flight when another resume of the same lease happens", async () => {
+    const lease = await releasedLease();
+    const resumed = await resume(lease);
+    const target = "/workspace/.paperclip-runtime/opencode/file.bin";
+    await expect(
+      execute(resumed, `mkdir -p '/workspace/.paperclip-runtime/opencode' && rm -f '${target}.paperclip-upload.b64' && : > '${target}.paperclip-upload.b64'`),
+    ).resolves.toMatchObject({ metadata: { fastUpload: "ack" } });
+    await expect(
+      execute(resumed, `printf '%s' 'aGVsbG8=' >> '${target}.paperclip-upload.b64'`),
+    ).resolves.toMatchObject({ metadata: { fastUpload: "ack" } });
+
+    // A second acquisition resumes the same lease (it loses the host's lease handoff).
+    await resume(lease);
+
+    await expect(
+      execute(resumed, `base64 -d < '${target}.paperclip-upload.b64' > '${target}' && rm -f '${target}.paperclip-upload.b64'`),
+    ).resolves.toMatchObject({ metadata: { fastUpload: "flush", uploadedBytes: 5 } });
+  });
+
   it("reports the lease expired when reuse was turned off", async () => {
     const lease = await releasedLease();
     await expect(resume(lease, { ...REUSE_CONFIG, reuseLease: false })).resolves.toMatchObject({
@@ -484,7 +682,46 @@ describe("resume with reuseLease", () => {
   });
 });
 
+describe("idle expiry across restarts", () => {
+  it("finds kept sandboxes in other namespaces from any call, even with reuse turned off", async () => {
+    const lease = await acquire(REUSE_CONFIG);
+    await release(lease);
+    const name = lease.providerLeaseId!;
+    cluster.sandboxes.get(name)!.metadata.annotations[REUSE_ANNOTATIONS.lastUsedAt] =
+      new Date(Date.now() - 25 * 3_600_000).toISOString();
+
+    // A worker restart forgets every registration; reuse was also turned off.
+    resetIdleReaper();
+    const reuseOff = { inCluster: true, backend: "sandbox-cr", adapterType: "opencode_local", companySlug: "other" };
+    await acquire(reuseOff, { companyId: "company-2" });
+    await vi.waitFor(() =>
+      expect(idleReaperState().namespaces).toEqual([{ namespace: "paperclip-company-1", maxSandboxes: null }]),
+    );
+
+    await sweepAllRegisteredNamespaces();
+    expect(cluster.sandboxes.has(name)).toBe(false);
+    // Nothing reusable left there: the namespace is no longer swept.
+    await sweepAllRegisteredNamespaces();
+    expect(idleReaperState().registrations).toBe(0);
+  });
+});
+
 describe("cap on reusable sandboxes", () => {
+  it("holds the cap when several tasks acquire at once", async () => {
+    const config = { ...REUSE_CONFIG, reuseMaxSandboxes: 8 };
+    for (let i = 0; i < 8; i += 1) {
+      const lease = await acquire(config, { executionWorkspaceId: `workspace-idle-${i}`, runId: `run-idle-${i}` });
+      await release(lease, config);
+    }
+    expect(cluster.sandboxes.size).toBe(8);
+
+    await Promise.all(
+      [0, 1, 2].map((i) => acquire(config, { executionWorkspaceId: `workspace-new-${i}`, runId: `run-new-${i}` })),
+    );
+
+    expect(cluster.sandboxes.size).toBe(8);
+  });
+
   it("evicts the least recently used idle sandbox before creating one at the cap", async () => {
     const config = { ...REUSE_CONFIG, reuseMaxSandboxes: 2 };
     const first = await acquire(config, { executionWorkspaceId: "workspace-a" });

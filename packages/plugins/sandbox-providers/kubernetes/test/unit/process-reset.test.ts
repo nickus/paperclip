@@ -145,6 +145,7 @@ describe("resetSandboxProcesses", () => {
     await expect(resetSandboxProcesses(exec)).resolves.toEqual({
       ok: true,
       detail: "paperclip-process-reset: ok stopped=2",
+      execFailed: false,
     });
     expect(exec).toHaveBeenCalledWith(
       ["/bin/sh", "-c", PROCESS_RESET_SCRIPT, "paperclip-process-reset"],
@@ -155,14 +156,15 @@ describe("resetSandboxProcesses", () => {
   it("treats a non-zero exit, missing confirmation or exec error as unverified", async () => {
     await expect(
       resetSandboxProcesses(async () => ({ exitCode: 1, stdout: "", stderr: "paperclip-process-reset: failed remaining= 5" })),
-    ).resolves.toMatchObject({ ok: false });
+    ).resolves.toMatchObject({ ok: false, execFailed: false });
     await expect(resetSandboxProcesses(async () => ({ exitCode: 0, stdout: "", stderr: "" }))).resolves.toMatchObject({
       ok: false,
+      execFailed: false,
     });
     await expect(
       resetSandboxProcesses(async () => {
         throw new Error("exec connection dropped");
       }),
-    ).resolves.toEqual({ ok: false, detail: "exec connection dropped" });
+    ).resolves.toEqual({ ok: false, detail: "exec connection dropped", execFailed: true });
   });
 });

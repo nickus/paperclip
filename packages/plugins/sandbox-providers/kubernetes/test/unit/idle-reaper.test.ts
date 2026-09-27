@@ -8,14 +8,18 @@ vi.mock("../../src/kube-client.js", () => ({
 }));
 
 import {
+  DISCOVERY_INTERVAL_MS,
   RPC_SWEEP_THROTTLE_MS,
+  discoverReuseNamespaces,
   idleReaperState,
   maybeSweepReuseNamespace,
   registerReuseNamespace,
   resetIdleReaper,
   sweepAllRegisteredNamespaces,
   sweepReusableSandboxes,
+  withReuseSlot,
 } from "../../src/idle-reaper.js";
+import { kubeConnectionCacheSize, getKubeConnection } from "../../src/kube-client-cache.js";
 import { resetKubeConnectionCache } from "../../src/kube-client-cache.js";
 import { REUSE_ANNOTATIONS, REUSE_LABEL_SELECTOR } from "../../src/reuse.js";
 
@@ -139,7 +143,7 @@ describe("sweepReusableSandboxes", () => {
 
     const result = await sweepReusableSandboxes(clients as never, { namespace: "ns", maxSandboxes: 8 });
 
-    expect(result).toEqual({ reaped: [], skipped: ["pc-expired"] });
+    expect(result).toEqual({ reaped: [], skipped: ["pc-expired"], remaining: 1 });
     expect(deletedCrs).toEqual([]);
     expect(clients.core.deleteNamespacedPod).not.toHaveBeenCalled();
   });
@@ -188,6 +192,7 @@ describe("sweepReusableSandboxes", () => {
     await expect(sweepReusableSandboxes(clients as never, { namespace: "ns", maxSandboxes: 8 })).resolves.toEqual({
       reaped: [],
       skipped: [],
+      remaining: 0,
     });
   });
 });
@@ -203,7 +208,14 @@ describe("reaper registry", () => {
     registerReuseNamespace({ connection: { inCluster: true }, namespace: "ns-a", maxSandboxes: 4 });
     registerReuseNamespace({ connection: { inCluster: true }, namespace: "ns-b", maxSandboxes: 8 });
 
-    expect(idleReaperState()).toEqual({ registrations: 2, timerActive: true });
+    expect(idleReaperState()).toMatchObject({
+      registrations: 2,
+      timerActive: true,
+      namespaces: [
+        { namespace: "ns-a", maxSandboxes: 4 },
+        { namespace: "ns-b", maxSandboxes: 8 },
+      ],
+    });
     expect(setIntervalSpy).toHaveBeenCalledTimes(1);
     expect(unref).toHaveBeenCalled();
 
@@ -226,6 +238,126 @@ describe("reaper registry", () => {
     now += RPC_SWEEP_THROTTLE_MS;
     await maybeSweepReuseNamespace(registration, { waitMs: 1_000 });
     expect(clients.custom.listNamespacedCustomObject).toHaveBeenCalledTimes(2);
+  });
+
+  it("never throttles a sweep that reserves a slot for an acquire", async () => {
+    const { clients } = fakeClients([]);
+    h.clients = clients;
+    vi.spyOn(globalThis, "setInterval").mockReturnValue({ unref: vi.fn() } as never);
+    const registration = registerReuseNamespace({ connection: { inCluster: true }, namespace: "ns", maxSandboxes: 8 });
+
+    await maybeSweepReuseNamespace(registration, { waitMs: 1_000 });
+    await maybeSweepReuseNamespace(registration, { reserveSlot: true, waitMs: 1_000 });
+    await maybeSweepReuseNamespace(registration, { reserveSlot: true, waitMs: 1_000 });
+    expect(clients.custom.listNamespacedCustomObject).toHaveBeenCalledTimes(3);
+  });
+
+  it("runs a reserving sweep after a non-reserving one that is still in flight", async () => {
+    let finishList!: () => void;
+    const listed: string[] = [];
+    const clients = {
+      custom: {
+        listNamespacedCustomObject: vi.fn(async () => {
+          listed.push("list");
+          if (listed.length === 1) await new Promise<void>((resolve) => { finishList = resolve; });
+          return { items: [] };
+        }),
+      },
+    };
+    h.clients = clients;
+    vi.spyOn(globalThis, "setInterval").mockReturnValue({ unref: vi.fn() } as never);
+    const registration = registerReuseNamespace({ connection: { inCluster: true }, namespace: "ns", maxSandboxes: 8 });
+
+    void maybeSweepReuseNamespace(registration);
+    await vi.waitFor(() => expect(listed).toHaveLength(1));
+    const reserving = maybeSweepReuseNamespace(registration, { reserveSlot: true, waitMs: 5_000 });
+    finishList();
+    await reserving;
+    expect(listed).toHaveLength(2);
+  });
+
+  it("stops sweeping a namespace without a cap once it holds no reusable sandbox", async () => {
+    const { clients } = fakeClients([]);
+    h.clients = clients;
+    vi.spyOn(globalThis, "setInterval").mockReturnValue({ unref: vi.fn() } as never);
+    registerReuseNamespace({ connection: { inCluster: true }, namespace: "ns-found", maxSandboxes: null });
+    registerReuseNamespace({ connection: { inCluster: true }, namespace: "ns-reuse", maxSandboxes: 8 });
+
+    await sweepAllRegisteredNamespaces();
+
+    expect(idleReaperState().namespaces).toEqual([{ namespace: "ns-reuse", maxSandboxes: 8 }]);
+  });
+
+  it("enforces only the TTLs in a namespace without a cap", async () => {
+    const { clients } = fakeClients([
+      sandbox("pc-a", "idle", { lastUsedAt: NOW - HOUR }),
+      sandbox("pc-b", "idle", { lastUsedAt: NOW - 2 * HOUR }),
+    ]);
+    const result = await sweepReusableSandboxes(clients as never, { namespace: "ns", maxSandboxes: null, reserveSlot: true });
+    expect(result).toEqual({ reaped: [], skipped: [], remaining: 2 });
+  });
+
+  it("registers every namespace that holds a reusable sandbox, at most once per interval", async () => {
+    let now = NOW;
+    resetIdleReaper({ now: () => now });
+    const listClusterCustomObject = vi.fn(async () => ({
+      items: [
+        { metadata: { name: "pc-1", namespace: "paperclip-a" } },
+        { metadata: { name: "pc-2", namespace: "paperclip-b" } },
+        { metadata: { name: "pc-3", namespace: "paperclip-a" } },
+      ],
+    }));
+    h.clients = { custom: { listClusterCustomObject } };
+    vi.spyOn(globalThis, "setInterval").mockReturnValue({ unref: vi.fn() } as never);
+
+    await discoverReuseNamespaces({ inCluster: true });
+    expect(listClusterCustomObject).toHaveBeenCalledWith(expect.objectContaining({ labelSelector: REUSE_LABEL_SELECTOR }));
+    expect(idleReaperState().namespaces).toEqual([
+      { namespace: "paperclip-a", maxSandboxes: null },
+      { namespace: "paperclip-b", maxSandboxes: null },
+    ]);
+    expect(discoverReuseNamespaces({ inCluster: true })).toBeNull();
+    now += DISCOVERY_INTERVAL_MS;
+    await discoverReuseNamespaces({ inCluster: true });
+    expect(listClusterCustomObject).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the connection when the credential may not list cluster-wide", async () => {
+    h.clients = {
+      custom: {
+        listClusterCustomObject: vi.fn(async () => {
+          throw Object.assign(new Error("Forbidden"), { code: 403 });
+        }),
+      },
+    };
+    getKubeConnection({ inCluster: true });
+    await discoverReuseNamespaces({ inCluster: true }, { reportErrors: false });
+    expect(kubeConnectionCacheSize()).toBe(1);
+    expect(idleReaperState().registrations).toBe(0);
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it("lets one acquire per namespace create its sandbox at a time, with a bounded wait", async () => {
+    vi.spyOn(globalThis, "setInterval").mockReturnValue({ unref: vi.fn() } as never);
+    const registration = registerReuseNamespace({ connection: { inCluster: true }, namespace: "ns", maxSandboxes: 8 });
+    const order: string[] = [];
+    let finishFirst!: () => void;
+    const first = withReuseSlot(registration, async () => {
+      order.push("first:start");
+      await new Promise<void>((resolve) => { finishFirst = resolve; });
+      order.push("first:end");
+    });
+    const second = withReuseSlot(registration, async () => {
+      order.push("second");
+    });
+    await vi.waitFor(() => expect(order).toEqual(["first:start"]));
+    finishFirst();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first:start", "first:end", "second"]);
+
+    // A stuck holder does not block the next acquire forever.
+    void withReuseSlot(registration, () => new Promise<void>(() => undefined));
+    await expect(withReuseSlot(registration, async () => "ran", 20)).resolves.toBe("ran");
   });
 
   it("drops a registration whose credential is rejected", async () => {

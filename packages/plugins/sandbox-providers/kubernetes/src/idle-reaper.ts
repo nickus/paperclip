@@ -10,8 +10,16 @@
  *
  * State lives only in Sandbox CR annotations (see reuse.ts), so the reaper
  * survives worker and host restarts. The only in-memory part is the registry of
- * (connection, namespace) pairs to sweep, filled by every reuse RPC; after a
- * restart a namespace is swept again from its first reuse RPC on.
+ * (connection, namespace) pairs to sweep. It is filled from two sides:
+ *   - every RPC for a reusable lease, or with reuse on, registers its namespace
+ *     (with the configured cap);
+ *   - every RPC that carries a cluster connection, whatever its config, lists
+ *     reusable Sandbox CRs cluster-wide (at most every DISCOVERY_INTERVAL_MS
+ *     per connection) and registers each namespace it finds, without a cap.
+ * So after a restart, the first RPC on a connection finds idle sandboxes in
+ * every namespace again, including ones whose environment turned reuse off.
+ * A registration without a cap whose namespace holds no reusable sandbox any
+ * more is dropped by its next sweep.
  *
  * Deletes are compare-and-swap: the CR delete carries
  * `preconditions.resourceVersion` = the version the decision was made on. A
@@ -46,7 +54,11 @@ const REAPER_JITTER_MS = 30_000;
 export const RPC_SWEEP_THROTTLE_MS = 60_000;
 /** An acquire waits at most this long for its sweep before creating the sandbox. */
 export const ACQUIRE_SWEEP_BUDGET_MS = 5_000;
-const MAX_REGISTRATIONS = 64;
+/** An acquire waits at most this long for another acquire in the same namespace. */
+export const ACQUIRE_SLOT_WAIT_MS = 15_000;
+/** Minimum spacing of cluster-wide discovery lists per connection. */
+export const DISCOVERY_INTERVAL_MS = 30 * 60_000;
+const MAX_REGISTRATIONS = 256;
 
 export type ReapReason = "idle_expired" | "stale_busy" | "over_capacity";
 
@@ -54,20 +66,35 @@ export interface SweepResult {
   reaped: Array<{ name: string; reason: ReapReason }>;
   /** CAS conflicts: the CR changed after it was read (e.g. a concurrent resume). */
   skipped: string[];
+  /** Reusable sandboxes left in the namespace after the sweep. */
+  remaining: number;
 }
 
 export interface ReuseNamespaceRegistration {
   key: string;
   connection: KubeConnectionInput;
   namespace: string;
-  maxSandboxes: number;
+  /** Cap on reusable sandboxes; null when only TTLs are enforced (no reuse config seen). */
+  maxSandboxes: number | null;
   lastSweepAt: number;
   inFlight: Promise<SweepResult | null> | null;
+  /** Whether the in-flight sweep reserves a slot for an acquire. */
+  inFlightReserves: boolean;
+  /** Tail of the acquire queue (see withReuseSlot). */
+  slotTail: Promise<void>;
 }
 
 const registrations = new Map<string, ReuseNamespaceRegistration>();
+/** Connection key -> time of its last cluster-wide discovery. */
+const discoveries = new Map<string, number>();
 let timer: ReturnType<typeof setInterval> | null = null;
 let now: () => number = Date.now;
+
+function connectionKey(connection: KubeConnectionInput): string {
+  return createHash("sha256")
+    .update(JSON.stringify([connection.inCluster === true, connection.kubeconfig ?? ""]))
+    .digest("hex");
+}
 
 function registrationKey(connection: KubeConnectionInput, namespace: string): string {
   return createHash("sha256")
@@ -141,10 +168,10 @@ export async function deleteReusableSandboxIfUnchanged(
  */
 export async function sweepReusableSandboxes(
   clients: KubeClients,
-  input: { namespace: string; maxSandboxes: number; reserveSlot?: boolean; nowMs?: number },
+  input: { namespace: string; maxSandboxes: number | null; reserveSlot?: boolean; nowMs?: number },
 ): Promise<SweepResult> {
   const nowMs = input.nowMs ?? now();
-  const result: SweepResult = { reaped: [], skipped: [] };
+  const result: SweepResult = { reaped: [], skipped: [], remaining: 0 };
   let listed: { items?: unknown[] };
   try {
     listed = (await clients.custom.listNamespacedCustomObject({
@@ -178,7 +205,10 @@ export async function sweepReusableSandboxes(
     }
   }
 
-  const limit = Math.max(0, input.maxSandboxes - (input.reserveSlot ? 1 : 0));
+  // Without a cap (a namespace found by discovery, no reuse config seen yet)
+  // only the TTL rules above apply.
+  const limit =
+    input.maxSandboxes === null ? Number.POSITIVE_INFINITY : Math.max(0, input.maxSandboxes - (input.reserveSlot ? 1 : 0));
   let count = remaining.length;
   if (count > limit) {
     // Least recently used idle sandboxes first.
@@ -200,6 +230,7 @@ export async function sweepReusableSandboxes(
       `[plugin-kubernetes] removed reusable sandbox ${input.namespace}/${reaped.name} (${reaped.reason})`,
     );
   }
+  result.remaining = count;
   return result;
 }
 
@@ -207,11 +238,17 @@ async function sweepRegistration(registration: ReuseNamespaceRegistration, reser
   registration.lastSweepAt = now();
   try {
     const { clients } = getKubeConnection(registration.connection);
-    return await sweepReusableSandboxes(clients, {
+    const result = await sweepReusableSandboxes(clients, {
       namespace: registration.namespace,
       maxSandboxes: registration.maxSandboxes,
       reserveSlot,
     });
+    if (result.remaining === 0 && registration.maxSandboxes === null && !reserveSlot) {
+      // Found by discovery (or by an RPC with reuse off) and now empty: stop
+      // sweeping it. Discovery or the next reuse RPC registers it again.
+      if (registrations.get(registration.key) === registration) registrations.delete(registration.key);
+    }
+    return result;
   } catch (err) {
     if (isKubeAuthError(err)) {
       // A rotated or revoked credential: stop sweeping with it. The next RPC
@@ -227,11 +264,18 @@ async function sweepRegistration(registration: ReuseNamespaceRegistration, reser
 }
 
 function runSweep(registration: ReuseNamespaceRegistration, reserveSlot: boolean): Promise<SweepResult | null> {
-  if (registration.inFlight) return registration.inFlight;
+  if (registration.inFlight) {
+    if (!reserveSlot || registration.inFlightReserves) return registration.inFlight;
+    // A running sweep that does not reserve a slot may leave the namespace at
+    // the cap: run a reserving one right after it instead of joining it.
+    return registration.inFlight.then(() => runSweep(registration, true));
+  }
   const inFlight = sweepRegistration(registration, reserveSlot).finally(() => {
     registration.inFlight = null;
+    registration.inFlightReserves = false;
   });
   registration.inFlight = inFlight;
+  registration.inFlightReserves = reserveSlot;
   return inFlight;
 }
 
@@ -253,17 +297,19 @@ function ensureTimer(): void {
 
 /**
  * Remember a (connection, namespace) pair for the periodic sweep. Every RPC on
- * a reusable lease calls this, so the latest cap and credentials win.
+ * a reusable lease calls this, so the latest cap and credentials win. Without
+ * `maxSandboxes` an existing registration keeps its cap and a new one gets
+ * none (TTL rules only).
  */
 export function registerReuseNamespace(input: {
   connection: KubeConnectionInput;
   namespace: string;
-  maxSandboxes: number;
+  maxSandboxes?: number | null;
 }): ReuseNamespaceRegistration {
   const key = registrationKey(input.connection, input.namespace);
   let registration = registrations.get(key);
   if (registration) {
-    registration.maxSandboxes = input.maxSandboxes;
+    if (input.maxSandboxes !== undefined) registration.maxSandboxes = input.maxSandboxes;
     // Re-insert so the Map keeps least recently registered first.
     registrations.delete(key);
     registrations.set(key, registration);
@@ -272,9 +318,11 @@ export function registerReuseNamespace(input: {
       key,
       connection: { inCluster: input.connection.inCluster === true, kubeconfig: input.connection.kubeconfig },
       namespace: input.namespace,
-      maxSandboxes: input.maxSandboxes,
+      maxSandboxes: input.maxSandboxes ?? null,
       lastSweepAt: 0,
       inFlight: null,
+      inFlightReserves: false,
+      slotTail: Promise.resolve(),
     };
     registrations.set(key, registration);
     while (registrations.size > MAX_REGISTRATIONS) {
@@ -289,14 +337,17 @@ export function registerReuseNamespace(input: {
 
 /**
  * RPC-triggered sweep, at most once per RPC_SWEEP_THROTTLE_MS per namespace.
- * `waitMs` bounds how long the caller waits; the sweep itself keeps running.
+ * A sweep that reserves a slot for an acquire is never throttled: it is what
+ * keeps the namespace under its cap. `waitMs` bounds how long the caller
+ * waits; the sweep itself keeps running.
  */
 export async function maybeSweepReuseNamespace(
   registration: ReuseNamespaceRegistration,
   options: { reserveSlot?: boolean; waitMs?: number } = {},
 ): Promise<void> {
-  if (!registration.inFlight && now() - registration.lastSweepAt < RPC_SWEEP_THROTTLE_MS) return;
-  const sweep = runSweep(registration, options.reserveSlot === true);
+  const reserveSlot = options.reserveSlot === true;
+  if (!reserveSlot && !registration.inFlight && now() - registration.lastSweepAt < RPC_SWEEP_THROTTLE_MS) return;
+  const sweep = runSweep(registration, reserveSlot);
   const waitMs = options.waitMs ?? 0;
   if (waitMs <= 0) return;
   let handle: ReturnType<typeof setTimeout> | undefined;
@@ -310,16 +361,108 @@ export async function maybeSweepReuseNamespace(
   if (handle) clearTimeout(handle);
 }
 
+/**
+ * Run `work` (a reserving sweep plus the create of a new sandbox) for one
+ * namespace at a time within this worker, so concurrent acquires each see the
+ * sandboxes the previous one created and the cap holds. A caller waits for the
+ * one ahead of it at most `maxWaitMs`, then goes ahead anyway: a stuck API call
+ * must not block every other acquire in the namespace.
+ */
+export async function withReuseSlot<T>(
+  registration: ReuseNamespaceRegistration,
+  work: () => Promise<T>,
+  maxWaitMs: number = ACQUIRE_SLOT_WAIT_MS,
+): Promise<T> {
+  const previous = registration.slotTail;
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  registration.slotTail = previous.then(() => mine);
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    previous,
+    new Promise<void>((resolve) => {
+      handle = setTimeout(resolve, maxWaitMs);
+      handle.unref?.();
+    }),
+  ]);
+  if (handle) clearTimeout(handle);
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * List reusable Sandbox CRs across the cluster and register every namespace
+ * that holds one, at most once per DISCOVERY_INTERVAL_MS per connection. Runs
+ * in the background; failures (for example a credential that may only list
+ * its own namespaces) are logged when `reportErrors` is set and otherwise
+ * ignored, and never evict the connection.
+ */
+export function discoverReuseNamespaces(
+  connection: KubeConnectionInput,
+  options: { reportErrors?: boolean } = {},
+): Promise<void> | null {
+  const key = connectionKey(connection);
+  const last = discoveries.get(key);
+  if (last !== undefined && now() - last < DISCOVERY_INTERVAL_MS) return null;
+  discoveries.set(key, now());
+  // Keep the discovery map bounded like the registrations.
+  while (discoveries.size > MAX_REGISTRATIONS) {
+    const oldest = discoveries.keys().next().value;
+    if (oldest === undefined) break;
+    discoveries.delete(oldest);
+  }
+  return (async () => {
+    try {
+      const { clients } = getKubeConnection(connection);
+      const listed = (await clients.custom.listClusterCustomObject({
+        group: SANDBOX_GROUP,
+        version: SANDBOX_VERSION,
+        plural: SANDBOX_PLURAL,
+        labelSelector: REUSE_LABEL_SELECTOR,
+      })) as { items?: Array<{ metadata?: { namespace?: unknown } }> };
+      const namespaces = new Set<string>();
+      for (const item of listed.items ?? []) {
+        const namespace = item?.metadata?.namespace;
+        if (typeof namespace === "string" && namespace.length > 0) namespaces.add(namespace);
+      }
+      for (const namespace of namespaces) registerReuseNamespace({ connection, namespace });
+    } catch (err) {
+      if (options.reportErrors) {
+        console.warn(
+          `[plugin-kubernetes] could not list reusable sandboxes cluster-wide (${err instanceof Error ? err.message : String(err)}); idle sandboxes are swept only in namespaces this worker serves`,
+        );
+      }
+    }
+  })();
+}
+
 /** Test hooks. */
 export function resetIdleReaper(options: { now?: () => number } = {}): void {
   if (timer) clearInterval(timer);
   timer = null;
   registrations.clear();
+  discoveries.clear();
   now = options.now ?? Date.now;
 }
 
-export function idleReaperState(): { registrations: number; timerActive: boolean } {
-  return { registrations: registrations.size, timerActive: timer !== null };
+export function idleReaperState(): {
+  registrations: number;
+  timerActive: boolean;
+  namespaces: Array<{ namespace: string; maxSandboxes: number | null }>;
+} {
+  return {
+    registrations: registrations.size,
+    timerActive: timer !== null,
+    namespaces: [...registrations.values()].map((registration) => ({
+      namespace: registration.namespace,
+      maxSandboxes: registration.maxSandboxes,
+    })),
+  };
 }
 
 /** Run the periodic sweep once over every registration (what the timer does). */

@@ -26,7 +26,12 @@ import {
   findPodForSandbox,
   waitForSandboxReady,
 } from "./sandbox-cr-orchestrator.js";
-import { REUSE_ANNOTATIONS, annotationsJsonPatch } from "./reuse.js";
+import {
+  REUSE_ANNOTATIONS,
+  annotationPath,
+  annotationsJsonPatch,
+  busyRefreshJsonPatch,
+} from "./reuse.js";
 
 /** True when a Kubernetes API error means "resource not found" (HTTP 404). */
 export function isKubeNotFoundError(err: unknown): boolean {
@@ -453,7 +458,7 @@ async function readOrTransient<T>(action: string, read: () => Promise<T>): Promi
  * afterwards), so a slow resume from a run that lost the lease race is harmless.
  *
  * Returns `resumable: false` for states that will not recover: CR gone or being
- * deleted, CR failed, a different reuse key or spec hash, the recorded pod
+ * deleted, CR failed, a different reuse key or spec hash, the pod gone or
  * replaced, a stuck container, or a pod not Ready for longer than
  * `notReadyExpiryMs`. Throws KubernetesTransientError for temporary API errors
  * and for a pod that is only briefly not Ready.
@@ -531,40 +536,38 @@ export async function checkReusableLeaseResumable(
       clients.core.readNamespacedPod({ namespace: input.namespace, name: podName }),
     ) as PodLike | null;
     if (!pod) {
-      if (recordedPodUid) {
-        // The pod whose filesystem held the task state is gone; a replacement
-        // pod would start empty.
-        return { resumable: false, reason: "pod_replaced", detail: `Pod ${podName} no longer exists` };
-      }
-    } else {
-      const uid = pod.metadata?.uid ?? "";
-      if (pod.metadata?.deletionTimestamp) {
-        return { resumable: false, reason: "deleting", detail: `Pod ${podName} is terminating` };
-      }
-      if (recordedPodUid && uid !== recordedPodUid) {
-        return {
-          resumable: false,
-          reason: "pod_replaced",
-          detail: `Pod ${podName} was replaced since the sandbox was released`,
-        };
-      }
-      const phase = pod.status?.phase;
-      if (phase === "Failed" || phase === "Succeeded") {
-        return { resumable: false, reason: "pod_unhealthy", detail: `Pod ${podName} is ${phase}` };
-      }
-      const stuck = (pod.status?.containerStatuses ?? [])
-        .map((s) => s.state?.waiting?.reason)
-        .find((reason): reason is string => typeof reason === "string" && STUCK_CONTAINER_REASONS.has(reason));
-      if (stuck) {
-        return { resumable: false, reason: "pod_unhealthy", detail: `Pod ${podName} is stuck in ${stuck}` };
-      }
-      const ready = (pod.status?.conditions ?? []).find((c) => c.type === "Ready");
-      if (phase === "Running" && ready?.status === "True" && uid) {
-        return { resumable: true, podName, podUid: uid };
-      }
-      notReadySince =
-        toMillis(ready?.lastTransitionTime) ?? toMillis(pod.metadata?.creationTimestamp) ?? notReadySince;
+      // The pod whose filesystem held the task state is gone; a replacement
+      // pod would start empty. This holds with or without a recorded UID: a
+      // released sandbox always had a pod, so waiting cannot bring it back.
+      return { resumable: false, reason: "pod_replaced", detail: `Pod ${podName} no longer exists` };
     }
+    const uid = pod.metadata?.uid ?? "";
+    if (pod.metadata?.deletionTimestamp) {
+      return { resumable: false, reason: "deleting", detail: `Pod ${podName} is terminating` };
+    }
+    if (recordedPodUid && uid !== recordedPodUid) {
+      return {
+        resumable: false,
+        reason: "pod_replaced",
+        detail: `Pod ${podName} was replaced since the sandbox was released`,
+      };
+    }
+    const phase = pod.status?.phase;
+    if (phase === "Failed" || phase === "Succeeded") {
+      return { resumable: false, reason: "pod_unhealthy", detail: `Pod ${podName} is ${phase}` };
+    }
+    const stuck = (pod.status?.containerStatuses ?? [])
+      .map((s) => s.state?.waiting?.reason)
+      .find((reason): reason is string => typeof reason === "string" && STUCK_CONTAINER_REASONS.has(reason));
+    if (stuck) {
+      return { resumable: false, reason: "pod_unhealthy", detail: `Pod ${podName} is stuck in ${stuck}` };
+    }
+    const ready = (pod.status?.conditions ?? []).find((c) => c.type === "Ready");
+    if (phase === "Running" && ready?.status === "True" && uid) {
+      return { resumable: true, podName, podUid: uid };
+    }
+    notReadySince =
+      toMillis(ready?.lastTransitionTime) ?? toMillis(pod.metadata?.creationTimestamp) ?? notReadySince;
     if (now() + pollMs > deadline) break;
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
@@ -641,4 +644,86 @@ export async function deleteScopedNetworkPolicy(
   await ignoreNotFound(
     clients.networking.deleteNamespacedNetworkPolicy({ namespace: input.namespace, name: input.name }),
   );
+}
+
+function isPatchRejected(err: unknown): boolean {
+  // 409: resourceVersion conflict; 422: a JSON Patch `test` op did not match.
+  const status = kubeStatusCode(err);
+  return status === 409 || status === 422;
+}
+
+/**
+ * Move busy-since forward on a sandbox a run is still using, so a long run is
+ * never mistaken for an abandoned one. Best effort: the `test` op makes it a
+ * no-op once the sandbox was released, and any failure is ignored (the next
+ * refresh tries again). Returns true when the patch was applied.
+ */
+export async function refreshReusableSandboxBusy(
+  clients: KubeClients,
+  input: { namespace: string; name: string; now?: Date },
+): Promise<boolean> {
+  try {
+    await clients.custom.patchNamespacedCustomObject({
+      group: SANDBOX_GROUP,
+      version: SANDBOX_VERSION,
+      namespace: input.namespace,
+      plural: SANDBOX_PLURAL,
+      name: input.name,
+      body: busyRefreshJsonPatch(input.now ?? new Date()),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Record the UID of the pod a freshly acquired reusable sandbox runs on, the
+ * first time a run reaches it. Release compares it with the pod it finds, so a
+ * pod replaced during the very first run is not kept as the task's sandbox.
+ * Keeps an already recorded UID; the patch carries the CR's resourceVersion as
+ * a `test` op so it never overwrites a concurrent update. Best effort: returns
+ * the recorded UID, or null when it could not be read or written.
+ */
+export async function recordReusableSandboxPodUid(
+  clients: KubeClients,
+  input: { namespace: string; name: string; podName: string },
+): Promise<string | null> {
+  try {
+    const cr = (await clients.custom.getNamespacedCustomObject({
+      group: SANDBOX_GROUP,
+      version: SANDBOX_VERSION,
+      namespace: input.namespace,
+      plural: SANDBOX_PLURAL,
+      name: input.name,
+    })) as { metadata?: { resourceVersion?: unknown; annotations?: Record<string, unknown> } };
+    const recorded = cr.metadata?.annotations?.[REUSE_ANNOTATIONS.podUid];
+    if (typeof recorded === "string" && recorded) return recorded;
+    const resourceVersion = cr.metadata?.resourceVersion;
+    if (typeof resourceVersion !== "string" || !cr.metadata?.annotations) return null;
+    const pod = (await clients.core.readNamespacedPod({ namespace: input.namespace, name: input.podName })) as {
+      metadata?: { uid?: string; deletionTimestamp?: unknown };
+    };
+    const uid = pod.metadata?.uid;
+    if (!uid || pod.metadata?.deletionTimestamp) return null;
+    await clients.custom.patchNamespacedCustomObject({
+      group: SANDBOX_GROUP,
+      version: SANDBOX_VERSION,
+      namespace: input.namespace,
+      plural: SANDBOX_PLURAL,
+      name: input.name,
+      body: [
+        { op: "test", path: "/metadata/resourceVersion", value: resourceVersion },
+        { op: "add", path: annotationPath(REUSE_ANNOTATIONS.podUid), value: uid },
+      ],
+    });
+    return uid;
+  } catch (err) {
+    if (!isKubeNotFoundError(err) && !isPatchRejected(err)) {
+      console.warn(
+        `[plugin-kubernetes] could not record the pod of reusable sandbox ${input.namespace}/${input.name}: ${errorText(err)}`,
+      );
+    }
+    return null;
+  }
 }

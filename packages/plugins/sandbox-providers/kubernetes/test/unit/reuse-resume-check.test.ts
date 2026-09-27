@@ -100,6 +100,18 @@ describe("checkReusableLeaseResumable", () => {
     ).resolves.toMatchObject({ resumable: false, reason: "pod_replaced" });
   });
 
+  it("treats a missing pod as replaced even when no pod UID was recorded, instead of retrying forever", async () => {
+    const readPod = vi.fn(async () => {
+      throw Object.assign(new Error("not found"), { code: 404 });
+    });
+    const cr = sandboxCr({ [REUSE_ANNOTATIONS.podUid]: "" });
+    await expect(
+      checkReusableLeaseResumable(clients(cr, readPod), { ...INPUT, readyTimeoutMs: 30_000 }),
+    ).resolves.toMatchObject({ resumable: false, reason: "pod_replaced" });
+    // Decided on the first read; no polling until the ready timeout.
+    expect(readPod).toHaveBeenCalledTimes(1);
+  });
+
   it("reports a spec that cannot be rendered any more as changed", async () => {
     await expect(
       checkReusableLeaseResumable(clients(sandboxCr(), async () => pod()), { ...INPUT, expectedSpecHash: null }),

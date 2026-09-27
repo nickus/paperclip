@@ -17,6 +17,14 @@ function conflict(): Error {
   return Object.assign(new Error("HTTP-Code: 409 Message: precondition failed"), { code: 409 });
 }
 
+function patchTestFailed(): Error {
+  return Object.assign(new Error("HTTP-Code: 422 Message: the server rejected our request: test operation failed"), { code: 422 });
+}
+
+function unescapePointer(token: string): string {
+  return token.replace(/~1/g, "/").replace(/~0/g, "~");
+}
+
 function matchesSelector(labels: Record<string, string> | undefined, selector: string | undefined): boolean {
   if (!selector) return true;
   return selector.split(",").every((term) => {
@@ -53,9 +61,15 @@ export function createFakeCluster() {
   }
 
   const custom = {
-    createNamespacedCustomObject: vi.fn(async (req: { plural: string; body: Obj }) => {
+    createNamespacedCustomObject: vi.fn(async (req: { plural: string; namespace?: string; body: Obj }) => {
       const body = structuredClone(req.body);
-      body.metadata = { ...body.metadata, uid: `cr-uid-${body.metadata.name}`, resourceVersion: nextVersion(), creationTimestamp: new Date().toISOString() };
+      body.metadata = {
+        ...body.metadata,
+        namespace: body.metadata.namespace ?? req.namespace,
+        uid: `cr-uid-${body.metadata.name}`,
+        resourceVersion: nextVersion(),
+        creationTimestamp: new Date().toISOString(),
+      };
       if (req.plural === "sandboxes") {
         body.status = { podName: body.metadata.name, conditions: [{ type: "Ready", status: "True" }] };
         sandboxes.set(body.metadata.name, body);
@@ -75,13 +89,29 @@ export function createFakeCluster() {
         ? [...sandboxes.values()].filter((cr) => matchesSelector(cr.metadata.labels, req.labelSelector)).map((cr) => structuredClone(cr))
         : [],
     })),
+    listClusterCustomObject: vi.fn(async (req: { plural: string; labelSelector?: string }) => ({
+      items: req.plural === "sandboxes"
+        ? [...sandboxes.values()].filter((cr) => matchesSelector(cr.metadata.labels, req.labelSelector)).map((cr) => structuredClone(cr))
+        : [],
+    })),
     patchNamespacedCustomObject: vi.fn(async (req: { name: string; body: Array<{ op: string; path: string; value: string }> }) => {
       const cr = sandboxes.get(req.name);
       if (!cr) throw notFound();
+      // JSON Patch is atomic: check every `test` op before applying anything.
+      const annotationPrefix = "/metadata/annotations/";
       for (const op of req.body) {
-        const prefix = "/metadata/annotations/";
-        if (op.op !== "add" || !op.path.startsWith(prefix)) throw new Error(`unsupported patch ${op.op} ${op.path}`);
-        const key = op.path.slice(prefix.length).replace(/~1/g, "/").replace(/~0/g, "~");
+        if (op.op !== "test") continue;
+        const actual = op.path === "/metadata/resourceVersion"
+          ? cr.metadata.resourceVersion
+          : op.path.startsWith(annotationPrefix)
+            ? cr.metadata.annotations?.[unescapePointer(op.path.slice(annotationPrefix.length))]
+            : (() => { throw new Error(`unsupported test path ${op.path}`); })();
+        if (actual !== op.value) throw patchTestFailed();
+      }
+      for (const op of req.body) {
+        if (op.op === "test") continue;
+        if (op.op !== "add" || !op.path.startsWith(annotationPrefix)) throw new Error(`unsupported patch ${op.op} ${op.path}`);
+        const key = unescapePointer(op.path.slice(annotationPrefix.length));
         if (!cr.metadata.annotations) throw new Error("add to a missing annotations map");
         cr.metadata.annotations[key] = op.value;
       }

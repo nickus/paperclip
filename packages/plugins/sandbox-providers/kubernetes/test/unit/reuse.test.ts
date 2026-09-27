@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
   DEFAULT_REUSE_IDLE_TTL_SEC,
+  MIN_REUSE_STALE_BUSY_SEC,
   REUSE_ANNOTATIONS,
   annotationsJsonPatch,
   buildIdleAnnotations,
+  busyRefreshJsonPatch,
   buildReuseLabels,
   computeReuseKey,
   computeReuseSpecHash,
@@ -39,6 +41,13 @@ describe("reuse settings", () => {
     expect(resolveReuseSettings(job).enabled).toBe(false);
     expect(resolveReuseSettings(on).maxSandboxes).toBe(8);
     expect(resolveReuseSettings(on).staleBusySec).toBe(3600);
+  });
+
+  it("keeps the stale-busy window well above the busy refresh interval", () => {
+    const short = kubernetesProviderConfigSchema.parse({ inCluster: true, reuseLease: true, podActivityDeadlineSec: 60 });
+    expect(resolveReuseSettings(short).staleBusySec).toBe(MIN_REUSE_STALE_BUSY_SEC);
+    const long = kubernetesProviderConfigSchema.parse({ inCluster: true, reuseLease: true, podActivityDeadlineSec: 7200 });
+    expect(resolveReuseSettings(long).staleBusySec).toBe(7200);
   });
 
   it("keeps reuseLease and the reuse fields through config parsing", () => {
@@ -202,7 +211,11 @@ describe("sandbox state and TTL rules", () => {
       podName: "pc-1",
       podUid: "uid-1",
       deleting: false,
+      consecutiveFailures: 0,
     });
+    expect(
+      readReusableSandboxState(sandbox({ [REUSE_ANNOTATIONS.consecutiveFailures]: "2", [REUSE_ANNOTATIONS.podUid]: "" }))!,
+    ).toMatchObject({ consecutiveFailures: 2, podUid: null });
   });
 
   it("reaps an idle sandbox only after its TTL", () => {
@@ -245,9 +258,10 @@ describe("sandbox state and TTL rules", () => {
     expect(reapDecision(state, T0 + 10 * 86_400_000)).toEqual({ reap: false });
   });
 
-  it("writes idle annotations with the pod uid and an informational expiry", () => {
+  it("writes idle annotations with the pod uid, the failure streak and an informational expiry", () => {
     expect(buildIdleAnnotations({ now: new Date(T0), idleTtlSec: 60, podUid: "uid-9" })).toEqual({
       [REUSE_ANNOTATIONS.leaseState]: "idle",
+      [REUSE_ANNOTATIONS.consecutiveFailures]: "0",
       [REUSE_ANNOTATIONS.lastUsedAt]: new Date(T0).toISOString(),
       [REUSE_ANNOTATIONS.idleTtlSeconds]: "60",
       [REUSE_ANNOTATIONS.idleExpiresAt]: new Date(T0 + 60_000).toISOString(),
@@ -258,6 +272,13 @@ describe("sandbox state and TTL rules", () => {
   it("escapes annotation keys in the JSON patch path", () => {
     expect(annotationsJsonPatch({ "paperclip.io/lease-state": "busy" })).toEqual([
       { op: "add", path: "/metadata/annotations/paperclip.io~1lease-state", value: "busy" },
+    ]);
+  });
+
+  it("refreshes busy-since only while the sandbox is still busy", () => {
+    expect(busyRefreshJsonPatch(new Date(T0))).toEqual([
+      { op: "test", path: "/metadata/annotations/paperclip.io~1lease-state", value: "busy" },
+      { op: "add", path: "/metadata/annotations/paperclip.io~1busy-since", value: new Date(T0).toISOString() },
     ]);
   });
 });

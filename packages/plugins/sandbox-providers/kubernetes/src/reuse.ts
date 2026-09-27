@@ -30,10 +30,31 @@ export const DEFAULT_REUSE_IDLE_TTL_SEC = 86_400;
 export const MIN_REUSE_IDLE_TTL_SEC = 60;
 export const MAX_REUSE_IDLE_TTL_SEC = 604_800;
 export const DEFAULT_REUSE_MAX_SANDBOXES = 8;
-/** Requests an idle sandbox holds for its whole lifetime (LimitRange min is 100m/128Mi). */
+/**
+ * Default requests of a reusable sandbox (LimitRange min is 100m/128Mi). A pod
+ * cannot change its requests in place here, so these apply for the pod's whole
+ * life: while it idles AND while a run uses it. Low requests let many idle
+ * sandboxes fit on a node and under a requests quota; the cost is a smaller
+ * CPU share under contention and an earlier place in the kubelet's eviction
+ * order under node memory pressure during a run. Set `reuseResources.requests`
+ * to the regular values to trade idle density for that.
+ */
 export const DEFAULT_REUSE_REQUESTS = { cpu: "100m", memory: "256Mi" } as const;
 /** Same limits a regular sandbox gets (see sandbox-cr-builder.ts). */
 export const DEFAULT_SANDBOX_LIMITS = { cpu: "2", memory: "4Gi" } as const;
+/**
+ * Lower bound of the stale-busy window. A run refreshes busy-since every
+ * REUSE_BUSY_REFRESH_MS while it executes, so the window must stay well above
+ * that interval whatever `podActivityDeadlineSec` is set to.
+ */
+export const MIN_REUSE_STALE_BUSY_SEC = 1_800;
+/** How often a running command re-marks its sandbox busy (see plugin.ts). */
+export const REUSE_BUSY_REFRESH_MS = 5 * 60_000;
+/**
+ * Consecutive failed runs after which a sandbox is removed at release instead
+ * of kept, so a sandbox whose own state breaks every run gets a clean start.
+ */
+export const REUSE_MAX_CONSECUTIVE_FAILURES = 3;
 
 export const MANAGED_BY_LABEL = "paperclip.io/managed-by";
 export const MANAGED_BY_VALUE = "paperclip-k8s-plugin";
@@ -56,6 +77,7 @@ export const REUSE_ANNOTATIONS = {
   staleBusySeconds: "paperclip.io/stale-busy-seconds",
   idleExpiresAt: "paperclip.io/idle-expires-at",
   podUid: "paperclip.io/pod-uid",
+  consecutiveFailures: "paperclip.io/consecutive-failures",
 } as const;
 
 /** Label selector matching every reusable Sandbox CR this plugin created. */
@@ -128,7 +150,7 @@ export function resolveReuseSettings(config: KubernetesProviderConfig): ReuseSet
     enabled: config.reuseLease === true && config.backend === "sandbox-cr",
     idleTtlSec: resolveReuseIdleTtlSec(config),
     maxSandboxes: config.reuseMaxSandboxes ?? DEFAULT_REUSE_MAX_SANDBOXES,
-    staleBusySec: config.podActivityDeadlineSec,
+    staleBusySec: Math.max(config.podActivityDeadlineSec, MIN_REUSE_STALE_BUSY_SEC),
     resources: resolveReuseResources(config),
   };
 }
@@ -282,9 +304,12 @@ export function buildIdleAnnotations(input: {
   now: Date;
   idleTtlSec: number;
   podUid: string;
+  /** Failed runs in a row, this one included; 0 after a run that did not fail. */
+  consecutiveFailures?: number;
 }): Record<string, string> {
   return {
     [REUSE_ANNOTATIONS.leaseState]: "idle",
+    [REUSE_ANNOTATIONS.consecutiveFailures]: String(input.consecutiveFailures ?? 0),
     [REUSE_ANNOTATIONS.lastUsedAt]: input.now.toISOString(),
     [REUSE_ANNOTATIONS.idleTtlSeconds]: String(input.idleTtlSec),
     // Informational only: the reaper always recomputes from last-used-at.
@@ -310,9 +335,25 @@ export function annotationsJsonPatch(
 ): Array<{ op: "add"; path: string; value: string }> {
   return Object.entries(annotations).map(([key, value]) => ({
     op: "add" as const,
-    path: `/metadata/annotations/${jsonPointerToken(key)}`,
+    path: annotationPath(key),
     value,
   }));
+}
+
+export function annotationPath(key: string): string {
+  return `/metadata/annotations/${jsonPointerToken(key)}`;
+}
+
+/**
+ * JSON Patch that moves busy-since forward only while the sandbox is still
+ * busy: the `test` op fails (HTTP 422) once a release marked it idle, so a late
+ * refresh never overwrites a newer state.
+ */
+export function busyRefreshJsonPatch(now: Date): Array<{ op: "test" | "add"; path: string; value: string }> {
+  return [
+    { op: "test", path: annotationPath(REUSE_ANNOTATIONS.leaseState), value: "busy" },
+    { op: "add", path: annotationPath(REUSE_ANNOTATIONS.busySince), value: now.toISOString() },
+  ];
 }
 
 export interface ReusableSandboxState {
@@ -330,6 +371,8 @@ export interface ReusableSandboxState {
   reuseKey: string | null;
   specHash: string | null;
   podUid: string | null;
+  /** Failed runs in a row recorded at the last release (0 when absent). */
+  consecutiveFailures: number;
 }
 
 function parseTime(value: unknown): number | null {
@@ -386,9 +429,10 @@ export function readReusableSandboxState(cr: unknown): ReusableSandboxState | nu
     specHash: typeof annotations[REUSE_ANNOTATIONS.specHash] === "string"
       ? (annotations[REUSE_ANNOTATIONS.specHash] as string)
       : null,
-    podUid: typeof annotations[REUSE_ANNOTATIONS.podUid] === "string"
+    podUid: typeof annotations[REUSE_ANNOTATIONS.podUid] === "string" && annotations[REUSE_ANNOTATIONS.podUid]
       ? (annotations[REUSE_ANNOTATIONS.podUid] as string)
       : null,
+    consecutiveFailures: parsePositiveInt(annotations[REUSE_ANNOTATIONS.consecutiveFailures]) ?? 0,
   };
 }
 

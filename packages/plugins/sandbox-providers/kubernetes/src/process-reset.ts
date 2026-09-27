@@ -159,6 +159,8 @@ export type PodCommandExec = (
 export interface ProcessResetResult {
   ok: boolean;
   detail: string;
+  /** The exec itself failed (nothing ran or its result was lost), as opposed to the script reporting a failure. */
+  execFailed: boolean;
 }
 
 /** Run the reset script through `exec`; any exec failure counts as "not verified". */
@@ -169,8 +171,12 @@ export async function resetSandboxProcesses(
   try {
     const result = await exec(buildProcessResetCommand(options), options.timeoutMs ?? PROCESS_RESET_TIMEOUT_MS);
     const detail = `${result.stdout}${result.stderr}`.trim();
-    return { ok: result.exitCode === 0 && /paperclip-process-reset: ok\b/.test(result.stdout), detail };
+    return {
+      ok: result.exitCode === 0 && /paperclip-process-reset: ok\b/.test(result.stdout),
+      detail,
+      execFailed: false,
+    };
   } catch (err) {
-    return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+    return { ok: false, detail: err instanceof Error ? err.message : String(err), execFailed: true };
   }
 }

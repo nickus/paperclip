@@ -29,8 +29,10 @@ import {
 import {
   evictKubeConnectionOnAuthError,
   getKubeConnection,
+  isKubeAuthError,
   type KubeConnectionInput,
 } from "./kube-client-cache.js";
+import type { KubeClients } from "./kube-client.js";
 import { getAdapterDefaults, buildAdapterEnv, resolveRunAdapterType } from "./adapter-defaults.js";
 import { resolveImage } from "./image-allowlist.js";
 import { buildJobManifest } from "./pod-spec-builder.js";
@@ -59,10 +61,17 @@ import {
   checkReusableLeaseResumable,
   deleteScopedNetworkPolicy,
   isKubeNotFoundError,
+  isTransientKubeError,
   patchReusableSandboxAnnotations,
+  recordReusableSandboxPodUid,
+  refreshReusableSandboxBusy,
   terminateLeaseResources,
 } from "./lease-lifecycle.js";
 import {
+  REUSE_BUSY_REFRESH_MS,
+  REUSE_LABEL_SELECTOR,
+  REUSE_LABELS,
+  REUSE_MAX_CONSECUTIVE_FAILURES,
   REUSE_REMOTE_CWD,
   REUSE_SPEC_VERSION,
   buildBusyAnnotations,
@@ -76,13 +85,17 @@ import {
   readReuseStamp,
   resolveReuseResources,
   resolveReuseSettings,
-  type ReuseSettings,
+  reuseKeyLabelValue,
 } from "./reuse.js";
 import { resetSandboxProcesses } from "./process-reset.js";
 import {
   ACQUIRE_SWEEP_BUDGET_MS,
+  deleteReusableSandboxIfUnchanged,
+  discoverReuseNamespaces,
   maybeSweepReuseNamespace,
   registerReuseNamespace,
+  withReuseSlot,
+  type ReuseNamespaceRegistration,
 } from "./idle-reaper.js";
 import {
   appendNetworkEgressDenyHint,
@@ -156,6 +169,16 @@ function getOrCreateUploadInterceptor(leaseId: string): FastUploadInterceptor {
 // lease then re-confirms readiness from scratch.
 const readySandboxesByLease = new Set<string>();
 
+// Reusable sandboxes this worker released and kept. A command that still
+// arrives for one of them (for example from a startup the host is cancelling)
+// is refused instead of running in the idle sandbox after its processes were
+// verified stopped. The next resume of the sandbox clears the entry.
+const releasedReusableLeases = new Set<string>();
+
+// When each reusable sandbox in use was last marked busy by this worker (see
+// withReusableSandboxBusy).
+const busyRefreshedAt = new Map<string, number>();
+
 // Forcibly delete every resource acquireLease created for a lease (workload,
 // pod, per-run Secret; 404s are success) and confirm the stop. Shared by
 // onEnvironmentReleaseLease and onEnvironmentDestroyLease.
@@ -187,9 +210,12 @@ async function teardownLease(
   // so unrelated concurrent leases keep their in-flight buffers intact.
   uploadInterceptorsByLease.delete(params.providerLeaseId);
   readySandboxesByLease.delete(params.providerLeaseId);
+  releasedReusableLeases.delete(params.providerLeaseId);
+  busyRefreshedAt.delete(params.providerLeaseId);
 
   // Reuse the parsed kubeconfig + API clients across RPCs (see kube-client-cache.ts).
   const { clients } = getKubeConnection(config);
+  trackReuseNamespaces(config, namespace, readReuseStamp(params.leaseMetadata) !== null);
 
   // Throws (so the host keeps the lease in pending_cleanup and retries) when
   // the stop cannot be confirmed within the bounded wait.
@@ -204,14 +230,23 @@ async function teardownLease(
 
   // A reusable sandbox can live for a day; remove its task-scoped egress policy
   // explicitly instead of relying on owner-reference garbage collection alone.
-  // Ordinary leases keep the previous behavior (garbage collection only).
+  // Ordinary leases keep the previous behavior (garbage collection only). Best
+  // effort: the workload is already confirmed gone and the collector removes
+  // the policy with it, so a failed delete must not fail the teardown.
   const scopedNetworkPolicyName = params.leaseMetadata?.scopedNetworkPolicyName;
   if (readReuseStamp(params.leaseMetadata) && typeof scopedNetworkPolicyName === "string" && scopedNetworkPolicyName) {
-    await deleteScopedNetworkPolicy(clients, {
-      namespace,
-      name: scopedNetworkPolicyName,
-      mode: config.egressMode,
-    });
+    try {
+      await deleteScopedNetworkPolicy(clients, {
+        namespace,
+        name: scopedNetworkPolicyName,
+        mode: config.egressMode,
+      });
+    } catch (err) {
+      evictKubeConnectionOnAuthError(config, err);
+      console.warn(
+        `[plugin-kubernetes] could not delete egress policy ${namespace}/${scopedNetworkPolicyName} of a removed sandbox (garbage collection removes it with its owner): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
   return receipt;
 }
@@ -222,10 +257,10 @@ async function teardownLease(
 // runs (see reuse.ts for the state kept on the CR and idle-reaper.ts for its
 // expiry). Lifecycle:
 //
-//   acquire ──> BUSY ──release (processes stopped + verified)──> IDLE ──reaper──> GONE
-//                ^  |                                              |
-//                |  +── destroy / cancel / reuse off / unverified ─┴──────────> GONE
-//                +──────────────── resume (mark busy) ─────────────+
+//   acquire ──> BUSY ──release or cancel (processes stopped + verified)──> IDLE ──reaper──> GONE
+//                ^  |                                                        |
+//                |  +── destroy / reuse off / unverified / failing runs ─────┴──────────> GONE
+//                +──────────────────── resume (mark busy) ───────────────────+
 //
 // Resume reports the lease expired (the host then destroys it and acquires a
 // fresh sandbox, which also starts a fresh harness session) when the CR is
@@ -272,12 +307,64 @@ function reusableSandboxSpecHash(
   });
 }
 
-function registerReuseNamespaceFor(config: KubernetesProviderConfig, namespace: string, settings: ReuseSettings) {
-  return registerReuseNamespace({
-    connection: { inCluster: config.inCluster, kubeconfig: config.kubeconfig },
-    namespace,
-    maxSandboxes: settings.maxSandboxes,
-  });
+/**
+ * Keep the idle reaper informed (see idle-reaper.ts). Every RPC that reaches
+ * the cluster calls this:
+ *   - with reuse on, the namespace is registered with the configured cap;
+ *   - for a reusable lease while reuse is off (e.g. after turning it off), the
+ *     namespace is registered without a cap, so its idle sandboxes still
+ *     expire;
+ *   - in every case the connection's cluster-wide discovery runs when due, so
+ *     a restart does not leave idle sandboxes in namespaces that see no RPC.
+ */
+function trackReuseNamespaces(
+  config: KubernetesProviderConfig,
+  namespace: string,
+  reusableLease: boolean,
+): ReuseNamespaceRegistration | null {
+  const connection = { inCluster: config.inCluster, kubeconfig: config.kubeconfig };
+  const settings = resolveReuseSettings(config);
+  void discoverReuseNamespaces(connection, { reportErrors: settings.enabled });
+  if (settings.enabled) {
+    return registerReuseNamespace({ connection, namespace, maxSandboxes: settings.maxSandboxes });
+  }
+  return reusableLease ? registerReuseNamespace({ connection, namespace }) : null;
+}
+
+/**
+ * Run `work` (an exec or a sync on a reusable sandbox) while keeping the
+ * sandbox's busy-since recent, so the reaper's stale-busy rule never removes a
+ * sandbox under a long run: once when the last refresh is older than
+ * REUSE_BUSY_REFRESH_MS, then every REUSE_BUSY_REFRESH_MS until `work` ends.
+ */
+async function withReusableSandboxBusy<T>(
+  reusable: boolean,
+  clients: KubeClients,
+  namespace: string,
+  leaseId: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  if (!reusable) return await work();
+  const refresh = () => {
+    busyRefreshedAt.set(leaseId, Date.now());
+    void refreshReusableSandboxBusy(clients, { namespace, name: leaseId });
+  };
+  const last = busyRefreshedAt.get(leaseId);
+  if (last === undefined || Date.now() - last >= REUSE_BUSY_REFRESH_MS) refresh();
+  const handle = setInterval(refresh, REUSE_BUSY_REFRESH_MS);
+  handle.unref?.();
+  try {
+    return await work();
+  } finally {
+    clearInterval(handle);
+  }
+}
+
+/** Why a command for `leaseId` must not run, or null when it may. */
+function releasedLeaseRefusal(leaseId: string): string | null {
+  return releasedReusableLeases.has(leaseId)
+    ? `Sandbox lease ${leaseId} was released; the command was not run.`
+    : null;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -314,7 +401,10 @@ async function resumeReusableLease(
     expired("identity_mismatch", detail, { workspaceSentinel: { result: "mismatch", reason: detail } });
 
   const settings = resolveReuseSettings(config);
-  if (!settings.enabled || leaseBackend !== "sandbox-cr") {
+  // Registered even when reuse is now off, so the idle sandboxes left in the
+  // namespace still expire.
+  const registration = trackReuseNamespaces(config, namespace, true);
+  if (!settings.enabled || leaseBackend !== "sandbox-cr" || !registration) {
     return expired("reuse_disabled", "Sandbox reuse is not enabled for this environment");
   }
 
@@ -346,7 +436,6 @@ async function resumeReusableLease(
   }
 
   const { clients } = getKubeConnection(config);
-  const registration = registerReuseNamespaceFor(config, namespace, settings);
   const check = await checkReusableLeaseResumable(clients, {
     namespace,
     name: params.providerLeaseId,
@@ -364,6 +453,13 @@ async function resumeReusableLease(
   // failure there leaves an idle sandbox idle. The patch bumps the CR's
   // resourceVersion, which makes a concurrent reaper delete fail its
   // precondition; a delete that won the race shows up here as gone/deleting.
+  //
+  // This patch carries no precondition of its own, so it does NOT decide which
+  // run gets the sandbox: two resumes of the same released lease would both
+  // succeed here. The host's compare-and-swap on the lease row (the reusable
+  // lease handoff in the environments service) is what lets only one run use
+  // the sandbox; do not remove that check on the assumption that this patch
+  // serializes resumes.
   const patched = await patchReusableSandboxAnnotations(clients, {
     namespace,
     name: params.providerLeaseId,
@@ -378,9 +474,12 @@ async function resumeReusableLease(
     return expired(patched.reason, "Sandbox was removed while it was being resumed");
   }
 
-  // Fresh per-lease state for the new run; the pod was just observed Ready.
-  uploadInterceptorsByLease.delete(params.providerLeaseId);
+  // The pod was just observed Ready and marked busy. The upload interceptor is
+  // left alone: a concurrent resume that loses the host's lease handoff must
+  // not clear the buffers of the run that won it. Release and destroy clear it.
   readySandboxesByLease.add(params.providerLeaseId);
+  releasedReusableLeases.delete(params.providerLeaseId);
+  busyRefreshedAt.set(params.providerLeaseId, Date.now());
   void maybeSweepReuseNamespace(registration);
 
   const leaseMetadata: KubernetesLeaseMetadata = {
@@ -413,18 +512,80 @@ async function resumeReusableLease(
 }
 
 /**
+ * Retry `read` on temporary API errors (5xx, 429, transport failures) with
+ * backoff until `deadline`. Not-found, credential and other errors are thrown
+ * at once, as is the last temporary error once the deadline has passed.
+ */
+async function retryTransientKubeCall<T>(deadline: number, read: () => Promise<T>): Promise<T> {
+  let delayMs = 250;
+  for (;;) {
+    try {
+      return await read();
+    } catch (err) {
+      if (!isTransientKubeError(err) || isKubeAuthError(err) || Date.now() + delayMs > deadline) throw err;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      delayMs = Math.min(delayMs * 2, 2_000);
+    }
+  }
+}
+
+/** Part of the release budget spent retrying temporary API errors. */
+const REUSE_RELEASE_RETRY_BUDGET_MS = 8_000;
+
+/**
+ * Remove other idle sandboxes stamped with the same reuse key. The host keeps
+ * one sandbox per task: it resumes the most recently released lease of the
+ * task, so any older idle sibling (possible only when two runs of the same task
+ * each created a sandbox) would never be resumed and would hold a cap slot
+ * until its TTL. Busy siblings are left alone; the delete is conditional on
+ * the version read, like the reaper's. Best effort.
+ */
+async function removeIdleSiblings(
+  clients: KubeClients,
+  input: { namespace: string; keepName: string; reuseKey: string },
+): Promise<void> {
+  try {
+    const listed = (await clients.custom.listNamespacedCustomObject({
+      group: SANDBOX_GROUP,
+      version: SANDBOX_VERSION,
+      namespace: input.namespace,
+      plural: SANDBOX_PLURAL,
+      labelSelector: `${REUSE_LABEL_SELECTOR},${REUSE_LABELS.reuseKey}=${reuseKeyLabelValue(input.reuseKey)}`,
+    })) as { items?: unknown[] };
+    for (const item of listed.items ?? []) {
+      const sibling = readReusableSandboxState(item);
+      if (!sibling || sibling.name === input.keepName || sibling.deleting) continue;
+      if (sibling.reuseKey !== input.reuseKey || sibling.leaseState !== "idle") continue;
+      if (await deleteReusableSandboxIfUnchanged(clients, input.namespace, sibling)) {
+        console.info(
+          `[plugin-kubernetes] removed reusable sandbox ${input.namespace}/${sibling.name}: a newer sandbox of the same task was released`,
+        );
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `[plugin-kubernetes] could not check ${input.namespace} for older sandboxes of the same task: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
  * Release a reusable lease: stop every process the run left in the pod, verify
  * nothing is left, and mark the sandbox idle. Returns a `stopped` receipt only
- * after the processes are confirmed gone. Anything that prevents that proof
- * (cancellation, a missing or replaced pod, a failed verification, a failed
- * patch) falls back to a full teardown with a `destroyed` receipt.
+ * after the processes are confirmed gone; an explicit cancellation takes the
+ * same path, since the verified stop is exactly the proof it needs. Anything
+ * that prevents that proof (a missing or replaced pod, a failed verification)
+ * or that makes the sandbox unfit to keep (removed while being released, too
+ * many failed runs in a row) falls back to a full teardown with a `destroyed`
+ * receipt. Temporary API errors are retried within the release budget.
  */
 async function releaseReusableLease(
-  params: PluginEnvironmentReleaseLeaseParams & { providerLeaseId: string },
+  params: PluginEnvironmentReleaseLeaseParams & { providerLeaseId: string; runStatus?: unknown },
   config: KubernetesProviderConfig,
   stamp: KubernetesReuseLeaseStamp,
 ): Promise<PluginEnvironmentTerminationReceipt> {
   const startedAt = Date.now();
+  const retryDeadline = startedAt + REUSE_RELEASE_RETRY_BUDGET_MS;
   const leaseId = params.providerLeaseId;
   const namespace =
     typeof params.leaseMetadata?.namespace === "string"
@@ -432,9 +593,12 @@ async function releaseReusableLease(
       : deriveTenantNamespace(config, params.companyId);
   const settings = resolveReuseSettings(config);
 
-  // The run is over either way: drop its per-lease in-memory state.
+  // The run is over either way: drop its per-lease in-memory state, and refuse
+  // commands that still arrive for it until a later run resumes the sandbox.
   uploadInterceptorsByLease.delete(leaseId);
   readySandboxesByLease.delete(leaseId);
+  busyRefreshedAt.delete(leaseId);
+  releasedReusableLeases.add(leaseId);
 
   const destroy = async (why: string): Promise<PluginEnvironmentTerminationReceipt> => {
     console.warn(
@@ -444,20 +608,21 @@ async function releaseReusableLease(
       confirmTimeoutMs: Math.max(5_000, REUSE_RELEASE_BUDGET_MS - (Date.now() - startedAt)),
     });
   };
-  if (params.cancelActiveWork) return await destroy("the run was cancelled");
 
   const { kc, clients } = getKubeConnection(config);
-  const registration = registerReuseNamespaceFor(config, namespace, settings);
+  const registration = trackReuseNamespaces(config, namespace, true);
 
   let cr: unknown;
   try {
-    cr = await clients.custom.getNamespacedCustomObject({
-      group: SANDBOX_GROUP,
-      version: SANDBOX_VERSION,
-      namespace,
-      plural: SANDBOX_PLURAL,
-      name: leaseId,
-    });
+    cr = await retryTransientKubeCall(retryDeadline, () =>
+      clients.custom.getNamespacedCustomObject({
+        group: SANDBOX_GROUP,
+        version: SANDBOX_VERSION,
+        namespace,
+        plural: SANDBOX_PLURAL,
+        name: leaseId,
+      }),
+    );
   } catch (err) {
     if (isKubeNotFoundError(err)) return await destroy("the sandbox no longer exists");
     throw err;
@@ -468,7 +633,9 @@ async function releaseReusableLease(
 
   let pod: { metadata?: { uid?: string; deletionTimestamp?: unknown }; status?: { phase?: string } };
   try {
-    pod = await clients.core.readNamespacedPod({ namespace, name: state.podName }) as typeof pod;
+    pod = await retryTransientKubeCall(retryDeadline, () =>
+      clients.core.readNamespacedPod({ namespace, name: state.podName }),
+    ) as typeof pod;
   } catch (err) {
     if (isKubeNotFoundError(err)) return await destroy(`pod ${state.podName} no longer exists`);
     throw err;
@@ -477,43 +644,73 @@ async function releaseReusableLease(
   if (!podUid || pod.metadata?.deletionTimestamp || pod.status?.phase !== "Running") {
     return await destroy(`pod ${state.podName} is not running`);
   }
-  if (stamp.podUid && stamp.podUid !== podUid) {
+  // The pod the run started on: recorded by the resume, or for a run that
+  // created the sandbox, on the CR when the run first reached the pod.
+  const expectedPodUid = stamp.podUid ?? state.podUid;
+  if (expectedPodUid && expectedPodUid !== podUid) {
     // The run started on another pod; this one has none of the task's state.
     return await destroy(`pod ${state.podName} was replaced during the run`);
   }
 
-  const reset = await resetSandboxProcesses((command, timeoutMs) =>
-    execInPod(
-      kc,
-      namespace,
-      state.podName,
-      "agent",
-      command,
-      undefined,
-      timeoutMs,
-      undefined,
-      undefined,
-      execLivenessFromConfig(config),
-    ),
-  );
+  const execReset = () =>
+    resetSandboxProcesses((command, timeoutMs) =>
+      execInPod(
+        kc,
+        namespace,
+        state.podName,
+        "agent",
+        command,
+        undefined,
+        timeoutMs,
+        undefined,
+        undefined,
+        execLivenessFromConfig(config),
+      ),
+    );
+  let reset = await execReset();
+  if (!reset.ok && reset.execFailed && Date.now() < retryDeadline) {
+    // The exec itself failed (e.g. a dropped connection): nothing was verified
+    // either way, so try once more before giving the sandbox up.
+    reset = await execReset();
+  }
   if (!reset.ok) {
     return await destroy(`could not verify that the run's processes stopped (${reset.detail || "no output"})`);
   }
 
+  // Only the host knows how the run ended; older hosts do not say, and then
+  // nothing is counted.
+  const consecutiveFailures = params.runStatus === "failed" ? state.consecutiveFailures + 1 : 0;
+  if (consecutiveFailures >= REUSE_MAX_CONSECUTIVE_FAILURES) {
+    return await destroy(`the last ${consecutiveFailures} runs in it failed; the next run starts in a fresh sandbox`);
+  }
+
   let marked;
   try {
-    marked = await patchReusableSandboxAnnotations(clients, {
-      namespace,
-      name: leaseId,
-      annotations: buildIdleAnnotations({ now: new Date(), idleTtlSec: settings.idleTtlSec, podUid }),
-      action: `releasing sandbox ${namespace}/${leaseId}`,
-    });
+    marked = await retryTransientKubeCall(retryDeadline, () =>
+      patchReusableSandboxAnnotations(clients, {
+        namespace,
+        name: leaseId,
+        annotations: buildIdleAnnotations({ now: new Date(), idleTtlSec: settings.idleTtlSec, podUid, consecutiveFailures }),
+        action: `releasing sandbox ${namespace}/${leaseId}`,
+      }),
+    );
   } catch (err) {
+    if (isTransientKubeError(err)) {
+      // The run's processes are verified stopped, so the receipt is true and
+      // the sandbox stays usable. It only keeps its busy mark, so the reaper
+      // applies the stale-busy rule to it instead of the idle TTL.
+      evictKubeConnectionOnAuthError(config, err);
+      console.warn(
+        `[plugin-kubernetes] kept reusable sandbox ${namespace}/${leaseId} but could not mark it idle: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { providerLeaseId: leaseId, state: "stopped" };
+    }
     return await destroy(`could not mark the sandbox idle (${err instanceof Error ? err.message : String(err)})`);
   }
   if (!marked.ok) return await destroy("the sandbox was removed while it was being released");
 
-  void maybeSweepReuseNamespace(registration);
+  await removeIdleSiblings(clients, { namespace, keepName: leaseId, reuseKey: stamp.key });
+  if (registration) void maybeSweepReuseNamespace(registration);
   return { providerLeaseId: leaseId, state: "stopped" };
 }
 
@@ -557,7 +754,11 @@ async function resolveSyncPodExec(
   params:
     | PluginEnvironmentSyncInParams
     | PluginEnvironmentSyncOutParams,
-): Promise<{ exec: PodStreamExec; timeoutMs: number }> {
+): Promise<{
+  exec: PodStreamExec;
+  timeoutMs: number;
+  keepBusy: <T>(work: () => Promise<T>) => Promise<T>;
+}> {
   const { lease } = params;
   if (!lease.providerLeaseId) {
     throw new Error("Kubernetes file sync requires a provider lease ID.");
@@ -582,10 +783,15 @@ async function resolveSyncPodExec(
   // Reuse the parsed kubeconfig + API clients across RPCs (see kube-client-cache.ts).
   const { kc, clients } = getKubeConnection(config);
   const timeoutMs = config.podActivityDeadlineSec * 1000;
+  const reuseStamp = readReuseStamp(lease.metadata);
+  trackReuseNamespaces(config, namespace, reuseStamp !== null);
+  const refusal = releasedLeaseRefusal(lease.providerLeaseId);
+  if (refusal) throw new Error(refusal);
 
   // Ensure the Sandbox pod is Ready (wait only the first time for this lease),
   // then resolve the pod name — mirrors the onEnvironmentExecute resolution.
-  if (!readySandboxesByLease.has(lease.providerLeaseId)) {
+  const podAlreadyKnownReady = readySandboxesByLease.has(lease.providerLeaseId);
+  if (!podAlreadyKnownReady) {
     await sandboxCrOrchestrator.waitForCompletion(clients, namespace, lease.providerLeaseId, {
       timeoutMs,
       pollMs: 2000,
@@ -600,6 +806,13 @@ async function resolveSyncPodExec(
   if (!podName) {
     throw new Error("Kubernetes file sync could not resolve the Sandbox pod name.");
   }
+  if (!podAlreadyKnownReady && reuseStamp && !reuseStamp.podUid) {
+    // See onEnvironmentExecute: the first sync of a new sandbox records its pod.
+    await recordReusableSandboxPodUid(clients, { namespace, name: lease.providerLeaseId, podName });
+  }
+  const leaseId = lease.providerLeaseId;
+  const keepBusy = <T>(work: () => Promise<T>) =>
+    withReusableSandboxBusy(reuseStamp !== null, clients, namespace, leaseId, work);
 
   // Bind the streaming exec: raw tar bytes move over stdin/stdout straight to and
   // from a host file, so neither side buffers the whole payload. The file-sync
@@ -611,7 +824,7 @@ async function resolveSyncPodExec(
       timeoutMs: io.timeoutMs ?? timeoutMs,
       liveness: execLivenessFromConfig(config),
     });
-  return { exec, timeoutMs };
+  return { exec, timeoutMs, keepBusy };
 }
 
 /**
@@ -766,6 +979,7 @@ const plugin = definePlugin(withAuthEviction({
     params: PluginEnvironmentAcquireLeaseParams & {
       adapterType?: string;
       executionWorkspaceSettings?: Record<string, unknown> | null;
+      leasePolicy?: string;
     },
   ): Promise<PluginEnvironmentLease> {
     const config = kubernetesProviderConfigSchema.parse(params.config);
@@ -818,10 +1032,16 @@ const plugin = definePlugin(withAuthEviction({
 
     // Reuse applies only to a heartbeat-style run with a reuse scope (execution
     // workspace + agent) and no caller deadline: a lease that must end by a
-    // fixed time is never kept for later runs.
+    // fixed time is never kept for later runs. A host that states the lease
+    // policy it will record decides: a lease it records as ephemeral is never
+    // resumed, so its sandbox must not be kept. Without a stated policy (an
+    // older host) the plugin decides from the fields above alone.
     const reuseSettings = resolveReuseSettings(config);
+    const hostAllowsReuse =
+      typeof params.leasePolicy !== "string" || params.leasePolicy === "reuse_by_environment";
     const reuseScope =
       reuseSettings.enabled &&
+      hostAllowsReuse &&
       typeof params.executionWorkspaceId === "string" &&
       params.executionWorkspaceId.length > 0 &&
       typeof params.agentId === "string" &&
@@ -861,14 +1081,8 @@ const plugin = definePlugin(withAuthEviction({
         executionWorkspaceId: reuseScope.executionWorkspaceId,
         issueId: params.issueId ?? null,
       });
-      // Make room under the per-namespace cap (least recently used idle
-      // sandboxes go first) and reap expired ones, bounded so a slow API does
-      // not hold up the run.
-      await maybeSweepReuseNamespace(registerReuseNamespaceFor(config, namespace, reuseSettings), {
-        reserveSlot: true,
-        waitMs: ACQUIRE_SWEEP_BUDGET_MS,
-      });
     }
+    const reuseRegistration = trackReuseNamespaces(config, namespace, reuseStamp !== null);
 
     // TODO: use params.runId as stand-in for agentId in labels; future
     // versions will have a dedicated agentId on AcquireLeaseParams. A reusable
@@ -924,7 +1138,22 @@ const plugin = definePlugin(withAuthEviction({
           imagePullSecrets: config.imagePullSecrets,
         });
 
-    const { uid: ownerUid } = await orchestrator.claim(clients, namespace, manifest);
+    const claimWorkload = () => orchestrator.claim(clients, namespace, manifest);
+    const { uid: ownerUid } =
+      reuseStamp && reuseRegistration
+        ? // Make room under the per-namespace cap (least recently used idle
+          // sandboxes go first) and reap expired ones right before creating the
+          // sandbox, one acquire per namespace at a time so concurrent acquires
+          // do not overshoot the cap. The sweep wait is bounded so a slow API
+          // does not hold up the run.
+          await withReuseSlot(reuseRegistration, async () => {
+            await maybeSweepReuseNamespace(reuseRegistration, {
+              reserveSlot: true,
+              waitMs: ACQUIRE_SWEEP_BUDGET_MS,
+            });
+            return await claimWorkload();
+          })
+        : await claimWorkload();
     const scopedNetworkEgress = parseScopedNetworkEgressGrant(params.executionWorkspaceSettings);
     const scopedNetworkPolicyName = await createScopedNetworkEgressPolicyOrReleaseWorkload(
       {
@@ -973,6 +1202,7 @@ const plugin = definePlugin(withAuthEviction({
     });
 
     const podName = await orchestrator.findPod(clients, namespace, jobName);
+    if (reuseStamp) busyRefreshedAt.set(jobName, Date.now());
 
     const leaseMetadata: KubernetesLeaseMetadata = {
       namespace,
@@ -1023,6 +1253,7 @@ const plugin = definePlugin(withAuthEviction({
 
     // Reuse the parsed kubeconfig + API clients across RPCs (see kube-client-cache.ts).
     const { clients } = getKubeConnection(config);
+    trackReuseNamespaces(config, namespace, false);
 
     const check = await checkLeaseResumable(clients, {
       namespace,
@@ -1114,6 +1345,8 @@ const plugin = definePlugin(withAuthEviction({
         typeof params.leaseMetadata?.backend === "string" ? params.leaseMetadata.backend : config.backend;
       if (resolveReuseSettings(config).enabled && leaseBackend === "sandbox-cr") {
         return await releaseReusableLease(
+          // `runStatus` is how the run ended, when the host says (see
+          // releaseReusableLease); it is not part of the SDK params yet.
           { ...params, providerLeaseId: params.providerLeaseId },
           config,
           reuseStamp,
@@ -1166,11 +1399,24 @@ const plugin = definePlugin(withAuthEviction({
 
     // Reuse the parsed kubeconfig + API clients across RPCs (see kube-client-cache.ts).
     const { kc, clients } = getKubeConnection(config);
+    const reuseStamp = readReuseStamp(lease.metadata);
+    trackReuseNamespaces(config, namespace, reuseStamp !== null);
 
     const effectiveTimeoutMs =
       typeof timeoutMs === "number" && timeoutMs > 0
         ? timeoutMs
         : config.podActivityDeadlineSec * 1000;
+
+    const refusal = releasedLeaseRefusal(lease.providerLeaseId);
+    if (refusal) {
+      return {
+        exitCode: null,
+        timedOut: false,
+        stdout: "",
+        stderr: refusal,
+        metadata: { provider: "kubernetes", namespace, sandboxName: lease.providerLeaseId, leaseReleased: true },
+      };
+    }
 
     if (leaseBackend === "sandbox-cr") {
       // ── Sandbox-CR backend ──────────────────────────────────────────────────
@@ -1245,6 +1491,15 @@ const plugin = definePlugin(withAuthEviction({
         };
       }
 
+      if (!podAlreadyKnownReady && reuseStamp && !reuseStamp.podUid) {
+        // First time this worker reaches a sandbox the run created: record its
+        // pod so release can tell whether it was replaced during the run.
+        await recordReusableSandboxPodUid(clients, { namespace, name: lease.providerLeaseId, podName });
+      }
+      const leaseId = lease.providerLeaseId;
+      const keepBusy = <T>(work: () => Promise<T>) =>
+        withReusableSandboxBusy(reuseStamp !== null, clients, namespace, leaseId, work);
+
       // Build the command to exec. The adapter passes shell invocations as
       // `command: "sh", args: ["-c", "<script>"]` — must combine both, NOT
       // drop args. If only command is present (no args), wrap in a login shell.
@@ -1300,18 +1555,21 @@ const plugin = definePlugin(withAuthEviction({
             effectiveTimeoutMs - (Date.now() - executeStartedAt),
           );
           let flushResult: { exitCode: number; stdout: string; stderr: string };
+          const flushPodName = podName;
           try {
-            flushResult = await execInPod(
-              kc,
-              namespace,
-              podName,
-              "agent",
-              ["/bin/sh", "-c", script],
-              base64Body,
-              flushTimeoutMs,
-              undefined,
-              undefined,
-              execLivenessFromConfig(config),
+            flushResult = await keepBusy(() =>
+              execInPod(
+                kc,
+                namespace,
+                flushPodName,
+                "agent",
+                ["/bin/sh", "-c", script],
+                base64Body,
+                flushTimeoutMs,
+                undefined,
+                undefined,
+                execLivenessFromConfig(config),
+              ),
             );
           } catch (err) {
             // Converted to a result below, so evict here rather than in the RPC wrapper.
@@ -1381,18 +1639,21 @@ const plugin = definePlugin(withAuthEviction({
       );
 
       let execResult: { exitCode: number; stdout: string; stderr: string };
+      const execPodName = podName;
       try {
-        execResult = await execInPod(
-          kc,
-          namespace,
-          podName,
-          "agent",
-          execCommand,
-          typeof params.stdin === "string" ? params.stdin : undefined,
-          remainingTimeoutMs,
-          undefined,
-          undefined,
-          execLivenessFromConfig(config),
+        execResult = await keepBusy(() =>
+          execInPod(
+            kc,
+            namespace,
+            execPodName,
+            "agent",
+            execCommand,
+            typeof params.stdin === "string" ? params.stdin : undefined,
+            remainingTimeoutMs,
+            undefined,
+            undefined,
+            execLivenessFromConfig(config),
+          ),
         );
       } catch (err) {
         if (err instanceof PodExecTransportError) {
@@ -1532,13 +1793,15 @@ const plugin = definePlugin(withAuthEviction({
     params: PluginEnvironmentSyncInParams,
   ): Promise<PluginEnvironmentSyncResult> {
     const remoteDir = resolveSyncRemoteDir(params.lease);
-    const { exec, timeoutMs } = await resolveSyncPodExec(params);
-    return await performSyncIn({
-      exec,
-      operations: params.operations,
-      remoteDir,
-      timeoutMs,
-    });
+    const { exec, timeoutMs, keepBusy } = await resolveSyncPodExec(params);
+    return await keepBusy(() =>
+      performSyncIn({
+        exec,
+        operations: params.operations,
+        remoteDir,
+        timeoutMs,
+      }),
+    );
   },
 
   // Opt-in native outbound transfer. See onEnvironmentSyncIn.
@@ -1546,13 +1809,15 @@ const plugin = definePlugin(withAuthEviction({
     params: PluginEnvironmentSyncOutParams,
   ): Promise<PluginEnvironmentSyncResult> {
     const remoteDir = resolveSyncRemoteDir(params.lease);
-    const { exec, timeoutMs } = await resolveSyncPodExec(params);
-    return await performSyncOut({
-      exec,
-      operations: params.operations,
-      remoteDir,
-      timeoutMs,
-    });
+    const { exec, timeoutMs, keepBusy } = await resolveSyncPodExec(params);
+    return await keepBusy(() =>
+      performSyncOut({
+        exec,
+        operations: params.operations,
+        remoteDir,
+        timeoutMs,
+      }),
+    );
   },
 }, [
   "onEnvironmentAcquireLease",
