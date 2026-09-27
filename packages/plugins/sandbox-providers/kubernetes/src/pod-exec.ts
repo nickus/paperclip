@@ -23,10 +23,242 @@ import { PassThrough } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 import type { KubeConfig } from "@kubernetes/client-node";
 
-// Minimal WebSocket-like shape covering what we touch (close()). The full type
-// comes from @kubernetes/client-node's transitive ws/isomorphic-ws dep but
-// importing it directly couples this file to that internal choice.
-type WebSocketLike = { close(): void };
+// Minimal WebSocket-like shape covering what we touch. The full type comes from
+// @kubernetes/client-node's transitive ws/isomorphic-ws dep (the Node `ws`
+// package) but importing it directly couples this file to that internal choice.
+// Everything beyond close() is optional so a test double (or a future client
+// that hands back a browser-style socket) degrades to "no keepalive" instead of
+// crashing.
+type WebSocketLike = {
+  close(): void;
+  send?(data: unknown, ...rest: unknown[]): unknown;
+  terminate?(): void;
+  ping?(): void;
+  on?(event: string, listener: (...args: unknown[]) => void): unknown;
+  removeListener?(event: string, listener: (...args: unknown[]) => void): unknown;
+  readyState?: number;
+  bufferedAmount?: number;
+};
+
+// `ws` readyState values (RFC 6455 / WHATWG): 2 = CLOSING, 3 = CLOSED.
+const WS_CLOSING = 2;
+
+/**
+ * Keepalive / dead-connection detection for a pod exec WebSocket.
+ *
+ * Why this exists: @kubernetes/client-node's WebSocketHandler.connect() only
+ * wires `onerror` BEFORE the socket opens and never wires `onclose` at all, so
+ * once the exec is running a dropped connection (apiserver restart, node/NAT
+ * blip, kubelet stream torn down) is invisible to us: no status frame, no
+ * stream `end`, nothing — the exec just waits out its whole watchdog (3600s for
+ * an agent run). A half-open TCP connection (peer vanished without a FIN) is
+ * even worse: not even the kernel notices until TCP keepalive (~2h default).
+ *
+ * The liveness contract: the connection is considered alive while ANY evidence
+ * of a live peer arrives — an inbound frame (stdout/stderr/status data), a pong
+ * to our periodic ping, or bytes leaving our outbound send buffer (the kernel
+ * only frees send-buffer space when the peer ACKs, which matters during a big
+ * stdin upload where our ping sits queued behind megabytes of data). RFC 6455 §5.5.2
+ * obliges the endpoint (the kube-apiserver, whose websocket servers answer
+ * pings automatically) to answer every ping, so a command that is merely QUIET
+ * but still connected keeps answering pongs and is never killed — only a
+ * connection that shows no sign of life for `timeoutMs` is.
+ */
+export interface ExecLivenessOptions {
+  /** How often to ping the apiserver. 0 disables pinging AND the idle check. */
+  keepaliveIntervalMs?: number;
+  /** Declare the exec dead after this long without any liveness evidence. */
+  timeoutMs?: number;
+}
+
+export const DEFAULT_EXEC_KEEPALIVE_INTERVAL_MS = 15_000;
+export const DEFAULT_EXEC_LIVENESS_TIMEOUT_MS = 60_000;
+
+/** Why an exec failed at the transport level rather than by the command exiting. */
+export type PodExecTransportFailureKind =
+  | "timeout" // overall watchdog (caller's budget) expired
+  | "connection_closed" // WebSocket closed before a status frame arrived
+  | "connection_error" // WebSocket emitted an error after setup
+  | "keepalive_timeout"; // no frame / pong / send progress within the liveness window
+
+/**
+ * Transport-level exec failure. Carries whatever stdout/stderr had arrived
+ * before the failure so the caller can still surface partial output (e.g. an
+ * agent's JSONL session id) instead of dropping it.
+ *
+ * IMPORTANT: on any kind other than "timeout" the in-pod process may STILL BE
+ * RUNNING — the Kubernetes exec API has no re-attach, and the container runtime
+ * does not reliably kill an exec'd process when its stream goes away. Callers
+ * must NOT blindly re-run the command (agent runs are not idempotent).
+ */
+export class PodExecTransportError extends Error {
+  constructor(
+    message: string,
+    readonly kind: PodExecTransportFailureKind,
+    readonly partialStdout: string,
+    readonly partialStderr: string,
+  ) {
+    super(message);
+    this.name = "PodExecTransportError";
+  }
+}
+
+function describeCloseReason(reason: unknown): string {
+  if (Buffer.isBuffer(reason)) return reason.toString("utf-8");
+  return typeof reason === "string" ? reason : "";
+}
+
+// Byte size of a ws.send() payload. Unknown shapes count as 0, which only makes
+// the outbound-progress estimate more conservative (never a false "alive").
+function byteLengthOf(data: unknown): number {
+  if (typeof data === "string") return Buffer.byteLength(data);
+  if (ArrayBuffer.isView(data)) return data.byteLength; // Buffer / TypedArray / DataView
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  return 0;
+}
+
+/**
+ * Attach close/error listeners and a ping/pong liveness monitor to an exec
+ * WebSocket. `onDead` is called at most once with the failure kind and a
+ * human-readable detail; `hasStatus()` tells the monitor that a status frame
+ * already arrived, in which case a close is the normal end of the exec and is
+ * ignored. Returns a disposer that stops the timer, removes the listeners and
+ * un-wraps `ws.send`.
+ */
+export function monitorExecSocket(
+  ws: WebSocketLike,
+  opts: ExecLivenessOptions | undefined,
+  hasStatus: () => boolean,
+  onDead: (kind: Exclude<PodExecTransportFailureKind, "timeout">, detail: string) => void,
+): () => void {
+  const intervalMs = opts?.keepaliveIntervalMs ?? DEFAULT_EXEC_KEEPALIVE_INTERVAL_MS;
+  // The liveness window must span at least two pings, or a single delayed pong
+  // would already count as dead.
+  const timeoutMs = Math.max(opts?.timeoutMs ?? DEFAULT_EXEC_LIVENESS_TIMEOUT_MS, intervalMs * 2);
+  let fired = false;
+  let lastAliveAt = Date.now();
+  let lastBufferedAmount = ws.bufferedAmount ?? 0;
+  // Cumulative bytes handed to ws.send() (the k8s client's stdin frames). Wrap
+  // send on the instance rather than listening on the stdin stream: an extra
+  // `data` listener there could switch the stream to flowing mode early.
+  let sentBytes = 0;
+  let lastSentBytes = 0;
+  const originalSend = typeof ws.send === "function" ? ws.send : null;
+  const hadOwnSend = Object.prototype.hasOwnProperty.call(ws, "send");
+  if (originalSend) {
+    ws.send = (data: unknown, ...rest: unknown[]) => {
+      const result = originalSend.apply(ws, [data, ...rest]);
+      sentBytes += byteLengthOf(data); // only count what send() accepted (it throws if not OPEN)
+      return result;
+    };
+  }
+
+  const fire = (kind: Exclude<PodExecTransportFailureKind, "timeout">, detail: string) => {
+    if (fired || hasStatus()) return; // status already in hand => close is the normal end
+    fired = true;
+    dispose();
+    onDead(kind, detail);
+  };
+  const markAlive = () => { lastAliveAt = Date.now(); };
+  const onClose = (code: unknown, reason: unknown) => {
+    const why = describeCloseReason(reason);
+    fire("connection_closed", `WebSocket closed (code=${String(code)}${why ? `, reason=${why}` : ""})`);
+  };
+  const onError = (err: unknown) => {
+    fire("connection_error", `WebSocket error: ${err instanceof Error ? err.message : String(err)}`);
+  };
+
+  const canListen = typeof ws.on === "function";
+  if (canListen) {
+    ws.on!("close", onClose);
+    ws.on!("error", onError);
+    ws.on!("message", markAlive); // any stdout/stderr/status frame
+    ws.on!("pong", markAlive); // apiserver answered our ping
+  }
+
+  let timer: ReturnType<typeof setInterval> | null = null;
+  if (intervalMs > 0 && typeof ws.ping === "function") {
+    timer = setInterval(() => {
+      // Outbound progress: bytes that LEFT our send buffer since the last tick
+      // mean the peer is ACKing data (a large stdin upload queues our ping, and
+      // so its pong, behind that data). By conservation,
+      //   flushed = (bytes enqueued since last tick) - (growth of bufferedAmount).
+      // Comparing bufferedAmount alone would miss a link that IS draining but
+      // whose buffer still net-grows because the source enqueues faster than it
+      // drains (the k8s client sends stdin with no backpressure). `sentBytes`
+      // counts message payload only, not WebSocket framing or our pings, so
+      // this can only under-estimate progress: a stalled link never reads as
+      // alive.
+      const buffered = ws.bufferedAmount ?? 0;
+      if (sentBytes - lastSentBytes - (buffered - lastBufferedAmount) > 0) markAlive();
+      lastBufferedAmount = buffered;
+      lastSentBytes = sentBytes;
+
+      if (Date.now() - lastAliveAt >= timeoutMs) {
+        fire(
+          "keepalive_timeout",
+          `no frame, pong or send progress for ${Date.now() - lastAliveAt}ms (liveness timeout ${timeoutMs}ms)`,
+        );
+        return;
+      }
+      try {
+        ws.ping!();
+      } catch (err) {
+        // `ws` throws synchronously when the socket is no longer OPEN.
+        fire("connection_error", `WebSocket ping failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }, intervalMs);
+    // Never keep the worker process alive just for a keepalive tick.
+    (timer as { unref?: () => void }).unref?.();
+  }
+
+  function dispose() {
+    if (timer) clearInterval(timer);
+    timer = null;
+    // Stop counting: restore the original send (normally the prototype's).
+    if (originalSend) {
+      if (hadOwnSend) ws.send = originalSend;
+      else delete ws.send;
+    }
+    if (canListen && typeof ws.removeListener === "function") {
+      ws.removeListener("close", onClose);
+      ws.removeListener("error", onError);
+      ws.removeListener("message", markAlive);
+      ws.removeListener("pong", markAlive);
+    }
+  }
+
+  // The socket may already be closing/closed by the time the exec promise hands
+  // it to us (close events that fired before we listened are otherwise lost).
+  if (typeof ws.readyState === "number" && ws.readyState >= WS_CLOSING) {
+    fire("connection_closed", `WebSocket already ${ws.readyState === WS_CLOSING ? "closing" : "closed"} when exec setup completed`);
+  }
+
+  return dispose;
+}
+
+// Tear a dead socket down hard: terminate() destroys the TCP socket without a
+// closing handshake, which a vanished peer would never complete anyway.
+function killSocket(ws: WebSocketLike | null): void {
+  try {
+    if (ws && typeof ws.terminate === "function") ws.terminate();
+    else ws?.close();
+  } catch { /* ignore */ }
+}
+
+// Shared error text for a transport failure. Spells out that the command was NOT
+// retried and may still be running, so an operator reading the run log knows
+// not to assume it stopped.
+function transportFailureMessage(
+  fn: string,
+  kind: Exclude<PodExecTransportFailureKind, "timeout">,
+  detail: string,
+  podName: string,
+  containerName: string,
+  cmd0: string,
+): string {
+  return `${fn} lost its exec connection before the command reported an exit status (${kind}: ${detail}; pod=${podName}, container=${containerName}, cmd0=${cmd0}). The command was not re-run and may still be running in the pod.`;
+}
 
 // Single-quote a string for safe interpolation into a sh -c script. Wraps in
 // '...' and escapes any embedded single quotes via '\'' (close, escape, reopen).
@@ -79,6 +311,10 @@ export async function execInPod(
   // fails closed at the cap; regardless of the cap, the `+=` is guarded so a
   // max-string-length `RangeError` can never escape as an uncaught exception.
   maxStderrBytes?: number,
+  // Dead-connection detection (ping/pong keepalive + liveness window). Omitted
+  // => defaults (15s ping, 60s window); `keepaliveIntervalMs: 0` disables it.
+  // See monitorExecSocket.
+  liveness?: ExecLivenessOptions,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const exec = new Exec(kc);
   const stdoutStream = new PassThrough();
@@ -119,6 +355,8 @@ export async function execInPod(
       let pendingExitCode: number | null = null;
       let stdoutEnded = false;
       let stderrEnded = false;
+      // Disposer for the keepalive monitor; set once the WebSocket is open.
+      let stopMonitor: (() => void) | null = null;
 
       // The k8s client writes stdout/stderr to our PassThroughs synchronously
       // and calls statusCallback in the same WS message handler. But `data`
@@ -129,19 +367,23 @@ export async function execInPod(
       // status frame) so all buffered data has been drained into our string
       // accumulators before resolving.
       //
-      // Watchdog: if the WebSocket drops silently after setup (network blip,
-      // pod OOM-killed mid-exec, apiserver restart) the statusCallback never
-      // fires and the stream `end` events never arrive. Without a timer the
-      // calling worker hangs forever. Reject with a clear error so the caller
-      // can retry or surface the failure.
+      // Watchdog: the caller's overall budget for the command. A dropped
+      // WebSocket is detected much earlier by the keepalive monitor below
+      // (close/error events + ping/pong); this timer is the last-resort bound
+      // for a command that is alive but simply runs too long, or for a socket
+      // double that exposes no events.
       let watchdog: ReturnType<typeof setTimeout> | null = null;
       if (typeof timeoutMs === "number" && timeoutMs > 0) {
         watchdog = setTimeout(() => {
           if (resolved) return;
           resolved = true;
+          stopMonitor?.();
           try { ws?.close(); } catch { /* ignore */ }
-          reject(new Error(
-            `execInPod timed out after ${timeoutMs}ms (pod=${podName}, container=${containerName}, cmd0=${effectiveCommand[0] ?? ""}). The WebSocket likely dropped before the command produced a status frame.`,
+          reject(new PodExecTransportError(
+            `execInPod timed out after ${timeoutMs}ms (pod=${podName}, container=${containerName}, cmd0=${effectiveCommand[0] ?? ""}). No exit status arrived within the exec budget.`,
+            "timeout",
+            stdoutData,
+            stderrData,
           ));
         }, timeoutMs);
       }
@@ -152,6 +394,7 @@ export async function execInPod(
         if (!stdoutEnded || !stderrEnded) return;
         resolved = true;
         if (watchdog) clearTimeout(watchdog);
+        stopMonitor?.();
         try { ws?.close(); } catch { /* ignore */ }
         resolve({ exitCode: pendingExitCode, stdout: stdoutData, stderr: stderrData });
       };
@@ -163,6 +406,7 @@ export async function execInPod(
         if (resolved) return;
         resolved = true;
         if (watchdog) clearTimeout(watchdog);
+        stopMonitor?.();
         try { ws?.close(); } catch { /* ignore */ }
         reject(err);
       };
@@ -244,6 +488,30 @@ export async function execInPod(
       execPromise
         .then((webSocket) => {
           ws = webSocket as unknown as WebSocketLike;
+          if (resolved) {
+            // Already failed (watchdog/cap) while connecting: just drop the socket.
+            try { ws.close(); } catch { /* ignore */ }
+            return;
+          }
+          // Fail fast on a dead exec connection instead of waiting out the
+          // watchdog. The exit status (`pendingExitCode`) is the only proof
+          // the command finished; a close after it is the normal teardown.
+          const socket = ws;
+          stopMonitor = monitorExecSocket(socket, liveness, () => pendingExitCode !== null, (kind, detail) => {
+            if (resolved) return;
+            resolved = true;
+            if (watchdog) clearTimeout(watchdog);
+            killSocket(socket);
+            reject(new PodExecTransportError(
+              transportFailureMessage("execInPod", kind, detail, podName, containerName, effectiveCommand[0] ?? ""),
+              kind,
+              stdoutData,
+              stderrData,
+            ));
+          });
+          // The monitor can declare the socket dead synchronously (already
+          // closed at setup); don't feed stdin into a torn-down exec.
+          if (resolved) return;
           if (stdinStream && stdinPayload) {
             // Remove the default `end -> ws.close()` listener that k8s client
             // attaches in handleStandardInput; it tears down the connection
@@ -306,6 +574,8 @@ export async function execInPodStreaming(
     stdout?: Writable;
     timeoutMs?: number;
     maxStderrBytes?: number;
+    // Dead-connection detection; see execInPod / monitorExecSocket.
+    liveness?: ExecLivenessOptions;
   },
 ): Promise<{ exitCode: number; stderr: string }> {
   const exec = new Exec(kc);
@@ -322,15 +592,21 @@ export async function execInPodStreaming(
     let pendingExitCode: number | null = null;
     let stdoutDone = false;
     let stderrEnded = false;
+    let stopMonitor: (() => void) | null = null;
 
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     if (typeof io.timeoutMs === "number" && io.timeoutMs > 0) {
       watchdog = setTimeout(() => {
         if (resolved) return;
         resolved = true;
+        stopMonitor?.();
         try { ws?.close(); } catch { /* ignore */ }
-        reject(new Error(
-          `execInPodStreaming timed out after ${io.timeoutMs}ms (pod=${podName}, container=${containerName}, cmd0=${command[0] ?? ""}). The WebSocket likely dropped before the command produced a status frame.`,
+        try { stdinStream?.destroy(); } catch { /* ignore */ }
+        reject(new PodExecTransportError(
+          `execInPodStreaming timed out after ${io.timeoutMs}ms (pod=${podName}, container=${containerName}, cmd0=${command[0] ?? ""}). No exit status arrived within the exec budget.`,
+          "timeout",
+          "",
+          stderrData,
         ));
       }, io.timeoutMs);
     }
@@ -341,6 +617,7 @@ export async function execInPodStreaming(
       if (!stdoutDone || !stderrEnded) return;
       resolved = true;
       if (watchdog) clearTimeout(watchdog);
+      stopMonitor?.();
       try { ws?.close(); } catch { /* ignore */ }
       resolve({ exitCode: pendingExitCode, stderr: stderrData });
     };
@@ -352,6 +629,7 @@ export async function execInPodStreaming(
       if (resolved) return;
       resolved = true;
       if (watchdog) clearTimeout(watchdog);
+      stopMonitor?.();
       try { ws?.close(); } catch { /* ignore */ }
       try { stdinStream?.destroy(); } catch { /* ignore */ }
       reject(err);
@@ -422,6 +700,29 @@ export async function execInPodStreaming(
     execPromise
       .then((webSocket) => {
         ws = webSocket as unknown as WebSocketLike;
+        if (resolved) {
+          try { ws.close(); } catch { /* ignore */ }
+          return;
+        }
+        // Same fast dead-connection detection as execInPod. Whether a dropped
+        // transfer may be retried is the caller's decision, not ours.
+        const socket = ws;
+        stopMonitor = monitorExecSocket(socket, io.liveness, () => pendingExitCode !== null, (kind, detail) => {
+          if (resolved) return;
+          resolved = true;
+          if (watchdog) clearTimeout(watchdog);
+          killSocket(socket);
+          try { stdinStream?.destroy(); } catch { /* ignore */ }
+          reject(new PodExecTransportError(
+            transportFailureMessage("execInPodStreaming", kind, detail, podName, containerName, command[0] ?? ""),
+            kind,
+            "",
+            stderrData,
+          ));
+        });
+        // Already declared dead synchronously (socket closed at setup): don't
+        // start piping the caller's source into a torn-down exec.
+        if (resolved) return;
         if (stdinStream && io.stdin) {
           // Strip the default `end -> ws.close()` listener (see execInPod) so
           // EOF on our stdin only signals the pod, then stream the caller's
