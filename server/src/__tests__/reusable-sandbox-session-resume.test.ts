@@ -12,6 +12,7 @@ import {
   projects,
 } from "@paperclipai/db";
 import {
+  adapterExecutionTargetReusesSandbox,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetSessionMatches,
   type AdapterExecutionTarget,
@@ -314,6 +315,24 @@ describeEmbeddedPostgres("reusable sandbox leases carry the harness session to t
     });
     expect(adapterExecutionTargetSessionMatches(opencodeSession.remoteExecution, second.target)).toBe(true);
     expect(adapterExecutionTargetSessionMatches(claudeSession.remoteExecution, second.target)).toBe(true);
+    // Adapters treat the sandbox as kept between runs (build directories and
+    // per-account harness homes carry over).
+    expect(adapterExecutionTargetReusesSandbox(second.target)).toBe(true);
+  });
+
+  it("tells the provider which lease policy it records and how each run ended", async () => {
+    const { runtime, worker, startRun } = await seed();
+    const first = await startRun();
+    await runtime.releaseRunLeases(first.runId, "failed");
+    const second = await startRun();
+    await runtime.releaseRunLeases(second.runId, "released");
+
+    const acquire = worker.call.mock.calls.find(([, method]) => method === "environmentAcquireLease");
+    expect(acquire?.[2]).toMatchObject({ leasePolicy: "reuse_by_environment" });
+    const releases = worker.call.mock.calls
+      .filter(([, method]) => method === "environmentReleaseLease")
+      .map(([, , params]) => params.runStatus);
+    expect(releases).toEqual(["failed", "released"]);
   });
 
   it("starts a fresh session when the sandbox had to be replaced", async () => {
