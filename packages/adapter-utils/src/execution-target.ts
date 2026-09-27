@@ -1298,6 +1298,20 @@ export async function ensureAdapterExecutionTargetDirectory(
   }
 }
 
+/**
+ * True when the host keeps this sandbox for the next run of the same task (a
+ * reusable provider lease), so what a run leaves in it is meant to carry over.
+ * Read from the host's effective capability snapshot when there is one, else
+ * from the environment's reuse setting.
+ */
+export function adapterExecutionTargetReusesSandbox(
+  target: AdapterExecutionTarget | null | undefined,
+): boolean {
+  if (!target || target.kind !== "remote" || target.transport !== "sandbox") return false;
+  if (target.effectiveCapabilities) return target.effectiveCapabilities.reusableLeases === true;
+  return target.reusableLeaseConfigured === true;
+}
+
 export function adapterExecutionTargetSessionIdentity(
   target: AdapterExecutionTarget | null | undefined,
 ): Record<string, unknown> | null {
@@ -1514,6 +1528,9 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     workspaceGitSnapshot: input.workspaceGitSnapshot,
     workspaceExclude: input.workspaceExclude,
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
+    // A sandbox kept for the next run of the task keeps its dependency and
+    // build directories through the per-run restage of the workspace.
+    preserveBuildDirs: adapterExecutionTargetReusesSandbox(target),
     assets: input.assets,
     additionalSources: input.additionalSources,
     installCommand: input.installCommand,

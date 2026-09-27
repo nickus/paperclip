@@ -17,6 +17,7 @@ import {
   assertSyncOperationsConfined,
   escapeTarExcludeLiteral,
   mirrorDirectory,
+  buildReusedBuildDirCommandsForTest,
   prepareSandboxManagedRuntime,
   REFERENCED_SOURCE_IGNORE_FAILURE_REASONS,
   resolveReferencedSourceIgnore,
@@ -2075,6 +2076,122 @@ describe("sandbox managed runtime", () => {
     await expect(
       readFile(path.join(remoteWorkspaceDir, "stale-junk.txt"), "utf8"),
     ).rejects.toThrow();
+  });
+
+  it.each([
+    ["git-backed", true],
+    ["plain", false],
+  ] as const)("keeps a reused sandbox's build directories through the restage of a %s workspace", async (_label, gitBacked) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-build-dirs-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(path.join(localWorkspaceDir, "packages", "a"), { recursive: true });
+    await mkdir(path.join(localWorkspaceDir, "target"), { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "packages", "a", "index.js"), "host\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "target", "host.txt"), "host\n", "utf8");
+    if (gitBacked) {
+      await git(localWorkspaceDir, ["init", "-q", "-b", "main"]);
+      await git(localWorkspaceDir, ["config", "user.name", "Paperclip Test"]);
+      await git(localWorkspaceDir, ["config", "user.email", "test@paperclip.dev"]);
+      await git(localWorkspaceDir, ["add", "."]);
+      await git(localWorkspaceDir, ["commit", "-q", "-m", "base"]);
+    }
+    // What the previous run left in the kept sandbox.
+    const remoteFiles: Array<[string, string]> = [
+      ["node_modules/dep/index.js", "installed"],
+      ["packages/a/node_modules/dep/index.js", "installed"],
+      ["packages/gone/node_modules/dep/index.js", "installed"],
+      [".venv/bin/python", "venv"],
+      ["target/remote-build.bin", "built"],
+      ["stale.txt", "stale"],
+    ];
+    for (const [relative, contents] of remoteFiles) {
+      await mkdir(path.dirname(path.join(remoteWorkspaceDir, relative)), { recursive: true });
+      await writeFile(path.join(remoteWorkspaceDir, relative), contents, "utf8");
+    }
+
+    const client = makeFilesystemClient();
+    const captured: SandboxSyncOperation[] = [];
+    attachNativeRecordingSyncIn(client, captured);
+    await prepareSandboxManagedRuntime({
+      spec: {
+        transport: "sandbox",
+        provider: "test",
+        sandboxId: "sandbox-1",
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+        apiKey: null,
+      },
+      adapterKey: "test-adapter",
+      client,
+      workspaceLocalDir: localWorkspaceDir,
+      preserveBuildDirs: true,
+    });
+
+    const read = (relative: string) => readFile(path.join(remoteWorkspaceDir, relative), "utf8");
+    // Dependency trees and tool caches survive, at any depth.
+    await expect(read("node_modules/dep/index.js")).resolves.toBe("installed");
+    await expect(read("packages/a/node_modules/dep/index.js")).resolves.toBe("installed");
+    await expect(read(".venv/bin/python")).resolves.toBe("venv");
+    // The host copy stays authoritative for everything else.
+    await expect(read("packages/a/index.js")).resolves.toBe("host\n");
+    await expect(read("stale.txt")).rejects.toMatchObject({ code: "ENOENT" });
+    // A directory the host staged wins over the sandbox's own copy.
+    await expect(read("target/host.txt")).resolves.toBe("host\n");
+    await expect(read("target/remote-build.bin")).rejects.toMatchObject({ code: "ENOENT" });
+    // A project the host no longer has is not brought back for its build dirs.
+    await expect(stat(path.join(remoteWorkspaceDir, "packages", "gone"))).rejects.toMatchObject({ code: "ENOENT" });
+    // The stash is gone.
+    await expect(
+      stat(path.join(remoteWorkspaceDir, ".paperclip-runtime", "test-adapter", "reused-build-dirs")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    const commands = captured[0]!.postUploadCommands!.map((command) => command.command);
+    expect(commands[0]).toContain("reused-build-dirs");
+    expect(commands.at(-1)).toContain("reused-build-dirs");
+  });
+
+  it("wipes build directories as before when the sandbox is not reused", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-build-dirs-off-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "index.js"), "host\n", "utf8");
+    await mkdir(path.join(remoteWorkspaceDir, "node_modules"), { recursive: true });
+    await writeFile(path.join(remoteWorkspaceDir, "node_modules", "dep.js"), "installed", "utf8");
+
+    const client = makeFilesystemClient();
+    const captured: SandboxSyncOperation[] = [];
+    attachNativeRecordingSyncIn(client, captured);
+    await prepareSandboxManagedRuntime({
+      spec: {
+        transport: "sandbox",
+        provider: "test",
+        sandboxId: "sandbox-1",
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+        apiKey: null,
+      },
+      adapterKey: "test-adapter",
+      client,
+      workspaceLocalDir: localWorkspaceDir,
+    });
+
+    await expect(stat(path.join(remoteWorkspaceDir, "node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(captured[0]!.postUploadCommands!.map((command) => command.command).join("\n")).not.toContain("reused-build-dirs");
+  });
+
+  it("stashes nothing and fails nothing when the workspace does not exist yet", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-build-dirs-empty-"));
+    cleanupDirs.push(rootDir);
+    const commands = buildReusedBuildDirCommandsForTest({
+      workspaceRemoteDir: path.join(rootDir, "missing"),
+      stashDir: path.join(rootDir, "stash"),
+    });
+    await expect(execFile("sh", ["-c", commands.stash])).resolves.toBeTruthy();
+    await expect(execFile("sh", ["-c", commands.restore])).resolves.toBeTruthy();
+    await expect(stat(path.join(rootDir, "stash"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("issues one merged syncIn operation for a git-backed workspace stage-sync with two ordered extract commands", async () => {

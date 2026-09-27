@@ -545,6 +545,8 @@ export async function prepareCommandManagedRuntime(input: {
   workspaceGitSnapshot?: GitWorkspaceSnapshot | null;
   workspaceExclude?: string[];
   preserveAbsentOnRestore?: string[];
+  /** See prepareSandboxManagedRuntime: keep the sandbox's build directories through the restage. */
+  preserveBuildDirs?: boolean;
   assets?: CommandManagedRuntimeAsset[];
   /** Referenced (additional) projects to stage into the sandbox as plain, read-only trees. */
   additionalSources?: SandboxAdditionalSource[];
@@ -610,6 +612,7 @@ export async function prepareCommandManagedRuntime(input: {
           workspaceGitSnapshot: input.workspaceGitSnapshot,
           workspaceExclude: mergeRuntimeExcludes(input.workspaceExclude),
           preserveAbsentOnRestore: input.preserveAbsentOnRestore,
+          preserveBuildDirs: input.preserveBuildDirs,
           assets: input.assets,
           additionalSources: input.additionalSources,
           onProgress: input.onProgress,
@@ -653,6 +656,7 @@ export async function prepareCommandManagedRuntime(input: {
     workspaceGitSnapshot: input.workspaceGitSnapshot,
     workspaceExclude: mergeRuntimeExcludes(input.workspaceExclude),
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
+    preserveBuildDirs: input.preserveBuildDirs,
     assets: input.assets,
     additionalSources: input.additionalSources,
     onProgress: input.onProgress,
