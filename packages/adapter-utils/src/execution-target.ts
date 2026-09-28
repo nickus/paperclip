@@ -44,6 +44,7 @@ import {
   SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT,
   SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
   sandboxCallbackBridgeDirectories,
+  sanitizeSandboxCallbackBridgeHeaders,
   startSandboxCallbackBridgeServer,
   startSandboxCallbackBridgeWorker,
   syncRemoteTextFileWithHashSkip,
@@ -4248,6 +4249,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // default is a no-op recorder, so the surface stays inert until the host injects
   // a real recorder.
   duplexObservabilityRecorder?: DuplexObservabilityRecorder | null;
+  // Override the route policy stamped on the target. A caller that bridges a
+  // narrow purpose (for example a credential broker) passes `"restricted"` so
+  // it never inherits a wider policy meant for the agent's own API calls.
+  routePolicy?: SandboxCallbackBridgePolicy | null;
 }): Promise<AdapterExecutionTargetPaperclipBridgeHandle | null> {
   if (!adapterExecutionTargetUsesPaperclipBridge(input.target)) {
     return null;
@@ -4270,7 +4275,9 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // the host stamped on the target. An unstamped target keeps the restricted
   // allowlist.
   const authorizeBridgeRequest = createSandboxCallbackBridgeAuthorizer({
-    policy: adapterExecutionTargetPaperclipApiBridgePolicy(target),
+    policy: input.routePolicy
+      ? normalizeSandboxCallbackBridgePolicy(input.routePolicy)
+      : adapterExecutionTargetPaperclipApiBridgePolicy(target),
     companyId: target.paperclipApiBridgeCompanyId ?? null,
   });
 
@@ -4376,8 +4383,15 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       );
     }
     const headers = new Headers();
-    for (const [key, value] of Object.entries(request.headers)) {
-      if (value.trim().length === 0) continue;
+    // Apply the header allowlist on the host as well. The in-sandbox gateway
+    // already filters headers, but a process in the sandbox can write a queue
+    // request file directly, so the host must not trust the file's headers.
+    const requestHeaders =
+      request.headers && typeof request.headers === "object" && !Array.isArray(request.headers)
+        ? request.headers
+        : {};
+    for (const [key, value] of Object.entries(sanitizeSandboxCallbackBridgeHeaders(requestHeaders))) {
+      if (typeof value !== "string" || value.trim().length === 0) continue;
       headers.set(key, value);
     }
     headers.set("authorization", `Bearer ${hostApiToken}`);
