@@ -29504,6 +29504,19 @@ export function heartbeatService(
     terminationGraceMs?: number;
     /** Caller is immediately scheduling an explicit successor path. */
     suppressImmediateRecovery?: boolean;
+    /**
+     * Narrows which current run statuses this call may cancel from (must be
+     * a subset of CANCELLABLE_HEARTBEAT_RUN_STATUSES). Every status check
+     * this function makes — the up-front guard and the atomic DB write that
+     * actually performs the transition — is gated on this list instead of
+     * the full cancellable set. So if the run has already left it by the
+     * time the write lands (for example a "queued" retry a caller meant to
+     * supersede got claimed and moved to "running" while the caller was
+     * still deciding), the write matches no row and the call is a no-op
+     * instead of tearing down a run the caller never intended to touch.
+     * Omit to keep the default: cancel from any cancellable status.
+     */
+    allowedFromStatuses?: readonly string[];
   };
 
   function cancellationTerminationGraceMs(
@@ -29538,12 +29551,13 @@ export function heartbeatService(
             )
             .then((rows) => rows.length > 0)
         : false;
-    if (
-      !pendingNativeRetry &&
-      !CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(
-        run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number],
-      )
-    )
+    // See CancelRunOptions.allowedFromStatuses: every status gate below uses
+    // this list (default: every cancellable status) instead of the module
+    // constant directly, so a caller can restrict this call to cancelling
+    // only a run that is still unstarted.
+    const cancellableFromStatuses: readonly string[] =
+      options.allowedFromStatuses ?? CANCELLABLE_HEARTBEAT_RUN_STATUSES;
+    if (!pendingNativeRetry && !cancellableFromStatuses.includes(run.status))
       return run;
     const agent = await getAgent(run.agentId);
     const errorCode = options.errorCode ?? "cancelled";
@@ -29584,7 +29598,7 @@ export function heartbeatService(
               and coalesce(${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType' = 'paperclip_runner', false)
           ))`,
       }).where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status,
-        pendingNativeRetry ? [...CANCELLABLE_HEARTBEAT_RUN_STATUSES, "failed"] : [...CANCELLABLE_HEARTBEAT_RUN_STATUSES],
+        pendingNativeRetry ? [...cancellableFromStatuses, "failed"] : [...cancellableFromStatuses],
       ))).returning();
       if (!fenced) return getRun(runId);
       run = fenced;
@@ -29711,8 +29725,8 @@ export function heartbeatService(
             run.id,
             "cancelled",
             pendingNativeRetry
-              ? [...CANCELLABLE_HEARTBEAT_RUN_STATUSES, "failed"]
-              : [...CANCELLABLE_HEARTBEAT_RUN_STATUSES],
+              ? [...cancellableFromStatuses, "failed"]
+              : [...cancellableFromStatuses],
             {
               finishedAt,
               error: reason,
