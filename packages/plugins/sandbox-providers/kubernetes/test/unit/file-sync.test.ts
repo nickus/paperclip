@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   assertConfinedSandboxPath,
   parseTarVerboseListingLine,
@@ -83,6 +83,10 @@ function makeOutputExec(totalBytes: number): { exec: PodStreamExec; calls: Recor
   };
   return { exec, calls };
 }
+
+// Nested-symlink exclusion relies on GNU tar's exact (anchored, literal)
+// exclude-from list; sandbox images ship GNU tar, but a developer host may not.
+const HOST_HAS_GNU_TAR = /GNU tar/.test(spawnSync("tar", ["--version"], { encoding: "utf-8" }).stdout ?? "");
 
 const tmpDirs: string[] = [];
 async function makeTmp(prefix: string): Promise<string> {
@@ -450,6 +454,197 @@ describe("kubernetes onEnvironmentSyncOut (native single-exec transfer)", () => 
     expect(await fs.readFile(path.join(target, "sub/b.txt"), "utf-8")).toBe("bbb");
     expect((await fs.lstat(path.join(target, "link.txt"))).isSymbolicLink()).toBe(true);
     expect(result.operations[0].filesTransferred).toBeGreaterThanOrEqual(2);
+  });
+
+  it("skips top-level symlinks whose target leaves the synced directory instead of failing the whole transfer", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const hostOut = await makeTmp("k8s-hostout-");
+    const srcDir = path.join(remoteDir, "workspace");
+    await fs.mkdir(path.join(srcDir, "sub"), { recursive: true });
+    await fs.writeFile(path.join(srcDir, "a.txt"), "aaa");
+    await fs.writeFile(path.join(srcDir, "sub", "b.txt"), "bbb");
+    await fs.symlink("a.txt", path.join(srcDir, "link.txt"));
+    // A confined link whose target does not exist yet is still a legitimate link.
+    await fs.symlink("./not-there-yet", path.join(srcDir, "dangling"));
+    // Absolute targets, including one naming a path inside the synced directory
+    // itself, and a relative target that climbs out of it: the host refuses
+    // every one of these, so the pod must not pack them.
+    await fs.symlink("/etc/passwd", path.join(srcDir, "abs-link"));
+    await fs.symlink(path.join(srcDir, "self-loop"), path.join(srcDir, "self-loop"));
+    await fs.symlink("../outside", path.join(srcDir, "up-link"));
+    await fs.symlink("/etc", path.join(srcDir, ".hidden-abs"));
+
+    const target = path.join(hostOut, "restored");
+    const { exec, calls } = makeRealExec();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const result = await performSyncOut({
+        exec,
+        remoteDir,
+        timeoutMs: 30_000,
+        operations: [
+          {
+            operationId: "op-dir-out",
+            files: [{ sourcePath: srcDir, targetPath: target, kind: "directory" }],
+          },
+        ],
+      });
+      expect(calls).toHaveLength(1);
+      expect(result.operations[0].operationId).toBe("op-dir-out");
+      expect(await fs.readFile(path.join(target, "a.txt"), "utf-8")).toBe("aaa");
+      expect(await fs.readFile(path.join(target, "sub/b.txt"), "utf-8")).toBe("bbb");
+      expect(await fs.readlink(path.join(target, "link.txt"))).toBe("a.txt");
+      expect(await fs.readlink(path.join(target, "dangling"))).toBe("./not-there-yet");
+      for (const skipped of ["abs-link", "self-loop", "up-link", ".hidden-abs"]) {
+        await expect(fs.lstat(path.join(target, skipped))).rejects.toThrow();
+      }
+      const logged = warn.mock.calls.map((args) => args.join(" ")).join("\n");
+      for (const skipped of ["abs-link", "self-loop", "up-link", ".hidden-abs"]) {
+        expect(logged).toContain(`skipped symlink whose target leaves the synced directory: ${skipped} -> `);
+      }
+      expect(logged).not.toContain("link.txt");
+      expect(logged).not.toContain("dangling");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("returns an empty directory when every top-level entry is a symlink that leaves the synced directory", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const hostOut = await makeTmp("k8s-hostout-");
+    const srcDir = path.join(remoteDir, "workspace");
+    await fs.mkdir(srcDir, { recursive: true });
+    await fs.symlink("/etc/passwd", path.join(srcDir, "abs-link"));
+    await fs.symlink("../../outside", path.join(srcDir, "up-link"));
+
+    const target = path.join(hostOut, "restored");
+    const { exec } = makeRealExec();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const result = await performSyncOut({
+        exec,
+        remoteDir,
+        timeoutMs: 30_000,
+        operations: [
+          {
+            operationId: "op-dir-out",
+            files: [{ sourcePath: srcDir, targetPath: target, kind: "directory" }],
+          },
+        ],
+      });
+      expect(await fs.readdir(target)).toEqual([]);
+      expect(result.operations[0].filesTransferred).toBe(0);
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.skipIf(!HOST_HAS_GNU_TAR)(
+    "skips nested symlinks whose target leaves the synced directory, excluding exactly those members",
+    async () => {
+      const remoteDir = await makeTmp("k8s-sandbox-");
+      const hostOut = await makeTmp("k8s-hostout-");
+      const srcDir = path.join(remoteDir, "workspace");
+      await fs.mkdir(path.join(srcDir, "pkg", "deep", "[ab]"), { recursive: true });
+      await fs.writeFile(path.join(srcDir, "a.txt"), "aaa");
+      await fs.writeFile(path.join(srcDir, "pkg", "deep", "[ab]", "kept.txt"), "kept");
+      // Confined relative links at depth, including one that climbs back to the root.
+      await fs.symlink("../a.txt", path.join(srcDir, "pkg", "to-root"));
+      await fs.symlink("../../a.txt", path.join(srcDir, "pkg", "deep", "to-root"));
+      await fs.symlink("x/../../a.txt", path.join(srcDir, "pkg", "via-sibling"));
+      // Escaping links at depth.
+      await fs.symlink("/usr/bin/env", path.join(srcDir, "pkg", "abs"));
+      await fs.symlink("../../../outside", path.join(srcDir, "pkg", "deep", "up"));
+      await fs.symlink(path.join(srcDir, "a.txt"), path.join(srcDir, "pkg", "deep", "abs-inside"));
+      // Glob metacharacters and whitespace in an excluded name must only exclude
+      // that exact member, never a look-alike sibling.
+      await fs.symlink("/etc", path.join(srcDir, "pkg", "st*r"));
+      await fs.writeFile(path.join(srcDir, "pkg", "star"), "star");
+      await fs.writeFile(path.join(srcDir, "pkg", "stXr"), "stXr");
+      await fs.symlink("/etc", path.join(srcDir, "pkg", "deep", "b"));
+      await fs.symlink("/etc", path.join(srcDir, "pkg", " lead"));
+      await fs.writeFile(path.join(srcDir, "pkg", "lead"), "lead");
+      await fs.symlink("/etc", path.join(srcDir, "pkg", "back\\slash"));
+      await fs.writeFile(path.join(srcDir, "pkg", "backslash"), "backslash");
+      // An excluded heavy directory is not scanned and still never packed.
+      await fs.mkdir(path.join(srcDir, "pkg", "node_modules"), { recursive: true });
+      await fs.symlink("/etc", path.join(srcDir, "pkg", "node_modules", "abs"));
+
+      const target = path.join(hostOut, "restored");
+      const { exec } = makeRealExec();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        await performSyncOut({
+          exec,
+          remoteDir,
+          timeoutMs: 30_000,
+          operations: [
+            {
+              operationId: "op-dir-out",
+              files: [{
+                sourcePath: srcDir,
+                targetPath: target,
+                kind: "directory",
+                exclude: ["node_modules", "*/node_modules", "*/node_modules/*"],
+              }],
+            },
+          ],
+        });
+        expect(await fs.readFile(path.join(target, "a.txt"), "utf-8")).toBe("aaa");
+        expect(await fs.readlink(path.join(target, "pkg", "to-root"))).toBe("../a.txt");
+        expect(await fs.readlink(path.join(target, "pkg", "deep", "to-root"))).toBe("../../a.txt");
+        expect(await fs.readlink(path.join(target, "pkg", "via-sibling"))).toBe("x/../../a.txt");
+        for (const kept of ["star", "stXr", "lead", "backslash"]) {
+          expect(await fs.readFile(path.join(target, "pkg", kept), "utf-8")).toBe(kept);
+        }
+        expect(await fs.readFile(path.join(target, "pkg", "deep", "[ab]", "kept.txt"), "utf-8")).toBe("kept");
+        for (const skipped of ["abs", "deep/up", "deep/abs-inside", "st*r", "deep/b", " lead", "back\\slash"]) {
+          await expect(fs.lstat(path.join(target, "pkg", skipped))).rejects.toThrow();
+        }
+        await expect(fs.lstat(path.join(target, "pkg", "node_modules"))).rejects.toThrow();
+        const logged = warn.mock.calls.map((args) => args.join(" ")).join("\n");
+        expect(logged).toContain("skipped symlink whose target leaves the synced directory: pkg/abs -> /usr/bin/env");
+        expect(logged).toContain("skipped symlink whose target leaves the synced directory: pkg/deep/up -> ../../../outside");
+        expect(logged).not.toContain("to-root");
+        expect(logged).not.toContain("node_modules");
+      } finally {
+        warn.mockRestore();
+      }
+    },
+  );
+
+  it("still refuses a nested escaping symlink it cannot exclude by name (host-side check stays fail-closed)", async () => {
+    const remoteDir = await makeTmp("k8s-sandbox-");
+    const hostOut = await makeTmp("k8s-hostout-");
+    const srcDir = path.join(remoteDir, "workspace");
+    await fs.mkdir(path.join(srcDir, "pkg"), { recursive: true });
+    // A name ending in whitespace cannot be listed as an exact tar exclusion, so
+    // the pod packs it and the host-side member check must still reject it.
+    await fs.symlink("/etc", path.join(srcDir, "pkg", "trail "));
+    await fs.writeFile(path.join(srcDir, "pkg", "trail"), "trail");
+
+    const target = path.join(hostOut, "restored");
+    const { exec } = makeRealExec();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(
+        performSyncOut({
+          exec,
+          remoteDir,
+          timeoutMs: 30_000,
+          operations: [
+            {
+              operationId: "op-dir-out",
+              files: [{ sourcePath: srcDir, targetPath: target, kind: "directory" }],
+            },
+          ],
+        }),
+      ).rejects.toThrow(/refusing tarball link whose target escapes/);
+      await expect(fs.lstat(path.join(target, "pkg"))).rejects.toThrow();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("rejects an outbound source that escapes the remote dir before any exec runs", async () => {
