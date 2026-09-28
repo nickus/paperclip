@@ -32,6 +32,20 @@ describe("external object references", () => {
     ]);
   });
 
+  it("trims a long run of trailing punctuation in linear time", () => {
+    // Regression guard: trailing-punctuation trimming used to re-scan the
+    // whole remaining token on every character considered for removal,
+    // making it quadratic. A URL followed by tens of thousands of ")" used
+    // to take tens of seconds; it should now complete in well under a second.
+    const url = "https://github.com/acme/app/pull/1";
+    const text = `see ${url}${")".repeat(50_000)}`;
+    const start = Date.now();
+    expect(findExternalObjectUrlMatches(text)).toEqual([
+      { index: 4, length: url.length, matchedText: url },
+    ]);
+    expect(Date.now() - start).toBeLessThan(2_000);
+  });
+
   it("canonicalizes urls by stripping query and fragment by default", () => {
     expect(canonicalizeExternalObjectUrl("HTTPS://GitHub.com/acme/app/pull/1?token=secret#discussion")).toMatchObject({
       sanitizedCanonicalUrl: "https://github.com/acme/app/pull/1",

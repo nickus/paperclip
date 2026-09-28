@@ -66,4 +66,18 @@ describe("issue references", () => {
 
     expect(extractIssueReferenceIdentifiers(markdown)).toEqual(["PAP-1", "PAP-5"]);
   });
+
+  it("trims a long run of trailing punctuation in linear time", () => {
+    // Regression guard: trailing-punctuation trimming used to re-scan the
+    // whole remaining token on every character considered for removal,
+    // making it quadratic. A URL followed by tens of thousands of ")" used
+    // to take tens of seconds; it should now complete in well under a second.
+    const url = "https://example.com/issues/PAP-123";
+    const text = `see ${url}${")".repeat(50_000)}`;
+    const start = Date.now();
+    expect(findIssueReferenceMatches(text)).toEqual([
+      { index: 4, length: url.length, identifier: "PAP-123", matchedText: url },
+    ]);
+    expect(Date.now() - start).toBeLessThan(2_000);
+  });
 });
