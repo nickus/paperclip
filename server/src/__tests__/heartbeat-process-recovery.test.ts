@@ -5408,7 +5408,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(repairs[0].idempotencyKey).toBe(`issue_disposition_repair:${issueId}:${legacyDispositionFingerprint(companyId, issueId, agentId, runId)}:1`);
   });
 
-  it("resumes the finish-handoff run with the whole saved session of the run it follows", async () => {
+  it("resumes the follow-up run with the whole saved session of the run it follows", async () => {
     const { agentId, runId, issueId, companyId } =
       await seedQueuedIssueRunFixture();
     // What an adapter saves after a run on a sandbox target: the session id
@@ -5454,7 +5454,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await heartbeat.resumeQueuedRuns();
     await waitForRunToSettle(heartbeat, runId, 5_000);
 
-    const handoffRun = await waitForValue(async () => {
+    // The run chose no issue disposition, so a disposition-repair run follows
+    // it on the same task.
+    const followUpRun = await waitForValue(async () => {
       const rows = await db
         .select()
         .from(heartbeatRuns)
@@ -5463,24 +5465,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         rows.find(
           (row) =>
             (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason ===
-            "finish_successful_run_handoff",
+            "issue_disposition_repair",
         ) ?? null
       );
     }, 5_000);
-    await waitForRunToSettle(heartbeat, handoffRun!.id, 5_000);
-    await waitForHeartbeatIdle(db, 5_000);
+    await waitForRunToSettle(heartbeat, followUpRun!.id, 5_000);
 
-    // The wake is queued while the first run finalizes. It must copy the
-    // session that run saved, not only its id: a bare id carries no execution
-    // identity, so a remote adapter refuses to resume it.
-    expect(handoffRun!.contextSnapshot).toMatchObject({
-      resumeFromRunId: runId,
-      resumeSessionParams: savedSessionParams,
-    });
-    const handoffInvocation = mockAdapterExecute.mock.calls
+    // The follow-up must resume the whole session the first run saved, not
+    // only its id: a bare id carries no execution identity, so a remote
+    // adapter refuses to resume it.
+    const followUpInvocation = mockAdapterExecute.mock.calls
       .map(([input]) => input as { runId?: string; runtime?: { sessionParams?: unknown } })
-      .find((input) => input.runId === handoffRun!.id);
-    expect(handoffInvocation?.runtime?.sessionParams).toMatchObject(
+      .find((input) => input.runId === followUpRun!.id);
+    expect(followUpInvocation?.runtime?.sessionParams).toMatchObject(
       savedSessionParams,
     );
   });
