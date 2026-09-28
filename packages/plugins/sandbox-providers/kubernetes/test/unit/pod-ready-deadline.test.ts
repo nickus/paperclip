@@ -95,4 +95,47 @@ describe("summarizeRecentPodEvents", () => {
     const result = await summarizeRecentPodEvents(clients as never, "ns", "pod-1");
     expect(result).toEqual({ summary: "", events: [] });
   });
+
+  it("sorts chronologically when timestamps arrive as a mix of Date instances and ISO strings", async () => {
+    // The real @kubernetes/client-node deserializes lastTimestamp/firstTimestamp
+    // (V1Time) to Date objects but leaves eventTime (V1MicroTime, not in its
+    // type-conversion map) as an ISO string. A scheduler event that only ever
+    // sets eventTime (no lastTimestamp) — e.g. FailedScheduling — must still
+    // sort correctly against Date-bearing events, including a Date that is
+    // textually "later" (Fri) but numerically earlier than a string time from
+    // earlier the same night (Thu 23:59 vs. Fri 00:01 — String(date)
+    // localeCompare would get this backwards).
+    const clients = fakeCoreClient([
+      {
+        reason: "ImagePullBackOff",
+        message: "later, via Date lastTimestamp",
+        lastTimestamp: new Date("2026-01-02T00:01:00.000Z"),
+      },
+      {
+        reason: "FailedScheduling",
+        message: "earlier, via string eventTime only",
+        eventTime: "2026-01-01T23:59:00.000Z",
+      },
+    ]);
+    const result = await summarizeRecentPodEvents(clients as never, "ns", "pod-1");
+    expect(result.events.map((e) => e.reason)).toEqual(["FailedScheduling", "ImagePullBackOff"]);
+  });
+
+  it("prefers series.lastObservedTime over lastTimestamp for a repeated event's true recency", async () => {
+    const clients = fakeCoreClient([
+      {
+        reason: "Started",
+        message: "old",
+        lastTimestamp: new Date("2026-01-01T00:00:00.000Z"),
+      },
+      {
+        reason: "BackOff",
+        message: "repeated, most recently observed later",
+        lastTimestamp: new Date("2026-01-01T00:00:01.000Z"),
+        series: { lastObservedTime: "2026-01-02T00:00:00.000Z" },
+      },
+    ]);
+    const result = await summarizeRecentPodEvents(clients as never, "ns", "pod-1");
+    expect(result.events.map((e) => e.reason)).toEqual(["Started", "BackOff"]);
+  });
 });

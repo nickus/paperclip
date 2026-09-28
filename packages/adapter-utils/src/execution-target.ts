@@ -723,6 +723,19 @@ export async function ensureAdapterExecutionTargetCommandResolvable(
   });
 }
 
+// A timed-out probe can still carry a provider's own explanation in stderr —
+// e.g. a Kubernetes sandbox provider that bounds its own pod-readiness wait
+// separately from this probe's timeout folds a "did not become Ready" pod
+// events summary into the exec result's stderr when THAT wait is what timed
+// out underneath this probe. Surfacing it here is the difference between
+// "timed out" and "timed out because 0/3 nodes have capacity".
+function formatSandboxProbeTimeoutMessage(command: string, stderr: string): string {
+  const trimmed = stderr.trim();
+  return trimmed
+    ? `Timed out checking command "${command}" on sandbox target. probe stderr: ${trimmed}`
+    : `Timed out checking command "${command}" on sandbox target.`;
+}
+
 async function probeSandboxCommandResolvable(
   command: string,
   target: AdapterSandboxExecutionTarget,
@@ -761,7 +774,7 @@ async function ensureSandboxCommandResolvable(
   let probe = await probeSandboxCommandResolvable(command, target, env);
   if (probe.resolved) return;
   if (probe.timedOut) {
-    throw new Error(`Timed out checking command "${command}" on sandbox target.`);
+    throw new Error(formatSandboxProbeTimeoutMessage(command, probe.stderr));
   }
 
   // If the caller supplied an install command, attempt the install once via
@@ -784,7 +797,10 @@ async function ensureSandboxCommandResolvable(
         timeoutMs: installTimeoutMs,
       });
       if (installResult.timedOut) {
-        installFailureDetail = `install command timed out: ${installCommand}`;
+        const installStderr = installResult.stderr.trim();
+        installFailureDetail = installStderr
+          ? `install command timed out: ${installCommand} (stderr: ${installStderr})`
+          : `install command timed out: ${installCommand}`;
       } else if ((installResult.exitCode ?? 0) !== 0) {
         const tail = (text: string) =>
           text.split(/\r?\n/).filter((line) => line.trim().length > 0).slice(-2).join(" | ").slice(0, 240);
@@ -797,7 +813,7 @@ async function ensureSandboxCommandResolvable(
     probe = await probeSandboxCommandResolvable(command, target, env);
     if (probe.resolved) return;
     if (probe.timedOut) {
-      throw new Error(`Timed out checking command "${command}" on sandbox target.`);
+      throw new Error(formatSandboxProbeTimeoutMessage(command, probe.stderr));
     }
   }
 

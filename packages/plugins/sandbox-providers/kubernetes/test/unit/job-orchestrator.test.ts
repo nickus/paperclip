@@ -1,5 +1,14 @@
 import { describe, it, expect, vi } from "vitest";
-import { createJob, deleteJob, getJobStatus, findPodForJob, JobTimeoutError, waitForJobCompletion } from "../../src/job-orchestrator.js";
+import {
+  createJob,
+  deleteJob,
+  getJobStatus,
+  findPodForJob,
+  JobTimeoutError,
+  JobPodNotReadyError,
+  waitForJobCompletion,
+  waitForJobPodRunning,
+} from "../../src/job-orchestrator.js";
 
 describe("createJob", () => {
   it("calls batch.createNamespacedJob with the manifest", async () => {
@@ -83,5 +92,51 @@ describe("waitForJobCompletion", () => {
     await expect(
       waitForJobCompletion(clients as never, "ns", "r-1", { timeoutMs: 50, pollMs: 10 }),
     ).rejects.toBeInstanceOf(JobTimeoutError);
+  });
+});
+
+describe("waitForJobPodRunning", () => {
+  it("throws JobPodNotReadyError when the pod never leaves Pending", async () => {
+    // getJobStatus reports Pending throughout (no active count yet — still
+    // scheduling), and no pod shows up as Running.
+    const get = vi.fn().mockResolvedValue({ status: {} });
+    const list = vi.fn().mockResolvedValue({
+      items: [{ metadata: { name: "r-1-xyz" }, status: { phase: "Pending" } }],
+    });
+    const clients = { batch: { readNamespacedJobStatus: get }, core: { listNamespacedPod: list } };
+    await expect(
+      waitForJobPodRunning(clients as never, "ns", "r-1", { timeoutMs: 50, pollMs: 10 }),
+    ).rejects.toBeInstanceOf(JobPodNotReadyError);
+  });
+
+  it("resolves once the pod's own status.phase is Running, distinct from the Job's active-count-based Running", async () => {
+    // getJobStatus's "Running" phase is driven by active>0, which the Job API
+    // sets once a pod exists at all (including while it is still Pending) —
+    // so this must poll the POD's phase, not trust getJobStatus alone.
+    let call = 0;
+    const list = vi.fn().mockImplementation(async () => {
+      call += 1;
+      const phase = call < 3 ? "Pending" : "Running";
+      return { items: [{ metadata: { name: "r-1-xyz" }, status: { phase } }] };
+    });
+    const get = vi.fn().mockResolvedValue({ status: { active: 1 } });
+    const clients = { batch: { readNamespacedJobStatus: get }, core: { listNamespacedPod: list } };
+    const result = await waitForJobPodRunning(clients as never, "ns", "r-1", { timeoutMs: 5000, pollMs: 1 });
+    expect(result.podName).toBe("r-1-xyz");
+    expect(result.jobStatus.phase).toBe("Running");
+    expect(call).toBeGreaterThanOrEqual(3);
+  });
+
+  it("treats a Job that finishes before its pod is ever observed Running as ready (nothing left to wait for)", async () => {
+    const get = vi.fn().mockResolvedValue({
+      status: { succeeded: 1, conditions: [{ type: "Complete", status: "True" }] },
+    });
+    const list = vi.fn().mockResolvedValue({
+      items: [{ metadata: { name: "r-1-xyz" }, status: { phase: "Succeeded" } }],
+    });
+    const clients = { batch: { readNamespacedJobStatus: get }, core: { listNamespacedPod: list } };
+    const result = await waitForJobPodRunning(clients as never, "ns", "r-1", { timeoutMs: 5000, pollMs: 10 });
+    expect(result.jobStatus.phase).toBe("Succeeded");
+    expect(result.podName).toBe("r-1-xyz");
   });
 });

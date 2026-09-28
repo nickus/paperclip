@@ -31,7 +31,13 @@ import { buildSandboxCrManifest } from "./sandbox-cr-builder.js";
 import { ensureTenant } from "./tenant-orchestrator.js";
 import { createPerRunSecret } from "./secret-manager.js";
 import { FastUploadInterceptor } from "./upload-interceptor.js";
-import { jobOrchestrator, JobTimeoutError } from "./job-orchestrator.js";
+import {
+  jobOrchestrator,
+  JobTimeoutError,
+  JobPodNotReadyError,
+  waitForJobPodRunning,
+  type JobStatus,
+} from "./job-orchestrator.js";
 import {
   sandboxCrOrchestrator,
   SandboxCrTimeoutError,
@@ -775,11 +781,16 @@ const plugin = definePlugin({
             );
             return {
               // exitCode: null + timedOut: true is this file's existing
-              // convention for a transient/retryable provider failure (the
-              // exec-call watchdog timeout below uses the identical shape) —
-              // callers already treat it as retryable, so no separate
-              // classification is needed. `metadata.transient` documents
-              // that intent explicitly for any consumer inspecting metadata.
+              // convention for a provider-side failure that a caller's own
+              // retry policy can act on (the exec-call watchdog timeout
+              // below uses the identical shape). `metadata.transient`
+              // documents that intent explicitly for any consumer
+              // inspecting metadata — but as of this change no caller reads
+              // it, and a plain `timedOut` result on this path is not
+              // auto-retried by the scheduler today. This still fails fast
+              // and explains why (recent pod events, above) instead of
+              // silently spending the whole run budget; wiring an actual
+              // retry decision to this shape is separate follow-up work.
               exitCode: null,
               timedOut: true,
               stdout: "",
@@ -997,43 +1008,73 @@ const plugin = definePlugin({
       //
       // params.command / params.args / params.stdin are intentionally ignored.
 
-      // Bound the wait the same way as the sandbox-cr backend: min(run
-      // budget, podReadyTimeoutSec ?? 600s). NOTE this caps the Job's whole
-      // completion wait, not just its scheduling — the Job backend has no
-      // separate "pod is scheduled" signal distinct from "Job finished" (see
-      // getJobStatus), so a long-running Job now needs podReadyTimeoutSec
-      // raised past its expected runtime, or it will time out the same way a
-      // pod stuck Pending would. Operators on the Job backend running jobs
-      // longer than ten minutes must set podReadyTimeoutSec accordingly.
+      // Two-phase wait, mirroring the sandbox-cr backend above: first bound
+      // how long we wait for the Job's pod to actually start running
+      // (scheduling + image pull) to min(run budget, podReadyTimeoutSec ??
+      // 600s) — the SAME cap the sandbox-cr backend uses for its readiness
+      // wait — then, only once the pod is up, wait for the Job to finish
+      // with whatever run budget remains. A Job stuck Pending (no capacity,
+      // a bad node selector, an image that will never pull) now fails fast
+      // and diagnosably instead of silently consuming the whole run budget,
+      // AND a Job that legitimately runs longer than podReadyTimeoutSec once
+      // its pod is up is no longer capped by it (see waitForJobPodRunning in
+      // job-orchestrator.ts for why getJobStatus's own "Running" phase isn't
+      // enough to detect the pod-is-up transition).
       const podReadyTimeoutMs = resolvePodReadyTimeoutMs(config, effectiveTimeoutMs);
+      const jobWaitStartedAt = Date.now();
 
-      let status;
-      let timedOut = false;
+      let status: JobStatus | null = null;
+      let timeoutStage: "pod_not_ready" | "completion" | null = null;
+      let completionTimeoutMs = 0;
+      let podName: string | null =
+        typeof lease.metadata?.podName === "string" ? lease.metadata.podName : null;
+
       try {
-        status = await jobOrchestrator.waitForCompletion(
+        const podRunning = await waitForJobPodRunning(
           clients,
           namespace,
           lease.providerLeaseId,
           { timeoutMs: podReadyTimeoutMs, pollMs: 2000 },
         );
+        podName = podRunning.podName ?? podName;
+        status = podRunning.jobStatus;
       } catch (err) {
-        if (err instanceof JobTimeoutError) {
-          timedOut = true;
-          status = null;
+        if (err instanceof JobPodNotReadyError) {
+          timeoutStage = "pod_not_ready";
         } else {
           throw err;
         }
       }
 
+      if (
+        timeoutStage === null &&
+        status &&
+        status.phase !== "Succeeded" &&
+        status.phase !== "Failed"
+      ) {
+        completionTimeoutMs = Math.max(0, effectiveTimeoutMs - (Date.now() - jobWaitStartedAt));
+        try {
+          status = await jobOrchestrator.waitForCompletion(
+            clients,
+            namespace,
+            lease.providerLeaseId,
+            { timeoutMs: completionTimeoutMs, pollMs: 2000 },
+          );
+        } catch (err) {
+          if (err instanceof JobTimeoutError) {
+            timeoutStage = "completion";
+            status = null;
+          } else {
+            throw err;
+          }
+        }
+      }
+      const timedOut = timeoutStage !== null;
+
       // Collect logs from the pod.
-      const podName =
-        typeof lease.metadata?.podName === "string"
-          ? lease.metadata.podName
-          : await jobOrchestrator.findPod(
-              clients,
-              namespace,
-              lease.providerLeaseId,
-            );
+      if (!podName) {
+        podName = await jobOrchestrator.findPod(clients, namespace, lease.providerLeaseId);
+      }
 
       const stdoutChunks: string[] = [];
       const stderrChunks: string[] = [];
@@ -1052,22 +1093,33 @@ const plugin = definePlugin({
 
       // On timeout, fetch the pod's recent events (FailedScheduling,
       // ImagePullBackOff, etc.) so the caller knows WHY the Job never
-      // finished, not just that it didn't. timedOut already carries this
-      // file's transient/retryable classification (exitCode: null,
-      // timedOut: true, mirrored by metadata.transient below).
+      // finished, not just that it didn't. exitCode: null + timedOut: true
+      // is this file's existing convention for a provider-side failure that
+      // is a candidate for a caller's own retry policy to act on;
+      // `metadata.transient` documents that intent explicitly for any
+      // consumer inspecting metadata, though see this plugin's own
+      // observation elsewhere that no caller currently reads it — treat a
+      // timed-out result as "explained, not yet auto-retried".
       const timeoutEventSummary = timedOut
         ? await summarizeRecentPodEvents(clients, namespace, podName ?? lease.providerLeaseId)
         : null;
+      const timeoutMessage =
+        timeoutStage === "pod_not_ready"
+          ? `Job's pod did not start running within ${podReadyTimeoutMs}ms`
+          : timeoutStage === "completion"
+            ? `Job did not complete within ${completionTimeoutMs}ms`
+            : null;
 
       const stderrText = appendNetworkEgressDenyHint(stderrChunks.join(""), scopedNetworkEgress);
       return {
         exitCode: timedOut ? null : status?.phase === "Succeeded" ? 0 : 1,
         timedOut,
         stdout: stdoutChunks.join(""),
-        stderr:
-          timeoutEventSummary?.summary
-            ? `${stderrText}${stderrText ? "\n" : ""}Job did not complete within ${podReadyTimeoutMs}ms — recent pod events: ${timeoutEventSummary.summary}`
-            : stderrText,
+        stderr: timeoutMessage
+          ? `${stderrText}${stderrText ? "\n" : ""}${timeoutMessage}${
+              timeoutEventSummary?.summary ? ` — recent pod events: ${timeoutEventSummary.summary}` : ""
+            }`
+          : stderrText,
         metadata: {
           provider: "kubernetes",
           backend: "job",
@@ -1078,6 +1130,7 @@ const plugin = definePlugin({
           ...(timedOut
             ? {
                 transient: true,
+                timeoutStage,
                 podReadyTimeoutMs,
                 podEvents: timeoutEventSummary?.events ?? [],
               }

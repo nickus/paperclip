@@ -97,6 +97,12 @@ const manifest: PaperclipPluginManifestV1 = {
             minimum: 1,
             description: "Hard ceiling on a single run's wall-clock time (default: 3600).",
           },
+          podReadyTimeoutSec: {
+            type: "integer",
+            minimum: 1,
+            description:
+              "Separate, shorter ceiling on how long a single command waits for its pod to become Ready/Running before scheduling or image pull is treated as stuck (default: 600). Never waits longer than podActivityDeadlineSec even when set higher. Only bounds the readiness/scheduling wait itself, not the run afterward.",
+          },
           adapterType: {
             type: "string",
             description:
