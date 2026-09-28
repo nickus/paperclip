@@ -685,24 +685,16 @@ describe("agent instructions bundle routes", () => {
       });
     }
 
-    // The host lists the target agent as running in the run's environment.
-    function bridgeDecision(
-      method: string,
-      path: string,
-      policy: "agent" | "agent-with-instruction-writes",
-      instructionWriteAgentIds: readonly string[] = [TARGET_AGENT_ID],
-    ) {
-      return authorizeSandboxCallbackBridgeRequestForPolicy(
-        { method, path },
-        { policy, companyId: "company-1", instructionWriteAgentIds },
-      );
+    function bridgeDecision(method: string, path: string, policy: "agent" | "agent-with-instruction-writes") {
+      return authorizeSandboxCallbackBridgeRequestForPolicy({ method, path }, { policy, companyId: "company-1" });
     }
 
-    it("passes the bridge only for a file write to a listed agent under the opened policy", () => {
+    it("passes the bridge only for a file write that names its agent by id, under the opened policy", () => {
       expect(bridgeDecision("PUT", FILE_PATH, "agent-with-instruction-writes")).toBeNull();
-      expect(bridgeDecision("PUT", FILE_PATH, "agent-with-instruction-writes", [])).toContain("Route not allowed");
-      expect(bridgeDecision("PUT", FILE_PATH, "agent-with-instruction-writes", [COACH_AGENT_ID]))
-        .toContain("Route not allowed");
+      for (const reference of [COACH_AGENT_ID, "me"]) {
+        expect(bridgeDecision("PUT", `/api/agents/${reference}/instructions-bundle/file`, "agent-with-instruction-writes"))
+          .toContain("Route not allowed");
+      }
       expect(bridgeDecision("PATCH", BUNDLE_PATH, "agent-with-instruction-writes")).toContain("Route not allowed");
       expect(bridgeDecision("DELETE", FILE_PATH, "agent-with-instruction-writes")).toContain("Route not allowed");
       expect(bridgeDecision("PUT", FILE_PATH, "agent")).toContain("Route not allowed");
@@ -793,9 +785,10 @@ describe("agent instructions bundle routes", () => {
       ]);
     });
 
-    it("applies a write from a direct agents:configure grant with no card at all", async () => {
-      // A direct change grant never reaches the consent gate. This documents
-      // that holders of such a grant need no accepted card.
+    it("applies a write from a direct agents:configure grant with no card on a local run", async () => {
+      // On a run outside a remote execution environment a direct change grant
+      // never reaches the consent gate. A bridged run needs a card even then
+      // (see agent-instructions-bridged-consent-routes.test.ts).
       mockAgentService.getById.mockImplementation(async (id: string) => {
         if (id === COACH_AGENT_ID) return makeReflectionCoachAgent({ id: COACH_AGENT_ID });
         return makeAgent();

@@ -1,6 +1,4 @@
 import type { Db } from "@paperclipai/db";
-import { agents } from "@paperclipai/db";
-import { and, eq, ne } from "drizzle-orm";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { adapterSupportsRemoteManagedEnvironments } from "@paperclipai/shared";
 import {
@@ -9,10 +7,7 @@ import {
   type SandboxLeaseAcquisition,
 } from "@paperclipai/adapter-utils/execution-target";
 import type { DuplexObservabilityRecorder } from "@paperclipai/adapter-utils/duplex-observability";
-import {
-  normalizeSandboxCallbackBridgePolicy,
-  type SandboxCallbackBridgePolicy,
-} from "@paperclipai/adapter-utils/sandbox-callback-bridge";
+import { normalizeSandboxCallbackBridgePolicy } from "@paperclipai/adapter-utils/sandbox-callback-bridge";
 import {
   clampSpanLabel,
   getActiveStepContext,
@@ -226,58 +221,6 @@ function setSandboxExecSpanFailure(
   span.setStatus({ code: SPAN_STATUS_CODE_ERROR });
 }
 
-/**
- * The agents whose instruction files an `agent-with-instruction-writes` bridge
- * may write for a run in `environmentId`: the company's live agents that run
- * there by default, with an adapter that can run there at all. Every other
- * policy writes no instructions, so it gets no list. Agents that would run on
- * another target (the host included) are never on the list, whatever change
- * grants the run's agent holds.
- */
-async function resolveBridgeInstructionWriteAgentIds(input: {
-  db: Db;
-  companyId: string;
-  environmentId: string | null | undefined;
-  policy: SandboxCallbackBridgePolicy;
-}): Promise<string[]> {
-  if (input.policy !== "agent-with-instruction-writes" || !input.environmentId) return [];
-  const rows = await input.db
-    .select({ id: agents.id, adapterType: agents.adapterType })
-    .from(agents)
-    .where(and(
-      eq(agents.companyId, input.companyId),
-      eq(agents.defaultEnvironmentId, input.environmentId),
-      ne(agents.status, "terminated"),
-    ));
-  return rows
-    .filter((row) => adapterSupportsRemoteManagedEnvironments(row.adapterType))
-    .map((row) => row.id.toLowerCase())
-    .sort();
-}
-
-/** The host-only bridge settings for a remote target in `environmentId`. */
-async function resolveRemoteTargetBridgeSettings(input: {
-  db: Db;
-  companyId: string;
-  environmentId: string | null | undefined;
-  configuredPolicy: unknown;
-}) {
-  const policy = normalizeSandboxCallbackBridgePolicy(input.configuredPolicy);
-  const instructionWriteAgentIds = await resolveBridgeInstructionWriteAgentIds({
-    db: input.db,
-    companyId: input.companyId,
-    environmentId: input.environmentId,
-    policy,
-  });
-  return {
-    paperclipApiBridgePolicy: policy,
-    paperclipApiBridgeCompanyId: input.companyId,
-    ...(instructionWriteAgentIds.length > 0
-      ? { paperclipApiBridgeInstructionWriteAgentIds: instructionWriteAgentIds }
-      : {}),
-  };
-}
-
 export async function resolveEnvironmentExecutionTarget(input: {
   db: Db;
   companyId: string;
@@ -425,14 +368,9 @@ export async function resolveEnvironmentExecutionTarget(input: {
       remoteCwd,
       enableSandboxDuplexBridge,
       // Host-only bridge settings: the route policy from the environment
-      // config (absent means restricted), the run's company, and the agents
-      // whose instructions the run may write.
-      ...(await resolveRemoteTargetBridgeSettings({
-        db: input.db,
-        companyId: input.companyId,
-        environmentId: input.environment.id,
-        configuredPolicy: parsed.config.paperclipApiBridgePolicy,
-      })),
+      // config (absent means restricted) and the run's company.
+      paperclipApiBridgePolicy: normalizeSandboxCallbackBridgePolicy(parsed.config.paperclipApiBridgePolicy),
+      paperclipApiBridgeCompanyId: input.companyId,
       runnerLifecyclePolicy:
         parsed.config.runnerLifecycleMode === "warm"
           ? {
@@ -722,12 +660,8 @@ export async function resolveEnvironmentExecutionTarget(input: {
     leaseId: input.leaseId ?? null,
     remoteCwd,
     // Host-only bridge settings, as for sandbox targets above.
-    ...(await resolveRemoteTargetBridgeSettings({
-      db: input.db,
-      companyId: input.companyId,
-      environmentId: input.environment.id,
-      configuredPolicy: parsed.config.paperclipApiBridgePolicy,
-    })),
+    paperclipApiBridgePolicy: normalizeSandboxCallbackBridgePolicy(parsed.config.paperclipApiBridgePolicy),
+    paperclipApiBridgeCompanyId: input.companyId,
     spec: {
       host: parsed.config.host,
       port: parsed.config.port,

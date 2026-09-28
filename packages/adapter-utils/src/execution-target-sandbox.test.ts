@@ -2311,7 +2311,7 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
-  it("forwards instruction file writes only when the target's policy opens them, for listed agents", async () => {
+  it("forwards instruction file writes only when the target's policy opens them, for agents named by id", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-instructions-"));
     cleanupDirs.push(rootDir);
     const remoteCwd = path.join(rootDir, "workspace");
@@ -2353,12 +2353,13 @@ describe("sandbox adapter execution targets", () => {
     };
     const fileBody = JSON.stringify({ path: "AGENTS.md", content: "# Updated\n" });
     const bundleBody = JSON.stringify({ entryFile: "AGENTS.md" });
+    const targetAgentId = "22222222-2222-4222-8222-222222222222";
     const writes = [
+      { method: "PUT", route: `/api/agents/${targetAgentId}/instructions-bundle/file`, body: fileBody },
+      // A target named by shortname rather than by id.
       { method: "PUT", route: "/api/agents/agent-2/instructions-bundle/file", body: fileBody },
-      // An agent the host did not list for this run.
-      { method: "PUT", route: "/api/agents/agent-3/instructions-bundle/file", body: fileBody },
-      { method: "PATCH", route: "/api/agents/agent-2/instructions-bundle", body: bundleBody },
-      { method: "DELETE", route: "/api/agents/agent-2/instructions-bundle/file?path=AGENTS.md", body: null },
+      { method: "PATCH", route: `/api/agents/${targetAgentId}/instructions-bundle`, body: bundleBody },
+      { method: "DELETE", route: `/api/agents/${targetAgentId}/instructions-bundle/file?path=AGENTS.md`, body: null },
     ];
 
     async function statusesThroughBridge(target: AdapterSandboxExecutionTarget, runId: string) {
@@ -2394,36 +2395,32 @@ describe("sandbox adapter execution targets", () => {
 
     try {
       const agentPolicy = await statusesThroughBridge(
-        { ...baseTarget, paperclipApiBridgePolicy: "agent", paperclipApiBridgeInstructionWriteAgentIds: ["agent-2"] },
+        { ...baseTarget, paperclipApiBridgePolicy: "agent" },
         "run-bridge-agent-instructions",
       );
       expect(agentPolicy.map((result) => result.status)).toEqual([403, 403, 403, 403]);
       expect(forwarded).toEqual([]);
 
-      // The policy alone, with no agents listed, opens nothing.
-      const unlisted = await statusesThroughBridge(
-        { ...baseTarget, paperclipApiBridgePolicy: "agent-with-instruction-writes" },
-        "run-bridge-instruction-writes-unlisted",
-      );
-      expect(unlisted.map((result) => result.status)).toEqual([403, 403, 403, 403]);
-      expect(forwarded).toEqual([]);
-
       const opened = await statusesThroughBridge(
-        {
-          ...baseTarget,
-          paperclipApiBridgePolicy: "agent-with-instruction-writes",
-          paperclipApiBridgeInstructionWriteAgentIds: ["agent-2"],
-        },
+        { ...baseTarget, paperclipApiBridgePolicy: "agent-with-instruction-writes" },
         "run-bridge-instruction-writes",
       );
       expect(opened.map((result) => result.status)).toEqual([200, 403, 403, 403]);
       for (const result of opened.slice(1)) {
         expect(result.error).toContain('bridge policy "agent-with-instruction-writes"');
       }
-      // Only the listed agent's file write reaches the API, unchanged.
+      // Only the file write naming its target by id reaches the API, unchanged.
       expect(forwarded).toEqual([
-        { request: "PUT /api/agents/agent-2/instructions-bundle/file", body: fileBody },
+        { request: `PUT /api/agents/${targetAgentId}/instructions-bundle/file`, body: fileBody },
       ]);
+
+      // A target with no bound company opens no instruction write either.
+      const unbound = await statusesThroughBridge(
+        { ...baseTarget, paperclipApiBridgeCompanyId: null, paperclipApiBridgePolicy: "agent-with-instruction-writes" },
+        "run-bridge-instruction-writes-unbound",
+      );
+      expect(unbound.map((result) => result.status)).toEqual([403, 403, 403, 403]);
+      expect(forwarded).toHaveLength(1);
     } finally {
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));
     }

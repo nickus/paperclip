@@ -37,7 +37,6 @@ import {
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeAuthorizer,
   createSandboxCallbackBridgeToken,
-  normalizeSandboxCallbackBridgeInstructionWriteAgentIds,
   normalizeSandboxCallbackBridgePolicy,
   type SandboxCallbackBridgePolicy,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
@@ -156,13 +155,6 @@ interface AdapterRemoteExecutionTargetBridgeSettings {
    * company-scoped paths for any other company.
    */
   paperclipApiBridgeCompanyId?: string | null;
-  /**
-   * The agents, by id, whose instruction files the
-   * `"agent-with-instruction-writes"` policy may write for this run: the
-   * agents that run in the same execution environment. Absent or empty means
-   * no instruction writes.
-   */
-  paperclipApiBridgeInstructionWriteAgentIds?: readonly string[] | null;
 }
 
 export interface AdapterSshExecutionTarget
@@ -596,16 +588,10 @@ function readBridgeSettingsFromParsedTarget(
 ): AdapterRemoteExecutionTargetBridgeSettings {
   // Keep only an exact wider policy name; anything else stays unset (restricted).
   const policy = normalizeSandboxCallbackBridgePolicy(parsed.paperclipApiBridgePolicy);
-  const instructionWriteAgentIds = normalizeSandboxCallbackBridgeInstructionWriteAgentIds(
-    parsed.paperclipApiBridgeInstructionWriteAgentIds,
-  );
   return {
     ...(policy !== "restricted" ? { paperclipApiBridgePolicy: policy } : {}),
     ...(typeof parsed.paperclipApiBridgeCompanyId === "string" && parsed.paperclipApiBridgeCompanyId.trim()
       ? { paperclipApiBridgeCompanyId: parsed.paperclipApiBridgeCompanyId.trim() }
-      : {}),
-    ...(instructionWriteAgentIds.length > 0
-      ? { paperclipApiBridgeInstructionWriteAgentIds: instructionWriteAgentIds }
       : {}),
   };
 }
@@ -4288,15 +4274,14 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // forward budget (30 s) when the caller sets no option, so current behavior
   // does not change.
   const forwardTimeoutMs = input.forwardTimeoutMs ?? DEFAULT_DUPLEX_BROKER_BUDGETS.forwardTimeoutMs;
-  // One route authorizer for both transports, bound to the policy, company
-  // and instruction-writable agents the host stamped on the target. An
-  // unstamped target keeps the restricted allowlist.
+  // One route authorizer for both transports, bound to the policy and company
+  // the host stamped on the target. An unstamped target keeps the restricted
+  // allowlist.
   const authorizeBridgeRequest = createSandboxCallbackBridgeAuthorizer({
     policy: input.routePolicy
       ? normalizeSandboxCallbackBridgePolicy(input.routePolicy)
       : adapterExecutionTargetPaperclipApiBridgePolicy(target),
     companyId: target.paperclipApiBridgeCompanyId ?? null,
-    instructionWriteAgentIds: target.paperclipApiBridgeInstructionWriteAgentIds ?? null,
   });
 
   const runtimeRootDir =

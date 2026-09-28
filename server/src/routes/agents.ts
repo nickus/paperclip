@@ -240,6 +240,7 @@ import {
   changeConsentGateService,
   touchesAgentProfileChangeConsentFields,
 } from "../services/change-consent-gate.js";
+import { heartbeatRunUsesPaperclipApiBridge } from "../services/run-api-bridge.js";
 import {
   PaperclipRunnerProviderProfileError,
   resolvePaperclipRunnerProviderProfile,
@@ -248,6 +249,10 @@ import { managedAgentProfileService } from "../services/managed-agent-profiles.j
 import { remoteAgentProfileService } from "../services/remote-agent-profiles.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
+const BRIDGED_RUN_CHANGE_CONSENT_REQUIRED =
+  "Runs in a remote execution environment need an accepted change consent for this change, "
+  + "even with agents:configure: a request_confirmation bound to this target, created in an earlier run "
+  + "and accepted by a board user.";
 
 function requireAgentSkillAssignmentMode(req: Request, _res: Response, next: NextFunction) {
   if (!AGENT_SKILL_ASSIGNMENT_MODES.includes(req.body?.mode)) {
@@ -2791,23 +2796,33 @@ export function agentRoutes(
       scope: changeScope,
     });
     if (decision.allowed) {
+      // An agent run that reaches the API through a remote execution
+      // environment's bridge applies these changes only with a change consent
+      // a board user accepted, which the change consumes, even under a direct
+      // change grant. Whether the run is bridged comes from the run's
+      // environment lease, looked up by the actor's run id (the signed run
+      // claim of an agent JWT, which the bridge forwards and a run cannot
+      // change); no other request input decides it.
+      if (
+        req.actor.type === "agent"
+        && await heartbeatRunUsesPaperclipApiBridge(db, {
+          companyId: targetAgent.companyId,
+          runId: req.actor.runId,
+        })
+      ) {
+        await consumeChangeConsentOrForbid(req, targetAgent.companyId, targetKeys, {
+          explanation: BRIDGED_RUN_CHANGE_CONSENT_REQUIRED,
+          details: { reason: "deny_missing_consent" },
+        });
+      }
       return;
     }
 
     if (decision.reason === "deny_missing_consent" && req.actor.type === "agent" && targetKeys.length > 0) {
-      try {
-        await changeConsentGateService(db).assertConsented({
-          companyId: targetAgent.companyId,
-          actorAgentId: req.actor.agentId,
-          actorRunId: req.actor.runId ?? null,
-          targetKeys,
-        });
-      } catch (err) {
-        if (err instanceof HttpError && err.status === 403) {
-          throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
-        }
-        throw err;
-      }
+      await consumeChangeConsentOrForbid(req, targetAgent.companyId, targetKeys, {
+        explanation: decision.explanation,
+        details: authorizationDeniedDetails(decision),
+      });
 
       const consentedDecision = await access.decide({
         actor: req.actor,
@@ -2822,6 +2837,30 @@ export function agentRoutes(
     }
 
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+  }
+
+  // Consume a board-accepted change consent for `targetKeys`, or refuse the
+  // change with `refusal`.
+  async function consumeChangeConsentOrForbid(
+    req: Request,
+    companyId: string,
+    targetKeys: string[],
+    refusal: { explanation: string; details: Record<string, unknown> },
+  ) {
+    let consented = false;
+    try {
+      consented = await changeConsentGateService(db).assertConsented({
+        companyId,
+        actorAgentId: req.actor.agentId,
+        actorRunId: req.actor.runId ?? null,
+        targetKeys,
+      });
+    } catch (err) {
+      if (!(err instanceof HttpError && err.status === 403)) throw err;
+    }
+    if (!consented) {
+      throw forbidden(refusal.explanation, refusal.details);
+    }
   }
 
   async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {

@@ -36,26 +36,6 @@ describe("Paperclip API bridge policy on execution targets", () => {
     }
   });
 
-  it("keeps a well-formed instruction-writable agent list through a round trip, and drops a malformed one", () => {
-    for (const target of [sshTarget, sandboxTarget]) {
-      const parsed = parseAdapterExecutionTarget({
-        ...target,
-        paperclipApiBridgePolicy: "agent-with-instruction-writes",
-        paperclipApiBridgeCompanyId: "company-1",
-        paperclipApiBridgeInstructionWriteAgentIds: [" Agent-2 ", "agent-3", "", 4],
-      });
-      expect(parsed).toMatchObject({ paperclipApiBridgeInstructionWriteAgentIds: ["agent-2", "agent-3"] });
-      for (const value of [undefined, null, "agent-2", [], [""], { 0: "agent-2" }]) {
-        const malformed = parseAdapterExecutionTarget({
-          ...target,
-          paperclipApiBridgePolicy: "agent-with-instruction-writes",
-          paperclipApiBridgeInstructionWriteAgentIds: value,
-        });
-        expect(malformed, JSON.stringify(value)).not.toHaveProperty("paperclipApiBridgeInstructionWriteAgentIds");
-      }
-    }
-  });
-
   it("fails closed to the restricted policy for any other value", () => {
     for (const value of [
       undefined,
