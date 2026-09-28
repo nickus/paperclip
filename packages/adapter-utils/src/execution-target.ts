@@ -1817,6 +1817,55 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
   };
 }
 
+// Builds the PATH-fixup snippet staged into every rc file a managed GitHub
+// launch may source (.profile, the bash rc/profile files, and — since
+// BASH_ENV and these same dotfiles are also read by a plain login/non-login
+// shell a tool spawns for its own purposes, e.g. a test runner building its
+// own child-process PATH — the zsh dotfiles too). It must therefore be
+// POSIX-sh source that a bare `sh`, `bash`, or `zsh` (zsh sources its
+// dotfiles with its own, non-sh-emulating parser) all execute the same way:
+// no bash-only substitutions, and no unquoted expansion of a PATH entry
+// that could let the shell glob it against the filesystem — so this avoids
+// `for x in $list`/IFS splitting entirely and only ever uses `case` and
+// `#`/`%` pattern-trim parameter expansion, neither of which performs
+// filename expansion on the string being matched.
+//
+// Login shells may reorder PATH through /etc/profile or path_helper after
+// this file runs, and a tool may build its own PATH for a child shell it
+// spawns. Either way the launchers must still win, so this keeps whatever
+// PATH is current at *source* time — not the one captured when the
+// launchers were staged — and only removes every existing copy of the
+// launcher directory before putting it back at the front. That also makes
+// sourcing idempotent: a second sourcing finds its own prior insertion,
+// removes it, and reinserts it in the same place, so PATH never grows.
+// Falls back to the staging-time PATH when this shell's PATH is unset or
+// empty.
+function githubOperationLauncherPathRc(directory: string, basePath: string): string {
+  return [
+    `_paperclip_launcher_dir=${shellQuote(directory)}`,
+    `_paperclip_launcher_base=${shellQuote(basePath)}`,
+    `_paperclip_launcher_list=":\${PATH:-$_paperclip_launcher_base}:"`,
+    `while`,
+    `  case $_paperclip_launcher_list in`,
+    `    *":$_paperclip_launcher_dir:"*) true ;;`,
+    `    *) false ;;`,
+    `  esac`,
+    `do`,
+    `  _paperclip_launcher_list=\${_paperclip_launcher_list%%":$_paperclip_launcher_dir:"*}:\${_paperclip_launcher_list#*":$_paperclip_launcher_dir:"}`,
+    `done`,
+    `_paperclip_launcher_list=\${_paperclip_launcher_list#:}`,
+    `_paperclip_launcher_list=\${_paperclip_launcher_list%:}`,
+    `if [ -z "$_paperclip_launcher_list" ]; then`,
+    `  PATH=$_paperclip_launcher_dir`,
+    `else`,
+    `  PATH="$_paperclip_launcher_dir:$_paperclip_launcher_list"`,
+    `fi`,
+    `export PATH`,
+    `unset _paperclip_launcher_dir _paperclip_launcher_base _paperclip_launcher_list`,
+    ``,
+  ].join("\n");
+}
+
 /** Stage token-free launchers next to the execution, not in shared global Git config. */
 export async function prepareGitHubOperationLaunchers(input: {
   runId: string; target: AdapterExecutionTarget | null | undefined; cwd: string; env: Record<string, string>;
@@ -1828,13 +1877,16 @@ export async function prepareGitHubOperationLaunchers(input: {
   const managedPath = basePath ? `${directory}:${basePath}` : directory;
   // Login shells may reorder PATH through /etc/profile or path_helper. Restore
   // the managed launchers after startup without loading a host user's profile.
+  // The rc body keeps the PATH current when it is sourced (with the launcher
+  // directory first) instead of the PATH captured when the launchers were
+  // staged; see githubOperationLauncherPathRc.
   // Empty merge overrides clear host identity before launch, but Git treats
   // them as an explicit empty author. Remove them once the shell has inherited
   // its final environment; preserve nonempty per-operation identity values.
   const clearEmptyGitIdentity = ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"]
     .map((key) => `if [ -z "\${${key}-}" ]; then unset ${key}; fi\n`)
     .join("");
-  const profile = `export PATH=${shellQuote(managedPath)}\n${clearEmptyGitIdentity}`;
+  const profile = `${githubOperationLauncherPathRc(directory, basePath)}${clearEmptyGitIdentity}`;
   const files: Record<string, string> = Object.fromEntries([
     // Remote launchers live beneath the checkout. Pin their own package scope
     // so an enclosing project's "type": "module" cannot reinterpret require().
