@@ -23957,6 +23957,10 @@ export function heartbeatService(
                     hostApiToken: adapterEnv.PAPERCLIP_GITHUB_BROKER_TOKEN,
                     hostApiUrl: adapterEnv.PAPERCLIP_GITHUB_BROKER_URL,
                     onLog,
+                    // This bridge only carries GitHub credential requests,
+                    // so it keeps the restricted routes whatever policy the
+                    // environment grants the agent's own API bridge.
+                    routePolicy: "restricted",
                   });
               } catch {
                 await onLog(

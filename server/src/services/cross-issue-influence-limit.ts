@@ -1,6 +1,6 @@
-import { and, count, eq } from "drizzle-orm";
+import { and, asc, count, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -10,6 +10,8 @@ export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.00
 
 const CROSS_ISSUE_INFLUENCE_ACTIVITY = "issue.cross_issue_influence_observed";
 const CROSS_ISSUE_INFLUENCE_REJECTED_ACTIVITY = "issue.cross_issue_influence_cap_rejected";
+// Records the one issue a run without a task has taken as its own task.
+const UNBOUND_RUN_TASK_CLAIMED_ACTIVITY = "issue.unbound_run_task_claimed";
 
 /**
  * Every kind shares one per-run counter. `interaction_resolution` covers the
@@ -110,12 +112,63 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
-    if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
-    ) {
-      return null;
+    if (sourceIssueId) {
+      if (
+        sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      ) {
+        return null;
+      }
+    } else {
+      // A run woken without a task (an on-demand or timer wake) has no source
+      // issue. The first issue it writes to among those it checked out with
+      // this run becomes its task, so writes there are free, as they are on a
+      // bound run's source issue. Like a bound run, it gets one such issue:
+      // every other write, including one to a second issue it checked out, is
+      // counted against the same per-run cap. The run row lock above
+      // serializes the claim.
+      const claimedIssueId = await tx
+        .select({ issueId: activityLog.entityId })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, input.companyId),
+          eq(activityLog.runId, input.runId),
+          eq(activityLog.action, UNBOUND_RUN_TASK_CLAIMED_ACTIVITY),
+        ))
+        .orderBy(asc(activityLog.createdAt))
+        .limit(1)
+        .then((rows) => rows[0]?.issueId ?? null);
+      if (claimedIssueId) {
+        if (claimedIssueId === input.targetIssueId) return null;
+      } else {
+        const ownsTarget = await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(and(
+            eq(issues.id, input.targetIssueId),
+            eq(issues.companyId, input.companyId),
+            or(eq(issues.checkoutRunId, input.runId), eq(issues.executionRunId, input.runId)),
+          ))
+          .then((rows) => rows.length > 0);
+        if (ownsTarget) {
+          await tx.insert(activityLog).values({
+            companyId: input.companyId,
+            actorType: "agent",
+            actorId: input.agentId,
+            agentId: input.agentId,
+            runId: input.runId,
+            responsibleUserId: input.responsibleUserId ?? run.responsibleUserId ?? null,
+            action: UNBOUND_RUN_TASK_CLAIMED_ACTIVITY,
+            entityType: "issue",
+            entityId: input.targetIssueId,
+            details: {
+              targetIssueId: input.targetIssueId,
+              targetIssueIdentifier: input.targetIssueIdentifier ?? null,
+            },
+          });
+          return null;
+        }
+      }
     }
 
     const priorCount = await tx
@@ -143,7 +196,7 @@ export async function observeCrossIssueInfluence(
       entityId: input.targetIssueId,
       details: {
         kind: input.kind,
-        sourceIssueId,
+        sourceIssueId: sourceIssueId ?? null,
         targetIssueId: input.targetIssueId,
         targetIssueIdentifier: input.targetIssueIdentifier ?? null,
         count: decision.count,
@@ -159,7 +212,7 @@ export async function observeCrossIssueInfluence(
       companyId: input.companyId,
       runId: input.runId,
       agentId: input.agentId,
-      sourceIssueId,
+      sourceIssueId: sourceIssueId ?? null,
       targetIssueId: input.targetIssueId,
       kind: input.kind,
       count: decision.count,

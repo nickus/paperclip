@@ -577,6 +577,21 @@ export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
 export const ENVIRONMENT_DRIVERS = ["local", "ssh", "sandbox", "plugin"] as const;
 export type EnvironmentDriver = (typeof ENVIRONMENT_DRIVERS)[number];
 
+/**
+ * Route policies for the Paperclip API bridge that remote (SSH and sandbox)
+ * environments use to reach the control plane.
+ *
+ * - `restricted` (the default) forwards only the fixed route list the
+ *   Paperclip skill documents.
+ * - `agent` forwards the route families agents use for their work, minus a
+ *   fixed denylist (secret values, credentials, environment configuration,
+ *   unscrubbed host output, irreversible deletes, costs, and instance/company
+ *   administration). The server still authorizes every forwarded call for
+ *   the agent.
+ */
+export const SANDBOX_CALLBACK_BRIDGE_POLICIES = ["restricted", "agent"] as const;
+export type SandboxCallbackBridgePolicy = (typeof SANDBOX_CALLBACK_BRIDGE_POLICIES)[number];
+
 export const ENVIRONMENT_STATUSES = ["active", "archived"] as const;
 export type EnvironmentStatus = (typeof ENVIRONMENT_STATUSES)[number];
 

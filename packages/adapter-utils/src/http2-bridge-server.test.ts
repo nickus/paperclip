@@ -37,6 +37,7 @@ import {
   type Http2BridgeGoawayRecord,
 } from "./http2-bridge-server.js";
 import {
+  createSandboxCallbackBridgeAuthorizer,
   createSandboxHttp2BridgeGateway,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
   HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
@@ -95,6 +96,7 @@ interface TestPairOptions {
   responseWriteSettleDeadlineMs?: number;
   maxBodyBytes?: number;
   routes?: readonly SandboxCallbackBridgeRouteRule[];
+  authorizeRequest?: (request: { method: string; path: string }) => string | null;
   onGoaway?: (record: Http2BridgeGoawayRecord) => void;
   onSessionError?: (error: Error) => void;
   onSession?: (session: http2.ServerHttp2Session) => void;
@@ -124,6 +126,7 @@ function bindTestServer(options: TestPairOptions = {}) {
     responseWriteSettleDeadlineMs: options.responseWriteSettleDeadlineMs,
     maxBodyBytes: options.maxBodyBytes,
     routes: options.routes,
+    authorizeRequest: options.authorizeRequest,
     onGoaway: options.onGoaway,
     onSessionError: options.onSessionError,
     onSession: options.onSession,
@@ -1936,6 +1939,65 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
         if (status === 200) expect(JSON.parse(response.body!.toString())).toEqual(schema);
       }
       expect(forwarded).toEqual(["GET /api/openapi.json"]);
+    } finally {
+      await gateway.close();
+      await handle.close();
+    }
+  });
+
+  it("applies an agent-policy authorizer in place of the route allowlist", async () => {
+    const forwarded: string[] = [];
+    const { gateway, handle } = createTestPair({
+      forwardRequest: async (request) => {
+        forwarded.push(`${request.method} ${request.pathname}`);
+        return { status: 200, body: Buffer.from("{}") };
+      },
+      authorizeRequest: createSandboxCallbackBridgeAuthorizer({ policy: "agent", companyId: "co-1" }),
+    });
+    try {
+      const statuses: Array<[string, string, number, string | null]> = [];
+      for (const [method, path] of [
+        ["GET", "/api/companies/co-1/heartbeat-runs"],
+        ["GET", "/api/agents/agent-2/instructions-bundle"],
+        ["GET", "/api/agents/me/secrets"],
+        ["PATCH", "/api/agents/agent-1"],
+        ["GET", "/api/companies/co-2/issues"],
+      ] as const) {
+        const response = await gateway.forwardRequest({
+          method, path, query: "", headers: {}, body: Buffer.alloc(0), receivedToken: BRIDGE_TOKEN,
+        });
+        const body = response.body ? JSON.parse(response.body.toString()) as { error?: string } : {};
+        statuses.push([method, path, response.status, body.error ?? null]);
+      }
+      expect(statuses.map(([, , status]) => status)).toEqual([200, 200, 403, 403, 403]);
+      for (const [, , , error] of statuses.slice(2)) {
+        expect(error).toContain('bridge policy "agent"');
+      }
+      expect(forwarded).toEqual([
+        "GET /api/companies/co-1/heartbeat-runs",
+        "GET /api/agents/agent-2/instructions-bundle",
+      ]);
+    } finally {
+      await gateway.close();
+      await handle.close();
+    }
+  });
+
+  it("keeps the restricted allowlist when no authorizer is set", async () => {
+    const { gateway, handle } = createTestPair();
+    try {
+      const response = await gateway.forwardRequest({
+        method: "GET",
+        path: "/api/companies/co-1/heartbeat-runs",
+        query: "",
+        headers: {},
+        body: Buffer.alloc(0),
+        receivedToken: BRIDGE_TOKEN,
+      });
+      expect(response.status).toBe(403);
+      expect(JSON.parse(response.body!.toString())).toEqual({
+        error: "Route not allowed: GET /api/companies/co-1/heartbeat-runs",
+      });
     } finally {
       await gateway.close();
       await handle.close();
