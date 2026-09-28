@@ -102,24 +102,35 @@ export async function prepareHeartbeatRunScratch(input: {
   return { dir, markerPath, metadata };
 }
 
-export function buildHeartbeatRunScratchEnv(
+/**
+ * Env that points a run at its scratch directory `dir`. The temp keys
+ * (TMPDIR, TEMP, TMP) are set too, unless the agent config already sets them.
+ */
+export function buildRunScratchEnvForDir(
   existingEnv: Record<string, unknown>,
-  scratch: HeartbeatRunScratch,
+  dir: string,
 ): HeartbeatRunScratchEnvResult {
   const env: Record<string, string> = {
-    PAPERCLIP_RUN_SCRATCH_DIR: scratch.dir,
-    PAPERCLIP_TASK_SCRATCH_DIR: scratch.dir,
-    PAPERCLIP_SCRATCH_DIR: scratch.dir,
-    PAPERCLIP_TMPDIR: scratch.dir,
+    PAPERCLIP_RUN_SCRATCH_DIR: dir,
+    PAPERCLIP_TASK_SCRATCH_DIR: dir,
+    PAPERCLIP_SCRATCH_DIR: dir,
+    PAPERCLIP_TMPDIR: dir,
   };
   const tempKeysApplied: string[] = [];
   for (const key of TEMP_ENV_KEYS) {
     const existing = existingEnv[key];
     if (typeof existing === "string" && existing.trim().length > 0) continue;
-    env[key] = scratch.dir;
+    env[key] = dir;
     tempKeysApplied.push(key);
   }
   return { env, tempKeysApplied };
+}
+
+export function buildHeartbeatRunScratchEnv(
+  existingEnv: Record<string, unknown>,
+  scratch: HeartbeatRunScratch,
+): HeartbeatRunScratchEnvResult {
+  return buildRunScratchEnvForDir(existingEnv, scratch.dir);
 }
 
 export async function cleanupHeartbeatRunScratch(input: {

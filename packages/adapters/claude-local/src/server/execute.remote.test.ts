@@ -10,6 +10,7 @@ const {
   resolveCommandForLogs,
   prepareWorkspaceForSshExecution,
   restoreWorkspaceFromSshExecution,
+  runSshCommand,
   syncDirectoryToSsh,
   startAdapterExecutionTargetPaperclipBridge,
 } = vi.hoisted(() => ({
@@ -32,6 +33,7 @@ const {
   resolveCommandForLogs: vi.fn(async () => "ssh://fixture@127.0.0.1:2222/remote/workspace :: claude"),
   prepareWorkspaceForSshExecution: vi.fn(async () => ({ gitBacked: false })),
   restoreWorkspaceFromSshExecution: vi.fn(async () => undefined),
+  runSshCommand: vi.fn(async () => ({ stdout: "", stderr: "" })),
   syncDirectoryToSsh: vi.fn(async () => undefined),
   startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => ({
     env: {
@@ -63,6 +65,7 @@ vi.mock("@paperclipai/adapter-utils/ssh", async () => {
     ...actual,
     prepareWorkspaceForSshExecution,
     restoreWorkspaceFromSshExecution,
+    runSshCommand,
     syncDirectoryToSsh,
   };
 });
@@ -77,7 +80,9 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
+import type { AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { execute } from "./execute.js";
+import { sessionCodec } from "./index.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
 
 describe("claude remote execution", () => {
@@ -348,6 +353,108 @@ describe("claude remote execution", () => {
     const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
     expect(call?.[2]).toContain("--resume");
     expect(call?.[2]).toContain("12345678-1234-4abc-9def-123456789012");
+  });
+
+  it("resumes the session of an earlier run of the same task from the stable SSH workspace", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-stable-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    const key = "0123456789abcdef0123456789abcdef";
+    const stableWorkspace = `/remote/workspace/.paperclip-runtime/workspaces/${key}/workspace`;
+    const target = (leaseId: string): AdapterSshExecutionTarget => ({
+      kind: "remote",
+      transport: "ssh",
+      environmentId: "env-1",
+      leaseId,
+      remoteCwd: "/remote/workspace",
+      spec: {
+        host: "127.0.0.1",
+        port: 2222,
+        username: "fixture",
+        remoteWorkspacePath: "/remote/workspace",
+        remoteCwd: "/remote/workspace",
+        privateKey: "PRIVATE KEY",
+        knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+        strictHostKeyChecking: true,
+      },
+      workspaceReuseKey: key,
+    });
+    const sessionId = "12345678-1234-4abc-9def-123456789012";
+    runChildProcess.mockImplementation(async (_runId: string, _command: string, args: string[]) => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: args.includes("--version")
+        ? "2.1.251 (Claude Code)\n"
+        : [
+            JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: "claude-sonnet" }),
+            JSON.stringify({ type: "result", session_id: sessionId, result: "done", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }),
+          ].join("\n"),
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    }));
+    const logs: string[] = [];
+    const base = {
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      config: { engine: "cli", command: "claude" },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      onLog: async (_stream: "stdout" | "stderr", chunk: string) => {
+        logs.push(chunk);
+      },
+    };
+
+    try {
+      const first = await execute({
+        ...base,
+        runId: "run-1",
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: "task-1" },
+        executionTarget: target("lease-1"),
+      });
+      expect(first.sessionParams).toMatchObject({
+        sessionId,
+        remoteExecution: {
+          transport: "ssh",
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteCwd: stableWorkspace,
+        },
+      });
+      // The host stores the session through the codec, as a JSON column.
+      const saved = sessionCodec.deserialize(
+        JSON.parse(JSON.stringify(sessionCodec.serialize(first.sessionParams ?? null))),
+      );
+      const firstRun = runChildProcess.mock.calls.find((entry) => !entry[2].includes("--version")) as unknown as
+        | [string, string, string[], { remoteExecution?: { remoteCwd: string } | null }]
+        | undefined;
+      expect(firstRun?.[3].remoteExecution?.remoteCwd).toBe(stableWorkspace);
+      runChildProcess.mockClear();
+
+      await execute({
+        ...base,
+        runId: "run-2",
+        runtime: { sessionId, sessionParams: saved, sessionDisplayId: sessionId, taskKey: "task-1" },
+        executionTarget: target("lease-2"),
+      });
+
+      const secondRun = runChildProcess.mock.calls.find((entry) => !entry[2].includes("--version")) as unknown as
+        | [string, string, string[], { remoteExecution?: { remoteCwd: string } | null }]
+        | undefined;
+      expect(secondRun?.[2]).toContain("--resume");
+      expect(secondRun?.[2]).toContain(sessionId);
+      expect(secondRun?.[3].remoteExecution?.remoteCwd).toBe(stableWorkspace);
+      expect(logs.join("")).not.toContain("will not be resumed");
+    } finally {
+      runChildProcess.mockReset();
+    }
   });
 
   it("forwards the duplex_channel_lost transport code on the unparsed Claude result path", async () => {

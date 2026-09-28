@@ -278,16 +278,56 @@ describe("adapter session codecs", () => {
 
   it.each([
     ["claude", claudeSessionCodec, "11111111-1111-4111-8111-111111111111"],
-    ["codex", codexSessionCodec, "codex-session-1"],
     ["opencode", opencodeSessionCodec, "ses_opencode_1"],
-  ] as const)("does not keep SSH or malformed execution identities for %s sessions", (_name, codec, sessionId) => {
-    expect(
-      codec.serialize({
+  ] as const)(
+    "keeps the SSH execution identity of %s sessions, without key material, so they can resume on the same host",
+    (_name, codec, sessionId) => {
+      const remoteCwd = "/home/agent/work/.paperclip-runtime/workspaces/0123456789abcdef0123456789abcdef/workspace";
+      const remoteExecution = {
+        transport: "ssh",
+        host: "ssh.example.test",
+        port: 22,
+        username: "paperclip",
+        remoteCwd,
+      };
+      const serialized = codec.serialize({
         sessionId,
+        cwd: remoteCwd,
+        remoteExecution: {
+          ...remoteExecution,
+          privateKey: "PRIVATE KEY",
+          knownHosts: "KNOWN HOSTS",
+          spec: { privateKey: "PRIVATE KEY" },
+        },
+      });
+      expect(serialized).toEqual({ sessionId, cwd: remoteCwd, remoteExecution });
+      expect(JSON.stringify(serialized)).not.toContain("PRIVATE KEY");
+      expect(codec.deserialize(JSON.parse(JSON.stringify(serialized)))).toEqual({
+        sessionId,
+        cwd: remoteCwd,
+        remoteExecution,
+      });
+    },
+  );
+
+  it("does not keep SSH execution identities for codex sessions, whose session files are staged per run", () => {
+    expect(
+      codexSessionCodec.serialize({
+        sessionId: "codex-session-1",
         remoteExecution: { transport: "ssh", host: "ssh.example.test", port: 22, username: "paperclip" },
       }),
-    ).toEqual({ sessionId });
+    ).toEqual({ sessionId: "codex-session-1" });
+  });
+
+  it.each([
+    ["claude", claudeSessionCodec, "11111111-1111-4111-8111-111111111111"],
+    ["codex", codexSessionCodec, "codex-session-1"],
+    ["opencode", opencodeSessionCodec, "ses_opencode_1"],
+  ] as const)("does not keep malformed or unknown execution identities for %s sessions", (_name, codec, sessionId) => {
     expect(codec.deserialize({ sessionId, remoteExecution: "sandbox" })).toEqual({ sessionId });
+    expect(
+      codec.serialize({ sessionId, remoteExecution: { transport: "local", remoteCwd: "/workspace" } }),
+    ).toEqual({ sessionId });
   });
 });
 

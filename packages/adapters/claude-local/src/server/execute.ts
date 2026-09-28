@@ -806,6 +806,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   } else if (
     runtimeSessionId &&
     isValidUuid &&
+    // A remote session saves the host cwd, which never equals the remote
+    // working directory; only report a session that is really not resumed.
+    !canResumeSession &&
     runtimeSessionCwd.length > 0 &&
     path.resolve(runtimeSessionCwd) !== path.resolve(effectiveExecutionCwd)
   ) {
