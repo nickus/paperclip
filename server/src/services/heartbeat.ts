@@ -21581,10 +21581,14 @@ export function heartbeatService(
         issueRef?.executionWorkspacePreference ?? null;
       let issueExecutionWorkspaceModeForRun =
         issueExecutionWorkspaceSettings?.mode ?? null;
-      const warmReusableExecutionWorkspace =
+      // A sandbox environment that keeps its sandbox between runs (`reuseLease`,
+      // with or without a warm runner) hands a retained sandbox back only to a
+      // run on the same execution workspace. Keep the issue on the workspace
+      // its first run persisted; otherwise every run of a shared-workspace issue
+      // creates a new workspace row and never finds its sandbox again.
+      const reusableSandboxExecutionWorkspace =
         selectedEnvironmentForConfig?.driver === "sandbox" &&
-        selectedEnvironmentConfigForFingerprint.reuseLease === true &&
-        selectedEnvironmentConfigForFingerprint.runnerLifecycleMode === "warm";
+        selectedEnvironmentConfigForFingerprint.reuseLease === true;
       const bindIssueToPersistedExecutionWorkspace = async (
         workspace: ExecutionWorkspace | null,
       ) => {
@@ -21598,7 +21602,7 @@ export function heartbeatService(
           issueRef?.executionWorkspacePreference === "reuse_existing" ||
           requestedExecutionWorkspaceMode === "isolated_workspace" ||
           requestedExecutionWorkspaceMode === "operator_branch" ||
-          warmReusableExecutionWorkspace;
+          reusableSandboxExecutionWorkspace;
         const nextIssuePatch: Record<string, unknown> = {};
         if (issueExecutionWorkspaceIdForRun !== workspace.id) {
           nextIssuePatch.executionWorkspaceId = workspace.id;
@@ -21627,7 +21631,7 @@ export function heartbeatService(
             db,
             undefined,
             undefined,
-            { bindRuntimeSharedWorkspace: warmReusableExecutionWorkspace && workspace.mode === "shared_workspace" },
+            { bindRuntimeSharedWorkspace: reusableSandboxExecutionWorkspace && workspace.mode === "shared_workspace" },
           );
           issueExecutionWorkspaceIdForRun = workspace.id;
           issueProjectWorkspaceIdForRun =

@@ -99,7 +99,7 @@ The provider creates a workload-owned policy selected by the task run label, so 
 
 ### Reusable sandboxes (`reuseLease`)
 
-By default every run gets a fresh sandbox that is deleted when the run ends, so an agent re-clones its repositories and starts a new harness session on every follow-up run. With `reuseLease: true` (sandbox-cr backend only) the plugin keeps **one sandbox per task** instead: per reuse scope of company, environment, execution workspace, agent and adapter. With `isolated_workspace` execution workspaces that is one sandbox per issue and agent. The next run on the same task resumes the same pod, so both of these carry over:
+By default every run gets a fresh sandbox that is deleted when the run ends, so an agent re-clones its repositories and starts a new harness session on every follow-up run. With `reuseLease: true` (sandbox-cr backend only) the plugin keeps **one sandbox per task** instead: per reuse scope of company, environment, execution workspace, agent and adapter. While the selected environment reuses leases, the host keeps each issue on the execution workspace its first run created, also in the shared project workspace, so that is one sandbox per issue and agent. The next run on the same task resumes the same pod, so both of these carry over:
 
 - the harness session: the OpenCode session store and Claude's config/session directory live under `/workspace/.paperclip-runtime/<adapter>/` (the harness `HOME`; with a managed AI connection, OpenCode keeps one home per account there), and the session resumes because the run keeps the same provider lease and the same working directory (`/workspace`);
 - the environment: dependency and build directories in the working tree (`node_modules`, `vendor`, `dist`, `build`, `out`, `coverage`, `.next`, `.turbo`, `.cache`, `target`, `.venv`, `venv`, `__pycache__`, `.gradle`, `.pytest_cache`, `.mypy_cache`, `.tox`, at any depth), `$HOME` caches (`~/.cache`, `~/.npm`, `~/.cargo`, ...) under `.paperclip-runtime`, `/tmp`, and `/home/paperclip`.
@@ -197,6 +197,8 @@ Every agent pod is:
 - `automountServiceAccountToken: true` (for the agent shim's paperclip-server callback)
 
 Plus per-namespace `pod-security.kubernetes.io/enforce: restricted` and a deny-all NetworkPolicy baseline with explicit egress allow-list (DNS, paperclip-server, configured FQDNs/CIDRs).
+
+Directories synced back from a sandbox are checked on the host before anything is extracted: an archive with a member that would land outside the target directory, or a symlink whose target leaves it (an absolute target, or `..` above its root), is refused as a whole. So that one stray link does not fail the whole transfer, the pod leaves such symlinks out (unless the mapping follows symlinks) and names them in a warning. Leaving out nested ones needs GNU tar in the runtime image; the `agent-runtime-*` images are Ubuntu-based and ship it. With another tar (busybox, bsdtar) only top-level ones are left out, and a nested one still fails the transfer.
 
 The per-run Secret carrying the bootstrap token and adapter API keys has `ownerReferences` pointing at the owning Job, so a single `kubectl delete job …` cascades cleanly to the Pod and Secret.
 
