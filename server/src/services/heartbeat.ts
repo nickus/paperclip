@@ -721,7 +721,9 @@ const STALE_TERMINAL_RUN_LEASE_PAGE_SIZE = 20;
 // A terminal run's lease is stale only after both the run finished and the
 // lease last changed this long ago. A live executor (possibly still inside a
 // slow provider acquire when the run was cancelled) releases its own lease
-// well within this window; the grace keeps the reaper from racing it.
+// well within this window; the grace keeps the reaper from racing it. The
+// periodic reaper tick passes its own, shorter staleness threshold so this
+// release reaches a legacy run's lease before the orphaned-active-lease sweep.
 export const STALE_TERMINAL_RUN_LEASE_GRACE_MS = 10 * 60 * 1000;
 
 // A provider or plugin destroy rejection can carry a bearer credential, a
@@ -732,6 +734,7 @@ export const STALE_TERMINAL_RUN_LEASE_GRACE_MS = 10 * 60 * 1000;
 const PENDING_CLEANUP_RETRY_ERROR_KIND = "destroy_failed";
 const PENDING_CLEANUP_SWEEP_ERROR_KIND = "sweep_failed";
 const ORPHANED_ACTIVE_LEASE_SWEEP_ERROR_KIND = "orphaned_active_lease_sweep_failed";
+const STALE_TERMINAL_RUN_LEASE_RELEASE_ERROR_KIND = "stale_terminal_run_lease_release_failed";
 
 // Read the stored retry attempt count as a safe value, directly in SQL. A
 // provider can write a malformed value under the attempts key. The type guard
@@ -10535,11 +10538,17 @@ export function heartbeatService(
         });
         runIds.push(run.id);
         // A confirmed stop may unblock the user's saved messages right away.
-        await resumeRemoteStopComments((await getRun(run.id)) ?? run).catch((err) => {
-          logger.warn({ err, runId: run.id }, "could not reconsider messages after stale lease release");
+        await resumeRemoteStopComments((await getRun(run.id)) ?? run).catch(() => {
+          logger.warn({ runId: run.id }, "could not reconsider messages after stale lease release");
         });
-      } catch (err) {
-        logger.warn({ err, runId }, "failed to reconcile stale environment lease for terminal run");
+      } catch {
+        // Log a constant errorKind only, like the reaper's lease sweeps: a
+        // provider release error can carry a credential in its message,
+        // cause, or stack.
+        logger.warn(
+          { errorKind: STALE_TERMINAL_RUN_LEASE_RELEASE_ERROR_KIND, runId },
+          "failed to reconcile stale environment lease for terminal run",
+        );
       }
     }
     return { reconciled: runIds.length, runIds };
@@ -19744,9 +19753,21 @@ export function heartbeatService(
     }
 
     // Release "active" leases left behind by terminal runs whose executor died
-    // before its teardown. Isolated like the sweep below.
+    // before its teardown. Isolated like the sweep below. The orphaned-lease
+    // sweep below covers the same leases but destroys the sandbox instead of
+    // releasing it through the provider (which keeps a reusable sandbox). This
+    // release runs first, and on the periodic tick with a grace no longer than
+    // the tick's staleness threshold, so it handles a legacy run's lease once
+    // it is stale for the sweep too; its claim moves `updatedAt`, so the sweep
+    // skips what it handled. The startup reap keeps the standalone grace: the
+    // sweep deliberately tears down leases of runs that ended just before the
+    // restart. Native runs are always left to the sweep.
     try {
-      const staleLeases = await reconcileStaleTerminalRunLeases();
+      const staleLeases = await reconcileStaleTerminalRunLeases(
+        staleThresholdMs > 0
+          ? { graceMs: Math.min(STALE_TERMINAL_RUN_LEASE_GRACE_MS, staleThresholdMs) }
+          : undefined,
+      );
       if (staleLeases.reconciled > 0) {
         logger.warn(
           { reconciled: staleLeases.reconciled, runIds: staleLeases.runIds },

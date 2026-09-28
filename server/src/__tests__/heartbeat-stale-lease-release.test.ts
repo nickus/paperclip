@@ -35,6 +35,7 @@ vi.mock("../middleware/logger.js", () => ({
   httpLogger: vi.fn(),
 }));
 
+import { logger } from "../middleware/logger.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import {
   heartbeatService,
@@ -291,6 +292,64 @@ describeEmbeddedPostgres("heartbeat environment lease release for stopped runs",
     expect(lease.releasedAt).not.toBeNull();
   });
 
+  // The reaper also runs a generic orphaned-active-lease sweep that moves such
+  // a lease to pending_cleanup and destroys its sandbox. For a legacy run's
+  // lease that is stale for both, the release path above goes first (a
+  // reusable sandbox is released through the provider instead of destroyed).
+  function recordingReleaseRuntime() {
+    const releaseRunLeases = vi.fn(async (runId: string) => {
+      await db
+        .update(environmentLeases)
+        .set({ status: "expired", releasedAt: new Date(), updatedAt: new Date() })
+        .where(eq(environmentLeases.heartbeatRunId, runId));
+      return [];
+    });
+    return { releaseRunLeases } as unknown as HeartbeatEnvironmentRuntime & {
+      releaseRunLeases: typeof releaseRunLeases;
+    };
+  }
+
+  it("releases a legacy run's stranded lease before the orphaned-lease sweep on the periodic tick", async () => {
+    const reaperThresholdMs = 5 * 60 * 1000;
+    // Stale for the reaper tick, but younger than the standalone grace.
+    const staleForTick = new Date(Date.now() - reaperThresholdMs - 60 * 1000);
+    expect(Date.now() - staleForTick.getTime()).toBeLessThan(STALE_TERMINAL_RUN_LEASE_GRACE_MS);
+    const { runId, leaseId } = await seedRunWithActiveLease({
+      runStatus: "cancelled",
+      finishedAt: staleForTick,
+      leaseUpdatedAt: staleForTick,
+    });
+    const runtime = recordingReleaseRuntime();
+
+    await heartbeatService(db, { environmentRuntime: runtime }).reapOrphanedRuns({
+      staleThresholdMs: reaperThresholdMs,
+    });
+
+    expect(runtime.releaseRunLeases.mock.calls.map((call) => call[0])).toEqual([runId]);
+    const lease = await leaseRow(leaseId);
+    expect(lease.status).toBe("expired");
+    expect(lease.failureReason).not.toBe("orphaned_active_lease_recovered");
+  });
+
+  it("releases a legacy run's stranded lease before the orphaned-lease sweep on the startup reap", async () => {
+    const longAgo = new Date(Date.now() - 2 * STALE_TERMINAL_RUN_LEASE_GRACE_MS);
+    const { runId, leaseId } = await seedRunWithActiveLease({
+      runStatus: "failed",
+      finishedAt: longAgo,
+      leaseUpdatedAt: longAgo,
+    });
+    const runtime = recordingReleaseRuntime();
+
+    // The startup reap has no staleness threshold, so the sweep would take
+    // every stranded lease at once; one past the grace is released instead.
+    await heartbeatService(db, { environmentRuntime: runtime }).reapOrphanedRuns();
+
+    expect(runtime.releaseRunLeases.mock.calls.map((call) => call[0])).toEqual([runId]);
+    const lease = await leaseRow(leaseId);
+    expect(lease.status).toBe("expired");
+    expect(lease.failureReason).not.toBe("orphaned_active_lease_recovered");
+  });
+
   it("leaves a terminal run's lease alone within the grace period", async () => {
     const recent = new Date(Date.now() - 60 * 1000);
     const { leaseId } = await seedRunWithActiveLease({
@@ -398,6 +457,42 @@ describeEmbeddedPostgres("heartbeat environment lease release for stopped runs",
     const lease = await leaseRow(leaseId);
     expect(lease.status).toBe("active");
     expect(lease.updatedAt.getTime()).toBeGreaterThan(longAgo.getTime());
+  });
+
+  it("logs a constant error kind and never the exception when a release fails", async () => {
+    const sentinel = "Bearer sk-SENTINEL-d4e5f6";
+    const longAgo = new Date(Date.now() - 2 * STALE_TERMINAL_RUN_LEASE_GRACE_MS);
+    const { runId } = await seedRunWithActiveLease({
+      runStatus: "cancelled",
+      finishedAt: longAgo,
+      leaseUpdatedAt: longAgo,
+    });
+    const realUpdate = db.update.bind(db);
+    const updateSpy = vi.spyOn(db, "update").mockImplementation(((table: unknown) => {
+      if (table === environmentLeases) {
+        const failure = new Error(`lease claim failed: ${sentinel}`);
+        (failure as { code?: string }).code = `ECLAIM ${sentinel}`;
+        throw failure;
+      }
+      return realUpdate(table as Parameters<typeof realUpdate>[0]);
+    }) as typeof db.update);
+    vi.mocked(logger.warn).mockClear();
+
+    try {
+      const result = await heartbeatService(db).reconcileStaleTerminalRunLeases();
+      expect(result.reconciled).toBe(0);
+    } finally {
+      updateSpy.mockRestore();
+    }
+
+    const call = vi
+      .mocked(logger.warn)
+      .mock.calls.find((entry) => entry[1] === "failed to reconcile stale environment lease for terminal run");
+    expect(call).toBeDefined();
+    const record = call![0] as Record<string, unknown>;
+    expect(JSON.stringify(record)).not.toContain(sentinel);
+    expect(record).not.toHaveProperty("err");
+    expect(record).toEqual({ errorKind: "stale_terminal_run_lease_release_failed", runId });
   });
 
   it("leaves native runs to their finalization coordinator", async () => {
