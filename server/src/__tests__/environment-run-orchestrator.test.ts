@@ -431,6 +431,115 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(result.persistedExecutionWorkspace).toEqual(updatedEw);
   });
 
+  describe("remote dir reported by the provider at realize time", () => {
+    function sandboxRealizeRuntime(realized: { cwd: string; remoteCwd?: string }) {
+      return makeMockRuntime({
+        realizeWorkspace: vi.fn().mockResolvedValue({
+          cwd: realized.cwd,
+          metadata: {
+            provider: "kubernetes",
+            ...(realized.remoteCwd ? { remoteCwd: realized.remoteCwd } : {}),
+            workspaceRealization: {
+              version: 1,
+              mode: "copy",
+              remote: { path: realized.cwd },
+            },
+          },
+        }),
+      });
+    }
+
+    beforeEach(() => {
+      // The service returns the row as written, like the real update.
+      mockUpdateLeaseMetadata.mockImplementation(async (id: string, metadata: Record<string, unknown>) =>
+        makeLease({ id, metadata }),
+      );
+      mockResolveEnvironmentExecutionTarget.mockImplementation(async (input: { leaseMetadata?: Record<string, unknown> | null }) => ({
+        kind: "remote",
+        transport: "sandbox",
+        remoteCwd: typeof input.leaseMetadata?.remoteCwd === "string" ? input.leaseMetadata.remoteCwd : "/tmp",
+      }));
+    });
+
+    it("records it on a per-run sandbox lease that has no remote dir, before the target is resolved", async () => {
+      // A per-run sandbox (no execution workspace, so nothing to keep between
+      // runs): the provider pins no remote dir at acquire.
+      const lease = makeLease({
+        provider: "kubernetes",
+        providerLeaseId: "pc-sandbox-1",
+        metadata: { sandboxProviderPlugin: true, backend: "sandbox-cr" },
+      });
+      const runtime = sandboxRealizeRuntime({ cwd: "/workspace", remoteCwd: "/workspace" });
+      const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+      const result = await orchestrator.realizeForRun(
+        makeRealizeInput({ environment: makeEnvironment("sandbox"), lease }),
+      );
+
+      expect(mockUpdateLeaseMetadata).toHaveBeenCalledOnce();
+      expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(
+        "lease-1",
+        expect.objectContaining({
+          sandboxProviderPlugin: true,
+          backend: "sandbox-cr",
+          remoteCwd: "/workspace",
+          workspaceRealization: expect.any(Object),
+        }),
+      );
+      // The lease the execution target (and its native file sync) is built
+      // from carries the realized dir.
+      expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledWith(
+        expect.objectContaining({
+          leaseMetadata: expect.objectContaining({ remoteCwd: "/workspace" }),
+          lease: expect.objectContaining({
+            metadata: expect.objectContaining({ remoteCwd: "/workspace" }),
+          }),
+        }),
+      );
+      expect(result.lease.metadata?.remoteCwd).toBe("/workspace");
+      expect(result.executionTarget).toEqual(expect.objectContaining({ remoteCwd: "/workspace" }));
+    });
+
+    it("keeps the remote dir a lease was given at acquire", async () => {
+      const lease = makeLease({
+        provider: "kubernetes",
+        providerLeaseId: "pc-sandbox-1",
+        metadata: { sandboxProviderPlugin: true, remoteCwd: "/workspace" },
+      });
+      const runtime = sandboxRealizeRuntime({ cwd: "/elsewhere", remoteCwd: "/elsewhere" });
+      const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+      const result = await orchestrator.realizeForRun(
+        makeRealizeInput({ environment: makeEnvironment("sandbox"), lease }),
+      );
+
+      // Realize is asked for the pinned dir, and the lease keeps it.
+      expect(runtime.realizeWorkspace).toHaveBeenCalledWith(
+        expect.objectContaining({ workspace: expect.objectContaining({ remotePath: "/workspace" }) }),
+      );
+      expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(
+        "lease-1",
+        expect.objectContaining({ remoteCwd: "/workspace" }),
+      );
+      expect(result.lease.metadata?.remoteCwd).toBe("/workspace");
+    });
+
+    it("records nothing when the provider reports no remote dir", async () => {
+      const lease = makeLease({ metadata: { sandboxProviderPlugin: true } });
+      const runtime = sandboxRealizeRuntime({ cwd: "/workspace" });
+      const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+      const result = await orchestrator.realizeForRun(
+        makeRealizeInput({ environment: makeEnvironment("sandbox"), lease }),
+      );
+
+      expect(mockUpdateLeaseMetadata).toHaveBeenCalledOnce();
+      const [, written] = mockUpdateLeaseMetadata.mock.calls[0]!;
+      expect(written).not.toHaveProperty("remoteCwd");
+      expect(result.lease.metadata).not.toHaveProperty("remoteCwd");
+    });
+  });
+
   it("runs a remote provision command after workspace realization when configured", async () => {
     mockBuildWorkspaceRealizationRequest.mockReturnValue({
       version: 1,

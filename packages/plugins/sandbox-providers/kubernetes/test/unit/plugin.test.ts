@@ -113,6 +113,24 @@ describe("plugin", () => {
     ).rejects.toThrow(/workspace remote dir/);
   });
 
+  // A per-run sandbox pins no remote dir at acquire; realize reports it as
+  // `remoteCwd`, and the host records that on the lease before any file sync.
+  it.each([
+    ["the pod workspace by default", undefined, "/workspace"],
+    ["a remote path the host asks for", " /workspace/sub ", "/workspace/sub"],
+  ])("realize reports %s as the lease remote dir", async (_label, remotePath, expected) => {
+    const result = await plugin.definition.onEnvironmentRealizeWorkspace!({
+      driverKey: "kubernetes",
+      companyId: "co",
+      environmentId: "env",
+      config: { inCluster: true },
+      lease: { providerLeaseId: "lease-1", metadata: {} },
+      workspace: { ...(remotePath !== undefined ? { remotePath } : {}) },
+    });
+    expect(result.cwd).toBe(expected);
+    expect(result.metadata).toMatchObject({ remoteCwd: expected });
+  });
+
   it("file sync rejects the job backend (out of scope; sandbox-cr only)", async () => {
     await expect(
       plugin.definition.onEnvironmentSyncOut!({
