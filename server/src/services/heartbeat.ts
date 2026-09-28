@@ -46,6 +46,15 @@ import { executionFailureRetryCount, executionRetryAttemptCount, accountingForSc
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
+import {
+  isRunBriefEnabled,
+  loadRunBrief,
+  resolveRunBriefAuthority,
+  resolveRunBriefSessionReason,
+  runBriefTimeout,
+  runBriefWorkspaceState,
+  withRunBriefEnvironment,
+} from "./run-brief.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
@@ -7707,6 +7716,8 @@ export async function buildPaperclipWakePayload(input: {
     workMode: string;
     projectId?: string | null;
     executionPolicy?: unknown;
+    /** Current assignee; when omitted the Run Brief cannot tell ownership. */
+    assigneeAgentId?: string | null;
   } | null;
   exposeLowTrustRaw?: boolean;
   // Experimental: agents write user-interaction content in ASD-STE100
@@ -7737,6 +7748,7 @@ export async function buildPaperclipWakePayload(input: {
             status: issues.status,
             priority: issues.priority,
             workMode: issues.workMode,
+            assigneeAgentId: issues.assigneeAgentId,
           })
           .from(issues)
           .where(
@@ -8099,6 +8111,55 @@ export async function buildPaperclipWakePayload(input: {
           notice: externalAttachmentOmissionNotice(omission),
         }))
     : [];
+  const recoveryScoped = Boolean(
+    (!executionAlreadyReconciled && (recoveryAction || recoveryCause)) ||
+      readNonEmptyString(input.contextSnapshot.wakeReason) ===
+        "source_scoped_recovery_action",
+  );
+  // The Run Brief orients issue-scoped task wakes. Chat-shaped turns keep
+  // their own contracts, and a failed lookup must never block the wake.
+  let runBrief: Awaited<ReturnType<typeof loadRunBrief>> | null = null;
+  if (
+    isRunBriefEnabled() &&
+    issueId &&
+    issueSummary?.id === issueId &&
+    !conversationMode &&
+    !externalChatProvider &&
+    !agentMessageText
+  ) {
+    try {
+      runBrief = await loadRunBrief({
+        db: input.db,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        runId: input.runId,
+        issue: { id: issueId, identifier: issueSummary.identifier },
+        authority: resolveRunBriefAuthority({
+          wakeRole: executionStage.wakeRole,
+          recoveryScoped,
+          // Same cause as payload.recovery.cause below, which picks the wake
+          // text's cause-specific recovery instruction.
+          recoveryCause: executionAlreadyReconciled
+            ? null
+            : (recoveryAction?.cause ?? recoveryCause),
+          taskWatchdog: Boolean(input.contextSnapshot.taskWatchdog),
+          workMode: issueSummary.workMode,
+          ownsIssue:
+            input.agentId && issueSummary.assigneeAgentId !== undefined
+              ? issueSummary.assigneeAgentId === input.agentId
+              : null,
+        }),
+        priorRuns: parseObject(input.contextSnapshot.executionContinuation)
+          .priorRuns,
+        exposeLowTrustRaw: input.exposeLowTrustRaw,
+      });
+    } catch (error) {
+      logger.warn(
+        { err: error, companyId: input.companyId, issueId, runId: input.runId },
+        "run brief unavailable; continuing without it",
+      );
+    }
+  }
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
@@ -8268,6 +8329,7 @@ export async function buildPaperclipWakePayload(input: {
     },
     truncated: payloadTruncated,
     fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    ...(runBrief ? { runBrief } : {}),
   };
   return issueId
     ? createRunSecretRedactionRegistry(input.db).redactForIssue(
@@ -21075,6 +21137,7 @@ export function heartbeatService(
               workMode: issueRef.workMode,
               projectId: issueRef.projectId,
               executionPolicy: issueContext?.executionPolicy ?? null,
+              assigneeAgentId: issueContext?.assigneeAgentId ?? null,
             }
           : null,
         exposeLowTrustRaw,
@@ -23012,6 +23075,8 @@ export function heartbeatService(
         delete context.paperclipPreviousSessionId;
       }
 
+      // The Run Brief reports a session started fresh for a changed credential.
+      let sessionResetForCredential = false;
       const taskSessionCredentialCompatible = isTaskSessionCredentialCompatible(
         taskSession?.sessionParamsJson,
         managedAiRuntime?.identity,
@@ -23019,6 +23084,7 @@ export function heartbeatService(
       if (managedAiRuntime) {
         sessionConfigMetadata.aiCredentialIdentity = managedAiRuntime.identity;
         if (!taskSessionCredentialCompatible) {
+          sessionResetForCredential = true;
           runtimeSessionIdForAdapter = null;
           runtimeSessionParamsForAdapter = null;
           previousSessionDisplayId = null;
@@ -23042,6 +23108,41 @@ export function heartbeatService(
           context.forceFreshSession === true)
       ) {
         delete executionContinuation.resumeDelta;
+      }
+      // The wake payload (and its Run Brief) was built before the session and
+      // workspace were resolved; fill in the brief's environment line now.
+      if (context[PAPERCLIP_WAKE_PAYLOAD_KEY]) {
+        // Resolved the way the adapters resolve it, so a sandbox target's
+        // default backstop shows up instead of "no run timeout".
+        const { timeoutSec, deadlineAt } = runBriefTimeout({
+          executionTarget,
+          configuredTimeoutSec: runtimeConfig.timeoutSec,
+        });
+        const resumedSession = Boolean(runtimeForAdapter.sessionId);
+        context[PAPERCLIP_WAKE_PAYLOAD_KEY] = withRunBriefEnvironment(
+          context[PAPERCLIP_WAKE_PAYLOAD_KEY],
+          {
+            session: resumedSession ? "resumed" : "fresh",
+            sessionReason: resolveRunBriefSessionReason({
+              resumed: resumedSession,
+              explicitResume: Boolean(
+                explicitResumeSessionParams || explicitResumeSessionDisplayId,
+              ),
+              taskSessionReused: taskSessionForRun != null,
+              rotated: sessionCompaction.rotate,
+              credentialChanged: sessionResetForCredential,
+              resetForWake: shouldResetTaskSessionForWake(context),
+              resetForConfig: sessionConfigFreshness.reset,
+            }),
+            workspace: runBriefWorkspaceState({
+              reused: Boolean(reusedExecutionWorkspace),
+              mode: effectiveExecutionWorkspaceMode,
+            }),
+            workspaceMode: effectiveExecutionWorkspaceMode,
+            timeoutSec,
+            deadlineAt,
+          },
+        );
       }
       const configFreshnessResultMetadata = {
         version: sessionConfigMetadata.version,

@@ -14,6 +14,12 @@ import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import {
+  isPaperclipWakeRunBriefEnabled,
+  normalizePaperclipRunBrief,
+  renderPaperclipRunBrief,
+  type PaperclipRunBrief,
+} from "./wake-run-brief.js";
+import {
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
   resolvePaperclipRunnerModel,
   normalizeLegacyRunnerProvider,
@@ -851,6 +857,9 @@ type PaperclipWakePayload = {
   missingCount: number;
   truncated: boolean;
   fallbackFetchNeeded: boolean;
+  // Present only when the server attached a Run Brief; absent (not null) keeps
+  // the serialized payload unchanged when the brief is disabled.
+  runBrief?: PaperclipRunBrief;
 };
 
 function normalizePaperclipWakeRecovery(
@@ -1831,6 +1840,7 @@ export function normalizePaperclipWakePayload(
   );
   const agentMessage = normalizePaperclipWakeAgentMessage(payload.agentMessage);
   const issue = normalizePaperclipWakeIssue(payload.issue);
+  const runBrief = normalizePaperclipRunBrief(payload.runBrief);
   const skillTest =
     issue?.workMode === "skill_test" ||
     payload.skillTest === true ||
@@ -1923,7 +1933,24 @@ export function normalizePaperclipWakePayload(
     missingCount: asNumber(commentWindow.missingCount, 0),
     truncated: asBoolean(payload.truncated, false),
     fallbackFetchNeeded: asBoolean(payload.fallbackFetchNeeded, false),
+    ...(runBrief ? { runBrief } : {}),
   };
+}
+
+// True when the execution continuation already carries the issue continuation
+// summary as its completed-work evidence (the wake copy may be a truncated
+// prefix of it).
+function isContinuationSummaryInExecutionContinuation(
+  normalized: PaperclipWakePayload,
+): boolean {
+  const summary = normalized.continuationSummary;
+  const completedWork = normalized.executionContinuation?.completedWork;
+  if (!summary || typeof completedWork !== "string") return false;
+  const evidence = completedWork.trim();
+  return (
+    evidence === summary.body ||
+    (summary.bodyTruncated && evidence.startsWith(summary.body))
+  );
 }
 
 export function stringifyPaperclipWakePayload(
@@ -2248,6 +2275,23 @@ function renderPaperclipWakePromptBody(
   // template-less adapters need the wake-payload copy.
   const includeExecutionContract = options.conversationMode !== true &&
     (resumedSession || options.includeExecutionContract === true);
+  // The Run Brief leads the wake text. Chat turns keep their own contract
+  // (external chat forbids exploratory API calls), so they never get one.
+  const runBriefText =
+    normalized.runBrief &&
+    !externalChatContract &&
+    options.conversationMode !== true &&
+    isPaperclipWakeRunBriefEnabled()
+      ? renderPaperclipRunBrief(normalized.runBrief, {
+          resumedSession: options.resumedSession,
+        })
+      : "";
+  const runBriefLines = runBriefText ? [runBriefText, ""] : [];
+  // With the brief on, the continuation summary travels once: inside the
+  // fenced continuation evidence rather than again as raw text further down.
+  const continuationSummaryInEvidence =
+    runBriefText.length > 0 &&
+    isContinuationSummaryInExecutionContinuation(normalized);
   const hasWakeCommentBatch =
     normalized.comments.length > 0 ||
     normalized.includedCount > 0 ||
@@ -2261,6 +2305,8 @@ function renderPaperclipWakePromptBody(
     recovery?.originalAssignee?.name ??
     recovery?.originalAssignee?.id ??
     "the original assignee";
+  // The Run Brief picks its authority wording from the same cause; keep
+  // paperclipRunBriefRecoveryAuthority (wake-run-brief.ts) in step with this.
   const recoveryInstruction = (() => {
     switch (recovery?.cause) {
       case "process_lost":
@@ -2414,6 +2460,7 @@ function renderPaperclipWakePromptBody(
       : [];
   const lines = resumedSession
     ? [
+        ...runBriefLines,
         "## Paperclip Resume Delta",
         "",
         "You are resuming an existing Paperclip session.",
@@ -2430,6 +2477,7 @@ function renderPaperclipWakePromptBody(
         ...wakeSummaryLines,
       ]
     : [
+        ...runBriefLines,
         "## Paperclip Wake Payload",
         "",
         "Use this wake to continue the task, applying new user direction and preserving its approval gates.",
@@ -2474,7 +2522,9 @@ function renderPaperclipWakePromptBody(
         ? "These are new or edited messages since the named run; earlier history remains in this session."
         : "History is complete through the coverage cursor. Prefer source messages over summaries.",
       "humanResponses contains server-verified user answers and decisions; apply each only to its question or approval scope.");
-    const { interactionOutcomes, completedActions, completedWork, recoveryOutcomes, ...requestContext } = continuation;
+    // priorRuns feeds only the Run Brief (which fences it); it is never part
+    // of the request context or a second copy in the evidence below.
+    const { interactionOutcomes, completedActions, completedWork, recoveryOutcomes, priorRuns: _briefPriorRuns, ...requestContext } = continuation;
     const encodeData = (data: unknown) => markdownFencedText(JSON.stringify(data, (_key, value) =>
       typeof value === "string" ? value.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "") : value,
     ).replace(/</g, "\\u003c").replace(/>/g, "\\u003e"));
@@ -2948,7 +2998,7 @@ function renderPaperclipWakePromptBody(
     lines.push("");
   }
 
-  if (normalized.continuationSummary) {
+  if (normalized.continuationSummary && !continuationSummaryInEvidence) {
     lines.push(
       "",
       "Issue continuation summary:",

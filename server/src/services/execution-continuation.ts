@@ -13,6 +13,11 @@ import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
+import {
+  digestPriorRuns,
+  heartbeatRunTrustPresetSql,
+  isRunBriefEnabled,
+} from "./run-brief.js";
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
 
 export class StaleExecutionContinuationError extends Error {
@@ -276,7 +281,8 @@ export async function buildExecutionContinuation(input: {
       row.authorType === "user" && !row.createdByRunId && !row.deleted && row.body.trim().length > 0,
   );
   const priorRuns = await db
-    .select({ id: heartbeatRuns.id, result: heartbeatRuns.resultJson, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, runtimeMode: heartbeatRuns.runtimeMode, retryOfRunId: heartbeatRuns.retryOfRunId })
+    .select({ id: heartbeatRuns.id, result: heartbeatRuns.resultJson, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, runtimeMode: heartbeatRuns.runtimeMode, retryOfRunId: heartbeatRuns.retryOfRunId,
+      livenessState: heartbeatRuns.livenessState, error: heartbeatRuns.error, trustPreset: heartbeatRunTrustPresetSql })
     .from(heartbeatRuns)
     .where(
       and(
@@ -414,6 +420,11 @@ export async function buildExecutionContinuation(input: {
     unresolvedInteractionIds: interactions
       .filter((row) => row.status === "pending")
       .map((row) => row.id),
+    // Status, liveness and a one-line summary of the last few runs, for the
+    // wake Run Brief. Omitted entirely when the brief is switched off.
+    ...(isRunBriefEnabled()
+      ? { priorRuns: digestPriorRuns(priorRuns, { excludeRunId: input.runId, withholdLowTrust: !input.exposeLowTrustRaw }) }
+      : {}),
     coverage: {
       kind: "full_task_history",
       throughCommentId: messages.at(-1)?.id ?? null,
