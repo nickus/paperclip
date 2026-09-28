@@ -1330,20 +1330,6 @@ Terminal states: `done`, `cancelled`
 | 422  | Semantic violation | Invalid state transition (e.g. `backlog` -> `done`)                  |
 | 500  | Server error       | Transient failure. Comment on the task and move on.                  |
 
-### Bridge route policies (SSH and sandbox runs)
-
-Runs in an SSH or sandbox environment reach the API through a run-scoped bridge (`PAPERCLIP_API_URL`). Each environment picks a bridge route policy:
-
-- `restricted` (default): only the routes this skill documents for the heartbeat procedure are forwarded.
-- `agent`: every route agents normally use is forwarded, including issue create/edit/close, documents, attachments, work products, interactions, labels, routines, approvals, company runs and their events/logs, colleagues' configuration and instructions (read-only), summary slots, and `POST /api/agents/{yourAgentId}/wakeup`. Secret values, credentials and tokens, environment configuration, workspace-operation logs, changes to agent records, permissions and config history, instruction writes, watchdog and low-trust promotion writes, costs, budgets and the audit log, plugin tools, board-only decisions, and company/instance administration stay unreachable. Issues and labels cannot be deleted through the bridge: close an issue by setting its status to `done` or `cancelled`.
-- `agent-with-instruction-writes`: everything `agent` forwards, plus `PUT /api/agents/{agentId}/instructions-bundle/file` for agents that run in your run's execution environment, named by agent id (not shortname). A write for any other agent is refused at the bridge. The server still decides each write. With a direct `agents:configure` grant it applies at once. With only `agents:suggest-changes`, it needs a `request_confirmation` bound to `agent:{agentId}:instructions` that was created in an earlier run and accepted by a board user; agents cannot accept these cards. Changing bundle settings (`PATCH /api/agents/{agentId}/instructions-bundle`), deleting instruction files, and writing `promptTemplate.legacy.md` stay unreachable.
-
-A bridge denial is a `403` whose `error` starts with `Route not allowed`. It is a fixed property of the environment, not a transient failure: do not retry it, probe alternative spellings of the route, or look for another path to the same data. The server still authorizes every forwarded request as usual.
-
-A run woken without a task can still work one: check the issue out first (`POST /api/issues/{issueId}/checkout`), then update, comment on, and close it. The first checked-out issue the run writes to becomes its task; writes to any other issue, including a second one it checked out, count against the per-run cross-issue cap. To start a run that is bound to an issue, wake with `{"issueId": "<issue id or identifier>"}` (or `payload.issueId`); an agent can only do this for an issue assigned to itself.
-
-An agent that hires or creates another agent places it in its own execution environment. Omit `defaultEnvironmentId` in the request; naming a different environment is refused, and the board can move the new agent afterwards.
-
 ---
 
 ## Full API Reference
@@ -1639,3 +1625,5 @@ Every successful or failed value fetch writes both `secret_access_events` and `a
 | Sit silently on blocked work                | Nobody knows you're stuck; the task rots              | Comment the blocker and escalate immediately            |
 | Leave tasks in ambiguous states             | Others can't tell if work is progressing              | Always update status: `blocked`, `in_review`, or `done` |
 | Block on another task without `blockedByIssueIds` | No automatic wake when blocker resolves; manual follow-up needed | Set `blockedByIssueIds` so Paperclip auto-wakes the assignee when all blockers are done |
+
+Runs in an SSH or sandbox environment reach this API through a run-scoped bridge with a per-environment route policy; see `references/bridge-policies.md` before retrying a `403 Route not allowed`.
