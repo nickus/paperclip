@@ -84,6 +84,13 @@ import {
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import {
+  assertProcessEnvelopeWithinLimits,
+  createShellEnvPayloadFileStore,
+  externalizeEnvPayloads,
+  omitOversizedEnvPayloads,
+  type EnvPayloadShellExec,
+} from "./env-payload.js";
 import { isSshWorkspaceReuseKey } from "./ssh-workspace-layout.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import {
@@ -726,6 +733,27 @@ function preferredSandboxShell(target: AdapterSandboxExecutionTarget): "bash" | 
   return preferredShellForSandbox(target.shellCommand);
 }
 
+/**
+ * Shell exec inside a sandbox for payload files (see env-payload.ts): the file
+ * content goes over the command's stdin, never on a command line.
+ */
+function sandboxEnvPayloadShellExec(
+  target: AdapterSandboxExecutionTarget,
+  runner: CommandManagedRuntimeRunner,
+): EnvPayloadShellExec {
+  return async (script, stdin) => {
+    const result = await runner.execute({
+      command: preferredSandboxShell(target),
+      args: shellCommandArgs(script),
+      cwd: target.remoteCwd,
+      stdin,
+      timeoutMs: 60_000,
+      bypassSession: true,
+    });
+    return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, timedOut: result.timedOut };
+  };
+}
+
 type AdapterCommandCapableExecutionTarget = AdapterSshExecutionTarget | AdapterSandboxExecutionTarget;
 
 // The Secure Shell command runner's own output buffer. This value used to
@@ -767,9 +795,11 @@ export async function ensureAdapterExecutionTargetCommandResolvable(
     await ensureSandboxCommandResolvable(
       command,
       target,
-      sanitizeRemoteExecutionEnv(Object.fromEntries(
+      // A `command -v` probe (and the optional install) never reads Paperclip's
+      // JSON payload variables; leave oversized ones out instead of staging files.
+      omitOversizedEnvPayloads(sanitizeRemoteExecutionEnv(Object.fromEntries(
         Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
-      )),
+      ))),
       options.installCommand?.trim() || null,
       options.timeoutSec,
     );
@@ -933,49 +963,16 @@ export async function runAdapterExecutionTargetProcess(
 ): Promise<RunProcessResult> {
   if (target?.kind === "remote" && target.transport === "sandbox") {
     const runner = requireSandboxRunner(target);
-    const env = sanitizeRemoteExecutionEnv(options.env);
-    await options.onRuntimeProgress?.({
-      phase: "adapter_startup",
-      message: "Starting adapter in environment",
-    });
-    const runLogTail = options.runLogTail?.create() ?? null;
-    let execCommand = command;
-    let execArgs = args;
-    if (runLogTail) {
-      ({ command: execCommand, args: execArgs } = runLogTail.wrapCommand(command, args));
-      runLogTail.start(options.onLog);
-    }
+    // Oversized JSON payload variables become <NAME>_FILE files inside the
+    // sandbox; the exec'd process would otherwise fail with E2BIG.
+    const payloads = await externalizeEnvPayloads(
+      sanitizeRemoteExecutionEnv(options.env),
+      () => createShellEnvPayloadFileStore(sandboxEnvPayloadShellExec(target, runner)),
+    );
     try {
-      const result = await runner.execute({
-        command: execCommand,
-        args: execArgs,
-        cwd: target.remoteCwd,
-        env,
-        stdin: options.stdin,
-        timeoutMs: options.timeoutSec > 0 ? options.timeoutSec * 1000 : target.timeoutMs ?? undefined,
-        // The tail loop already streams incremental chunks; suppress the
-        // runner's end-of-run batched onLog to avoid duplicate log bytes.
-        onLog: runLogTail ? undefined : options.onLog,
-        onSpawn: options.onSpawn
-          ? async (meta) => options.onSpawn?.({ ...meta, processGroupId: null })
-          : undefined,
-      });
-      // Settle the duplex run disposition synchronously at the clean-completion
-      // boundary, before the run-log tail finishes. The atomic settle marks the
-      // host-observed orderly completion in one broker step, so a gateway exit
-      // after the clean process completion cannot latch a false mid-run loss. A
-      // control channel that died before this clean completion still fails the
-      // run closed.
-      const settled = applyRunDispositionSeam(result, options.settleRunDisposition);
-      if (runLogTail) {
-        await runLogTail.finish({ stdout: result.stdout, stderr: result.stderr });
-      }
-      return settled;
-    } catch (error) {
-      if (runLogTail) {
-        await runLogTail.abort();
-      }
-      throw error;
+      return await runSandboxTargetProcess(target, runner, command, args, payloads.env, options);
+    } finally {
+      await payloads.cleanup();
     }
   }
 
@@ -998,6 +995,60 @@ export async function runAdapterExecutionTargetProcess(
   });
 }
 
+async function runSandboxTargetProcess(
+  target: AdapterSandboxExecutionTarget,
+  runner: CommandManagedRuntimeRunner,
+  command: string,
+  args: string[],
+  env: Record<string, string>,
+  options: AdapterExecutionTargetProcessOptions,
+): Promise<RunProcessResult> {
+  assertProcessEnvelopeWithinLimits({ command, args, env, location: "sandbox" });
+  await options.onRuntimeProgress?.({
+    phase: "adapter_startup",
+    message: "Starting adapter in environment",
+  });
+  const runLogTail = options.runLogTail?.create() ?? null;
+  let execCommand = command;
+  let execArgs = args;
+  if (runLogTail) {
+    ({ command: execCommand, args: execArgs } = runLogTail.wrapCommand(command, args));
+    runLogTail.start(options.onLog);
+  }
+  try {
+    const result = await runner.execute({
+      command: execCommand,
+      args: execArgs,
+      cwd: target.remoteCwd,
+      env,
+      stdin: options.stdin,
+      timeoutMs: options.timeoutSec > 0 ? options.timeoutSec * 1000 : target.timeoutMs ?? undefined,
+      // The tail loop already streams incremental chunks; suppress the
+      // runner's end-of-run batched onLog to avoid duplicate log bytes.
+      onLog: runLogTail ? undefined : options.onLog,
+      onSpawn: options.onSpawn
+        ? async (meta) => options.onSpawn?.({ ...meta, processGroupId: null })
+        : undefined,
+    });
+    // Settle the duplex run disposition synchronously at the clean-completion
+    // boundary, before the run-log tail finishes. The atomic settle marks the
+    // host-observed orderly completion in one broker step, so a gateway exit
+    // after the clean process completion cannot latch a false mid-run loss. A
+    // control channel that died before this clean completion still fails the
+    // run closed.
+    const settled = applyRunDispositionSeam(result, options.settleRunDisposition);
+    if (runLogTail) {
+      await runLogTail.finish({ stdout: result.stdout, stderr: result.stderr });
+    }
+    return settled;
+  } catch (error) {
+    if (runLogTail) {
+      await runLogTail.abort();
+    }
+    throw error;
+  }
+}
+
 export async function runAdapterExecutionTargetShellCommand(
   runId: string,
   target: AdapterExecutionTarget | null | undefined,
@@ -1005,9 +1056,13 @@ export async function runAdapterExecutionTargetShellCommand(
   options: AdapterExecutionTargetShellOptions,
 ): Promise<RunProcessResult> {
   const onLog = options.onLog ?? (async () => {});
+  // Helper shell commands (probes, installs, config staging) never read
+  // Paperclip's JSON payload variables; leave oversized ones out instead of
+  // staging files for them. The agent process itself gets <NAME>_FILE.
+  const shellEnv = omitOversizedEnvPayloads(options.env);
   if (target?.kind === "remote") {
     const startedAt = new Date().toISOString();
-    const env = sanitizeRemoteExecutionEnv(options.env);
+    const env = sanitizeRemoteExecutionEnv(shellEnv);
     if (target.transport === "ssh") {
       try {
         // Pass the raw command — `runSshCommand` owns profile sourcing and
@@ -1069,6 +1124,12 @@ export async function runAdapterExecutionTargetShellCommand(
     }
 
     const shellCommand = preferredSandboxShell(target);
+    assertProcessEnvelopeWithinLimits({
+      command: shellCommand,
+      args: shellCommandArgs(command),
+      env,
+      location: "sandbox",
+    });
     return await requireSandboxRunner(target).execute({
       command: shellCommand,
       args: shellCommandArgs(command),
@@ -1086,7 +1147,7 @@ export async function runAdapterExecutionTargetShellCommand(
     ["-lc", command],
     {
       cwd: options.cwd,
-      env: options.env,
+      env: shellEnv,
       timeoutSec: options.timeoutSec ?? 15,
       graceSec: options.graceSec ?? 5,
       onLog,

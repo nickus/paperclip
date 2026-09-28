@@ -697,6 +697,45 @@ describe("ssh env-lab fixture", () => {
     expect(noStdin.stdout).toBe(`done:${token}`);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("hands an oversized JSON payload variable to the remote process as a file in the run scratch dir", async (ctx) => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH oversized env payload test", ctx);
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir };
+    const scratchDir = path.posix.join(started.workspaceDir, ".paperclip-runtime", "runs", "run-1", "scratch");
+    await mkdir(scratchDir, { recursive: true, mode: 0o700 });
+    // Far above the 128 KiB a single env string may have; as an env var of the
+    // local ssh process or of the remote command this fails with E2BIG.
+    const payload = JSON.stringify(Array.from({ length: 200 }, (_, index) => ({ workspaceId: `w${index}`, notes: "x".repeat(2_000) })));
+    const result = await runChildProcess(
+      `run-${randomUUID()}`,
+      "sh",
+      [
+        "-c",
+        'if [ -n "${PAPERCLIP_WORKSPACES_JSON+x}" ]; then echo inline; exit 3; fi; ' +
+          'printf "%s\n" "$PAPERCLIP_WORKSPACES_FILE"; wc -c < "$PAPERCLIP_WORKSPACES_FILE"; cat',
+      ],
+      {
+        cwd: rootDir,
+        env: { PAPERCLIP_WORKSPACES_JSON: payload, PAPERCLIP_RUN_SCRATCH_DIR: scratchDir },
+        stdin: "prompt on stdin\n",
+        timeoutSec: 30,
+        graceSec: 1,
+        onLog: async () => {},
+        remoteExecution: spec,
+      },
+    );
+    expect(result.exitCode).toBe(0);
+    const [filePath, byteCount, stdinEcho] = result.stdout.trim().split("\n").map((line) => line.trim());
+    expect(filePath!.startsWith(`${scratchDir}/paperclip-env-`)).toBe(true);
+    expect(Number(byteCount)).toBe(Buffer.byteLength(payload));
+    expect(stdinEcho).toBe("prompt on stdin");
+    // Removed once the remote command exited.
+    expect(existsSync(filePath!)).toBe(false);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("gives commands run through the SSH command runner their env over stdin", async (ctx) => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");

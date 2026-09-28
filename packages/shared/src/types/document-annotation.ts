@@ -247,6 +247,8 @@ export interface DocumentReviewContextDocument {
 export interface DocumentReviewContext {
   issueId: string;
   documents: DocumentReviewContextDocument[];
+  /** Documents with open threads left out once the thread budget was spent. */
+  omittedDocumentCount?: number;
   totals: PlanReviewContext["totals"];
   limits: PlanReviewContext["limits"];
   truncated: boolean;
