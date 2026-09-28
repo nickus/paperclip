@@ -266,24 +266,61 @@ export function shQuote(segment: string): string {
   return `'${segment.replace(/'/g, "'\\''")}'`;
 }
 
-// Wrap a command so the given env vars are exported before it runs. The Kubernetes
-// exec API has no env field, so the only way to give an exec'd process additional
-// env is to run it under a shell that exports the vars and then `exec`s the real
-// command. PATH is deliberately skipped (the caller's PATH is the orchestrator's,
-// not the sandbox image's, and overriding it would break command resolution), and
-// only valid shell identifiers are exported. Returns the original command unchanged
+// Shell that reads the env prologue written by `wrapCommandWithEnv` from stdin
+// and applies it. Only shell builtins touch the values: `read` consumes the
+// prologue one line at a time (shells read a pipe byte by byte, so nothing after
+// the prologue is consumed) and `eval` runs the `export` lines, so no value
+// becomes the argument of any process. The prologue is a line count followed by
+// exactly that many lines; a malformed or short prologue fails the command with
+// exit code 125 instead of running it without its env.
+const STDIN_ENV_READER = [
+  "{ IFS= read -r __pc_env_n",
+  "&& case $__pc_env_n in ''|*[!0-9]*) false;; esac",
+  "&& __pc_env=",
+  `&& while [ "$__pc_env_n" -gt 0 ]; do IFS= read -r __pc_env_l || exit 125; __pc_env="$__pc_env$__pc_env_l\n"; __pc_env_n=$((__pc_env_n - 1)); done; }`,
+  "|| { echo 'paperclip: could not read the command environment from stdin' >&2; exit 125; };",
+  'eval "$__pc_env" || exit 125;',
+  "unset __pc_env __pc_env_l __pc_env_n;",
+].join(" ");
+
+// Give a command the caller's env vars without putting any value on a command
+// line. The Kubernetes exec API has no env field, so the exec'd process has to
+// be a shell that exports the vars and then `exec`s the real command. Inlining
+// the values into that shell's `-c` script would make every run secret readable
+// from the pod's process list (`ps`, /proc/<pid>/cmdline) and put it in the exec
+// request URL, which API server audit logs record. Instead the `export`
+// statements travel over the exec's stdin as a prologue in front of the
+// caller's own stdin, which the command then reads unchanged.
+//
+// PATH is deliberately skipped (the caller's PATH is the orchestrator's, not the
+// sandbox image's, and overriding it would break command resolution), and only
+// valid shell identifiers are exported. Returns the command and stdin unchanged
 // when there is nothing to apply.
 export function wrapCommandWithEnv(
   command: string[],
   env: Record<string, string> | undefined | null,
-): string[] {
+  stdin?: string | Buffer,
+): { command: string[]; stdin: string | Buffer | undefined } {
   const entries = Object.entries(env && typeof env === "object" ? env : {}).filter(
     ([key, value]) =>
       typeof value === "string" && key !== "PATH" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key),
   );
-  if (entries.length === 0) return command;
-  const exports = entries.map(([k, v]) => `export ${k}=${shQuote(v)};`).join(" ");
-  return ["/bin/sh", "-c", `${exports} exec ${command.map(shQuote).join(" ")}`];
+  if (entries.length === 0) return { command, stdin };
+  const exportLines = entries.map(([k, v]) => `export ${k}=${shQuote(v)}\n`).join("");
+  // One header line with the number of lines that follow (values may span lines).
+  const lineCount = exportLines.split("\n").length - 1;
+  const prologue = Buffer.from(`${lineCount}\n${exportLines}`, "utf-8");
+  const callerStdin =
+    Buffer.isBuffer(stdin) ? stdin
+    : typeof stdin === "string" ? Buffer.from(stdin, "utf-8")
+    : Buffer.alloc(0);
+  return {
+    command: ["/bin/sh", "-c", `${STDIN_ENV_READER} exec ${command.map(shQuote).join(" ")}`],
+    // execInPod bounds the command's stdin to exactly these bytes, so the
+    // command still sees EOF right after the caller's stdin (or at once if the
+    // caller had none).
+    stdin: Buffer.concat([prologue, callerStdin]),
+  };
 }
 
 export async function execInPod(
