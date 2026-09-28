@@ -2777,7 +2777,10 @@ export function agentRoutes(
       throw notFound("Agent not found");
     }
     assertCompanyAccess(req, targetAgent.companyId);
-    const changeScope = { requiresChangeGrant: true };
+    // Name the target agent so a change grant scoped to agent ids or to a
+    // management subtree can match it. Without it every scoped grant fails
+    // closed and only company-wide grants apply.
+    const changeScope = { requiresChangeGrant: true, targetAgentId: targetAgent.id };
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:update",

@@ -761,6 +761,49 @@ describe("agent instructions bundle routes", () => {
       expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
     });
 
+    it("names the target agent in the change scope, so scoped grants can match it", async () => {
+      mockSuggestOnlyCoach();
+      const { db } = consentDb([consentRow()]);
+
+      const res = await requestApp(
+        await createApp(coachActor(), db),
+        (baseUrl) => request(baseUrl).put(FILE_PATH).send({ path: "AGENTS.md", content: "# Changed\n" }),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const changeDecisions = mockAccessService.decide.mock.calls
+        .map(([input]) => input as { action: string; scope?: Record<string, unknown> })
+        .filter((input) => input.action === "agent_config:update");
+      expect(changeDecisions.map((input) => input.scope)).toEqual([
+        { requiresChangeGrant: true, targetAgentId: TARGET_AGENT_ID },
+        { requiresChangeGrant: true, targetAgentId: TARGET_AGENT_ID, consentedChange: true },
+      ]);
+    });
+
+    it("applies a write from a direct agents:configure grant with no card at all", async () => {
+      // A direct change grant never reaches the consent gate. This documents
+      // that holders of such a grant need no accepted card.
+      mockAgentService.getById.mockImplementation(async (id: string) => {
+        if (id === COACH_AGENT_ID) return makeReflectionCoachAgent({ id: COACH_AGENT_ID });
+        return makeAgent();
+      });
+      mockAccessService.decide.mockResolvedValue({
+        allowed: true,
+        reason: "allow_direct_change",
+        explanation: "Allowed by direct change permission agents:configure.",
+      });
+      const { db, consumedUpdates } = consentDb([]);
+
+      const res = await requestApp(
+        await createApp(coachActor(), db),
+        (baseUrl) => request(baseUrl).put(FILE_PATH).send({ path: "AGENTS.md", content: "# Changed\n" }),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledTimes(1);
+      expect(consumedUpdates).toEqual([]);
+    });
+
     it("applies the write with a card a board user accepted in an earlier run, and consumes the card", async () => {
       mockSuggestOnlyCoach();
       const { db, consumedUpdates } = consentDb([consentRow()]);
