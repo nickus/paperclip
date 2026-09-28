@@ -219,14 +219,21 @@ async function teardownLease(
 
   // Throws (so the host keeps the lease in pending_cleanup and retries) when
   // the stop cannot be confirmed within the bounded wait.
-  const receipt = await terminateLeaseResources(clients, {
-    namespace,
-    name: params.providerLeaseId,
-    backend: leaseBackend,
-    podName,
-    secretName,
-    ...(options.confirmTimeoutMs !== undefined ? { confirmTimeoutMs: options.confirmTimeoutMs } : {}),
-  });
+  let receipt;
+  try {
+    receipt = await terminateLeaseResources(clients, {
+      namespace,
+      name: params.providerLeaseId,
+      backend: leaseBackend,
+      podName,
+      secretName,
+      ...(options.confirmTimeoutMs !== undefined ? { confirmTimeoutMs: options.confirmTimeoutMs } : {}),
+    });
+  } catch (err) {
+    // A rejected credential must not stay cached for the retry that follows.
+    evictKubeConnectionOnAuthError(config, err);
+    throw err;
+  }
 
   // A reusable sandbox can live for a day; remove its task-scoped egress policy
   // explicitly instead of relying on owner-reference garbage collection alone.
@@ -1572,7 +1579,8 @@ const plugin = definePlugin(withAuthEviction({
               ),
             );
           } catch (err) {
-            // Converted to a result below, so evict here rather than in the RPC wrapper.
+            // Converted to a result below, so evict here rather than in the RPC wrapper
+            // (evictKubeConnectionOnAuthError is a no-op unless err is actually a 401/403).
             evictKubeConnectionOnAuthError(config, err);
             // Same transport-failure contract as the main exec path below:
             // tag the failure kind and keep whatever output arrived.

@@ -980,6 +980,14 @@ function buildActivityToast(
     };
   }
 
+  // Agents comment on their own work constantly as they run; one toast per
+  // comment buries the events that actually need a human (run failures, join
+  // requests). Only issue.comment_added reaches this far — issue.created and
+  // issue.updated have already returned — so this suppresses agent comment
+  // toasts and nothing else. Comments from people still toast: that is
+  // someone talking to you, not an agent narrating itself.
+  if (actorType === "agent") return null;
+
   const commentId = readString(details?.commentId);
   const bodySnippet = readString(details?.bodySnippet);
   const reopened = details?.reopened === true;
