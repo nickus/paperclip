@@ -357,6 +357,11 @@ describe("resolveEnvironmentExecutionTarget", () => {
       paperclipApiBridgePolicy: "agent",
       paperclipApiBridgeCompanyId: "company-1",
     });
+    expect(await resolveFor({ ...sshConfig, paperclipApiBridgePolicy: "agent-with-instruction-writes" })).toMatchObject({
+      transport: "ssh",
+      paperclipApiBridgePolicy: "agent-with-instruction-writes",
+      paperclipApiBridgeCompanyId: "company-1",
+    });
   });
 
   it("stamps the environment's bridge policy and the run company on sandbox targets", async () => {
@@ -385,6 +390,15 @@ describe("resolveEnvironmentExecutionTarget", () => {
         paperclipApiBridgePolicy: "agent",
         paperclipApiBridgeCompanyId: "company-1",
       });
+    expect(await resolveFor({
+      provider: "fake-plugin",
+      reuseLease: false,
+      paperclipApiBridgePolicy: "agent-with-instruction-writes",
+    })).toMatchObject({
+      transport: "sandbox",
+      paperclipApiBridgePolicy: "agent-with-instruction-writes",
+      paperclipApiBridgeCompanyId: "company-1",
+    });
   });
 
   it("resolves SSH execution targets for grok_local", async () => {

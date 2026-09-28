@@ -449,12 +449,15 @@ export function authorizeSandboxCallbackBridgeRequestWithRoutes(
 // ---------------------------------------------------------------------------
 
 /**
- * Read a bridge route policy from untrusted config. Only the literal
- * `"agent"` selects the wider policy; every other value, including a missing
- * one, keeps the `restricted` allowlist, so a typo never widens access.
+ * Read a bridge route policy from untrusted config. Only the exact literals
+ * `"agent"` and `"agent-with-instruction-writes"` select a wider policy; every
+ * other value, including a missing one, keeps the `restricted` allowlist, so a
+ * typo never widens access.
  */
 export function normalizeSandboxCallbackBridgePolicy(value: unknown): SandboxCallbackBridgePolicy {
-  return value === "agent" ? "agent" : "restricted";
+  // Exact string match only: no trimming or case folding.
+  if (value === "agent" || value === "agent-with-instruction-writes") return value;
+  return "restricted";
 }
 
 const CANONICAL_PATH_CHECK_BASE = "http://bridge.invalid";
@@ -500,6 +503,28 @@ const ALL_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
 const WRITE_METHODS = ["POST", "PUT", "PATCH", "DELETE"] as const;
 
 /**
+ * Every write under an agent's instruction bundle. Only the
+ * `agent-with-instruction-writes` policy lifts this rule, and only for the
+ * requests {@link AGENT_INSTRUCTION_WRITE_BRIDGE_ALLOW_RULES} matches.
+ */
+const AGENT_INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE: AgentBridgeRouteRule = {
+  methods: WRITE_METHODS,
+  path: /^\/api\/agents\/[^/]+\/instructions-bundle(?:\/|$)/,
+};
+
+/**
+ * The instruction bundle writes the `agent-with-instruction-writes` policy
+ * forwards: updating the bundle settings and writing one file. The server
+ * decides each one with the same agent configuration check a local run gets,
+ * which requires an accepted change consent for agents that may only suggest
+ * changes. Deleting a file stays refused under every policy.
+ */
+export const AGENT_INSTRUCTION_WRITE_BRIDGE_ALLOW_RULES: readonly AgentBridgeRouteRule[] = [
+  { methods: ["PATCH"], path: /^\/api\/agents\/[^/]+\/instructions-bundle$/ },
+  { methods: ["PUT"], path: /^\/api\/agents\/[^/]+\/instructions-bundle\/file$/ },
+];
+
+/**
  * Routes the `agent` policy refuses even when an allow rule below would match.
  * Each one either returns credential material, or lets a run change where or
  * with which secrets later runs execute (an agent's own record, its config
@@ -519,8 +544,10 @@ export const AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRoute
   { methods: WRITE_METHODS, path: /^\/api\/agents\/[^/]+$/ },
   {
     methods: WRITE_METHODS,
-    path: /^\/api\/agents\/[^/]+\/(?:permissions|budgets|pause|resume|approve|terminate|clear-error|claude-login|heartbeat|runtime-state|config-revisions|instructions-bundle)(?:\/|$)/,
+    path: /^\/api\/agents\/[^/]+\/(?:permissions|budgets|pause|resume|approve|terminate|clear-error|claude-login|heartbeat|runtime-state|config-revisions)(?:\/|$)/,
   },
+  // Instruction bundle writes (see AGENT_INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE).
+  AGENT_INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE,
   // Board-only issue recovery and host workspace file reads.
   { methods: ALL_METHODS, path: /^\/api\/issues\/[^/]+\/admin(?:\/|$)/ },
   { methods: ALL_METHODS, path: /^\/api\/issues\/[^/]+\/file-resources(?:\/|$)/ },
@@ -649,9 +676,9 @@ function agentPolicyRouteMatches(rules: readonly AgentBridgeRouteRule[], method:
   return rules.some((rule) => rule.methods.includes(method) && rule.path.test(path));
 }
 
-function agentPolicyDenial(method: string, path: string): string {
+function agentPolicyDenial(policy: SandboxCallbackBridgePolicy, method: string, path: string): string {
   return (
-    `Route not allowed (bridge policy "agent"): ${method} ${path}. ` +
+    `Route not allowed (bridge policy "${policy}"): ${method} ${path}. ` +
     "Secret values, credentials, environment configuration and administration APIs are not reachable " +
     "from isolated agent runs; retrying this route will not succeed."
   );
@@ -661,7 +688,8 @@ export interface SandboxCallbackBridgeAuthorizerOptions {
   /** The route policy. Absent or unknown values mean `restricted`. */
   policy?: SandboxCallbackBridgePolicy | string | null;
   /**
-   * The company the run belongs to. Under the `agent` policy a
+   * The company the run belongs to. Under the `agent` and
+   * `agent-with-instruction-writes` policies a
    * `/api/companies/:companyId/...` path for any other company is refused at
    * the bridge, in addition to the server's own company check.
    */
@@ -672,12 +700,15 @@ export interface SandboxCallbackBridgeAuthorizerOptions {
  * Authorize one bridge request under a route policy. Returns null to forward
  * the request, or the denial message the bridge sends back with a 403.
  *
- * Both policies first require a canonical path (see
+ * Every policy first requires a canonical path (see
  * {@link describeNonCanonicalSandboxCallbackBridgePath}). `restricted` then
  * applies {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST} unchanged.
  * `agent` matches case-insensitively and ignores one trailing slash, the way
  * the server's router does; it applies the deny rules, then the company
  * check, then the allow families, and refuses everything else.
+ * `agent-with-instruction-writes` does the same, except that it lifts the
+ * instruction bundle write deny rule for exactly the requests
+ * {@link AGENT_INSTRUCTION_WRITE_BRIDGE_ALLOW_RULES} matches and forwards them.
  */
 export function authorizeSandboxCallbackBridgeRequestForPolicy(
   request: Pick<SandboxCallbackBridgeRequest, "method" | "path">,
@@ -697,25 +728,33 @@ export function authorizeSandboxCallbackBridgeRequestForPolicy(
   // see (the router matches literal routes on the raw path, but decodes
   // parameters), so the wider policy accepts no encoded characters at all.
   if (request.path.includes("%")) {
-    return agentPolicyDenial(method, request.path);
+    return agentPolicyDenial(policy, method, request.path);
   }
   const lowered = request.path.toLowerCase();
   const matchPath = lowered.length > 1 && lowered.endsWith("/") ? lowered.slice(0, -1) : lowered;
-  if (agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES, method, matchPath)) {
-    return agentPolicyDenial(method, request.path);
+  // An instruction bundle write this policy opens. Only the instruction bundle
+  // write deny rule is lifted for it; every other deny rule still applies.
+  const openedInstructionWrite =
+    policy === "agent-with-instruction-writes" &&
+    agentPolicyRouteMatches(AGENT_INSTRUCTION_WRITE_BRIDGE_ALLOW_RULES, method, matchPath);
+  const denyRules = openedInstructionWrite
+    ? AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES.filter((rule) => rule !== AGENT_INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE)
+    : AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES;
+  if (agentPolicyRouteMatches(denyRules, method, matchPath)) {
+    return agentPolicyDenial(policy, method, request.path);
   }
   // A run with no bound company reaches no company-scoped path at all, so a
   // target that stamps the policy but not the company fails closed.
   const companyId = options.companyId?.trim().toLowerCase() || null;
   const companyMatch = /^\/api\/companies\/([^/]+)/.exec(matchPath);
   if (companyMatch && companyMatch[1] !== companyId) {
-    return `Route not allowed (bridge policy "agent"): ${method} ${request.path}. ` +
+    return `Route not allowed (bridge policy "${policy}"): ${method} ${request.path}. ` +
       "Runs can only reach their own company.";
   }
-  if (agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, method, matchPath)) {
+  if (openedInstructionWrite || agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, method, matchPath)) {
     return null;
   }
-  return agentPolicyDenial(method, request.path);
+  return agentPolicyDenial(policy, method, request.path);
 }
 
 /** Build a request authorizer bound to one policy and run company. */

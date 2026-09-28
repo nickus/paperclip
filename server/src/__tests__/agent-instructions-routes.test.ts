@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { authorizeSandboxCallbackBridgeRequestForPolicy } from "@paperclipai/adapter-utils/sandbox-callback-bridge";
 
 const mockAgentService = vi.hoisted(() => ({
   create: vi.fn(),
@@ -586,6 +587,173 @@ describe("agent instructions bundle routes", () => {
       expect.objectContaining({ id: "11111111-1111-4111-8111-111111111111" }),
       "AGENTS.md",
     );
+  });
+
+  describe("instruction writes forwarded by the agent-with-instruction-writes bridge policy", () => {
+    const TARGET_AGENT_ID = "11111111-1111-4111-8111-111111111111";
+    const COACH_AGENT_ID = "coach-agent";
+    const APPLY_RUN_ID = "run-apply";
+    const FILE_PATH = `/api/agents/${TARGET_AGENT_ID}/instructions-bundle/file`;
+    const BUNDLE_PATH = `/api/agents/${TARGET_AGENT_ID}/instructions-bundle`;
+    const SUGGEST_ONLY_DENIAL =
+      "Permission agents:suggest-changes requires accepted change consent before applying this mutation.";
+
+    function coachActor() {
+      return {
+        type: "agent",
+        agentId: COACH_AGENT_ID,
+        companyId: "company-1",
+        runId: APPLY_RUN_ID,
+        source: "agent_jwt",
+      };
+    }
+
+    // A request_confirmation row as the change-consent gate reads it.
+    function consentRow(overrides: { sourceRunId?: string; consumed?: boolean } = {}) {
+      return {
+        id: "interaction-1",
+        sourceRunId: overrides.sourceRunId ?? "run-proposal",
+        payload: {
+          version: 1,
+          prompt: "Apply the proposed instructions change?",
+          detailsMarkdown: "```diff\n- old rule\n+ new rule\n```",
+          target: { type: "custom", key: `agent:${TARGET_AGENT_ID}:instructions` },
+        },
+        result: {
+          version: 1,
+          outcome: "accepted",
+          ...(overrides.consumed ? { consumedAt: "2026-01-01T00:00:00.000Z", consumedByRunId: "run-old" } : {}),
+        },
+      };
+    }
+
+    // The gate's only database access: one select of candidate rows and, on a
+    // match, one update that marks the row consumed.
+    function consentDb(rows: Array<ReturnType<typeof consentRow>>) {
+      const consumedUpdates: Array<Record<string, unknown>> = [];
+      const db = {
+        select: () => ({
+          from: () => ({
+            where: () => ({
+              orderBy: () => ({
+                limit: async () => rows,
+              }),
+            }),
+          }),
+        }),
+        update: () => ({
+          set: (value: Record<string, unknown>) => {
+            consumedUpdates.push(value);
+            return {
+              where: () => ({
+                returning: async () => [{ id: rows[0]?.id ?? "missing" }],
+              }),
+            };
+          },
+        }),
+      };
+      return { db, consumedUpdates };
+    }
+
+    // The coach may only suggest changes: its direct write is refused for
+    // missing consent, and allowed once the gate confirms an accepted card.
+    function mockSuggestOnlyCoach() {
+      mockAgentService.getById.mockImplementation(async (id: string) => {
+        if (id === COACH_AGENT_ID) return makeReflectionCoachAgent({ id: COACH_AGENT_ID });
+        return makeAgent();
+      });
+      mockAccessService.decide.mockImplementation(async (input: { action: string; scope?: Record<string, unknown> }) => {
+        if (input.action !== "agent_config:update") {
+          return { allowed: true, reason: "allow_explicit_grant", explanation: "Allowed by test grant" };
+        }
+        if (input.scope?.consentedChange === true) {
+          return {
+            allowed: true,
+            reason: "allow_consented_change",
+            explanation: "Allowed by suggest permission agents:suggest-changes after accepted change consent.",
+          };
+        }
+        return { allowed: false, reason: "deny_missing_consent", explanation: SUGGEST_ONLY_DENIAL };
+      });
+    }
+
+    function bridgeDecision(method: string, path: string, policy: "agent" | "agent-with-instruction-writes") {
+      return authorizeSandboxCallbackBridgeRequestForPolicy({ method, path }, { policy, companyId: "company-1" });
+    }
+
+    it("passes the bridge only under the opened policy, and never for deletes", () => {
+      expect(bridgeDecision("PUT", FILE_PATH, "agent-with-instruction-writes")).toBeNull();
+      expect(bridgeDecision("PATCH", BUNDLE_PATH, "agent-with-instruction-writes")).toBeNull();
+      expect(bridgeDecision("DELETE", FILE_PATH, "agent-with-instruction-writes")).toContain("Route not allowed");
+      expect(bridgeDecision("PUT", FILE_PATH, "agent")).toContain("Route not allowed");
+      expect(bridgeDecision("PATCH", BUNDLE_PATH, "agent")).toContain("Route not allowed");
+    });
+
+    it("still refuses a suggest-only agent's file write without an accepted change consent", async () => {
+      expect(bridgeDecision("PUT", FILE_PATH, "agent-with-instruction-writes")).toBeNull();
+      mockSuggestOnlyCoach();
+      const { db, consumedUpdates } = consentDb([]);
+
+      const res = await requestApp(
+        await createApp(coachActor(), db),
+        (baseUrl) => request(baseUrl).put(FILE_PATH).send({ path: "AGENTS.md", content: "# Changed\n" }),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe(SUGGEST_ONLY_DENIAL);
+      expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(consumedUpdates).toEqual([]);
+    });
+
+    it("still refuses a suggest-only agent's bundle update without an accepted change consent", async () => {
+      expect(bridgeDecision("PATCH", BUNDLE_PATH, "agent-with-instruction-writes")).toBeNull();
+      mockSuggestOnlyCoach();
+      const { db } = consentDb([]);
+
+      const res = await requestApp(
+        await createApp(coachActor(), db),
+        (baseUrl) => request(baseUrl).patch(BUNDLE_PATH).send({ entryFile: "AGENTS.md" }),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockAgentInstructionsService.updateBundle).not.toHaveBeenCalled();
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses a card accepted in the applying run itself, or one already consumed", async () => {
+      mockSuggestOnlyCoach();
+      for (const row of [consentRow({ sourceRunId: APPLY_RUN_ID }), consentRow({ consumed: true })]) {
+        const { db, consumedUpdates } = consentDb([row]);
+        const res = await requestApp(
+          await createApp(coachActor(), db),
+          (baseUrl) => request(baseUrl).put(FILE_PATH).send({ path: "AGENTS.md", content: "# Changed\n" }),
+        );
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(consumedUpdates).toEqual([]);
+      }
+      expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+    });
+
+    it("applies the write with a card accepted in an earlier run, and consumes the card", async () => {
+      mockSuggestOnlyCoach();
+      const { db, consumedUpdates } = consentDb([consentRow()]);
+
+      const res = await requestApp(
+        await createApp(coachActor(), db),
+        (baseUrl) => request(baseUrl).put(FILE_PATH).send({ path: "AGENTS.md", content: "# Changed\n" }),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledWith(
+        expect.objectContaining({ id: TARGET_AGENT_ID }),
+        "AGENTS.md",
+        "# Changed\n",
+        expect.any(Object),
+      );
+      expect(consumedUpdates).toHaveLength(1);
+      expect(consumedUpdates[0]!.result).toMatchObject({ outcome: "accepted", consumedByRunId: APPLY_RUN_ID });
+    });
   });
 
   it("writes a bundle file and persists compatibility config", async () => {

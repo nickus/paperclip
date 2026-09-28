@@ -588,8 +588,14 @@ export type EnvironmentDriver = (typeof ENVIRONMENT_DRIVERS)[number];
  *   unscrubbed host output, irreversible deletes, costs, and instance/company
  *   administration). The server still authorizes every forwarded call for
  *   the agent.
+ * - `agent-with-instruction-writes` is `agent` plus instruction bundle
+ *   writes: `PATCH /api/agents/:id/instructions-bundle` and
+ *   `PUT /api/agents/:id/instructions-bundle/file`. The server's agent
+ *   configuration check (including the change-consent gate for agents that
+ *   may only suggest changes) still decides each write. Deleting instruction
+ *   files stays refused.
  */
-export const SANDBOX_CALLBACK_BRIDGE_POLICIES = ["restricted", "agent"] as const;
+export const SANDBOX_CALLBACK_BRIDGE_POLICIES = ["restricted", "agent", "agent-with-instruction-writes"] as const;
 export type SandboxCallbackBridgePolicy = (typeof SANDBOX_CALLBACK_BRIDGE_POLICIES)[number];
 
 export const ENVIRONMENT_STATUSES = ["active", "archived"] as const;

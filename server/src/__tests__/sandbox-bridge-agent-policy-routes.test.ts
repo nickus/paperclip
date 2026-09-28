@@ -151,10 +151,12 @@ function samplePaths(routePath: string): Array<{ path: string; values: Record<st
   return samples.map((sample) => ({ ...sample, path: sample.path.replace(/:[A-Za-z0-9_]+\??/g, "sample-id") }));
 }
 
-function allowed(method: string, path: string): boolean {
+type RoutePolicy = "agent" | "agent-with-instruction-writes";
+
+function allowed(policy: RoutePolicy, method: string, path: string): boolean {
   return authorizeSandboxCallbackBridgeRequestForPolicy(
     { method, path },
-    { policy: "agent", companyId: RUN_COMPANY_ID },
+    { policy, companyId: RUN_COMPANY_ID },
   ) === null;
 }
 
@@ -163,7 +165,7 @@ function allowed(method: string, path: string): boolean {
  * samples. A `router.use` mount is tried for every method, at its own path and
  * one level below it.
  */
-function classify(route: RouteEntry): string {
+function classify(route: RouteEntry, policy: RoutePolicy = "agent"): string {
   const probes: Array<{ label: string; method: string; path: string }> = [];
   for (const sample of samplePaths(route.path)) {
     const valueLabel = Object.entries(sample.values).map(([name, value]) => `${name}=${value}`).join(",");
@@ -176,14 +178,14 @@ function classify(route: RouteEntry): string {
       probes.push({ label: valueLabel, method: route.method, path: sample.path });
     }
   }
-  const allowedLabels = probes.filter((probe) => allowed(probe.method, probe.path)).map((probe) => probe.label);
+  const allowedLabels = probes.filter((probe) => allowed(policy, probe.method, probe.path)).map((probe) => probe.label);
   if (allowedLabels.length === 0) return "DENY";
   if (allowedLabels.length === probes.length) return "ALLOW";
   return `MIXED (allows ${allowedLabels.join("; ")})`;
 }
 
-function decisionOf(route: RouteEntry): "allow" | "deny" | "mixed" {
-  const decision = classify(route);
+function decisionOf(route: RouteEntry, policy: RoutePolicy = "agent"): "allow" | "deny" | "mixed" {
+  const decision = classify(route, policy);
   return decision === "ALLOW" ? "allow" : decision === "DENY" ? "deny" : "mixed";
 }
 
@@ -272,5 +274,20 @@ describe("agent bridge policy route inventory", () => {
       expect(route, `${key} is registered`).toBeDefined();
       expect(decisionOf(route!), key).toBe("allow");
     }
+  });
+
+  it("agent-with-instruction-writes forwards exactly the instruction bundle update and file write on top of agent", () => {
+    const changed = [...new Set(routes
+      .filter((route) => classify(route, "agent-with-instruction-writes") !== classify(route))
+      .map((route) => `${classify(route, "agent-with-instruction-writes")} ${route.method} ${route.path}`))]
+      .sort();
+    expect(changed).toEqual([
+      "ALLOW PATCH /api/agents/:id/instructions-bundle",
+      "ALLOW PUT /api/agents/:id/instructions-bundle/file",
+    ]);
+    const byKey = new Map(routes.map((route) => [`${route.method} ${route.path}`, route]));
+    const deleteFile = byKey.get("DELETE /api/agents/:id/instructions-bundle/file");
+    expect(deleteFile, "DELETE /api/agents/:id/instructions-bundle/file is registered").toBeDefined();
+    expect(decisionOf(deleteFile!, "agent-with-instruction-writes")).toBe("deny");
   });
 });
