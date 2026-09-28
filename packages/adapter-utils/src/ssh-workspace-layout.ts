@@ -5,6 +5,7 @@ import path from "node:path";
  * working directory (`remoteCwd`):
  *
  *   <remoteCwd>/.paperclip-runtime/
+ *   ├── .stage.lock                flock(1) lock held while a workspace is staged
  *   ├── workspaces/<key>/          stable per (agent, task, host workspace)
  *   │   ├── workspace/             the agent's working directory
  *   │   ├── .last-used             touched when a run stages it (GC clock)
@@ -19,8 +20,18 @@ import path from "node:path";
  * earlier run of the same task, because CLIs key their session stores by the
  * working directory. Everything that must stay private to one run lives under
  * `runs/<runId>`.
+ *
+ * Paperclip removes neither `runs/` nor `workspaces/`; the host's operator
+ * does. A cleanup of idle entries that runs concurrently with Paperclip should
+ * take `.stage.lock` (flock(1), exclusive) while it decides what to remove and
+ * moves it out of the tree, then delete it after releasing the lock. The stage
+ * script holds the same lock and marks the slot as used first, so such a
+ * cleanup never removes a slot or run directory while a run is staging it.
  */
 export const SSH_RUNTIME_DIR_NAME = ".paperclip-runtime";
+
+/** Lock file under the runtime directory; see the layout comment above. */
+export const SSH_STAGE_LOCK_FILE_NAME = ".stage.lock";
 
 const WORKSPACE_REUSE_KEY_PATTERN = /^[0-9a-f]{32}$/;
 const RUN_ID_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -47,6 +58,10 @@ function requireWorkspaceReuseKey(key: string): string {
 
 export function sshRuntimeDir(baseRemoteDir: string): string {
   return path.posix.join(baseRemoteDir, SSH_RUNTIME_DIR_NAME);
+}
+
+export function sshStageLockPath(baseRemoteDir: string): string {
+  return path.posix.join(sshRuntimeDir(baseRemoteDir), SSH_STAGE_LOCK_FILE_NAME);
 }
 
 export function sshRunsRootDir(baseRemoteDir: string): string {
@@ -84,12 +99,17 @@ function shellQuote(value: string): string {
  * over from the previous run keeps writing into the moved directory instead of
  * the new one. The new run then starts from an empty directory at the same
  * path.
+ *
+ * When the host has flock(1), the script holds `.stage.lock` for its whole
+ * duration (waiting at most 30 s for it), and it marks the slot as used before
+ * it changes anything in it.
  */
 export function buildSshReusableWorkspaceStageScript(input: {
   baseRemoteDir: string;
   key: string;
   runId: string;
 }): string {
+  const runtimeDir = sshRuntimeDir(input.baseRemoteDir);
   const runsRoot = sshRunsRootDir(input.baseRemoteDir);
   const runDir = sshRunDir(input.baseRemoteDir, input.runId);
   const slotDir = sshReusableWorkspaceSlotDir(input.baseRemoteDir, input.key);
@@ -98,7 +118,17 @@ export function buildSshReusableWorkspaceStageScript(input: {
     `runs=${shellQuote(runsRoot)}`,
     `slot=${shellQuote(slotDir)}`,
     'ws="$slot/workspace"',
+    `mkdir -p ${shellQuote(runtimeDir)}`,
+    // Exclusive with a host cleanup of idle directories that takes this lock.
+    // The lock is released when the script exits.
+    "if command -v flock >/dev/null 2>&1; then",
+    `  exec 9>>${shellQuote(sshStageLockPath(input.baseRemoteDir))}`,
+    '  flock -w 30 9 || { echo "Timed out waiting for the SSH workspace stage lock" >&2; exit 1; }',
+    "fi",
     `mkdir -p ${shellQuote(runDir)} "$slot"`,
+    // Mark the slot as used before changing it; this also narrows the window
+    // for a cleanup that checks the mark without taking the lock.
+    'touch "$slot/.last-used"',
     'if [ -e "$ws" ] || [ -L "$ws" ]; then',
     // The recorded run id names a directory, so keep only safe characters.
     `  prev=$(head -c 128 "$slot/.last-run" 2>/dev/null | tr -cd 'A-Za-z0-9._-' || true)`,
@@ -110,6 +140,5 @@ export function buildSshReusableWorkspaceStageScript(input: {
     "fi",
     'mkdir "$ws"',
     `printf '%s\\n' ${shellQuote(input.runId)} > "$slot/.last-run"`,
-    'touch "$slot/.last-used"',
   ].join("\n");
 }

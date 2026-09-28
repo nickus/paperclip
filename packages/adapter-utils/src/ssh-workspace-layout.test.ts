@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { mkdtemp, readdir, readFile, rm, stat, writeFile, mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -12,9 +12,20 @@ import {
   sshRunDir,
   sshRunScratchDir,
   sshRunsRootDir,
+  sshRuntimeDir,
+  sshStageLockPath,
 } from "./ssh-workspace-layout.js";
 
 const KEY = "0123456789abcdef0123456789abcdef";
+
+function hasFlock(): boolean {
+  try {
+    execFileSync("sh", ["-c", "command -v flock"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // The stage script is plain POSIX sh, so it runs against a local directory
 // exactly as it runs on the SSH host.
@@ -115,6 +126,35 @@ describe("ssh workspace layout", () => {
     const movedCopy = run2Entries.find((entry) => entry.startsWith("workspace-"));
     expect(movedCopy).toBeDefined();
     expect(await readFile(path.join(sshRunDir(base, "run-2"), movedCopy!, "b.txt"), "utf8")).toBe("b\n");
+  });
+
+  it.skipIf(!hasFlock())("waits for the stage lock that a host cleanup holds", async () => {
+    const base = await makeBase();
+    const slot = sshReusableWorkspaceSlotDir(base, KEY);
+    await mkdir(sshRuntimeDir(base), { recursive: true });
+
+    // Stand-in for a cleanup: holds the lock, then reports whether the slot
+    // appeared while it held it.
+    const holder = spawn(
+      "flock",
+      [sshStageLockPath(base), "sh", "-c", 'echo held; sleep 1; if [ -e "$1" ]; then echo slot-present; else echo slot-absent; fi', "sh", slot],
+      { stdio: ["ignore", "pipe", "inherit"] },
+    );
+    let holderOutput = "";
+    const held = new Promise<void>((resolve) => {
+      holder.stdout.on("data", (chunk: Buffer) => {
+        holderOutput += chunk.toString("utf8");
+        if (holderOutput.includes("held")) resolve();
+      });
+    });
+    const holderDone = new Promise<number | null>((resolve) => holder.on("close", resolve));
+    await held;
+
+    await runScript(buildSshReusableWorkspaceStageScript({ baseRemoteDir: base, key: KEY, runId: "run-1" }));
+    expect(await holderDone).toBe(0);
+    expect(holderOutput).toContain("slot-absent");
+    expect((await stat(sshReusableWorkspaceDir(base, KEY))).isDirectory()).toBe(true);
+    expect((await stat(path.join(slot, ".last-used"))).isFile()).toBe(true);
   });
 
   it("keeps a tampered .last-run record inside the runs directory", async () => {
