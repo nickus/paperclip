@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, like, ne, notInArray, notLike, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, like, lt, ne, notInArray, notLike, or, sql } from "drizzle-orm";
+import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -46,7 +47,7 @@ import {
   secretProviderConfigDiscoveryPreviewSchema,
   updateSecretProviderConfigSchema,
 } from "@paperclipai/shared";
-import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import {
   checkSecretProviders,
@@ -96,6 +97,45 @@ export const SANDBOX_CLEANUP_CONSUMER_ID = "environment-sandbox-cleanup";
 // trail marks the read as a same-account idempotency check, not a normal
 // runtime bind.
 export const DEVICE_LOGIN_SECRET_CHECK_CONSUMER_ID = "device-login-secret-check";
+
+// Pagination for `listAccessEvents`: a secret that a hot loop reads on every
+// tick can accumulate access-event rows far faster than anyone ever reads
+// them back, so the page size is capped on both ends and always enforced in
+// the SQL query itself (never by loading everything and slicing in JS).
+export const SECRET_ACCESS_EVENTS_DEFAULT_LIMIT = 100;
+export const SECRET_ACCESS_EVENTS_MAX_LIMIT = 1000;
+
+interface SecretAccessEventsCursor {
+  createdAt: string;
+  id: string;
+}
+
+const secretAccessEventsCursorSchema = z.object({
+  createdAt: z.string().datetime({ offset: true }),
+  id: z.string().guid(),
+});
+
+function encodeSecretAccessEventsCursor(value: SecretAccessEventsCursor): string {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+// Decodes an opaque `before=<createdAt,id>` cursor. Returns `null` for an
+// absent cursor and throws for a malformed one, so callers can tell "first
+// page" apart from "bad input" instead of silently treating a corrupt cursor
+// as the start of the list.
+function decodeSecretAccessEventsCursor(cursor: string | null | undefined): SecretAccessEventsCursor | null {
+  if (!cursor) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+  } catch {
+    throw badRequest("Invalid access events cursor");
+  }
+  const parsed = secretAccessEventsCursorSchema.safeParse(raw);
+  if (!parsed.success) throw badRequest("Invalid access events cursor");
+  return parsed.data;
+}
+
 const SENSITIVE_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 const REDACTED_SENTINEL = "***REDACTED***";
@@ -3765,12 +3805,86 @@ export function secretService(db: Db | DbTransaction) {
       }));
     },
 
-    listAccessEvents: (companyId: string, secretId: string) =>
-      db
-        .select()
+    listAccessEvents: async (
+      companyId: string,
+      secretId: string,
+      options?: { limit?: number; cursor?: string | null },
+    ) => {
+      const cursor = decodeSecretAccessEventsCursor(options?.cursor);
+      const requestedLimit = options?.limit ?? SECRET_ACCESS_EVENTS_DEFAULT_LIMIT;
+      if (!Number.isFinite(requestedLimit) || requestedLimit < 1) {
+        throw badRequest("Invalid access events limit");
+      }
+      // Clamped defensively even though callers (the route) already enforce
+      // the max: this is the boundary that actually reaches the database, so
+      // it is the one that must never trust its caller alone.
+      const limit = Math.min(Math.trunc(requestedLimit), SECRET_ACCESS_EVENTS_MAX_LIMIT);
+
+      const conditions = [eq(secretAccessEvents.companyId, companyId), eq(secretAccessEvents.secretId, secretId)];
+      if (cursor) {
+        conditions.push(or(
+          sql<boolean>`${secretAccessEvents.createdAt} < ${cursor.createdAt}::timestamptz`,
+          and(
+            sql<boolean>`${secretAccessEvents.createdAt} = ${cursor.createdAt}::timestamptz`,
+            lt(secretAccessEvents.id, cursor.id),
+          ),
+        )!);
+      }
+
+      // Fetch one row past the page so `nextCursor` reflects whether more
+      // rows actually exist, without a second COUNT query. `limit` is passed
+      // to the SQL `LIMIT` clause below, so a secret with a million events
+      // still only ever pulls `limit + 1` rows off the wire.
+      const rows = await db
+        .select({
+          id: secretAccessEvents.id,
+          companyId: secretAccessEvents.companyId,
+          secretId: secretAccessEvents.secretId,
+          userSecretDefinitionId: secretAccessEvents.userSecretDefinitionId,
+          secretScope: secretAccessEvents.secretScope,
+          version: secretAccessEvents.version,
+          provider: secretAccessEvents.provider,
+          responsibleUserId: secretAccessEvents.responsibleUserId,
+          credentialOwnerUserId: secretAccessEvents.credentialOwnerUserId,
+          credentialSubjectType: secretAccessEvents.credentialSubjectType,
+          credentialSubjectId: secretAccessEvents.credentialSubjectId,
+          actorType: secretAccessEvents.actorType,
+          actorId: secretAccessEvents.actorId,
+          consumerType: secretAccessEvents.consumerType,
+          consumerId: secretAccessEvents.consumerId,
+          configPath: secretAccessEvents.configPath,
+          issueId: secretAccessEvents.issueId,
+          heartbeatRunId: secretAccessEvents.heartbeatRunId,
+          pluginId: secretAccessEvents.pluginId,
+          outcome: secretAccessEvents.outcome,
+          errorCode: secretAccessEvents.errorCode,
+          createdAt: secretAccessEvents.createdAt,
+          // A JS `Date`'s `.toISOString()` only carries millisecond
+          // precision, but Postgres timestamps carry microseconds, so two
+          // events in the same millisecond could round-trip through a
+          // JS-formatted cursor and no longer match the row they came from.
+          // This mirrors the DB's own precision instead, so the cursor's
+          // equality branch above only ever matches the exact row.
+          cursorCreatedAt: sql<string>`to_char(${secretAccessEvents.createdAt} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`.as(
+            "cursor_created_at",
+          ),
+        })
         .from(secretAccessEvents)
-        .where(and(eq(secretAccessEvents.companyId, companyId), eq(secretAccessEvents.secretId, secretId)))
-        .orderBy(desc(secretAccessEvents.createdAt)),
+        .where(and(...conditions))
+        .orderBy(desc(secretAccessEvents.createdAt), desc(secretAccessEvents.id))
+        .limit(limit + 1);
+
+      const page = rows.slice(0, limit);
+      const last = page.at(-1);
+      const nextCursor = rows.length > limit && last
+        ? encodeSecretAccessEventsCursor({ createdAt: last.cursorCreatedAt, id: last.id })
+        : null;
+
+      return {
+        items: page.map(({ cursorCreatedAt: _cursorCreatedAt, ...row }) => row),
+        nextCursor,
+      };
+    },
 
     listUserSecretDefinitions: (companyId: string) =>
       db

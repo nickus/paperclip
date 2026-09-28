@@ -647,7 +647,7 @@ describe("Secrets page layout", () => {
   it("opens the secret detail sheet from a ?secret= deep link", async () => {
     mockSecretsApi.list.mockResolvedValue([makeCompanySecret()]);
     mockSecretsApi.usage.mockResolvedValue({ secretId: "secret-openai", bindings: [] });
-    mockSecretsApi.accessEvents.mockResolvedValue([]);
+    mockSecretsApi.accessEvents.mockResolvedValue({ events: [], nextCursor: null });
 
     const root = createRoot(container);
     const queryClient = new QueryClient({
@@ -691,7 +691,7 @@ describe("Secrets page layout", () => {
     });
     mockSecretsApi.list.mockResolvedValue([externalSecret]);
     mockSecretsApi.usage.mockResolvedValue({ secretId: "secret-neon", bindings: [] });
-    mockSecretsApi.accessEvents.mockResolvedValue([]);
+    mockSecretsApi.accessEvents.mockResolvedValue({ events: [], nextCursor: null });
     mockSecretsApi.rotate.mockResolvedValue({ ...externalSecret, latestVersion: 2 });
 
     const root = createRoot(container);
@@ -1436,7 +1436,7 @@ describe("Secrets page layout", () => {
   it("grants and revokes agent access from the secret detail sheet", async () => {
     mockSecretsApi.list.mockResolvedValue([makeCompanySecret()]);
     mockSecretsApi.usage.mockResolvedValue({ secretId: "secret-openai", bindings: [] });
-    mockSecretsApi.accessEvents.mockResolvedValue([]);
+    mockSecretsApi.accessEvents.mockResolvedValue({ events: [], nextCursor: null });
     const coder = {
       id: "agent-coder",
       name: "CodexCoder",

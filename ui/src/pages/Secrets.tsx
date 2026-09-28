@@ -2370,7 +2370,7 @@ export function Secrets() {
                   <TabsContent value="events">
                     <SecretEventsTab
                       loading={eventsQuery.isPending}
-                      events={eventsQuery.data ?? []}
+                      events={eventsQuery.data?.events ?? []}
                       companyId={selectedCompanyId}
                     />
                   </TabsContent>

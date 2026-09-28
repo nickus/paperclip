@@ -302,6 +302,13 @@ export interface SecretAccessEvent {
   createdAt: Date;
 }
 
+/** A page of `GET /secrets/:id/access-events`, newest first. */
+export interface SecretAccessEventPage {
+  events: SecretAccessEvent[];
+  /** Opaque cursor for the next page's `cursor` query param, or `null` past the last page. */
+  nextCursor: string | null;
+}
+
 export type RemoteSecretImportCandidateStatus = "ready" | "duplicate" | "conflict";
 
 export interface RemoteSecretImportConflict {

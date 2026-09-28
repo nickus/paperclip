@@ -5228,7 +5228,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       errorReason: expect.stringContaining("configuration incomplete"),
     });
     // Value-free gate: no secret access events were recorded.
-    expect(await svc.listAccessEvents(companyId, secret.id)).toHaveLength(0);
+    expect((await svc.listAccessEvents(companyId, secret.id)).items).toHaveLength(0);
 
     const issue = await waitForValue(async () =>
       db
