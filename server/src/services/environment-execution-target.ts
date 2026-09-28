@@ -16,6 +16,7 @@ import {
   SANDBOX_STARTUP_SPAN_ATTRS,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { parseObject } from "../adapters/utils.js";
+import { resolveAdapterEnvironmentSupportSubject } from "../adapters/environment-support.js";
 import { getStartupTracer } from "../instrumentation.js";
 import { resolveEnvironmentDriverConfigForRuntime } from "./environment-config.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
@@ -256,7 +257,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
     // Keep this gate in lockstep with the shared capability metadata that the
     // environment selector and capabilities API expose; a drift here lets the
     // UI offer environments the runtime then refuses.
-    if (!adapterSupportsRemoteManagedEnvironments(input.adapterType)) {
+    if (!adapterSupportsRemoteManagedEnvironments(resolveAdapterEnvironmentSupportSubject(input.adapterType))) {
       return null;
     }
 
@@ -633,8 +634,8 @@ export async function resolveEnvironmentExecutionTarget(input: {
   }
 
   if (
-    !adapterSupportsRemoteManagedEnvironments(input.adapterType) ||
-    input.environment.driver !== "ssh"
+    input.environment.driver !== "ssh" ||
+    !adapterSupportsRemoteManagedEnvironments(resolveAdapterEnvironmentSupportSubject(input.adapterType))
   ) {
     return null;
   }

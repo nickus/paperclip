@@ -1,7 +1,6 @@
 import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import {
-  AGENT_ADAPTER_TYPES,
   cancelEnvironmentCustomImageSetupSessionSchema,
   createEnvironmentCustomImageTerminalSessionTokenSchema,
   createEnvironmentSchema,
@@ -17,6 +16,7 @@ import {
   updateEnvironmentSchema,
 } from "@paperclipai/shared";
 import { conflict, forbidden, unprocessable } from "../errors.js";
+import { listAdapterEnvironmentSupportSubjects } from "../adapters/environment-support.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getManagedInstanceConfig, SECRET_LIKE_CONFIG_KEY_PATTERN } from "../services/managed-config.js";
 import { parseExecutionPolicyBootstrapEnv } from "../services/execution-policy-bootstrap.js";
@@ -729,7 +729,9 @@ export function environmentRoutes(
       recoverMissingWorker: options.recoverMissingPluginWorker,
     });
     res.json(getEnvironmentCapabilities(
-      AGENT_ADAPTER_TYPES,
+      // Built-in types plus enabled external adapters, each with what its
+      // registered module declares about remote-managed environments.
+      listAdapterEnvironmentSupportSubjects(),
       {
         sandboxProviders: Object.fromEntries(pluginDrivers.map((driver) => [
           driver.driverKey,

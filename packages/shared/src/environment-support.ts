@@ -76,49 +76,80 @@ const REMOTE_MANAGED_ADAPTERS = new Set<AgentAdapterType>([
   "pi_local",
 ]);
 
-export function adapterSupportsRemoteManagedEnvironments(adapterType: string): boolean {
-  return REMOTE_MANAGED_ADAPTERS.has(adapterType as AgentAdapterType);
+/**
+ * An adapter as the environment-support helpers see it: its type alone, or its
+ * type together with what the adapter module itself declares. The object form
+ * matches the `type` and `supportsRemoteManagedEnvironments` members of a
+ * server adapter module, so a caller that holds the registered module (built-in
+ * or loaded from an external plugin package) can pass it directly.
+ */
+export type AdapterEnvironmentSupportSubject =
+  | string
+  | {
+      type: string;
+      /**
+       * The adapter's own declaration. A boolean wins over the built-in list,
+       * so an external adapter plugin can opt in, and a plugin that replaces a
+       * built-in adapter type describes the module that actually runs.
+       * Absent (or null) falls back to the built-in list.
+       */
+      supportsRemoteManagedEnvironments?: boolean | null;
+    };
+
+function subjectAdapterType(adapter: AdapterEnvironmentSupportSubject): string {
+  return typeof adapter === "string" ? adapter : adapter.type;
 }
 
-export function supportedEnvironmentDriversForAdapter(adapterType: string): EnvironmentDriver[] {
-  return adapterSupportsRemoteManagedEnvironments(adapterType)
+export function adapterSupportsRemoteManagedEnvironments(
+  adapter: AdapterEnvironmentSupportSubject,
+): boolean {
+  if (typeof adapter !== "string" && typeof adapter.supportsRemoteManagedEnvironments === "boolean") {
+    return adapter.supportsRemoteManagedEnvironments;
+  }
+  return REMOTE_MANAGED_ADAPTERS.has(subjectAdapterType(adapter) as AgentAdapterType);
+}
+
+export function supportedEnvironmentDriversForAdapter(
+  adapter: AdapterEnvironmentSupportSubject,
+): EnvironmentDriver[] {
+  return adapterSupportsRemoteManagedEnvironments(adapter)
     ? ["local", "ssh", "sandbox"]
     : ["local"];
 }
 
 export function supportedSandboxProvidersForAdapter(
-  adapterType: string,
+  adapter: AdapterEnvironmentSupportSubject,
   additionalProviders: readonly string[] = [],
 ): SandboxEnvironmentProvider[] {
-  return adapterSupportsRemoteManagedEnvironments(adapterType)
+  return adapterSupportsRemoteManagedEnvironments(adapter)
     ? Array.from(new Set(additionalProviders)) as SandboxEnvironmentProvider[]
     : [];
 }
 
 export function isEnvironmentDriverSupportedForAdapter(
-  adapterType: string,
+  adapter: AdapterEnvironmentSupportSubject,
   driver: string,
 ): boolean {
-  return supportedEnvironmentDriversForAdapter(adapterType).includes(driver as EnvironmentDriver);
+  return supportedEnvironmentDriversForAdapter(adapter).includes(driver as EnvironmentDriver);
 }
 
 export function isSandboxProviderSupportedForAdapter(
-  adapterType: string,
+  adapter: AdapterEnvironmentSupportSubject,
   provider: string | null | undefined,
   additionalProviders: readonly string[] = [],
 ): boolean {
   if (!provider) return false;
-  return supportedSandboxProvidersForAdapter(adapterType, additionalProviders).includes(
+  return supportedSandboxProvidersForAdapter(adapter, additionalProviders).includes(
     provider as SandboxEnvironmentProvider,
   );
 }
 
 export function getAdapterEnvironmentSupport(
-  adapterType: AgentAdapterType,
+  adapter: AdapterEnvironmentSupportSubject,
   additionalSandboxProviders: readonly string[] = [],
 ): AdapterEnvironmentSupport {
-  const supportedDrivers = new Set(supportedEnvironmentDriversForAdapter(adapterType));
-  const supportedProviders = new Set(supportedSandboxProvidersForAdapter(adapterType, additionalSandboxProviders));
+  const supportedDrivers = new Set(supportedEnvironmentDriversForAdapter(adapter));
+  const supportedProviders = new Set(supportedSandboxProvidersForAdapter(adapter, additionalSandboxProviders));
   const sandboxProviders: Record<SandboxEnvironmentProvider, EnvironmentSupportStatus> = {
     fake: "unsupported",
   };
@@ -128,7 +159,7 @@ export function getAdapterEnvironmentSupport(
       : "unsupported";
   }
   return {
-    adapterType,
+    adapterType: subjectAdapterType(adapter),
     drivers: {
       local: supportedDrivers.has("local") ? "supported" : "unsupported",
       ssh: supportedDrivers.has("ssh") ? "supported" : "unsupported",
@@ -140,7 +171,7 @@ export function getAdapterEnvironmentSupport(
 }
 
 export function getEnvironmentCapabilities(
-  adapterTypes: readonly AgentAdapterType[],
+  adapters: readonly AdapterEnvironmentSupportSubject[],
   options: {
     sandboxProviders?: Record<string, Partial<EnvironmentProviderCapability>>;
   } = {},
@@ -189,7 +220,7 @@ export function getEnvironmentCapabilities(
     };
   }
   return {
-    adapters: adapterTypes.map((adapterType) => getAdapterEnvironmentSupport(adapterType, pluginProviderKeys)),
+    adapters: adapters.map((adapter) => getAdapterEnvironmentSupport(adapter, pluginProviderKeys)),
     drivers: {
       local: "supported",
       ssh: "supported",
