@@ -117,6 +117,7 @@ describe("opencode remote execution", () => {
     vi.clearAllMocks();
     syncDirectoryToSsh.mockImplementation(async () => undefined);
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
     if (originalOpenCodeAllowAllModels === undefined) {
       delete process.env.OPENCODE_ALLOW_ALL_MODELS;
     } else {
@@ -407,6 +408,74 @@ describe("opencode remote execution", () => {
       | undefined;
     expect(call?.[2]).toContain("--session");
     expect(call?.[2]).toContain("session-123");
+  });
+
+  it("skips the model-endpoint pre-spawn probe for a remote SSH target and runs unchanged", async () => {
+    // The probe runs from the Paperclip server process. A baseURL that only
+    // resolves or routes from the execution target itself (cluster-internal
+    // DNS, a target-local sidecar, target-specific egress) would make the
+    // server-side probe fail even though opencode — once actually spawned on
+    // the remote target — could reach it fine. The preflight must fail open
+    // for any remote target instead of probing from the wrong place.
+    const fetchMock = vi.fn().mockRejectedValue(new Error("must not be called for a remote target"));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubEnv("OPENCODE_ALLOW_ALL_MODELS", "1");
+    vi.stubEnv(
+      "PAPERCLIP_OPENCODE_PROVIDERS",
+      JSON.stringify({ acme_gateway: { options: { baseURL: "http://gateway.example/v1" } } }),
+    );
+
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-preflight-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    const result = await execute({
+      runId: "run-ssh-preflight",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Builder",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: "opencode",
+        model: "acme_gateway/some-model",
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+      },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.errorCode ?? null).toBeNull();
+    const call = runChildProcess.mock.calls.find((entry) => Array.isArray(entry[2]) && entry[2].includes("run")) as
+      | [string, string, string[]]
+      | undefined;
+    expect(call).toBeDefined();
   });
 
   it("resumes the session of an earlier run of the same task from the stable SSH workspace", async () => {

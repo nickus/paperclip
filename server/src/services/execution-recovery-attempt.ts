@@ -45,6 +45,14 @@ function historicalFailureCount(run: RetryRun): number {
     const saved = count(run.contextSnapshot?.failureRetriesBeforeWorkspaceWait);
     if (saved !== null) return saved;
   }
+  if (run.scheduledRetryReason === "model_endpoint_unreachable_retry") {
+    // Same shape as ai_connection_busy/workspace_busy above: a down model
+    // endpoint is an outage wait, not a failed provider attempt, so its own
+    // retry count must not feed the reconciliation gate's failure budget —
+    // only the count from BEFORE the outage began does.
+    const count = run.contextSnapshot?.failureRetriesBeforeModelEndpointWait;
+    if (typeof count === "number" && Number.isInteger(count) && count >= 0) return count;
+  }
   // Historical ambiguous counters remain conservative rather than resetting.
   return count(run.scheduledRetryAttempt) ?? 0;
 }
@@ -52,7 +60,9 @@ function historicalFailureCount(run: RetryRun): number {
 export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccounting {
   const saved = savedAccounting(run);
   const nonFailureLane = isProductiveContinuationReason(run.scheduledRetryReason) ||
-    ["issue_disposition_repair", "workspace_busy", "ai_connection_busy"].includes(run.scheduledRetryReason ?? "");
+    ["issue_disposition_repair", "workspace_busy", "ai_connection_busy", "model_endpoint_unreachable_retry"].includes(
+      run.scheduledRetryReason ?? "",
+    );
   return {
     version: 1,
     failureRetries: Math.max(saved?.failureRetries ?? 0, saved && nonFailureLane ? 0 : historicalFailureCount(run)),
@@ -67,7 +77,7 @@ export function executionFailureRetryCount(run: RetryRun): number {
 }
 
 export function executionRetryAttemptCount(run: RetryRun, reason: string): number {
-  if (reason === "workspace_busy" || reason === "ai_connection_busy") {
+  if (reason === "workspace_busy" || reason === "ai_connection_busy" || reason === "model_endpoint_unreachable_retry") {
     return run.scheduledRetryReason === reason ? count(run.scheduledRetryAttempt) ?? 0 : 0;
   }
   const accounting = executionRetryAccounting(run);
@@ -77,6 +87,7 @@ export function executionRetryAttemptCount(run: RetryRun, reason: string): numbe
 export function accountingForScheduledRetry(run: RetryRun, reason: string, attempt: number): ExecutionRetryAccounting {
   const accounting = executionRetryAccounting(run);
   if (isProductiveContinuationReason(reason)) accounting.maxTurnContinuations = attempt;
-  else if (reason !== "workspace_busy" && reason !== "ai_connection_busy") accounting.failureRetries = attempt;
+  else if (reason !== "workspace_busy" && reason !== "ai_connection_busy" && reason !== "model_endpoint_unreachable_retry")
+    accounting.failureRetries = attempt;
   return accounting;
 }
