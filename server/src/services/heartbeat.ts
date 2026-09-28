@@ -16153,7 +16153,11 @@ export function heartbeatService(
   // run workspace resolution tries first), or the managed project directory
   // when the project has no workspace. `defaultTreeProjectId` is set when the
   // tree is that default tree, so issues of the project without a project
-  // workspace share it. Returns null for an issue without a project.
+  // workspace share it. This also applies in a project that has workspaces:
+  // an issue without a project workspace is serialized against the issues on
+  // the project's first workspace, and against the project's other issues
+  // without one, since run workspace resolution puts all of them in that
+  // tree. Returns null for an issue without a project.
   async function resolveSharedWorkspaceScope(input: {
     companyId: string;
     projectId: string | null;
