@@ -584,3 +584,119 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
     ).rejects.toThrow("Configured OpenCode model is unavailable on the remote execution target");
   });
 });
+
+describe("execute — model-endpoint preflight", () => {
+  let configHome: string;
+  let commandPath: string;
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  const GATEWAY_PROVIDERS = JSON.stringify({
+    acme_gateway: { options: { baseURL: "http://gateway.example/v1", apiKey: "secret" } },
+  });
+
+  function baseCtx(overrides: Record<string, unknown> = {}) {
+    return {
+      runId: "preflight-run",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: commandPath,
+        cwd: configHome,
+        model: "acme_gateway/some-model",
+        env: { OPENCODE_ALLOW_ALL_MODELS: "1" },
+      },
+      context: {},
+      onLog: async () => {},
+      ...overrides,
+    } as never;
+  }
+
+  beforeEach(async () => {
+    configHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-preflight-"));
+    vi.stubEnv("XDG_CONFIG_HOME", configHome);
+    vi.stubEnv("PAPERCLIP_OPENCODE_PROVIDERS", GATEWAY_PROVIDERS);
+    vi.stubEnv("PAPERCLIP_MODEL_ENDPOINT_PREFLIGHT", "");
+    commandPath = path.join(configHome, "fake-opencode");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValue(
+      probeResult({ stdout: JSON.stringify({ type: "text", sessionID: "s-1", part: { text: "ok" } }) }),
+    );
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    await fs.rm(configHome, { recursive: true, force: true });
+  });
+
+  it("unreachable: a network failure fails without spawning opencode", async () => {
+    fetchMock.mockRejectedValue(new Error("ECONNREFUSED"));
+
+    const result = await execute(baseCtx());
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://gateway.example/v1/models",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(result.errorCode).toBe("model_endpoint_unreachable");
+    expect(result.errorMessage).toMatch(/unreachable/i);
+    expect(runProcessMock).not.toHaveBeenCalled();
+  });
+
+  it("unreachable: a 5xx response fails without spawning opencode", async () => {
+    fetchMock.mockResolvedValue({ status: 503 });
+
+    const result = await execute(baseCtx());
+
+    expect(result.errorCode).toBe("model_endpoint_unreachable");
+    expect(runProcessMock).not.toHaveBeenCalled();
+  });
+
+  it("reachable: a 2xx response spawns opencode as usual", async () => {
+    fetchMock.mockResolvedValue({ status: 200 });
+
+    const result = await execute(baseCtx());
+
+    expect(result.errorCode ?? null).toBeNull();
+    expect(runProcessMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reachable: a 4xx response (e.g. auth) fails open and still spawns opencode", async () => {
+    fetchMock.mockResolvedValue({ status: 401 });
+
+    const result = await execute(baseCtx());
+
+    expect(result.errorCode ?? null).toBeNull();
+    expect(runProcessMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("no baseURL: an unresolvable provider skips the probe entirely and spawns opencode", async () => {
+    vi.stubEnv("PAPERCLIP_OPENCODE_PROVIDERS", "");
+
+    const result = await execute(baseCtx());
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.errorCode ?? null).toBeNull();
+    expect(runProcessMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("kill switch: PAPERCLIP_MODEL_ENDPOINT_PREFLIGHT=0 skips the probe even with a known, unreachable baseURL", async () => {
+    vi.stubEnv("PAPERCLIP_MODEL_ENDPOINT_PREFLIGHT", "0");
+    fetchMock.mockRejectedValue(new Error("should never be called"));
+
+    const result = await execute(baseCtx());
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.errorCode ?? null).toBeNull();
+    expect(runProcessMock).toHaveBeenCalledTimes(1);
+  });
+});

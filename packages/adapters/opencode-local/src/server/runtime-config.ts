@@ -199,6 +199,39 @@ export function renderOpenCodeRuntimeConfigWithMcpServers(
   return { text: `${JSON.stringify(config, null, 2)}\n`, notes };
 }
 
+/**
+ * Resolve the baseURL of the OpenCode provider the configured model
+ * (`config.model`, `"<provider>/<model>"`) would route through, when that
+ * provider is a custom gateway declared via PAPERCLIP_OPENCODE_PROVIDERS
+ * (see prepareOpenCodeRuntimeConfig above for why that env var exists).
+ *
+ * Returns null whenever the baseURL isn't knowable this way: `config.model`
+ * isn't in `"<provider>/<model>"` form, PAPERCLIP_OPENCODE_PROVIDERS doesn't
+ * declare that provider, or the provider entry has no `options.baseURL`. A
+ * caller that only wants to act when the baseURL IS known (e.g. a pre-spawn
+ * health probe) should treat null as "nothing to check", not as a failure.
+ */
+export function resolveConfiguredOpenCodeProviderBaseUrl(input: {
+  env: Record<string, string>;
+  config: Record<string, unknown>;
+}): string | null {
+  const configuredModel = parseConfiguredModelRef(input.config.model);
+  if (!configuredModel) return null;
+
+  const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
+  const gatewayProviders = parseProviderConfig(
+    input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS,
+    resolveEnv,
+    [], // discard notes here -- this is a lookup, not the config-writing path
+  );
+  const providerEntry = gatewayProviders?.[configuredModel.provider];
+  if (!isPlainObject(providerEntry)) return null;
+  const options = providerEntry.options;
+  if (!isPlainObject(options)) return null;
+  const baseUrl = options.baseURL;
+  return typeof baseUrl === "string" && baseUrl.trim().length > 0 ? baseUrl.trim() : null;
+}
+
 export async function prepareOpenCodeRuntimeConfig(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
