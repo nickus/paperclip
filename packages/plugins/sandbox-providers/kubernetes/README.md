@@ -198,6 +198,8 @@ Every agent pod is:
 
 Plus per-namespace `pod-security.kubernetes.io/enforce: restricted` and a deny-all NetworkPolicy baseline with explicit egress allow-list (DNS, paperclip-server, configured FQDNs/CIDRs).
 
+Directories synced back from a sandbox are checked on the host before anything is extracted: an archive with a member that would land outside the target directory, or a symlink whose target leaves it (an absolute target, or `..` above its root), is refused as a whole. So that one stray link does not fail the whole transfer, the pod leaves such symlinks out (unless the mapping follows symlinks) and names them in a warning. Leaving out nested ones needs GNU tar in the runtime image; the `agent-runtime-*` images are Ubuntu-based and ship it. With another tar (busybox, bsdtar) only top-level ones are left out, and a nested one still fails the transfer.
+
 The per-run Secret carrying the bootstrap token and adapter API keys has `ownerReferences` pointing at the owning Job, so a single `kubectl delete job …` cascades cleanly to the Pod and Secret.
 
 ## Optional Kata-FC microVM isolation
