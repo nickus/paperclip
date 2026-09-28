@@ -82,6 +82,7 @@ const mockBudgetService = vi.hoisted(() => ({
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
+  wakeup: vi.fn(),
   listTaskSessions: vi.fn(),
   resetRuntimeSession: vi.fn(),
   getRun: vi.fn(),
@@ -95,6 +96,7 @@ const mockIssueApprovalService = vi.hoisted(() => ({
 
 const mockIssueService = vi.hoisted(() => ({
   list: vi.fn(),
+  getById: vi.fn(),
 }));
 
 const mockSecretService = vi.hoisted(() => ({
@@ -891,6 +893,103 @@ describe.sequential("agent permission routes", () => {
       .send({}));
 
     expect(res.status).toBe(403);
+  });
+
+  describe("wake bound to an issue", () => {
+    const issueUuid = "44444444-4444-4444-8444-444444444444";
+    const ownIssue = {
+      id: issueUuid,
+      identifier: "BLD-7",
+      companyId,
+      assigneeAgentId: agentId,
+    };
+    const agentActor = {
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_jwt",
+      runId: "55555555-5555-4555-8555-555555555555",
+    };
+
+    beforeEach(() => {
+      mockHeartbeatService.wakeup.mockResolvedValue({ id: "66666666-6666-4666-8666-666666666666", status: "queued" });
+      mockIssueService.getById.mockResolvedValue(ownIssue);
+    });
+
+    it("lets an agent wake itself for an issue assigned to it", async () => {
+      const app = await createApp(agentActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${agentId}/wakeup`)
+        .send({ issueId: "BLD-7", reason: "continue_task" }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockIssueService.getById).toHaveBeenCalledWith("BLD-7");
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(agentId, expect.objectContaining({
+        payload: expect.objectContaining({ issueId: issueUuid }),
+      }));
+    });
+
+    it("refuses an agent binding its wake to an issue assigned to someone else", async () => {
+      mockIssueService.getById.mockResolvedValue({ ...ownIssue, assigneeAgentId: "77777777-7777-4777-8777-777777777777" });
+      const app = await createApp(agentActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${agentId}/wakeup`)
+        .send({ issueId: issueUuid }));
+
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("refuses an issue from another company", async () => {
+      mockIssueService.getById.mockResolvedValue({ ...ownIssue, companyId: "88888888-8888-4888-8888-888888888888" });
+      const app = await createApp(agentActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${agentId}/wakeup`)
+        .send({ issueId: issueUuid }));
+
+      expect(res.status).toBe(404);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("refuses an issueId that disagrees with payload.issueId", async () => {
+      const app = await createApp(agentActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${agentId}/wakeup`)
+        .send({ issueId: issueUuid, payload: { issueId: "99999999-9999-4999-8999-999999999999" } }));
+
+      expect(res.status).toBe(400);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("binds a board wake to the named issue", async () => {
+      mockIssueService.getById.mockResolvedValue({ ...ownIssue, assigneeAgentId: null });
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "local_implicit",
+        isInstanceAdmin: true,
+        companyIds: [companyId],
+      });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${agentId}/wakeup`)
+        .send({ issueId: issueUuid, payload: { note: "kept" } }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(agentId, expect.objectContaining({
+        payload: { note: "kept", issueId: issueUuid },
+      }));
+    });
+
+    it("leaves a wake without issueId unchanged", async () => {
+      const app = await createApp(agentActor);
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${agentId}/wakeup`)
+        .send({ reason: "check_inbox" }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockIssueService.getById).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(agentId, expect.objectContaining({ payload: null }));
+    });
   });
 
   it("blocks agent-authenticated self-updates that set host-executed workspace commands", async () => {

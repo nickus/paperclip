@@ -221,6 +221,12 @@ export const wakeAgentSchema = z.object({
   reason: z.string().optional().nullable(),
   /** Select an exact failed run; its chat request and actor are server-derived. */
   failedRunId: z.string().uuid().optional(),
+  /**
+   * Bind the run to one issue (id or identifier) in the agent's company. An
+   * agent waking itself may only name an issue assigned to it. The run then
+   * starts with that issue as its task, as a wake with `payload.issueId` does.
+   */
+  issueId: z.string().trim().min(1).optional(),
   payload: z.record(z.string(), z.unknown()).optional().nullable(),
   idempotencyKey: z.string().optional().nullable(),
   forceFreshSession: z.preprocess(

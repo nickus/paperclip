@@ -5680,6 +5680,32 @@ export function agentRoutes(
     source: HeartbeatSource | undefined;
     skippedResponse: (agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>, payload: Record<string, unknown> | null) => unknown | Promise<unknown>;
   };
+  // Resolve a wake's top-level `issueId` into the payload binding the
+  // heartbeat reads (`payload.issueId`). The issue must belong to the woken
+  // agent's company, and an agent waking itself may only bind an issue
+  // assigned to it.
+  const bindWakePayloadToIssue = async (
+    req: Request,
+    agent: { id: string; companyId: string },
+    requestedIssueId: unknown,
+    payload: Record<string, unknown> | null,
+  ): Promise<Record<string, unknown> | null> => {
+    if (requestedIssueId === undefined || requestedIssueId === null) return payload;
+    if (typeof requestedIssueId !== "string" || requestedIssueId.trim().length === 0) {
+      throw badRequest("issueId must be a non-empty issue id or identifier.");
+    }
+    const issue = await issueService(db).getById(requestedIssueId);
+    if (!issue || issue.companyId !== agent.companyId) throw notFound("Issue not found");
+    if (req.actor.type === "agent" && issue.assigneeAgentId !== agent.id) {
+      throw forbidden("An agent can only start a run for an issue assigned to it.");
+    }
+    const payloadIssueId = typeof payload?.issueId === "string" ? payload.issueId.trim() : "";
+    if (payloadIssueId && payloadIssueId !== issue.id && payloadIssueId !== issue.identifier) {
+      throw badRequest("issueId and payload.issueId name different issues.");
+    }
+    return { ...(payload ?? {}), issueId: issue.id };
+  };
+
   const handleWakeupRoute = async (
     req: Request,
     res: Response,
@@ -5708,6 +5734,10 @@ export function agentRoutes(
     }
 
     let wakePayload = req.body.payload ?? null;
+    if (req.body.issueId !== undefined && req.body.failedRunId) {
+      throw badRequest("An exact failed-run retry cannot override its execution context.");
+    }
+    wakePayload = await bindWakePayloadToIssue(req, agent, req.body.issueId, wakePayload);
     if (req.body.failedRunId) {
       assertBoard(req);
       if (
@@ -5930,6 +5960,7 @@ export function agentRoutes(
 
     const body = (req.body ?? {}) as Partial<{
       reason: unknown;
+      issueId: unknown;
       payload: unknown;
       idempotencyKey: unknown;
       forceFreshSession: unknown;
@@ -5964,10 +5995,18 @@ export function agentRoutes(
     if (typeof body.reason === "string" && body.reason.length > 0) {
       wakeOpts.reason = body.reason;
     }
-    if (body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)) {
+    const invokePayload = await bindWakePayloadToIssue(
+      req,
+      agent,
+      body.issueId,
+      body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)
+        ? body.payload as Record<string, unknown>
+        : null,
+    );
+    if (invokePayload) {
       wakeOpts.payload = req.actor.type === "agent"
-        ? { ...body.payload, commentId: undefined, wakeCommentId: undefined, wakeCommentIds: undefined }
-        : body.payload as Record<string, unknown>;
+        ? { ...invokePayload, commentId: undefined, wakeCommentId: undefined, wakeCommentIds: undefined }
+        : invokePayload;
     }
     if (typeof body.idempotencyKey === "string" && body.idempotencyKey.length > 0) {
       wakeOpts.idempotencyKey = body.idempotencyKey;
