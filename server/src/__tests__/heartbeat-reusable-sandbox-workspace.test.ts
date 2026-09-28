@@ -134,7 +134,7 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
 
   beforeAll(async () => {
     const started = await startEmbeddedPostgresTestDatabase("heartbeat-reusable-sandbox-workspace");
-    stopDb = started.stop;
+    stopDb = () => started.cleanup();
     db = createDb(started.connectionString);
     // The default posture: the opt-in isolated worktree UI is off.
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
@@ -151,7 +151,7 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
   afterAll(async () => {
     await db.$client.end();
     await stopDb?.();
-  });
+  }, 30_000);
 
   async function seed(environmentConfig: Record<string, unknown>) {
     const companyId = randomUUID();
@@ -255,18 +255,28 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
     });
     // A plain task: no project workspace policy and no per-task workspace
     // settings, so it runs in the shared project workspace.
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      projectId,
-      title: "Implement the feature",
-      status: "in_progress",
-      priority: "medium",
-      responsibleUserId: "responsible-user",
-      assigneeAgentId: agentId,
-      createdAt: now,
-      updatedAt: now,
-    });
+    async function insertIssue(id: string, title: string) {
+      await db.insert(issues).values({
+        id,
+        companyId,
+        projectId,
+        title,
+        status: "in_progress",
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+        assigneeAgentId: agentId,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    await insertIssue(issueId, "Implement the feature");
+
+    /** Another task for the same agent, in the same project and environment. */
+    async function addIssue(title: string) {
+      const id = randomUUID();
+      await insertIssue(id, title);
+      return id;
+    }
     const sandboxRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-reusable-sandbox-pod-"));
     tempRoots.push(sandboxRoot);
     await mkdir(path.join(sandboxRoot, "workspace"), { recursive: true });
@@ -290,7 +300,7 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
      * heartbeat may queue its own follow-up runs) has finished and released its
      * sandbox lease, as between two real runs of a task.
      */
-    async function wakeAndSettle() {
+    async function wakeAndSettle(targetIssueId: string = issueId) {
       const before = (await agentRuns()).length;
       if (before > 0) {
         // A reply on the task since the last run, so the follow-up wake is new
@@ -301,14 +311,14 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
           actorId: "responsible-user",
           action: "issue.comment_added",
           entityType: "issue",
-          entityId: issueId,
+          entityId: targetIssueId,
           createdAt: new Date(),
         });
       }
       const run = await heartbeat.wakeup(agentId, {
         source: "on_demand",
         triggerDetail: "manual",
-        contextSnapshot: { issueId },
+        contextSnapshot: { issueId: targetIssueId },
       });
       expect(run).not.toBeNull();
       let settledCount = -1;
@@ -331,7 +341,7 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
       return runs.length;
     }
 
-    async function readIssue() {
+    async function readIssue(targetIssueId: string = issueId) {
       return await db
         .select({
           executionWorkspaceId: issues.executionWorkspaceId,
@@ -339,7 +349,7 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
           executionWorkspaceSettings: issues.executionWorkspaceSettings,
         })
         .from(issues)
-        .where(eq(issues.id, issueId))
+        .where(eq(issues.id, targetIssueId))
         .then((rows) => rows[0]!);
     }
 
@@ -354,7 +364,7 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
         .map(([, method, params]) => ({ method, params: params as Record<string, unknown> }));
     }
 
-    return { wakeAndSettle, readIssue, countExecutionWorkspaces, leaseCalls, worker };
+    return { issueId, wakeAndSettle, readIssue, addIssue, countExecutionWorkspaces, leaseCalls, worker };
   }
 
   it("pins the task to its execution workspace so later runs resume the same sandbox", async () => {
@@ -386,6 +396,67 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
     expect(resumes.map((call) => call.params.providerLeaseId)).toEqual(resumes.map(() => "pc-sandbox-1"));
     expect(worker.sandboxes.size).toBe(1);
   }, 60_000);
+
+  it("gives each task its own execution workspace and sandbox and never resumes another task's sandbox", async () => {
+    const { issueId, wakeAndSettle, readIssue, addIssue, countExecutionWorkspaces, leaseCalls, worker } = await seed({
+      reuseLease: true,
+      runnerIdleTimeoutMs: 86_400_000,
+    });
+    const otherIssueId = await addIssue("Fix the other bug");
+
+    // Interleave the two tasks: each first run creates a sandbox, and each later
+    // run must resume its own task's sandbox, not the most recently released one.
+    await wakeAndSettle();
+    const firstTask = await readIssue();
+    const callsAfterWake1 = leaseCalls().length;
+    await wakeAndSettle(otherIssueId);
+    const otherTask = await readIssue(otherIssueId);
+    const callsAfterWake2 = leaseCalls().length;
+    await wakeAndSettle();
+    const callsAfterWake3 = leaseCalls().length;
+    await wakeAndSettle(otherIssueId);
+
+    expect(firstTask.executionWorkspaceId).toEqual(expect.any(String));
+    expect(otherTask.executionWorkspaceId).toEqual(expect.any(String));
+    expect(otherTask.executionWorkspaceId).not.toBe(firstTask.executionWorkspaceId);
+    expect((await readIssue()).executionWorkspaceId).toBe(firstTask.executionWorkspaceId);
+    expect((await readIssue(otherIssueId)).executionWorkspaceId).toBe(otherTask.executionWorkspaceId);
+    expect(await countExecutionWorkspaces()).toBe(2);
+
+    // Lease calls name the task they are for (acquire also its workspace).
+    const calls = leaseCalls().map((call) => [
+      call.method,
+      call.params.issueId,
+      call.params.executionWorkspaceId ?? null,
+      call.params.providerLeaseId ?? null,
+    ]);
+    const acquires = calls.filter(([method]) => method === "environmentAcquireLease");
+    expect(acquires).toEqual([
+      ["environmentAcquireLease", issueId, firstTask.executionWorkspaceId, null],
+      ["environmentAcquireLease", otherIssueId, otherTask.executionWorkspaceId, null],
+    ]);
+    // Every later run resumes its own task's sandbox, never the other one.
+    const sandboxOf = new Map<string, string>([
+      [issueId, "pc-sandbox-1"],
+      [otherIssueId, "pc-sandbox-2"],
+    ]);
+    const resumes = calls.filter(([method]) => method === "environmentResumeLease");
+    expect(resumes.length).toBeGreaterThanOrEqual(2);
+    for (const [, resumedIssueId, , providerLeaseId] of resumes) {
+      expect(providerLeaseId).toBe(sandboxOf.get(resumedIssueId as string));
+    }
+    // Per wake: each wake only touches its own task, and each task's second
+    // wake resumes (never acquires) that task's sandbox.
+    for (const [, callIssueId] of calls.slice(0, callsAfterWake1)) expect(callIssueId).toBe(issueId);
+    for (const [, callIssueId] of calls.slice(callsAfterWake1, callsAfterWake2)) expect(callIssueId).toBe(otherIssueId);
+    const firstTaskAgain = calls.slice(callsAfterWake2, callsAfterWake3);
+    expect(firstTaskAgain.length).toBeGreaterThanOrEqual(1);
+    expect(firstTaskAgain).toEqual(firstTaskAgain.map(() => ["environmentResumeLease", issueId, null, "pc-sandbox-1"]));
+    const otherTaskAgain = calls.slice(callsAfterWake3);
+    expect(otherTaskAgain.length).toBeGreaterThanOrEqual(1);
+    expect(otherTaskAgain).toEqual(otherTaskAgain.map(() => ["environmentResumeLease", otherIssueId, null, "pc-sandbox-2"]));
+    expect(worker.sandboxes.size).toBe(2);
+  }, 90_000);
 
   it("leaves the task unpinned and provisions a fresh workspace per run when leases are not reused", async () => {
     const { wakeAndSettle, readIssue, countExecutionWorkspaces, leaseCalls } = await seed({ reuseLease: false });
