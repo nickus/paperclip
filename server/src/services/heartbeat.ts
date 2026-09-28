@@ -434,10 +434,19 @@ import {
 import {
   HEARTBEAT_RUN_SCRATCH_MARKER,
   buildHeartbeatRunScratchEnv,
+  buildRunScratchEnvForDir,
   cleanupHeartbeatRunScratch,
   prepareHeartbeatRunScratch,
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
+import {
+  cleanupSshRunScratch,
+  omitRemoteRunScratchEnv,
+  prepareSshRunScratch,
+  resolveSshWorkspaceReuse,
+  type SshRunScratch,
+  type SshWorkspaceReuseClaim,
+} from "./ssh-workspace-reuse.js";
 import {
   applyDefaultIsolatedExecutionWorkspacePolicy,
   buildExecutionWorkspaceAdapterConfig,
@@ -571,7 +580,10 @@ import {
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
-import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
+import {
+  isRemoteSessionWorkspaceCwd,
+  isUnsafeSessionWorkspaceCwd,
+} from "./session-workspace-cwd.js";
 import {
   clearHeartbeatRunRuntimeStatus,
   getHeartbeatRunRuntimeStatus,
@@ -12493,7 +12505,12 @@ export function heartbeatService(
       };
     }
 
-    const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
+    // A session saved by a remote run records the remote working directory as
+    // its cwd. That is not a path on this host, so it never selects the local
+    // workspace.
+    const sessionCwd = isRemoteSessionWorkspaceCwd(previousSessionParams)
+      ? null
+      : readNonEmptyString(previousSessionParams?.cwd);
     const sessionCwdLooksUnsafe = isUnsafeSessionWorkspaceCwd(sessionCwd);
     if (sessionCwd && !sessionCwdLooksUnsafe) {
       const sessionCwdExists = await fs
@@ -20022,6 +20039,8 @@ export function heartbeatService(
     const executionControl = createAdapterExecutionControl();
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
     let runScratch: HeartbeatRunScratch | null = null;
+    let remoteRunScratch: SshRunScratch | null = null;
+    let sshWorkspaceReuseClaim: SshWorkspaceReuseClaim | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
     let nativeSessionResumeScheduled = false;
@@ -22114,7 +22133,18 @@ export function heartbeatService(
       // and lease scope instead of silently creating a per-run replacement.
       await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
       const workspaceRealization = realizationResult.workspaceRealization;
-      const executionTarget = realizationResult.executionTarget;
+      // SSH lane: runs of the same agent and task stage their workspace at one
+      // stable remote path, so the agent CLI can resume the session it saved
+      // there. The key is handed to one run at a time.
+      const sshWorkspaceReuse = resolveSshWorkspaceReuse({
+        target: realizationResult.executionTarget,
+        agentId: agent.id,
+        taskKey,
+        hostCwd: executionWorkspace.cwd,
+        runId: run.id,
+      });
+      sshWorkspaceReuseClaim = sshWorkspaceReuse.claim;
+      const executionTarget = sshWorkspaceReuse.target;
       if (managedAiRuntime && aiBinding) {
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
@@ -22229,6 +22259,51 @@ export function heartbeatService(
             "failed to prepare heartbeat run scratch directory; continuing without scratch env",
           );
         }
+      } else if (
+        executionTarget.kind === "remote" &&
+        executionTarget.transport === "ssh"
+      ) {
+        // The run scratch directory lives on the SSH host, next to the run's
+        // runtime files. Created before the adapter runs any remote command,
+        // since those already get TMPDIR pointed at it.
+        delete context.paperclipScratch;
+        try {
+          remoteRunScratch = await prepareSshRunScratch({
+            target: executionTarget,
+            runId: run.id,
+          });
+          const existingRuntimeEnv = parseObject(runtimeConfig.env);
+          const scratchEnv = buildRunScratchEnvForDir(
+            existingRuntimeEnv,
+            remoteRunScratch.dir,
+          );
+          runtimeConfig = {
+            ...runtimeConfig,
+            env: {
+              ...existingRuntimeEnv,
+              ...scratchEnv.env,
+            },
+          };
+          context.paperclipScratch = {
+            type: "heartbeat_run",
+            location: "remote",
+            dir: remoteRunScratch.dir,
+            cleanupPolicy: "terminal_run",
+            tempKeysApplied: scratchEnv.tempKeysApplied,
+          };
+        } catch (scratchPrepareError) {
+          remoteRunScratch = null;
+          delete context.paperclipScratch;
+          logger.warn(
+            {
+              err: scratchPrepareError,
+              runId: run.id,
+              issueId,
+              agentId: agent.id,
+            },
+            "failed to prepare remote run scratch directory; continuing without scratch env",
+          );
+        }
       } else {
         delete context.paperclipScratch;
       }
@@ -22321,6 +22396,7 @@ export function heartbeatService(
       const runtimeWorkspaceWarnings = [
         ...resolvedWorkspace.warnings,
         ...executionWorkspace.warnings,
+        ...(sshWorkspaceReuse.warning ? [sshWorkspaceReuse.warning] : []),
         ...(runtimeSessionResolution.warning
           ? [runtimeSessionResolution.warning]
           : []),
@@ -22803,7 +22879,9 @@ export function heartbeatService(
             issueRef?.executionWorkspaceId ??
             null,
           config: hostExecutionWorkspaceConfig,
-          adapterEnv,
+          // Runtime services run on this host; a scratch path on the SSH host
+          // means nothing to them.
+          adapterEnv: omitRemoteRunScratchEnv(adapterEnv, remoteRunScratch),
           onLog,
           recorder: workspaceOperationRecorder,
         });
@@ -25909,6 +25987,27 @@ export function heartbeatService(
             });
           }
         }
+        if (
+          remoteRunScratch &&
+          latestRun &&
+          isHeartbeatRunTerminalStatus(latestRun.status)
+        ) {
+          const remoteScratchForCleanup = remoteRunScratch;
+          remoteRunScratch = null;
+          // Best effort: the SSH host's run-directory GC removes what is left.
+          await cleanupSshRunScratch({ scratch: remoteScratchForCleanup }).catch(
+            (remoteScratchCleanupError) => {
+              logger.warn(
+                {
+                  err: remoteScratchCleanupError,
+                  runId: run.id,
+                  scratchDir: remoteScratchForCleanup.dir,
+                },
+                "failed to clean remote run scratch directory",
+              );
+            },
+          );
+        }
         if (latestRun?.status === "cancelled" && !nativeDispatchStarted && !nativeOwnershipHeld &&
             (latestRun.runtimeMode === "native" ||
               parseObject(latestRun.resultJson?.startupCancellation).beforeNativeSelection === true)) {
@@ -25921,6 +26020,8 @@ export function heartbeatService(
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
         }
       } finally {
+        sshWorkspaceReuseClaim?.release();
+        sshWorkspaceReuseClaim = null;
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
         // A failed owned Stop remains visible until this exact executor settles,
