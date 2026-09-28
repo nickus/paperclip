@@ -27,6 +27,14 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
+import {
+  isRunBriefEnabled,
+  loadRunBrief,
+  resolveRunBriefAuthority,
+  resolveRunBriefSessionReason,
+  runBriefWorkspaceState,
+  withRunBriefEnvironment,
+} from "./run-brief.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
@@ -7978,6 +7986,46 @@ export async function buildPaperclipWakePayload(input: {
           notice: externalAttachmentOmissionNotice(omission),
         }))
     : [];
+  const recoveryScoped = Boolean(
+    (!executionAlreadyReconciled && (recoveryAction || recoveryCause)) ||
+      readNonEmptyString(input.contextSnapshot.wakeReason) ===
+        "source_scoped_recovery_action",
+  );
+  // The Run Brief orients issue-scoped task wakes. Chat-shaped turns keep
+  // their own contracts, and a failed lookup must never block the wake.
+  let runBrief: Awaited<ReturnType<typeof loadRunBrief>> | null = null;
+  if (
+    isRunBriefEnabled() &&
+    issueId &&
+    issueSummary?.id === issueId &&
+    !conversationMode &&
+    !externalChatProvider &&
+    !agentMessageText
+  ) {
+    try {
+      runBrief = await loadRunBrief({
+        db: input.db,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        runId: input.runId,
+        issue: { id: issueId, identifier: issueSummary.identifier },
+        authority: resolveRunBriefAuthority({
+          wakeRole: executionStage.wakeRole,
+          recoveryScoped,
+          taskWatchdog: Boolean(input.contextSnapshot.taskWatchdog),
+          workMode: issueSummary.workMode,
+        }),
+        priorRuns: parseObject(input.contextSnapshot.executionContinuation)
+          .priorRuns,
+        exposeLowTrustRaw: input.exposeLowTrustRaw,
+      });
+    } catch (error) {
+      logger.warn(
+        { err: error, companyId: input.companyId, issueId, runId: input.runId },
+        "run brief unavailable; continuing without it",
+      );
+    }
+  }
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
@@ -8141,6 +8189,7 @@ export async function buildPaperclipWakePayload(input: {
     },
     truncated: payloadTruncated,
     fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    ...(runBrief ? { runBrief } : {}),
   };
   return issueId
     ? createRunSecretRedactionRegistry(input.db).redactForIssue(
@@ -22222,9 +22271,11 @@ export function heartbeatService(
         delete context.paperclipPreviousSessionId;
       }
 
+      let sessionResetForCredential = false;
       if (managedAiRuntime) {
         sessionConfigMetadata.aiCredentialIdentity = managedAiRuntime.identity;
         if (taskSessionDecodedParams?.paperclipAiCredentialIdentity !== managedAiRuntime.identity) {
+          sessionResetForCredential = true;
           runtimeSessionIdForAdapter = null;
           runtimeSessionParamsForAdapter = null;
           previousSessionDisplayId = null;
@@ -22248,6 +22299,45 @@ export function heartbeatService(
           context.forceFreshSession === true)
       ) {
         delete executionContinuation.resumeDelta;
+      }
+      // The wake payload (and its Run Brief) was built before the session and
+      // workspace were resolved; fill in the brief's environment line now.
+      if (context[PAPERCLIP_WAKE_PAYLOAD_KEY]) {
+        const runTimeoutSec = runtimeConfig.timeoutSec;
+        const timeoutSec =
+          typeof runTimeoutSec === "number" &&
+          Number.isFinite(runTimeoutSec) &&
+          runTimeoutSec > 0
+            ? Math.floor(runTimeoutSec)
+            : null;
+        const resumedSession = Boolean(runtimeForAdapter.sessionId);
+        context[PAPERCLIP_WAKE_PAYLOAD_KEY] = withRunBriefEnvironment(
+          context[PAPERCLIP_WAKE_PAYLOAD_KEY],
+          {
+            session: resumedSession ? "resumed" : "fresh",
+            sessionReason: resolveRunBriefSessionReason({
+              resumed: resumedSession,
+              explicitResume: Boolean(
+                explicitResumeSessionParams || explicitResumeSessionDisplayId,
+              ),
+              taskSessionReused: taskSessionForRun != null,
+              rotated: sessionCompaction.rotate,
+              credentialChanged: sessionResetForCredential,
+              resetForWake: shouldResetTaskSessionForWake(context),
+              resetForConfig: sessionConfigFreshness.reset,
+            }),
+            workspace: runBriefWorkspaceState({
+              reused: Boolean(reusedExecutionWorkspace),
+              mode: effectiveExecutionWorkspaceMode,
+            }),
+            workspaceMode: effectiveExecutionWorkspaceMode,
+            timeoutSec,
+            deadlineAt:
+              timeoutSec !== null
+                ? new Date(Date.now() + timeoutSec * 1_000).toISOString()
+                : null,
+          },
+        );
       }
       const configFreshnessResultMetadata = {
         version: sessionConfigMetadata.version,
