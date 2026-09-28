@@ -1635,8 +1635,14 @@ const plugin = definePlugin(withAuthEviction({
       // this the adapter's runtime env (e.g. XDG_CONFIG_HOME pointing at the shipped
       // OpenCode config, plus helper settings like small_model/provider routing) never
       // reaches the harness, which falls back to its in-image HOME config -> wrong or
-      // partial behaviour.
-      const execCommand = wrapCommandWithEnv(baseExecCommand, params.env);
+      // partial behaviour. The values go over stdin, never onto the command line:
+      // run env carries API keys and tokens, and a command line is readable by
+      // every process in the pod.
+      const { command: execCommand, stdin: execStdin } = wrapCommandWithEnv(
+        baseExecCommand,
+        params.env,
+        typeof params.stdin === "string" ? params.stdin : undefined,
+      );
 
       // Remaining share of the caller's budget after the readiness wait (floor
       // of 5s so an exec attempt is still made when readiness consumed most of
@@ -1656,7 +1662,7 @@ const plugin = definePlugin(withAuthEviction({
             execPodName,
             "agent",
             execCommand,
-            typeof params.stdin === "string" ? params.stdin : undefined,
+            execStdin,
             remainingTimeoutMs,
             undefined,
             undefined,

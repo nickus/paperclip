@@ -141,6 +141,26 @@ describe("onEnvironmentExecute exec transport failures", () => {
     expect(result.metadata).not.toHaveProperty("execTransportFailure");
   });
 
+  it("passes the run env to the pod over stdin, never on the exec command line", async () => {
+    h.execInPod.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    const secret = "test-run-secret-7f3a";
+    await plugin.definition.onEnvironmentExecute!({
+      ...(executeParams() as object),
+      env: { ANTHROPIC_API_KEY: secret, XDG_CONFIG_HOME: "/workspace/.config" },
+      stdin: "prompt on stdin",
+    } as never);
+
+    expect(h.execInPod).toHaveBeenCalledTimes(1);
+    const [, , , , command, stdin] = h.execInPod.mock.calls[0]!;
+    const argv = (command as string[]).join("\0");
+    expect(argv.split(secret).length - 1).toBe(0);
+    expect(argv.split("/workspace/.config").length - 1).toBe(0);
+    expect(argv).toContain("exec 'opencode' 'run' '--format' 'json'");
+    const stdinText = Buffer.from(stdin as Buffer).toString("utf-8");
+    expect(stdinText.split(secret).length - 1).toBe(1);
+    expect(stdinText.endsWith("prompt on stdin")).toBe(true);
+  });
+
   it("validateConfig normalizes the keepalive defaults", async () => {
     const result = await plugin.definition.onEnvironmentValidateConfig!({
       driverKey: "kubernetes",
