@@ -4,7 +4,7 @@ import { currentConversationCommentCondition } from "../../../services/agent-con
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { extractIssueReferenceIdentifiers } from "@paperclipai/shared";
+import { EXECUTION_RECONCILIATION_CAUSES, extractIssueReferenceIdentifiers } from "@paperclipai/shared";
 import {
   activityLog,
   agentWakeupRequests,
@@ -1091,6 +1091,20 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
               sql`${agentWakeupRequests.payload}->>'issueId' = ${issueRow.id}`,
             )).limit(1)
           : [];
+        // A legacy run whose outcome needed reconciliation skipped this drain
+        // while its hold stood. Once that hold is closed, the caller may ask
+        // for the drain it skipped; any other hold still stops it below.
+        const heldRunReleased = Boolean(
+          input.afterExecutionHold && issueRow &&
+          (await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+            eq(issueRecoveryActions.companyId, run.companyId),
+            eq(issueRecoveryActions.sourceIssueId, issueRow.id),
+            sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+            inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
+            inArray(issueRecoveryActions.status, ["resolved", "cancelled"]),
+            sql`coalesce(${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay', '') <> 'blocked'`,
+          )).limit(1)).length,
+        );
         const preDrainFacts: PreDrainFacts = {
           issueRowPresent: issueRow !== null,
           executionRunIdMatchesRun: !issueRow || !issueRow.executionRunId || issueRow.executionRunId === run.id,
@@ -1099,7 +1113,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           issueStatus: issueRow?.status ?? "",
           hasAssigneeUser: Boolean(issueRow?.assigneeUserId),
           assigneeAgentMatchesRunAgent: issueRow?.assigneeAgentId === run.agentId,
-          legacyExecutionNeedsReconciliation: legacyExecutionNeedsReconciliation(run),
+          legacyExecutionNeedsReconciliation: legacyExecutionNeedsReconciliation(run) && !heldRunReleased,
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.
@@ -1110,7 +1124,9 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         };
         const preDrain = decidePreDrain(preDrainFacts);
 
-        if (preDrain.kind === "released") {
+        // The run's own release already escalated a blocked outcome; a
+        // drain after its hold only promotes what is still queued.
+        if (preDrain.kind === "released" || (input.afterExecutionHold && preDrain.kind === "blocked")) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
@@ -1123,9 +1139,12 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // queued successor still owns the next turn, including during a late
         // finalization/stranded-queue retry under this issue lock. Another
         // agent's review participation retains its separate recovery path.
+        // A drain run after a hold is not the release of a run that just
+        // finished: any live run on the issue, of any agent, owns the next
+        // turn, and its own release drains the queue.
         const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, input.companyId),
-          eq(heartbeatRuns.agentId, run.agentId),
+          input.afterExecutionHold ? undefined : eq(heartbeatRuns.agentId, run.agentId),
           sql`${heartbeatRuns.id} <> ${run.id}`,
           or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
             sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
