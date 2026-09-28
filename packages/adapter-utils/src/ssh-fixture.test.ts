@@ -1,12 +1,15 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, type TestContext } from "vitest";
 import {
   buildSshSpawnTarget,
   buildSshEnvLabFixtureConfig,
+  createSshCommandManagedRuntimeRunner,
   getSshEnvLabSupport,
   prepareWorkspaceForSshExecution,
   readSshEnvLabFixtureStatus,
@@ -19,6 +22,7 @@ import {
   type SshEnvLabFixtureState,
 } from "./ssh.js";
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { runChildProcess } from "./server-utils.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
 let sshEnvLabUnsupportedReason: string | null = null;
@@ -104,7 +108,24 @@ async function findSshdPidByConfigPath(sshdConfigPath: string): Promise<number |
   return null;
 }
 
-async function startSshEnvLabFixtureOrSkip(statePath: string, label: string) {
+// Without a test context an unsupported environment makes the helper return
+// null and the caller returns early, so the test counts as passed. Tests whose
+// assertions are the only proof of a guarantee (the secret scans below) pass
+// their context instead and are then reported as skipped.
+async function startSshEnvLabFixtureOrSkip(
+  statePath: string,
+  label: string,
+  test: Pick<TestContext, "skip">,
+): Promise<SshEnvLabFixtureState>;
+async function startSshEnvLabFixtureOrSkip(
+  statePath: string,
+  label: string,
+): Promise<SshEnvLabFixtureState | null>;
+async function startSshEnvLabFixtureOrSkip(
+  statePath: string,
+  label: string,
+  test?: Pick<TestContext, "skip">,
+): Promise<SshEnvLabFixtureState | null> {
   // The teardown entry for this root directory must already exist: callers
   // create it with createFixtureRootDir() before they derive statePath, so
   // this only attaches the state to that entry instead of pushing a new
@@ -117,27 +138,31 @@ async function startSshEnvLabFixtureOrSkip(statePath: string, label: string) {
     );
   }
 
-  if (sshEnvLabUnsupportedReason) {
-    console.warn(`Skipping ${label}: ${sshEnvLabUnsupportedReason}`);
+  const skip = (reason: string): null => {
+    console.warn(`Skipping ${label}: ${reason}`);
+    if (test) test.skip(reason);
     return null;
+  };
+
+  if (sshEnvLabUnsupportedReason) {
+    return skip(sshEnvLabUnsupportedReason);
   }
 
   const support = await getSshEnvLabSupport();
   if (!support.supported) {
     sshEnvLabUnsupportedReason = support.reason ?? "unsupported environment";
-    console.warn(`Skipping ${label}: ${sshEnvLabUnsupportedReason}`);
-    return null;
+    return skip(sshEnvLabUnsupportedReason);
   }
 
+  let state: SshEnvLabFixtureState;
   try {
-    const state = await startSshEnvLabFixture({ statePath });
-    entry.state = state;
-    return state;
+    state = await startSshEnvLabFixture({ statePath });
   } catch (error) {
     sshEnvLabUnsupportedReason = error instanceof Error ? error.message : String(error);
-    console.warn(`Skipping ${label}: ${sshEnvLabUnsupportedReason}`);
-    return null;
+    return skip(sshEnvLabUnsupportedReason);
   }
+  entry.state = state;
+  return state;
 }
 
 interface ParsedProgressLine {
@@ -145,6 +170,47 @@ interface ParsedProgressLine {
   percent: number | null;
   doneMb: number | null;
   totalMb: number | null;
+}
+
+// How many live processes have `needle` in their argument vector. Only the
+// count is reported: a process command line may hold secrets.
+async function countProcessesWithArgument(needle: string): Promise<number> {
+  const bytes = Buffer.from(needle);
+  let count = 0;
+  for (const entry of await readdir("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      if ((await readFile(`/proc/${entry}/cmdline`)).includes(bytes)) count += 1;
+    } catch {
+      // The process exited or is not readable.
+    }
+  }
+  return count;
+}
+
+async function waitForFile(filePath: string, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(filePath)) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${filePath}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+// Env values that stress the stdin handoff: quotes, a newline, a value that
+// looks like the prologue's line-count header, shell syntax that must stay
+// inert, and non-ASCII.
+const TRICKY_ENV = {
+  QUOTED: "a'b\"c",
+  MULTILINE: "line one\nline two\n",
+  LOOKS_LIKE_HEADER: "3\n",
+  INERT: "$(echo pwned) `echo pwned` ; exit 9",
+  UNICODE: "grüße ✓",
+};
+const PRINT_TRICKY_ENV =
+  'for v in "$RUN_TOKEN" "$QUOTED" "$MULTILINE" "$LOOKS_LIKE_HEADER" "$INERT" "$UNICODE"; do printf "[%s]" "$v"; done; printf "|"';
+
+function expectedTrickyOutput(token: string): string {
+  return [token, ...Object.values(TRICKY_ENV)].map((value) => `[${value}]`).join("") + "|";
 }
 
 function parseProgressLine(line: string): ParsedProgressLine {
@@ -484,11 +550,190 @@ describe("ssh env-lab fixture", () => {
     // quotes are escaped. Assert the command still runs: cd, env, and the argv.
     expect(remoteScript).toContain("cd ");
     expect(remoteScript).toContain("/srv/paperclip/workspace");
-    expect(remoteScript).toContain("exec env ");
+    expect(remoteScript).toContain('eval "$__pc_env"');
+    expect(remoteScript).toContain("exec ");
     expect(remoteScript).toContain("node");
     expect(remoteScript).toContain("--version");
+    // The env value itself travels over stdin, not in the ssh arguments.
+    expect(target.args.join("\0")).not.toContain("bar");
+    expect(target.stdinPrefix).toBe("1\nexport FOO='bar'\n");
     await target.cleanup();
   });
+
+  it("keeps env values out of the ssh arguments and hands them over on stdin", async () => {
+    const token = `tok-${randomUUID()}`;
+    const target = await buildSshSpawnTarget({
+      spec: {
+        host: "ssh.example.test",
+        port: 22,
+        username: "ssh-user",
+        remoteCwd: "/srv/paperclip/workspace",
+        remoteWorkspacePath: "/srv/paperclip/workspace",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      command: "agent",
+      args: ["run"],
+      env: { RUN_TOKEN: token, ...TRICKY_ENV },
+    });
+    const argv = target.args.join("\0");
+    for (const value of [token, ...Object.values(TRICKY_ENV)]) {
+      expect(argv.split(value).length - 1).toBe(0);
+    }
+    expect(target.stdinPrefix?.split(token).length).toBe(2);
+    // The remote login shell parses the script first; keep it on one line.
+    expect(String(target.args.at(-1))).not.toContain("\n");
+    const withoutEnv = await buildSshSpawnTarget({
+      spec: {
+        host: "ssh.example.test",
+        port: 22,
+        username: "ssh-user",
+        remoteCwd: "/srv/paperclip/workspace",
+        remoteWorkspacePath: "/srv/paperclip/workspace",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      command: "agent",
+      args: ["run"],
+      env: {},
+    });
+    expect(withoutEnv.stdinPrefix).toBeUndefined();
+    expect(String(withoutEnv.args.at(-1))).not.toContain("__pc_env");
+    await target.cleanup();
+    await withoutEnv.cleanup();
+  });
+
+  it("runs remote commands with env from stdin and never exposes a value in a process command line", async (ctx) => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH env over stdin test", ctx);
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const token = `tok-${randomUUID()}`;
+    const marker = path.posix.join(started.workspaceDir, `running-${randomUUID()}`);
+
+    // The remote command signals that it is running, then waits so the process
+    // table can be inspected while the local ssh client and the remote shells
+    // are alive; then it prints the env it got and the stdin it was sent.
+    const pending = runSshCommand(
+      config,
+      `: > ${JSON.stringify(marker)}; sleep 1; ${PRINT_TRICKY_ENV}; cat`,
+      {
+        env: { RUN_TOKEN: token, ...TRICKY_ENV },
+        stdin: "caller stdin\nsecond line\n",
+        timeoutMs: 30_000,
+      },
+    );
+    await waitForFile(marker);
+    if (existsSync("/proc/self/cmdline")) {
+      // The scan does see these processes (the marker path is in their argv)...
+      expect(await countProcessesWithArgument(marker)).toBeGreaterThan(0);
+      // ...but no argument vector holds the secret.
+      expect(await countProcessesWithArgument(token)).toBe(0);
+    }
+    const result = await pending;
+    expect(result.stdout).toBe(`${expectedTrickyOutput(token)}caller stdin\nsecond line\n`);
+
+    // Without caller stdin, a command that reads stdin gets EOF right after
+    // the env handoff instead of waiting on an open pipe.
+    const noStdin = await runSshCommand(config, 'cat; printf "done:%s" "$RUN_TOKEN"', {
+      env: { RUN_TOKEN: token },
+      timeoutMs: 30_000,
+    });
+    expect(noStdin.stdout).toBe(`done:${token}`);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("spawns remote agent processes with env from stdin, ahead of the caller's stdin", async (ctx) => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH spawn env over stdin test", ctx);
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir };
+    const token = `tok-${randomUUID()}`;
+    const marker = path.posix.join(started.workspaceDir, `running-${randomUUID()}`);
+
+    const pending = runChildProcess(
+      `run-${randomUUID()}`,
+      "sh",
+      ["-c", `: > ${JSON.stringify(marker)}; sleep 1; ${PRINT_TRICKY_ENV}; cat`],
+      {
+        cwd: rootDir,
+        env: { RUN_TOKEN: token, ...TRICKY_ENV },
+        stdin: "prompt on stdin\n",
+        timeoutSec: 30,
+        graceSec: 1,
+        onLog: async () => {},
+        remoteExecution: spec,
+      },
+    );
+    await waitForFile(marker);
+    if (existsSync("/proc/self/cmdline")) {
+      expect(await countProcessesWithArgument(marker)).toBeGreaterThan(0);
+      expect(await countProcessesWithArgument(token)).toBe(0);
+    }
+    const result = await pending;
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe(`${expectedTrickyOutput(token)}prompt on stdin\n`);
+
+    // No caller stdin: the command still gets its env and an immediate EOF.
+    const noStdin = await runChildProcess(
+      `run-${randomUUID()}`,
+      "sh",
+      ["-c", 'cat; printf "done:%s" "$RUN_TOKEN"'],
+      {
+        cwd: rootDir,
+        env: { RUN_TOKEN: token },
+        timeoutSec: 30,
+        graceSec: 1,
+        onLog: async () => {},
+        remoteExecution: spec,
+      },
+    );
+    expect(noStdin.exitCode).toBe(0);
+    expect(noStdin.stdout).toBe(`done:${token}`);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("gives commands run through the SSH command runner their env over stdin", async (ctx) => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH command runner env test", ctx);
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const runner = createSshCommandManagedRuntimeRunner({
+      spec: { ...config, remoteCwd: started.workspaceDir },
+    });
+    const token = `tok-${randomUUID()}`;
+    const marker = path.posix.join(started.workspaceDir, `running-${randomUUID()}`);
+
+    const pending = runner.execute({
+      command: "sh",
+      args: ["-c", `: > ${JSON.stringify(marker)}; sleep 1; pwd; ${PRINT_TRICKY_ENV}; cat`],
+      env: { RUN_TOKEN: token, ...TRICKY_ENV },
+      stdin: "runner stdin\n",
+      timeoutMs: 30_000,
+    });
+    await waitForFile(marker);
+    if (existsSync("/proc/self/cmdline")) {
+      expect(await countProcessesWithArgument(marker)).toBeGreaterThan(0);
+      expect(await countProcessesWithArgument(token)).toBe(0);
+    }
+    const result = await pending;
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe(`${started.workspaceDir}\n${expectedTrickyOutput(token)}runner stdin\n`);
+
+    // A plain (non-shell) command gets the same env.
+    const printed = await runner.execute({
+      command: "printenv",
+      args: ["RUN_TOKEN"],
+      env: { RUN_TOKEN: token },
+      timeoutMs: 30_000,
+    });
+    expect(printed.exitCode).toBe(0);
+    expect(printed.stdout).toBe(`${token}\n`);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("rejects invalid environment variable keys when constructing SSH spawn targets", async () => {
     await expect(
