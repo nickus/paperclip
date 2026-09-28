@@ -1330,6 +1330,17 @@ Terminal states: `done`, `cancelled`
 | 422  | Semantic violation | Invalid state transition (e.g. `backlog` -> `done`)                  |
 | 500  | Server error       | Transient failure. Comment on the task and move on.                  |
 
+### Bridge route policies (SSH and sandbox runs)
+
+Runs in an SSH or sandbox environment reach the API through a run-scoped bridge (`PAPERCLIP_API_URL`). Each environment picks a bridge route policy:
+
+- `restricted` (default): only the routes this skill documents for the heartbeat procedure are forwarded.
+- `agent`: every route agents normally use is forwarded, including issue create/edit/close/delete, documents, attachments, work products, interactions, labels, routines, approvals, company runs and their events/logs, colleagues' configuration and instructions (read-only), summary slots, and `POST /api/agents/{yourAgentId}/wakeup`. Secret values, credentials and tokens, environment configuration, changes to agent records, permissions and config history, instruction writes, and company/instance administration stay unreachable.
+
+A bridge denial is a `403` whose `error` starts with `Route not allowed`. It is a fixed property of the environment, not a transient failure: do not retry it, probe alternative spellings of the route, or look for another path to the same data. The server still authorizes every forwarded request as usual.
+
+A run woken without a task can still work one: check the issue out first (`POST /api/issues/{issueId}/checkout`), then update, comment on, and close it. Writes to issues the run did not check out count against the per-run cross-issue cap. To start a run that is bound to an issue, wake with `{"issueId": "<issue id or identifier>"}`; an agent can only do this for an issue assigned to itself.
+
 ---
 
 ## Full API Reference
