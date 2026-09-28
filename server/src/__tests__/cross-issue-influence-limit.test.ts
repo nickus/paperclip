@@ -33,6 +33,19 @@ function counterDb(
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
             };
           }
+          if (Object.keys(selection).includes("issueId")) {
+            // The task a run without a source issue has already claimed.
+            const claims = () => inserted
+              .filter((row) => row.action === "issue.unbound_run_task_claimed")
+              .map((row) => ({ issueId: row.entityId }));
+            return {
+              orderBy: () => ({
+                limit: () => ({
+                  then: (resolve: (rows: unknown[]) => unknown) => resolve(claims().slice(0, 1)),
+                }),
+              }),
+            };
+          }
           return {
             for: () => ({
               then: (resolve: (rows: unknown[]) => unknown) => resolve(runOverrides === null ? [] : [{
@@ -224,7 +237,39 @@ describe("cross-issue influence limit rollout", () => {
         now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
       })).resolves.toBeNull();
     }
-    expect(fake.inserted).toEqual([]);
+    // The first write records the issue as the run's task; nothing is counted.
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({
+        action: "issue.unbound_run_task_claimed",
+        entityType: "issue",
+        entityId: targetIssueId,
+      }),
+    ]);
+    expect(fake.observedCount).toBe(0);
+  });
+
+  it("gives a run with no source issue one free task, and counts a second checked-out issue", async () => {
+    const firstIssueId = "55555555-5555-4555-8555-555555555555";
+    const secondIssueId = "66666666-6666-4666-8666-666666666666";
+    const fake = counterDb(0, { contextSnapshot: {} }, [firstIssueId, secondIssueId]);
+    const base = {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      kind: "update" as const,
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    };
+
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, targetIssueId: firstIssueId }))
+      .resolves.toBeNull();
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, targetIssueId: secondIssueId }))
+      .resolves.toMatchObject({ allowed: true, count: 1 });
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, targetIssueId: firstIssueId }))
+      .resolves.toBeNull();
+    expect(fake.inserted.map((row) => [row.action, row.entityId])).toEqual([
+      ["issue.unbound_run_task_claimed", firstIssueId],
+      ["issue.cross_issue_influence_observed", secondIssueId],
+    ]);
   });
 
   it("counts other writes from a run with no source issue against the same cap", async () => {

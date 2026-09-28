@@ -191,10 +191,73 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
     expect(recorded).toEqual([
       expect.objectContaining({
+        action: "issue.unbound_run_task_claimed",
+        entityId: checkedOutIssueId,
+      }),
+      expect.objectContaining({
         action: "issue.cross_issue_influence_observed",
         entityId: otherIssueId,
         details: expect.objectContaining({ sourceIssueId: null, targetIssueId: otherIssueId }),
       }),
     ]);
+  });
+
+  it("gives a run without a task one free checked-out issue, however many it checks out", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueIds = [randomUUID(), randomUUID(), randomUUID()];
+    const prefix = `U${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: prefix,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "On-demand Coder",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running", responsibleUserId: "board-user", contextSnapshot: {},
+    });
+    // The run checked out all three issues.
+    await db.insert(issues).values(issueIds.map((id, index) => ({
+      id,
+      companyId,
+      identifier: `${prefix}-${index + 1}`,
+      title: `Checked out by this run ${index + 1}`,
+      status: "in_progress" as const,
+      priority: "medium" as const,
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+      executionRunId: runId,
+    })));
+
+    const base = { companyId, runId, agentId, kind: "update" as const, now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT };
+    // Concurrent first writes still claim exactly one issue.
+    const first = await Promise.all(issueIds.map((targetIssueId) =>
+      observeCrossIssueInfluence(db, { ...base, targetIssueId })));
+    expect(first.filter((decision) => decision === null)).toHaveLength(1);
+    expect(first.filter((decision) => decision?.allowed === true)).toHaveLength(2);
+
+    const recorded = await db
+      .select({ action: activityLog.action, entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
+    const claims = recorded.filter((row) => row.action === "issue.unbound_run_task_claimed");
+    expect(claims).toHaveLength(1);
+    expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_observed")).toHaveLength(2);
+
+    // Later writes to the claimed issue stay free.
+    await expect(observeCrossIssueInfluence(db, { ...base, targetIssueId: claims[0]!.entityId }))
+      .resolves.toBeNull();
   });
 });

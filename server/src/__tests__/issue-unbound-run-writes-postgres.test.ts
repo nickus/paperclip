@@ -178,6 +178,28 @@ describeEmbeddedPostgres("issue writes from a run without a task (routes + postg
     ]);
   });
 
+  it("takes only the first issue it works as its task; a second checkout is counted", async () => {
+    const { companyId, runId, taskIssueId, otherIssueId, actor } = await seed();
+    const api = app(actor);
+
+    for (const issueId of [taskIssueId, otherIssueId]) {
+      const checkout = await request(api)
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId: actor.agentId, expectedStatuses: ["todo"] });
+      expect(checkout.status, JSON.stringify(checkout.body)).toBe(200);
+    }
+    for (const issueId of [taskIssueId, otherIssueId, taskIssueId]) {
+      const comment = await request(api)
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Progress note." });
+      expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    }
+
+    expect(await influenceRows(companyId, runId)).toEqual([
+      { action: "issue.cross_issue_influence_observed", entityId: otherIssueId },
+    ]);
+  });
+
   it("still refuses a run id that is not the calling agent's", async () => {
     const { otherIssueId, actor } = await seed();
 
