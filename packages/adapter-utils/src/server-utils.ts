@@ -2278,6 +2278,8 @@ function renderPaperclipWakePromptBody(
     recovery?.originalAssignee?.name ??
     recovery?.originalAssignee?.id ??
     "the original assignee";
+  // The Run Brief picks its authority wording from the same cause; keep
+  // paperclipRunBriefRecoveryAuthority (wake-run-brief.ts) in step with this.
   const recoveryInstruction = (() => {
     switch (recovery?.cause) {
       case "process_lost":

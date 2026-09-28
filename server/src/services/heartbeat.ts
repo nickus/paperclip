@@ -32,6 +32,7 @@ import {
   loadRunBrief,
   resolveRunBriefAuthority,
   resolveRunBriefSessionReason,
+  runBriefTimeout,
   runBriefWorkspaceState,
   withRunBriefEnvironment,
 } from "./run-brief.js";
@@ -7594,6 +7595,8 @@ export async function buildPaperclipWakePayload(input: {
     workMode: string;
     projectId?: string | null;
     executionPolicy?: unknown;
+    /** Current assignee; when omitted the Run Brief cannot tell ownership. */
+    assigneeAgentId?: string | null;
   } | null;
   exposeLowTrustRaw?: boolean;
   // Experimental: agents write user-interaction content in ASD-STE100
@@ -7624,6 +7627,7 @@ export async function buildPaperclipWakePayload(input: {
             status: issues.status,
             priority: issues.priority,
             workMode: issues.workMode,
+            assigneeAgentId: issues.assigneeAgentId,
           })
           .from(issues)
           .where(
@@ -8012,8 +8016,17 @@ export async function buildPaperclipWakePayload(input: {
         authority: resolveRunBriefAuthority({
           wakeRole: executionStage.wakeRole,
           recoveryScoped,
+          // Same cause as payload.recovery.cause below, which picks the wake
+          // text's cause-specific recovery instruction.
+          recoveryCause: executionAlreadyReconciled
+            ? null
+            : (recoveryAction?.cause ?? recoveryCause),
           taskWatchdog: Boolean(input.contextSnapshot.taskWatchdog),
           workMode: issueSummary.workMode,
+          ownsIssue:
+            input.agentId && issueSummary.assigneeAgentId !== undefined
+              ? issueSummary.assigneeAgentId === input.agentId
+              : null,
         }),
         priorRuns: parseObject(input.contextSnapshot.executionContinuation)
           .priorRuns,
@@ -20432,6 +20445,7 @@ export function heartbeatService(
               workMode: issueRef.workMode,
               projectId: issueRef.projectId,
               executionPolicy: issueContext?.executionPolicy ?? null,
+              assigneeAgentId: issueContext?.assigneeAgentId ?? null,
             }
           : null,
         exposeLowTrustRaw,
@@ -22303,13 +22317,12 @@ export function heartbeatService(
       // The wake payload (and its Run Brief) was built before the session and
       // workspace were resolved; fill in the brief's environment line now.
       if (context[PAPERCLIP_WAKE_PAYLOAD_KEY]) {
-        const runTimeoutSec = runtimeConfig.timeoutSec;
-        const timeoutSec =
-          typeof runTimeoutSec === "number" &&
-          Number.isFinite(runTimeoutSec) &&
-          runTimeoutSec > 0
-            ? Math.floor(runTimeoutSec)
-            : null;
+        // Resolved the way the adapters resolve it, so a sandbox target's
+        // default backstop shows up instead of "no run timeout".
+        const { timeoutSec, deadlineAt } = runBriefTimeout({
+          executionTarget,
+          configuredTimeoutSec: runtimeConfig.timeoutSec,
+        });
         const resumedSession = Boolean(runtimeForAdapter.sessionId);
         context[PAPERCLIP_WAKE_PAYLOAD_KEY] = withRunBriefEnvironment(
           context[PAPERCLIP_WAKE_PAYLOAD_KEY],
@@ -22332,10 +22345,7 @@ export function heartbeatService(
             }),
             workspaceMode: effectiveExecutionWorkspaceMode,
             timeoutSec,
-            deadlineAt:
-              timeoutSec !== null
-                ? new Date(Date.now() + timeoutSec * 1_000).toISOString()
-                : null,
+            deadlineAt,
           },
         );
       }

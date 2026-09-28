@@ -9,9 +9,14 @@ import {
 } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import {
+  resolveAdapterExecutionTargetTimeout,
+  type AdapterExecutionTarget,
+} from "@paperclipai/adapter-utils/execution-target";
+import {
   PAPERCLIP_RUN_BRIEF_PROMPT_MAX_CHARS,
   PAPERCLIP_RUN_BRIEF_SUMMARY_MAX_CHARS,
   paperclipRunBriefOneLine,
+  paperclipRunBriefRecoveryAuthority,
   type PaperclipRunBrief,
   type PaperclipRunBriefAuthority,
   type PaperclipRunBriefEnvironment,
@@ -341,16 +346,61 @@ export async function loadRunBrief(input: {
 export function resolveRunBriefAuthority(input: {
   wakeRole: unknown;
   recoveryScoped: boolean;
+  /** The cause the wake text's recovery instruction is chosen by. */
+  recoveryCause?: string | null;
   taskWatchdog: boolean;
   workMode: string | null | undefined;
+  /**
+   * Whether the woken agent is the issue's assignee; null or undefined when
+   * that is not known, which keeps the role-based wording.
+   */
+  ownsIssue?: boolean | null;
 }): PaperclipRunBriefAuthority {
   if (input.wakeRole === "reviewer" || input.wakeRole === "approver")
     return "review";
-  if (input.recoveryScoped) return "recovery";
+  if (input.recoveryScoped) {
+    const authority = paperclipRunBriefRecoveryAuthority(input.recoveryCause);
+    // "Go again" and "record your disposition" address the original owner;
+    // any other agent woken on the recovery keeps the hand-back contract.
+    return authority !== "recovery" && input.ownsIssue === false
+      ? "recovery"
+      : authority;
+  }
   if (input.taskWatchdog) return "watchdog";
+  // A mention or a question on someone else's issue is not a hand-off.
+  if (input.ownsIssue === false) return "comment";
   if (input.workMode === "planning") return "planning";
   if (input.workMode === "ask") return "ask";
   return "execute";
+}
+
+/**
+ * The run's wall-clock timeout as the adapter will apply it (sandbox targets
+ * default to a backstop when none is configured) and an approximate deadline.
+ * Adapters read `timeoutSec` with a fallback of 0, and so does this.
+ */
+export function runBriefTimeout(input: {
+  executionTarget: AdapterExecutionTarget | null | undefined;
+  configuredTimeoutSec: unknown;
+  nowMs?: number;
+}): Pick<PaperclipRunBriefEnvironment, "timeoutSec" | "deadlineAt"> {
+  const configured =
+    typeof input.configuredTimeoutSec === "number" &&
+    Number.isFinite(input.configuredTimeoutSec)
+      ? input.configuredTimeoutSec
+      : 0;
+  const { timeoutSec } = resolveAdapterExecutionTargetTimeout(
+    input.executionTarget,
+    configured,
+  );
+  if (!(timeoutSec > 0)) return { timeoutSec: null, deadlineAt: null };
+  return {
+    // Rounded up for display; the deadline keeps the exact value.
+    timeoutSec: Math.ceil(timeoutSec),
+    deadlineAt: new Date(
+      (input.nowMs ?? Date.now()) + timeoutSec * 1_000,
+    ).toISOString(),
+  };
 }
 
 /**

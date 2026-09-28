@@ -11,6 +11,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter-utils/execution-target";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -22,6 +23,7 @@ import {
   finalLineSummary,
   resolveRunBriefAuthority,
   resolveRunBriefSessionReason,
+  runBriefTimeout,
   runBriefWorkspaceState,
   withRunBriefEnvironment,
 } from "./run-brief.js";
@@ -92,6 +94,59 @@ describe("run brief helpers", () => {
     expect(resolveRunBriefAuthority({ ...base, taskWatchdog: true })).toBe("watchdog");
     expect(resolveRunBriefAuthority({ ...base, workMode: "planning" })).toBe("planning");
     expect(resolveRunBriefAuthority({ ...base, workMode: "ask" })).toBe("ask");
+  });
+
+  it("follows the recovery cause and the owner of the issue", () => {
+    const base = { wakeRole: null, recoveryScoped: true, taskWatchdog: false, workMode: "standard" };
+    // The original owner is told to go again, matching the cause instruction.
+    for (const recoveryCause of ["process_lost", "codex_output_inactivity_monitor"]) {
+      expect(resolveRunBriefAuthority({ ...base, recoveryCause, ownsIssue: true })).toBe("retry");
+      expect(resolveRunBriefAuthority({ ...base, recoveryCause })).toBe("retry");
+      expect(resolveRunBriefAuthority({ ...base, recoveryCause, ownsIssue: false })).toBe("recovery");
+    }
+    for (const recoveryCause of ["successful_run_missing_state", "successful_run_missing_issue_disposition"]) {
+      expect(resolveRunBriefAuthority({ ...base, recoveryCause, ownsIssue: true })).toBe("disposition");
+    }
+    for (const recoveryCause of ["provider_quota", "workspace_validation_failed", "stranded_assigned_issue", null]) {
+      expect(resolveRunBriefAuthority({ ...base, recoveryCause, ownsIssue: true })).toBe("recovery");
+    }
+  });
+
+  it("keeps a woken non-assignee to comments", () => {
+    const base = { wakeRole: null, recoveryScoped: false, taskWatchdog: false, workMode: "standard" };
+    expect(resolveRunBriefAuthority({ ...base, ownsIssue: false })).toBe("comment");
+    expect(resolveRunBriefAuthority({ ...base, ownsIssue: false, workMode: "planning" })).toBe("comment");
+    expect(resolveRunBriefAuthority({ ...base, ownsIssue: true })).toBe("execute");
+    // Unknown ownership keeps the role-based wording.
+    expect(resolveRunBriefAuthority({ ...base, ownsIssue: null })).toBe("execute");
+    // Reviewers and watchdogs are not assignees; their own wording applies.
+    expect(resolveRunBriefAuthority({ ...base, ownsIssue: false, wakeRole: "reviewer" })).toBe("review");
+    expect(resolveRunBriefAuthority({ ...base, ownsIssue: false, taskWatchdog: true })).toBe("watchdog");
+  });
+
+  it("resolves the timeout the way the adapters do", () => {
+    const nowMs = Date.UTC(2026, 8, 28, 12, 0, 0);
+    const sandbox = { kind: "remote", transport: "sandbox", remoteCwd: "/workspace" } as const;
+    expect(runBriefTimeout({ executionTarget: sandbox, configuredTimeoutSec: 0, nowMs })).toEqual({
+      timeoutSec: DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
+      deadlineAt: new Date(nowMs + DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC * 1_000).toISOString(),
+    });
+    expect(runBriefTimeout({ executionTarget: sandbox, configuredTimeoutSec: undefined, nowMs }).timeoutSec)
+      .toBe(DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC);
+    expect(runBriefTimeout({ executionTarget: sandbox, configuredTimeoutSec: 600, nowMs }).timeoutSec).toBe(600);
+    // A negative value is the explicit opt-out, even on a sandbox.
+    expect(runBriefTimeout({ executionTarget: sandbox, configuredTimeoutSec: -1, nowMs })).toEqual({
+      timeoutSec: null,
+      deadlineAt: null,
+    });
+    // Local targets keep "0 means no timeout".
+    expect(runBriefTimeout({ executionTarget: null, configuredTimeoutSec: 0, nowMs }).timeoutSec).toBeNull();
+    expect(runBriefTimeout({ executionTarget: { kind: "local" }, configuredTimeoutSec: "900", nowMs }).timeoutSec).toBeNull();
+    // Fractional values are kept for the deadline and rounded up for display.
+    expect(runBriefTimeout({ executionTarget: null, configuredTimeoutSec: 0.5, nowMs })).toEqual({
+      timeoutSec: 1,
+      deadlineAt: new Date(nowMs + 500).toISOString(),
+    });
   });
 
   it("fills the environment only on payloads that carry a brief", () => {
@@ -298,6 +353,55 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(brief.length).toBeLessThanOrEqual(1500);
     expect(brief).toContain("blocker issue=BRF-2 status=in_progress assignee=\"agent Reviewer\"");
     expect(brief).toContain(`run id=${priorRunIds[3]!.slice(0, 8)} status=succeeded liveness=completed summary="Next: wire the UI button."`);
+  });
+
+  it("tells a mentioned non-assignee to respond in comments", async () => {
+    const payload = await buildPaperclipWakePayload({
+      db,
+      companyId,
+      agentId: reviewerId,
+      runId: currentRunId,
+      contextSnapshot: { issueId, wakeReason: "issue_comment_mentioned" },
+      issueSummary: { ...issueSummary, assigneeAgentId: agentId },
+    });
+    expect(payload?.runBrief?.authority).toBe("comment");
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain("- authority: `BRF-1` is not assigned to you: respond in comments;");
+    expect(prompt).not.toContain("- authority: write within");
+
+    // Without a caller-supplied summary the builder reads the assignee itself.
+    const loaded = await buildPaperclipWakePayload({
+      db,
+      companyId,
+      agentId: reviewerId,
+      runId: currentRunId,
+      contextSnapshot: { issueId, wakeReason: "issue_comment_mentioned" },
+    });
+    expect(loaded?.runBrief?.authority).toBe("comment");
+    const owner = await payloadFor({});
+    expect(owner?.runBrief?.authority).toBe("execute");
+  });
+
+  it("matches the recovery instruction the wake text renders for the cause", async () => {
+    const recoveryPayload = (agent: string, recoveryCause: string) =>
+      buildPaperclipWakePayload({
+        db,
+        companyId,
+        agentId: agent,
+        runId: currentRunId,
+        contextSnapshot: { issueId, wakeReason: "issue_recovery_action", recoveryCause },
+      });
+    const retry = await recoveryPayload(agentId, "process_lost");
+    expect(retry?.recovery?.cause).toBe("process_lost");
+    expect(retry?.runBrief?.authority).toBe("retry");
+    const retryPrompt = renderPaperclipWakePrompt(retry);
+    expect(retryPrompt).toContain("- authority: resume the work on `BRF-1` from durable progress;");
+    expect(retryPrompt).toContain("Try again");
+
+    // Another agent woken for the same cause keeps the hand-back contract.
+    expect((await recoveryPayload(reviewerId, "process_lost"))?.runBrief?.authority).toBe("recovery");
+    expect((await recoveryPayload(agentId, "workspace_validation_failed"))?.runBrief?.authority).toBe("recovery");
+    expect((await recoveryPayload(agentId, "successful_run_missing_state"))?.runBrief?.authority).toBe("disposition");
   });
 
   it("skips the brief for conversation turns", async () => {
