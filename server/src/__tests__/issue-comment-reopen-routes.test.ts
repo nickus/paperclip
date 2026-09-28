@@ -1169,7 +1169,11 @@ describe.sequential("issue comment reopen routes", () => {
       "11111111-1111-4111-8111-111111111111",
       { status: "todo" },
     );
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "retry-run-1",
+      undefined,
+      { allowedFromStatuses: ["scheduled_retry", "queued"] },
+    );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -1200,6 +1204,147 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  it("moves in-progress issues with a queued (not yet claimed) retry back to todo via POST human comments", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: "retry-run-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    // "queued" is the other unstarted status alongside "scheduled_retry": the
+    // retry timer fired and the run was placed on the queue, but the
+    // claim-and-run transition has not happened yet, so it is still safe to
+    // supersede with this comment.
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue({
+      runId: "retry-run-1",
+      status: "queued",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      agentName: "CodexCoder",
+      retryOfRunId: "source-run-1",
+      scheduledRetryAt: new Date("2026-05-18T14:00:00.000Z"),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      error: null,
+      errorCode: null,
+    });
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }),
+    );
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "retry-run-1",
+      companyId: "company-1",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      status: "cancelled",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "I added the missing detail; please continue." });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "retry-run-1",
+      undefined,
+      { allowedFromStatuses: ["scheduled_retry", "queued"] },
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.updated",
+        details: expect.objectContaining({
+          status: "todo",
+          scheduledRetrySupersededByComment: true,
+          scheduledRetryRunId: "retry-run-1",
+          cancelledScheduledRetryRunId: "retry-run-1",
+        }),
+      }),
+    );
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({
+          reason: "issue_commented",
+          payload: expect.objectContaining({
+            commentId: "comment-1",
+            mutation: "comment",
+          }),
+          contextSnapshot: expect.objectContaining({
+            wakeReason: "issue_commented",
+            source: "issue.comment",
+          }),
+        }),
+      ),
+    );
+  });
+
+  it("does not report a queued retry as cancelled once claimed and running by the time the cancel write lands", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: "retry-run-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    // The route's own read still sees "queued" — the claim-to-"running"
+    // transition happens later, in the independent heartbeat queue-claim
+    // loop, not in this read. heartbeat.cancelRun's allowedFromStatuses guard
+    // is what actually has to catch that race: its atomic write only matches
+    // a row still in ["scheduled_retry", "queued"], so once the claim wins in
+    // the meantime the write matches nothing, and heartbeat.cancelRun returns
+    // the run unchanged (still "running", not "cancelled") rather than
+    // cancelling it — this mock stands in for that outcome.
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue({
+      runId: "retry-run-1",
+      status: "queued",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      agentName: "CodexCoder",
+      retryOfRunId: "source-run-1",
+      scheduledRetryAt: new Date("2026-05-18T14:00:00.000Z"),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      error: null,
+      errorCode: null,
+    });
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "retry-run-1",
+      companyId: "company-1",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      status: "running",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "I added the missing detail; please continue." });
+
+    expect(res.status).toBe(201);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "retry-run-1",
+      undefined,
+      { allowedFromStatuses: ["scheduled_retry", "queued"] },
+    );
+    // The run itself was never torn down (asserted above via the guarded
+    // cancelRun call), and the activity log must not falsely claim it was:
+    // no cancelledScheduledRetryRunId, because nothing was actually
+    // cancelled.
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        details: expect.objectContaining({
+          cancelledScheduledRetryRunId: expect.anything(),
+        }),
+      }),
+    );
+  });
+
   it("does not move scheduled-retry issues to todo when POST comment retry cancellation fails", async () => {
     const issue = {
       ...makeIssue("in_progress"),
@@ -1227,7 +1372,11 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: "I added the missing detail; please continue." });
 
     expect(res.status).toBe(500);
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "retry-run-1",
+      undefined,
+      { allowedFromStatuses: ["scheduled_retry", "queued"] },
+    );
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(
@@ -1970,7 +2119,11 @@ describe.sequential("issue comment reopen routes", () => {
         actorUserId: "local-board",
       }),
     );
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "retry-run-1",
+      undefined,
+      { allowedFromStatuses: ["scheduled_retry", "queued"] },
+    );
     await waitForWakeup(() =>
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
         "22222222-2222-4222-8222-222222222222",
@@ -1982,6 +2135,133 @@ describe.sequential("issue comment reopen routes", () => {
           }),
         }),
       ),
+    );
+  });
+
+  it("moves in-progress issues with a queued (not yet claimed) retry back to todo via the PATCH comment path", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: "retry-run-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    // "queued" is the other unstarted status alongside "scheduled_retry": the
+    // retry timer fired and the run was placed on the queue, but the
+    // claim-and-run transition has not happened yet, so it is still safe to
+    // supersede with this comment.
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue({
+      runId: "retry-run-1",
+      status: "queued",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      agentName: "CodexCoder",
+      retryOfRunId: "source-run-1",
+      scheduledRetryAt: new Date("2026-05-18T14:00:00.000Z"),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      error: null,
+      errorCode: null,
+    });
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }),
+    );
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "retry-run-1",
+      companyId: "company-1",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      status: "cancelled",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Retry window is over; please continue." });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({
+        status: "todo",
+        actorAgentId: null,
+        actorUserId: "local-board",
+      }),
+    );
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "retry-run-1",
+      undefined,
+      { allowedFromStatuses: ["scheduled_retry", "queued"] },
+    );
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({
+          reason: "issue_commented",
+          payload: expect.objectContaining({
+            commentId: "comment-1",
+            mutation: "comment",
+          }),
+        }),
+      ),
+    );
+  });
+
+  it("does not report a queued retry as cancelled once claimed and running by the time the cancel write lands (PATCH)", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: "retry-run-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    // Same race as the POST case: the route's own read still sees "queued",
+    // but the independent heartbeat queue-claim loop wins the race and
+    // promotes the row to "running" before heartbeat.cancelRun's atomic,
+    // allowedFromStatuses-gated write lands. That write then matches no row,
+    // so cancelRun returns the run unchanged (still "running") instead of
+    // cancelling it — this mock stands in for that outcome.
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue({
+      runId: "retry-run-1",
+      status: "queued",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      agentName: "CodexCoder",
+      retryOfRunId: "source-run-1",
+      scheduledRetryAt: new Date("2026-05-18T14:00:00.000Z"),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      error: null,
+      errorCode: null,
+    });
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "retry-run-1",
+      companyId: "company-1",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      status: "running",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Retry window is over; please continue." });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "retry-run-1",
+      undefined,
+      { allowedFromStatuses: ["scheduled_retry", "queued"] },
+    );
+    // The run itself was never torn down (asserted above via the guarded
+    // cancelRun call), and the activity log must not falsely claim it was:
+    // no cancelledScheduledRetryRunId, because nothing was actually
+    // cancelled.
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        details: expect.objectContaining({
+          cancelledScheduledRetryRunId: expect.anything(),
+        }),
+      }),
     );
   });
 
@@ -2012,7 +2292,11 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ comment: "Retry window is over; please continue." });
 
     expect(res.status).toBe(500);
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "retry-run-1",
+      undefined,
+      { allowedFromStatuses: ["scheduled_retry", "queued"] },
+    );
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(

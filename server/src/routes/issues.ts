@@ -2343,16 +2343,25 @@ function shouldHumanCommentResumeInProgressScheduledRetry(input: {
 
 // A comment must never cancel a run that is already executing — only a retry
 // that has not started yet may be superseded by it. "scheduled_retry" has no
-// process behind it yet, and a "queued" row observed here is, by construction,
-// not yet claimed: the claim that flips it to "running" happens atomically in
-// one transaction, so a plain read outside that transaction only ever sees the
-// row still queued (unclaimed) or already running, never in between. Once the
-// status is "running", the retry is a live run and a human comment on it must
-// fall back to the normal queued-comment path instead of tearing it down.
+// process behind it yet, and "queued" means not yet claimed: the claim that
+// flips it to "running" happens atomically in its own transaction. A plain
+// read of the row here can still be stale by the time this decision is acted
+// on — the callers below await several unrelated DB round trips first — so
+// this list is also passed as `allowedFromStatuses` to heartbeat.cancelRun,
+// which re-checks it against the same atomic write that performs the
+// cancellation. That closes the gap a one-time status read cannot: if the
+// queue-claim loop promotes the row to "running" in between, the write
+// matches no row and the cancellation is a no-op instead of tearing down the
+// run it raced with.
+const UNSTARTED_SCHEDULED_RETRY_STATUSES = ["scheduled_retry", "queued"] as const;
+
 function isUnstartedScheduledRetryStatus(
   status: string | null | undefined,
 ): boolean {
-  return status === "scheduled_retry" || status === "queued";
+  return (
+    status != null &&
+    (UNSTARTED_SCHEDULED_RETRY_STATUSES as readonly string[]).includes(status)
+  );
 }
 
 function isExplicitResumeCapableStatus(status: string | null | undefined) {
@@ -4246,8 +4255,20 @@ export function issueRoutes(
     if (!scheduledRetryRunId) return null;
 
     try {
-      const cancelled = await heartbeat.cancelRun(scheduledRetryRunId);
-      const cancelledRunId = cancelled?.id ?? scheduledRetryRunId;
+      const cancelled = await heartbeat.cancelRun(
+        scheduledRetryRunId,
+        undefined,
+        { allowedFromStatuses: UNSTARTED_SCHEDULED_RETRY_STATUSES },
+      );
+      if (!cancelled || cancelled.status !== "cancelled") {
+        // The retry left "queued"/"scheduled_retry" (claimed and started
+        // running) between the route's status read and this call. It is a
+        // live run now, not an unstarted retry — heartbeat.cancelRun's
+        // allowedFromStatuses guard already refused to touch it, so there is
+        // nothing to report as superseded.
+        return null;
+      }
+      const cancelledRunId = cancelled.id;
       await logActivity(db, {
         companyId: input.issue.companyId,
         actorType: input.actor.actorType,
