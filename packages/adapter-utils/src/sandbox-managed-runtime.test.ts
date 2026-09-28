@@ -2151,6 +2151,65 @@ describe("sandbox managed runtime", () => {
     expect(commands.at(-1)).toContain("reused-build-dirs");
   });
 
+  it.each([
+    ["git-backed", true],
+    ["plain", false],
+  ] as const)("does not restore a reused sandbox's build directories into a %s host workspace", async (_label, gitBacked) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-build-dirs-restore-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(path.join(localWorkspaceDir, "src"), { recursive: true });
+    await mkdir(path.join(localWorkspaceDir, ".pytest_cache"), { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "src", "app.py"), "host\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, ".pytest_cache", "host"), "host\n", "utf8");
+    if (gitBacked) {
+      await git(localWorkspaceDir, ["init", "-q", "-b", "main"]);
+      await git(localWorkspaceDir, ["config", "user.name", "Paperclip Test"]);
+      await git(localWorkspaceDir, ["config", "user.email", "test@paperclip.dev"]);
+      await git(localWorkspaceDir, ["add", "."]);
+      await git(localWorkspaceDir, ["commit", "-q", "-m", "base"]);
+    }
+    // Build directories an earlier run left in the kept sandbox; the host
+    // does not have them (they were never synced back, or were deleted).
+    const buildFiles = ["target/debug/app", ".venv/bin/python", "src/__pycache__/app.pyc", "lib/.tox/log"];
+    for (const relative of buildFiles) {
+      await mkdir(path.dirname(path.join(remoteWorkspaceDir, relative)), { recursive: true });
+      await writeFile(path.join(remoteWorkspaceDir, relative), "built", "utf8");
+    }
+
+    const client = makeFilesystemClient();
+    attachNativeRecordingSyncIn(client, []);
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: {
+        transport: "sandbox",
+        provider: "test",
+        sandboxId: "sandbox-1",
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+        apiKey: null,
+      },
+      adapterKey: "test-adapter",
+      client,
+      workspaceLocalDir: localWorkspaceDir,
+      preserveBuildDirs: true,
+    });
+    await expect(readFile(path.join(remoteWorkspaceDir, "target", "debug", "app"), "utf8")).resolves.toBe("built");
+    // The run edits a source file and rebuilds.
+    await writeFile(path.join(remoteWorkspaceDir, "src", "app.py"), "edited by the run\n", "utf8");
+    await writeFile(path.join(remoteWorkspaceDir, ".pytest_cache", "run"), "run\n", "utf8");
+
+    await prepared.restoreWorkspace();
+
+    await expect(readFile(path.join(localWorkspaceDir, "src", "app.py"), "utf8")).resolves.toBe("edited by the run\n");
+    for (const relative of buildFiles) {
+      await expect(stat(path.join(localWorkspaceDir, relative))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    // The host's own build directory is left as it was.
+    await expect(readFile(path.join(localWorkspaceDir, ".pytest_cache", "host"), "utf8")).resolves.toBe("host\n");
+    await expect(stat(path.join(localWorkspaceDir, ".pytest_cache", "run"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("wipes build directories as before when the sandbox is not reused", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-build-dirs-off-"));
     cleanupDirs.push(rootDir);
