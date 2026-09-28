@@ -4,6 +4,7 @@ DENY PATCH /api/agents/:agentId/budgets
 DENY PATCH /api/agents/:id
 DENY PATCH /api/agents/:id/instructions-bundle
 DENY PATCH /api/agents/:id/permissions
+DENY PATCH /api/auth/preferences
 DENY PATCH /api/auth/profile
 DENY PATCH /api/cases/:caseId
 DENY PATCH /api/cases/:id
@@ -79,6 +80,7 @@ DENY DELETE /api/companies/:companyId/skills/:skillId/files
 DENY DELETE /api/companies/:companyId/skills/:skillId/star
 DENY DELETE /api/companies/:companyId/skills/:skillId/test-inputs/:inputId
 DENY DELETE /api/companies/:companyId/skills/:skillId/test-runs/:runId
+DENY DELETE /api/companies/:companyId/slack/endpoints/:endpointId/search
 DENY DELETE /api/companies/:companyId/tools/policies/:policyId
 DENY DELETE /api/companies/:companyId/user-secret-definitions/:definitionId
 DENY DELETE /api/decision-training/:id
@@ -101,7 +103,6 @@ DENY DELETE /api/tool-applications/:applicationId
 DENY DELETE /api/tool-connections/:connectionId
 DENY DELETE /api/tool-connections/:connectionId/grants/:grantId
 DENY DELETE /api/tool-connections/:connectionId/grants/:grantId/delegations/:delegationId
-DENY DELETE /api/tool-connections/:connectionId/services/:toolkitSlug
 DENY DELETE /api/tool-profile-entries/:entryId
 DENY DELETE /api/tool-profiles/:profileId
 DENY GET /_plugins/:pluginId/ui/*filePath
@@ -111,6 +112,7 @@ DENY GET /api/adapters/:type/config-schema
 DENY GET /api/adapters/:type/ui-parser.js
 DENY GET /api/admin/users
 DENY GET /api/admin/users/:userId/company-access
+DENY GET /api/agent-avatars/:version/:palette/:file
 DENY GET /api/agents/:id/keys
 DENY GET /api/agents/:id/runtime-state
 DENY GET /api/agents/:id/task-sessions
@@ -120,6 +122,7 @@ DENY GET /api/announcements/:id/animation
 DENY GET /api/announcements/:id/image
 DENY GET /api/announcements/current
 DENY GET /api/auth/get-session
+DENY GET /api/auth/preferences
 DENY GET /api/auth/profile
 DENY GET /api/board-api-keys
 DENY GET /api/board-claim/:token
@@ -144,8 +147,12 @@ DENY GET /api/chat-endpoints/:endpointId
 DENY GET /api/chat-endpoints/:endpointId/activity
 DENY GET /api/chat-endpoints/:endpointId/conversations
 DENY GET /api/chat-endpoints/:endpointId/conversations/:conversationId/publications/:publicationId/status
+DENY GET /api/chat-endpoints/:endpointId/github/configuration
+DENY GET /api/chat-endpoints/:endpointId/github/personal-connections
+DENY GET /api/chat-endpoints/:endpointId/github/reviews
 DENY GET /api/chat-endpoints/:endpointId/principals
 DENY GET /api/chat-endpoints/:endpointId/resources
+DENY GET /api/chat-endpoints/:endpointId/test-status
 DENY GET /api/chat-identity-links/preview
 DENY GET /api/cli-auth/challenges/:id
 DENY GET /api/cli-auth/me
@@ -217,6 +224,8 @@ DENY GET /api/companies/:companyId/sidebar-badges
 DENY GET /api/companies/:companyId/sidebar-preferences/me
 DENY GET /api/companies/:companyId/skill-policy
 DENY GET /api/companies/:companyId/skill-test-run-templates
+DENY GET /api/companies/:companyId/slack/endpoints/:endpointId/capabilities
+DENY GET /api/companies/:companyId/slack/endpoints/:endpointId/search
 DENY GET /api/companies/:companyId/smoke-lab/oauth/authorize
 DENY GET /api/companies/:companyId/smoke-lab/oauth/userinfo
 DENY GET /api/companies/:companyId/smoke-lab/runs
@@ -264,6 +273,7 @@ DENY GET /api/feedback-traces/:traceId/bundle
 DENY GET /api/heartbeat-runs/:runId/provider-trace
 DENY GET /api/heartbeat-runs/:runId/provider-trace/download
 DENY GET /api/heartbeat-runs/:runId/workspace-operations
+DENY GET /api/instance/lifecycle
 DENY GET /api/instance/scheduler-heartbeats
 DENY GET /api/instance/settings
 DENY GET /api/instance/settings/experimental
@@ -304,6 +314,7 @@ DENY GET /api/secret-provider-configs/:id
 DENY GET /api/secrets/:id/access-events
 DENY GET /api/secrets/:id/usage
 DENY GET /api/sidebar-preferences/me
+DENY GET /api/slack/search/callback
 DENY GET /api/teams/catalog
 DENY GET /api/teams/catalog/:catalogId
 DENY GET /api/teams/catalog/:catalogId/files
@@ -312,8 +323,6 @@ DENY GET /api/tool-connections/:connectionId/activity
 DENY GET /api/tool-connections/:connectionId/catalog
 DENY GET /api/tool-connections/:connectionId/grants
 DENY GET /api/tool-connections/:connectionId/installs
-DENY GET /api/tool-connections/:connectionId/services
-DENY GET /api/tool-connections/:connectionId/services/:toolkitSlug/status
 DENY GET /api/tool-connections/:connectionId/test-agents
 DENY GET /api/tool-connections/:connectionId/test-agents/:agentId/access
 DENY GET /api/tool-connections/:connectionId/test-calls/:actionRequestId
@@ -514,6 +523,13 @@ DENY POST /api/cases/:id/links
 DENY POST /api/chat-endpoints/:endpointId/actions/:actionId/resolve
 DENY POST /api/chat-endpoints/:endpointId/conversations/:conversationId/publications
 DENY POST /api/chat-endpoints/:endpointId/deliveries/:deliveryId/replay
+DENY POST /api/chat-endpoints/:endpointId/finish
+DENY POST /api/chat-endpoints/:endpointId/github/app
+DENY POST /api/chat-endpoints/:endpointId/github/identity
+DENY POST /api/chat-endpoints/:endpointId/github/people/lookup
+DENY POST /api/chat-endpoints/:endpointId/github/registration
+DENY POST /api/chat-endpoints/:endpointId/github/repositories/refresh
+DENY POST /api/chat-endpoints/:endpointId/github/verify
 DENY POST /api/chat-endpoints/:endpointId/photon/inspect
 DENY POST /api/chat-endpoints/:endpointId/principals/:principalId/link-intent
 DENY POST /api/chat-endpoints/:endpointId/publications/:publicationId/replay
@@ -522,6 +538,7 @@ DENY POST /api/chat-endpoints/:endpointId/setup
 DENY POST /api/chat-endpoints/:endpointId/setup-secret
 DENY POST /api/chat-endpoints/:endpointId/test
 DENY POST /api/chat-identity-links/confirm
+DENY POST /api/chat-identity-links/request-access
 DENY POST /api/chat-webhooks/:publicId/:provider
 DENY POST /api/chat-webhooks/agentmail/:publicId
 DENY POST /api/cli-auth/challenges
@@ -623,6 +640,8 @@ DENY POST /api/companies/:companyId/skills/browse-project
 DENY POST /api/companies/:companyId/skills/import
 DENY POST /api/companies/:companyId/skills/install-catalog
 DENY POST /api/companies/:companyId/skills/scan-projects
+DENY POST /api/companies/:companyId/slack/endpoints/:endpointId/search/connect
+DENY POST /api/companies/:companyId/slack/tasks/:issueId/tools
 DENY POST /api/companies/:companyId/smoke-lab/install-fixtures
 DENY POST /api/companies/:companyId/smoke-lab/oauth/authorize
 DENY POST /api/companies/:companyId/smoke-lab/oauth/revoke
@@ -689,11 +708,13 @@ DENY POST /api/heartbeat-runs/:runId/provider-trace/reproject-workspace-diffs
 DENY POST /api/heartbeat-runs/:runId/runtime-requests/:requestId/resolve
 DENY POST /api/heartbeat-runs/:runId/watchdog-decisions
 DENY POST /api/instance/database-backups
+DENY POST /api/instance/lifecycle/unarchive-primary
 DENY POST /api/instance/task-drain
 DENY POST /api/invites/:inviteId/revoke
 DENY POST /api/invites/:token/accept
 DENY POST /api/issues/:id/admin/force-release
 DENY POST /api/issues/:id/low-trust/promotions
+DENY POST /api/issues/:id/recovery-actions/retry-workspace-export
 DENY POST /api/issues/:issueId/file-resources/availability
 DENY POST /api/join-requests/:requestId/claim-api-key
 DENY POST /api/mcp/project-tools
@@ -729,8 +750,8 @@ DENY POST /api/tool-connections/:connectionId/catalog/refresh
 DENY POST /api/tool-connections/:connectionId/grants/:grantId/delegations
 DENY POST /api/tool-connections/:connectionId/grants/installations
 DENY POST /api/tool-connections/:connectionId/health-check
+DENY POST /api/tool-connections/:connectionId/railway/ssh
 DENY POST /api/tool-connections/:connectionId/reconnect
-DENY POST /api/tool-connections/:connectionId/services/:toolkitSlug/connect
 DENY POST /api/tool-connections/:connectionId/test-calls
 DENY POST /api/tool-gateway/action-requests/:id/approve
 DENY POST /api/tool-gateway/action-requests/:id/decline
@@ -826,6 +847,8 @@ DENY PUT /api/agents/:id/instructions-bundle/file
 DENY PUT /api/cases/:caseId/blockers
 DENY PUT /api/cases/:caseId/documents/:key
 DENY PUT /api/cases/:id/documents/:key
+DENY PUT /api/chat-endpoints/:endpointId/github/configuration
+DENY PUT /api/chat-endpoints/:endpointId/github/progress
 DENY PUT /api/chat-endpoints/:endpointId/resources
 DENY PUT /api/companies/:companyId/ai-connections/default
 DENY PUT /api/companies/:companyId/decision-triage/:sourceKind/:sourceId
@@ -834,6 +857,7 @@ DENY PUT /api/companies/:companyId/resource-memberships/me/documents/:documentId
 DENY PUT /api/companies/:companyId/resource-memberships/me/projects/:projectId
 DENY PUT /api/companies/:companyId/sidebar-preferences/me
 DENY PUT /api/companies/:companyId/skill-policy
+DENY PUT /api/companies/:companyId/slack/endpoints/:endpointId/search
 DENY PUT /api/companies/:companyId/users/:userId/inbox-agent-policy
 DENY PUT /api/companies/:companyId/users/me/inbox-agent-policy
 DENY PUT /api/companies/import/transfers/:transferId/parts/:partIndex

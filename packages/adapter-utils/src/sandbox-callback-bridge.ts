@@ -523,6 +523,7 @@ export const AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRoute
   },
   // Board-only issue recovery and host workspace file reads.
   { methods: ALL_METHODS, path: /^\/api\/issues\/[^/]+\/admin(?:\/|$)/ },
+  { methods: ALL_METHODS, path: /^\/api\/issues\/[^/]+\/recovery-actions\/retry-workspace-export$/ },
   { methods: ALL_METHODS, path: /^\/api\/issues\/[^/]+\/file-resources(?:\/|$)/ },
   // Workspace provisioning, setup and runtime-service output from the host.
   // It is stored without secret scrubbing, so no run reads it through the

@@ -58,6 +58,17 @@ function readRouterMounts(): Map<string, string[]> {
     const prefix = (match[1] === "api" ? "/api" : "") + (match[2] ?? "");
     mounts.set(match[3]!, [...(mounts.get(match[3]!) ?? []), prefix]);
   }
+  // A factory that returns a handle: `const foo = fooRoutes(...)` and later
+  // `api.use(foo.router)`.
+  const handles = new Map(
+    [...app.matchAll(/\bconst\s+([A-Za-z0-9_]+)\s*=\s*([A-Za-z0-9_]+)\(/g)].map((match) => [match[1]!, match[2]!]),
+  );
+  for (const match of app.matchAll(/\b(app|api)\.use\(\s*(?:"([^"]*)"\s*,\s*)?([A-Za-z0-9_]+)\.router\b/g)) {
+    const factory = handles.get(match[3]!);
+    if (!factory) continue;
+    const prefix = (match[1] === "api" ? "/api" : "") + (match[2] ?? "");
+    mounts.set(factory, [...(mounts.get(factory) ?? []), prefix]);
+  }
   return mounts;
 }
 
