@@ -38,7 +38,12 @@ import {
   type RuntimeStatusPhase,
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
-import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
+import {
+  APPLEDOUBLE_EXCLUDES,
+  isRelativePathOrDescendant,
+  NESTED_GIT_EXCLUDES,
+  shouldExcludePath,
+} from "./exclude-patterns.js";
 import {
   scheduleSyncOperations,
   SYNC_OPERATION_CONCURRENCY_LIMIT,
@@ -1248,9 +1253,14 @@ export async function prepareSandboxManagedRuntime(input: {
     input.workspaceExclude,
     gitIgnoredExcludes,
   );
+  // The baseline must leave out what the workspace archives leave out: a path
+  // that is in the baseline but never reaches the sandbox, or never comes
+  // back from it, looks deleted to the restore merge.
   const restoreExclude = mergeExcludes(
     SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
     [...GIT_ARCHIVE_EXCLUDES],
+    [...NESTED_GIT_EXCLUDES],
+    [...APPLEDOUBLE_EXCLUDES],
     [".paperclip-runtime"],
     input.preserveAbsentOnRestore,
     input.workspaceExclude,

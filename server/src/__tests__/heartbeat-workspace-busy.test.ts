@@ -217,6 +217,12 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
     holderActivityAt?: Date;
     issueWorkspaceSettings?: Record<string, unknown> | null;
     agentEnvironmentDriver?: "sandbox";
+    // The project has no workspace: both issues run in its managed directory.
+    withoutProjectWorkspace?: boolean;
+    // The deferred issue names no project workspace of its own.
+    issueWithoutProjectWorkspace?: boolean;
+    // The holder issue belongs to a second project (also without a workspace).
+    holderInOtherProject?: boolean;
   }): Promise<WorkspaceFixture> {
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     const companyId = randomUUID();
@@ -245,16 +251,26 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       companyId,
       name: "Workspace Busy Project",
     });
+    const holderProjectId = input?.holderInOtherProject ? randomUUID() : projectId;
+    if (holderProjectId !== projectId) {
+      await db.insert(projects).values({
+        id: holderProjectId,
+        companyId,
+        name: "Other Workspace Busy Project",
+      });
+    }
 
-    await db.insert(projectWorkspaces).values({
-      id: projectWorkspaceId,
-      companyId,
-      projectId,
-      name: "Primary workspace",
-      sourceType: "local_path",
-      cwd: workspaceCwd,
-      isPrimary: true,
-    });
+    if (!input?.withoutProjectWorkspace) {
+      await db.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "Primary workspace",
+        sourceType: "local_path",
+        cwd: workspaceCwd,
+        isPrimary: true,
+      });
+    }
 
     if (agentEnvironmentId) {
       await db.insert(environments).values({
@@ -267,8 +283,10 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       });
     }
 
-    const holderProjectWorkspaceId = input?.holderProjectWorkspaceId ?? projectWorkspaceId;
-    if (holderProjectWorkspaceId !== projectWorkspaceId) {
+    const holderProjectWorkspaceId = input?.withoutProjectWorkspace
+      ? null
+      : (input?.holderProjectWorkspaceId ?? projectWorkspaceId);
+    if (holderProjectWorkspaceId && holderProjectWorkspaceId !== projectWorkspaceId) {
       await db.insert(projectWorkspaces).values({
         id: holderProjectWorkspaceId,
         companyId,
@@ -329,7 +347,7 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       priority: "medium",
       responsibleUserId: "responsible-user",
       assigneeAgentId: holderAgentId,
-      projectId,
+      projectId: holderProjectId,
       projectWorkspaceId: holderProjectWorkspaceId,
       executionRunId: holderRunId,
       executionAgentNameKey: "holdercoder",
@@ -350,7 +368,10 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       responsibleUserId: "responsible-user",
       assigneeAgentId: agentId,
       projectId,
-      projectWorkspaceId,
+      projectWorkspaceId:
+        input?.withoutProjectWorkspace || input?.issueWithoutProjectWorkspace
+          ? null
+          : projectWorkspaceId,
       issueNumber: 2,
       identifier: `${issuePrefix}-2`,
       executionWorkspaceSettings:
@@ -486,6 +507,87 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.scheduledRetryReason, WORKSPACE_BUSY_RETRY_REASON));
     expect(retryRuns).toHaveLength(0);
+  });
+
+  it("defers a sandbox run while another issue of its project runs in the project's managed directory", async () => {
+    const fixture = await seedWorkspaceFixture({
+      issueWorkspaceSettings: { sharedWorkspaceConcurrency: "auto" },
+      agentEnvironmentDriver: "sandbox",
+      withoutProjectWorkspace: true,
+    });
+
+    const run = await heartbeat.invoke(
+      fixture.agentId,
+      "assignment",
+      { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+      "system",
+    );
+    expect(run).not.toBeNull();
+
+    const finishedRun = await waitForRunToLeaveActiveStates(run!.id);
+    expect(finishedRun?.errorCode).toBe(WORKSPACE_BUSY_ERROR_CODE);
+    expect(executedRunIds).not.toContain(run!.id);
+    const workspaceBusy = (finishedRun?.resultJson as Record<string, unknown> | null)
+      ?.workspaceBusy as Record<string, unknown> | undefined;
+    expect(workspaceBusy).toMatchObject({
+      projectWorkspaceId: null,
+      projectId: fixture.projectId,
+      holderRunId: fixture.holderRunId,
+    });
+  });
+
+  it("defers an issue without a project workspace while the project's first workspace is held", async () => {
+    const fixture = await seedWorkspaceFixture({
+      issueWorkspaceSettings: { sharedWorkspaceConcurrency: "serialize" },
+      issueWithoutProjectWorkspace: true,
+    });
+
+    const run = await heartbeat.invoke(
+      fixture.agentId,
+      "assignment",
+      { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+      "system",
+    );
+    expect(run).not.toBeNull();
+
+    const finishedRun = await waitForRunToLeaveActiveStates(run!.id);
+    expect(finishedRun?.errorCode).toBe(WORKSPACE_BUSY_ERROR_CODE);
+    expect(executedRunIds).not.toContain(run!.id);
+    const workspaceBusy = (finishedRun?.resultJson as Record<string, unknown> | null)
+      ?.workspaceBusy as Record<string, unknown> | undefined;
+    expect(workspaceBusy).toMatchObject({
+      projectWorkspaceId: fixture.projectWorkspaceId,
+      holderRunId: fixture.holderRunId,
+    });
+  });
+
+  it("does not defer for a run in another project's managed directory", async () => {
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-busy-home-"));
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    try {
+      const fixture = await seedWorkspaceFixture({
+        issueWorkspaceSettings: { sharedWorkspaceConcurrency: "serialize" },
+        withoutProjectWorkspace: true,
+        holderInOtherProject: true,
+      });
+
+      const run = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      expect(run).not.toBeNull();
+
+      const finishedRun = await waitForRunToLeaveActiveStates(run!.id);
+      expect(finishedRun?.errorCode).not.toBe(WORKSPACE_BUSY_ERROR_CODE);
+      expect(executedRunIds).toContain(run!.id);
+    } finally {
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+    }
   });
 
   it("defers a run whose issue targets a busy shared workspace and schedules a bounded retry", async () => {

@@ -175,6 +175,22 @@ async function readSnapshotEntry(root: string, relative: string): Promise<Snapsh
   };
 }
 
+// The owner-executable bit: the only permission bit Git records for a file.
+const EXECUTABLE_MODE_BIT = 0o100;
+
+/**
+ * Two file modes match when they agree on the owner-executable bit. The other
+ * permission bits are not compared: a file that round-trips through a remote
+ * workspace comes back extracted by an unprivileged `tar`, which applies the
+ * extracting process's umask, so a restrictive umask (e.g. 027) turns an
+ * unchanged 0644 file into 0640. Comparing the full mode made every such file
+ * look changed, and the merge then rewrote the host copy with the run's
+ * version, overwriting any concurrent host write to it.
+ */
+function fileModesMatch(left: number, right: number): boolean {
+  return (left & EXECUTABLE_MODE_BIT) === (right & EXECUTABLE_MODE_BIT);
+}
+
 function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEntry | null | undefined): boolean {
   if (!left || !right) return false;
   if (left.kind !== right.kind) return false;
@@ -183,7 +199,7 @@ function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEnt
     return left.target === right.target;
   }
   if (left.kind === "file" && right.kind === "file") {
-    return left.mode === right.mode && left.hash === right.hash;
+    return fileModesMatch(left.mode, right.mode) && left.hash === right.hash;
   }
   return false;
 }
@@ -416,6 +432,7 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
   }
 
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  const existing = await fs.lstat(targetPath).catch(() => null);
   await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
   if (entry.kind === "symlink") {
     await fs.symlink(entry.target, targetPath);
@@ -425,7 +442,11 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
   await fs.copyFile(sourcePath, targetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
     await fs.copyFile(sourcePath, targetPath);
   });
-  await fs.chmod(targetPath, entry.mode);
+  // A file the run changed keeps the host copy's permission bits unless the run
+  // changed whether it is executable (see fileModesMatch): the other bits of an
+  // extracted file's mode come from the extracting umask, not from the run.
+  const keepHostMode = existing?.isFile() === true && fileModesMatch(existing.mode, entry.mode);
+  await fs.chmod(targetPath, keepHostMode ? existing!.mode : entry.mode);
 }
 
 export async function captureDirectorySnapshot(
