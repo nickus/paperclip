@@ -132,16 +132,42 @@ function expandTargetKeysForLegacyCompatibility(targetKeys: string[]) {
   return [...expanded];
 }
 
+/** A change consent a change consumed, as `consume` returns it. */
+export interface ChangeConsentReceipt {
+  interactionId: string;
+  companyId: string;
+  consumedByRunId: string;
+  consumedAt: string;
+}
+
+function missingConsent(targetKeys: string[]) {
+  return forbidden(
+    "This change requires a request_confirmation with a displayed diff for this target, "
+      + "accepted by a board user, created in a previous run and not already consumed.",
+    {
+      code: "reflection_coach_mutation_gate_required",
+      targetKeys,
+    },
+  );
+}
+
 export function changeConsentGateService(db: Db) {
-  return {
-    assertConsented: async (input: {
+  const gate = {
+    /**
+     * Consume an accepted change consent for `targetKeys`, or throw 403. Returns
+     * null when there is no acting agent. `matchesChange`, when given, must also
+     * accept the card's payload: the route uses it to check that the card showed
+     * this exact change, so a card accepted for one change cannot apply another.
+     */
+    consume: async (input: {
       companyId: string;
       actorAgentId: string | null | undefined;
       actorRunId: string | null | undefined;
       targetKeys: string[];
-    }): Promise<boolean> => {
+      matchesChange?: (payload: RequestConfirmationPayload) => boolean;
+    }): Promise<ChangeConsentReceipt | null> => {
       const actorAgentId = readNonEmptyString(input.actorAgentId);
-      if (!actorAgentId) return false;
+      if (!actorAgentId) return null;
 
       const actorRunId = readNonEmptyString(input.actorRunId);
       if (!actorRunId) {
@@ -166,7 +192,9 @@ export function changeConsentGateService(db: Db) {
 
       // Consent means a board user accepted the card. A card resolved by an
       // agent (including the one that created it, which the default
-      // `anyone` resolver policy allows) or by the system never counts.
+      // `anyone` resolver policy allows) or by the system never counts. Spent
+      // cards are filtered here, before the limit, so older spent cards never
+      // hide an unspent one.
       const rows = await db
         .select({
           id: issueThreadInteractions.id,
@@ -184,10 +212,11 @@ export function changeConsentGateService(db: Db) {
           eq(issueThreadInteractions.status, "accepted"),
           isNotNull(issueThreadInteractions.resolvedByUserId),
           isNull(issueThreadInteractions.resolvedByAgentId),
+          sql`coalesce(${issueThreadInteractions.result}->>'consumedByRunId', ${issueThreadInteractions.result}->>'consumedAt') is null`,
           targetKeyPredicate,
         ))
         .orderBy(desc(issueThreadInteractions.resolvedAt), desc(issueThreadInteractions.createdAt))
-        .limit(10);
+        .limit(50);
 
       const accepted = rows.find((row) => {
         const payload = row.payload as RequestConfirmationPayload;
@@ -200,31 +229,12 @@ export function changeConsentGateService(db: Db) {
           && !requestConfirmationResultConsumed(result)
           && payloadHasDisplayedDiff(payload)
           && Boolean(row.sourceRunId)
-          && row.sourceRunId !== actorRunId;
+          && row.sourceRunId !== actorRunId
+          && (!input.matchesChange || input.matchesChange(payload));
       });
 
-      if (!accepted) {
-        throw forbidden(
-          "This change requires a request_confirmation with a displayed diff for this target, "
-            + "accepted by a board user, created in a previous run and not already consumed.",
-          {
-            code: "reflection_coach_mutation_gate_required",
-            targetKeys,
-          },
-        );
-      }
-
-      const acceptedResult = accepted.result as RequestConfirmationResult | null;
-      if (!acceptedResult) {
-        throw forbidden(
-          "This change requires a request_confirmation with a displayed diff for this target, "
-            + "accepted by a board user, created in a previous run and not already consumed.",
-          {
-            code: "reflection_coach_mutation_gate_required",
-            targetKeys,
-          },
-        );
-      }
+      const acceptedResult = accepted?.result as RequestConfirmationResult | null | undefined;
+      if (!accepted || !acceptedResult) throw missingConsent(targetKeys);
 
       const now = new Date();
       const [consumed] = await db
@@ -246,18 +256,42 @@ export function changeConsentGateService(db: Db) {
         ))
         .returning({ id: issueThreadInteractions.id });
 
-      if (!consumed) {
-        throw forbidden(
-          "This change requires a request_confirmation with a displayed diff for this target, "
-            + "accepted by a board user, created in a previous run and not already consumed.",
-          {
-            code: "reflection_coach_mutation_gate_required",
-            targetKeys,
-          },
-        );
-      }
+      if (!consumed) throw missingConsent(targetKeys);
 
-      return true;
+      return {
+        interactionId: accepted.id,
+        companyId: input.companyId,
+        consumedByRunId: actorRunId,
+        consumedAt: now.toISOString(),
+      };
+    },
+
+    assertConsented: async (input: {
+      companyId: string;
+      actorAgentId: string | null | undefined;
+      actorRunId: string | null | undefined;
+      targetKeys: string[];
+    }): Promise<boolean> => (await gate.consume(input)) !== null,
+
+    /**
+     * Give back a consent a change consumed and then failed to apply, so the
+     * same change can be retried. Only the consumption `receipt` names is
+     * undone; a card consumed again since is left alone.
+     */
+    release: async (receipt: ChangeConsentReceipt): Promise<void> => {
+      await db
+        .update(issueThreadInteractions)
+        .set({
+          result: sql`(${issueThreadInteractions.result} - 'consumedAt') - 'consumedByRunId'`,
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(issueThreadInteractions.id, receipt.interactionId),
+          eq(issueThreadInteractions.companyId, receipt.companyId),
+          sql`${issueThreadInteractions.result}->>'consumedByRunId' = ${receipt.consumedByRunId}`,
+          sql`${issueThreadInteractions.result}->>'consumedAt' = ${receipt.consumedAt}`,
+        ));
     },
   };
+  return gate;
 }

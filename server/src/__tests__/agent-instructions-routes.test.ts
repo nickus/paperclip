@@ -615,6 +615,7 @@ describe("agent instructions bundle routes", () => {
       consumed?: boolean;
       resolvedByUserId?: string | null;
       resolvedByAgentId?: string | null;
+      detailsMarkdown?: string;
     } = {}) {
       return {
         id: "interaction-1",
@@ -624,7 +625,8 @@ describe("agent instructions bundle routes", () => {
         payload: {
           version: 1,
           prompt: "Apply the proposed instructions change?",
-          detailsMarkdown: "```diff\n- old rule\n+ new rule\n```",
+          // The change from the mocked AGENTS.md ("# Agent") to the written "# Changed".
+          detailsMarkdown: overrides.detailsMarkdown ?? "```diff\n-# Agent\n+# Changed\n```",
           target: { type: "custom", key: `agent:${TARGET_AGENT_ID}:instructions` },
         },
         result: {
@@ -712,7 +714,7 @@ describe("agent instructions bundle routes", () => {
       );
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.error).toBe(SUGGEST_ONLY_DENIAL);
+      expect(res.body.error).toContain(SUGGEST_ONLY_DENIAL);
       expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
       expect(mockAgentService.update).not.toHaveBeenCalled();
       expect(consumedUpdates).toEqual([]);
@@ -824,6 +826,38 @@ describe("agent instructions bundle routes", () => {
       expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
       expect(mockAgentService.update).not.toHaveBeenCalled();
       expect(consumedUpdates).toEqual([]);
+    });
+
+    it("refuses a card whose diff shows another change, without consuming it", async () => {
+      mockSuggestOnlyCoach();
+      const { db, consumedUpdates } = consentDb([consentRow({ detailsMarkdown: "```diff\n- old rule\n+ new rule\n```" })]);
+
+      const res = await requestApp(
+        await createApp(coachActor(), db),
+        (baseUrl) => request(baseUrl).put(FILE_PATH).send({ path: "AGENTS.md", content: "# Changed\n" }),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toContain("fenced ```diff block");
+      expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+      expect(consumedUpdates).toEqual([]);
+    });
+
+    it("gives the card back when the write fails after consuming it", async () => {
+      mockSuggestOnlyCoach();
+      mockAgentInstructionsService.writeFile.mockRejectedValueOnce(new Error("disk full"));
+      const { db, consumedUpdates } = consentDb([consentRow()]);
+
+      const res = await requestApp(
+        await createApp(coachActor(), db),
+        (baseUrl) => request(baseUrl).put(FILE_PATH).send({ path: "AGENTS.md", content: "# Changed\n" }),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(500);
+      // One update consumes the card, the next gives it back.
+      expect(consumedUpdates).toHaveLength(2);
+      expect(consumedUpdates[0]!.result).toMatchObject({ consumedByRunId: APPLY_RUN_ID });
+      expect(mockAgentService.update).not.toHaveBeenCalled();
     });
 
     it("applies the write with a card a board user accepted in an earlier run, and consumes the card", async () => {

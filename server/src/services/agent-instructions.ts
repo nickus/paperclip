@@ -119,6 +119,14 @@ function normalizeRelativeFilePath(candidatePath: string): string {
   return normalized;
 }
 
+/**
+ * The bundle-relative path a write or read of `candidatePath` resolves to.
+ * Throws 422 for a path that leaves the bundle root.
+ */
+export function normalizeAgentInstructionsFilePath(candidatePath: string): string {
+  return normalizeRelativeFilePath(candidatePath);
+}
+
 function resolvePathWithinRoot(rootPath: string, relativePath: string): string {
   const normalizedRelativePath = normalizeRelativeFilePath(relativePath);
   const absoluteRoot = path.resolve(rootPath);
