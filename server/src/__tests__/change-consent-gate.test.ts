@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
@@ -17,6 +17,8 @@ import {
 import {
   agentInstructionsChangeTargetKey,
   changeConsentGateService,
+  instructionsFileChangeMatchesWrite,
+  instructionsFileContentSha256,
   isChangeConsentTargetKey,
   skillChangeTargetKey,
 } from "../services/change-consent-gate.js";
@@ -347,6 +349,10 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
         prompt: "Apply this instructions change?",
         detailsMarkdown: "```diff\n-old rule\n+new rule\n```",
         target: { type: "custom" as const, key: targetKey },
+        instructionsFileChange: {
+          path: "AGENTS.md",
+          contentSha256: createHash("sha256").update("new rule\n").digest("hex"),
+        },
       },
     };
     const coachInProposalRun = { agentId: coachId, runId: sourceRunId };
@@ -398,5 +404,118 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       actorRunId: randomUUID(),
       targetKeys: [targetKey],
     })).resolves.toBe(true);
+  });
+  describe("a card bound to an agent's instructions names the write it allows", () => {
+    async function seedInstructionsCardFixture() {
+      const fixture = await seedGateFixture();
+      const targetAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: targetAgentId,
+        companyId: fixture.companyId,
+        name: "Target agent",
+        role: "general",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const issue = { id: fixture.proposalIssueId, companyId: fixture.companyId, goalId: null, projectId: null };
+      const create = (payload: Record<string, unknown>) =>
+        issueThreadInteractionService(db).create(
+          issue,
+          {
+            kind: "request_confirmation",
+            continuationPolicy: "wake_assignee_on_accept",
+            sourceRunId: fixture.sourceRunId,
+            payload: {
+              version: 1,
+              prompt: "Apply this instructions change?",
+              detailsMarkdown: "```diff\n--- a/AGENTS.md\n+++ b/AGENTS.md\n+New rule.\n```",
+              target: { type: "custom", key: agentInstructionsChangeTargetKey(targetAgentId) },
+              ...payload,
+            },
+          } as never,
+          { agentId: fixture.coachId, runId: fixture.sourceRunId },
+        );
+      return { ...fixture, targetAgentId, create };
+    }
+
+    const newRuleSha256 = instructionsFileContentSha256("New rule.\n");
+
+    it("refuses a card that does not name its write, or names one it cannot allow", async () => {
+      const { create } = await seedInstructionsCardFixture();
+
+      await expect(create({})).rejects.toMatchObject({
+        status: 422,
+        details: { code: "instructions_file_change_required" },
+      });
+      await expect(create({
+        instructionsFileChange: { path: "../outside.md", contentSha256: newRuleSha256 },
+      })).rejects.toMatchObject({ status: 422 });
+      await expect(create({
+        instructionsFileChange: { path: "promptTemplate.legacy.md", contentSha256: newRuleSha256 },
+      })).rejects.toMatchObject({
+        status: 422,
+        details: { code: "instructions_file_change_legacy_prompt_template" },
+      });
+      // The card's diff must show the named file.
+      await expect(create({
+        instructionsFileChange: { path: "TOOLS.md", contentSha256: newRuleSha256 },
+      })).rejects.toMatchObject({
+        status: 422,
+        details: { code: "instructions_file_change_diff_required" },
+      });
+      await expect(create({
+        detailsMarkdown: "Adds a new rule.",
+        instructionsFileChange: { path: "AGENTS.md", contentSha256: newRuleSha256 },
+      })).rejects.toMatchObject({
+        status: 422,
+        details: { code: "instructions_file_change_diff_required" },
+      });
+      // A hash that is not a SHA-256 fails validation.
+      await expect(create({
+        instructionsFileChange: { path: "AGENTS.md", contentSha256: "abc123" },
+      })).rejects.toThrow(/contentSha256/);
+    });
+
+    it("refuses a proposal on a card for another target", async () => {
+      const { create, skillId } = await seedInstructionsCardFixture();
+
+      await expect(create({
+        target: { type: "custom", key: skillChangeTargetKey(skillId) },
+        instructionsFileChange: { path: "AGENTS.md", contentSha256: newRuleSha256 },
+      })).rejects.toMatchObject({
+        status: 422,
+        details: { code: "instructions_file_change_target_required" },
+      });
+    });
+
+    it("stores the proposal normalized, as the write route compares it", async () => {
+      const { create } = await seedInstructionsCardFixture();
+
+      const card = await create({
+        instructionsFileChange: { path: " ./docs/../AGENTS.md ", contentSha256: newRuleSha256.toUpperCase() },
+      });
+
+      expect(card.payload).toMatchObject({
+        instructionsFileChange: {
+          version: 1,
+          path: "AGENTS.md",
+          contentSha256: newRuleSha256,
+          clearLegacyPromptTemplate: false,
+        },
+      });
+      const write = { path: "AGENTS.md", contentSha256: newRuleSha256, clearLegacyPromptTemplate: false };
+      const proposal = (card.payload as { instructionsFileChange?: Parameters<typeof instructionsFileChangeMatchesWrite>[0] })
+        .instructionsFileChange;
+      expect(instructionsFileChangeMatchesWrite(proposal, write)).toBe(true);
+      expect(instructionsFileChangeMatchesWrite(proposal, { ...write, path: "TOOLS.md" })).toBe(false);
+      expect(instructionsFileChangeMatchesWrite(proposal, {
+        ...write,
+        contentSha256: instructionsFileContentSha256("New rule. \n"),
+      })).toBe(false);
+      expect(instructionsFileChangeMatchesWrite(proposal, { ...write, clearLegacyPromptTemplate: true })).toBe(false);
+      expect(instructionsFileChangeMatchesWrite(undefined, write)).toBe(false);
+    });
   });
 });

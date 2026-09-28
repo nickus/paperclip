@@ -175,8 +175,8 @@ export function nativeChatQuestion(
 /**
  * Telegram can safely render ordinary binary confirmations as inline buttons.
  * Confirmations that collect a rejection reason or authorize a credential,
- * connection, or tool side effect stay in Paperclip, where the complete
- * governed review UI and permission checks are available.
+ * connection, tool side effect, or instruction change stay in Paperclip, where
+ * the complete governed review UI and permission checks are available.
  */
 export function nativeTelegramConfirmation(
   interaction: IssueThreadInteraction,
@@ -187,6 +187,7 @@ export function nativeTelegramConfirmation(
     interaction.payload.toolAction !== undefined ||
     interaction.payload.secretProposal !== undefined ||
     interaction.payload.connectionAuthorization !== undefined ||
+    interaction.payload.instructionsFileChange !== undefined ||
     interaction.payload.target?.type === "issue_document"
   ) {
     return null;

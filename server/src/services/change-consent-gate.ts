@@ -1,8 +1,15 @@
+import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { issueThreadInteractions } from "@paperclipai/db";
 import { and, desc, eq, isNotNull, isNull, or, sql } from "drizzle-orm";
-import type { RequestConfirmationPayload, RequestConfirmationResult } from "@paperclipai/shared";
-import { forbidden } from "../errors.js";
+import type {
+  RequestConfirmationInstructionsFileChangePayload,
+  RequestConfirmationPayload,
+  RequestConfirmationResult,
+} from "@paperclipai/shared";
+import { forbidden, unprocessable } from "../errors.js";
+import { LEGACY_PROMPT_TEMPLATE_PATH, normalizeAgentInstructionsFilePath } from "./agent-instructions.js";
+import { parseDisplayedDiff } from "./change-consent-diff.js";
 
 export const AGENT_PROFILE_CHANGE_CONSENT_FIELDS = ["name", "role", "title", "capabilities"] as const;
 
@@ -53,6 +60,116 @@ export function isChangeConsentTargetKey(key: unknown): boolean {
   if (typeof key !== "string") return false;
   const trimmed = key.trim();
   return trimmed.length > 0 && CHANGE_CONSENT_TARGET_KEY_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
+/** Target keys, current and legacy, that gate writes to an agent's instructions. */
+const AGENT_INSTRUCTIONS_TARGET_KEY_PATTERNS: readonly RegExp[] = [
+  /^agent:.+:instructions$/,
+  /^reflection-coach:agent-instructions:.+$/,
+];
+
+export function isAgentInstructionsChangeTargetKey(key: unknown): boolean {
+  if (typeof key !== "string") return false;
+  const trimmed = key.trim();
+  return AGENT_INSTRUCTIONS_TARGET_KEY_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
+/**
+ * The SHA-256 (lowercase hex) of an instruction file's full content, UTF-8
+ * encoded: the bytes the write stores. A card's `instructionsFileChange`
+ * names the content it allows by this hash.
+ */
+export function instructionsFileContentSha256(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+/** One instruction file write, as a card's `instructionsFileChange` must name it. */
+export interface InstructionsFileWrite {
+  /** Bundle-relative path, normalized. */
+  path: string;
+  /** See `instructionsFileContentSha256`. */
+  contentSha256: string;
+  clearLegacyPromptTemplate: boolean;
+}
+
+/**
+ * Whether a card's proposal names exactly `write`: the same file, content
+ * with the same SHA-256, and the same clearLegacyPromptTemplate flag.
+ */
+export function instructionsFileChangeMatchesWrite(
+  proposal: RequestConfirmationInstructionsFileChangePayload | null | undefined,
+  write: InstructionsFileWrite,
+): boolean {
+  if (!proposal || typeof proposal !== "object") return false;
+  if (typeof proposal.path !== "string" || typeof proposal.contentSha256 !== "string") return false;
+  let proposedPath: string;
+  try {
+    proposedPath = normalizeAgentInstructionsFilePath(proposal.path.trim());
+  } catch {
+    return false;
+  }
+  return proposedPath === write.path
+    && proposal.contentSha256.trim().toLowerCase() === write.contentSha256
+    && (proposal.clearLegacyPromptTemplate === true) === write.clearLegacyPromptTemplate;
+}
+
+/**
+ * Checks the change a `request_confirmation` proposes before the card is
+ * stored, and returns the payload with its proposal normalized.
+ *
+ * A card bound to an agent's instructions must name the one file write it
+ * allows in `payload.instructionsFileChange` (the file, the SHA-256 of its
+ * full new content, and the clearLegacyPromptTemplate flag), and show the
+ * change to that file in a fenced ```diff block of `detailsMarkdown`, so the
+ * board user sees what accepting it allows. A proposal on any other card is
+ * refused, since nothing would enforce it.
+ */
+export function prepareChangeConsentPayload<T extends RequestConfirmationPayload>(payload: T): T {
+  const targetKey = payload.target?.type === "custom" ? payload.target.key : null;
+  const proposal = payload.instructionsFileChange;
+  if (!isAgentInstructionsChangeTargetKey(targetKey)) {
+    if (proposal === undefined) return payload;
+    throw unprocessable(
+      "payload.instructionsFileChange is only for a card bound to an agent's instructions "
+        + '(target: {"type": "custom", "key": "agent:{agentId}:instructions"}).',
+      { code: "instructions_file_change_target_required" },
+    );
+  }
+  if (!proposal) {
+    throw unprocessable(
+      `A request_confirmation bound to ${targetKey} must name the one instruction file write it allows in `
+        + "payload.instructionsFileChange: {path, contentSha256, clearLegacyPromptTemplate}, where contentSha256 is "
+        + "the lowercase hex SHA-256 of the file's full new content (UTF-8).",
+      { code: "instructions_file_change_required", targetKey },
+    );
+  }
+  const filePath = normalizeAgentInstructionsFilePath(proposal.path);
+  if (filePath === LEGACY_PROMPT_TEMPLATE_PATH) {
+    throw unprocessable(
+      `${LEGACY_PROMPT_TEMPLATE_PATH} is not a bundle file and cannot be written under a change consent; `
+        + "propose a change to the bundle's entry file instead.",
+      { code: "instructions_file_change_legacy_prompt_template" },
+    );
+  }
+  const shown = parseDisplayedDiff(payload.detailsMarkdown).some((section) =>
+    section.paths.length === 0 || section.paths.includes(filePath),
+  );
+  if (!shown) {
+    throw unprocessable(
+      `payload.detailsMarkdown must show the change to ${filePath} in a fenced \`\`\`diff block `
+        + `(name the file with \`--- a/${filePath}\` and \`+++ b/${filePath}\` headers).`,
+      { code: "instructions_file_change_diff_required", path: filePath },
+    );
+  }
+  return {
+    ...payload,
+    instructionsFileChange: {
+      version: 1,
+      path: filePath,
+      contentSha256: proposal.contentSha256.trim().toLowerCase(),
+      clearLegacyPromptTemplate: proposal.clearLegacyPromptTemplate === true,
+    },
+  };
 }
 
 export function touchesAgentProfileChangeConsentFields(patchData: Record<string, unknown>) {
@@ -140,6 +257,17 @@ export interface ChangeConsentReceipt {
   consumedAt: string;
 }
 
+function consentDoesNotMatchChange(targetKeys: string[]) {
+  return forbidden(
+    "An accepted change consent for this target exists, but none allows this exact change, "
+      + "so none was consumed.",
+    {
+      code: "change_consent_mismatch",
+      targetKeys,
+    },
+  );
+}
+
 function missingConsent(targetKeys: string[]) {
   return forbidden(
     "This change requires a request_confirmation with a displayed diff for this target, "
@@ -218,7 +346,7 @@ export function changeConsentGateService(db: Db) {
         .orderBy(desc(issueThreadInteractions.resolvedAt), desc(issueThreadInteractions.createdAt))
         .limit(50);
 
-      const accepted = rows.find((row) => {
+      const eligible = rows.filter((row) => {
         const payload = row.payload as RequestConfirmationPayload;
         const result = row.result as RequestConfirmationResult | null;
         return payload.target?.type === "custom"
@@ -229,12 +357,20 @@ export function changeConsentGateService(db: Db) {
           && !requestConfirmationResultConsumed(result)
           && payloadHasDisplayedDiff(payload)
           && Boolean(row.sourceRunId)
-          && row.sourceRunId !== actorRunId
-          && (!input.matchesChange || input.matchesChange(payload));
+          && row.sourceRunId !== actorRunId;
       });
+      const matchesChange = input.matchesChange;
+      const accepted = matchesChange
+        ? eligible.find((row) => matchesChange(row.payload as RequestConfirmationPayload))
+        : eligible[0];
 
       const acceptedResult = accepted?.result as RequestConfirmationResult | null | undefined;
-      if (!accepted || !acceptedResult) throw missingConsent(targetKeys);
+      if (!accepted || !acceptedResult) {
+        // Say so when a card was accepted for another change, so the caller
+        // can tell a mismatch from a missing card.
+        if (matchesChange && eligible.length > 0) throw consentDoesNotMatchChange(targetKeys);
+        throw missingConsent(targetKeys);
+      }
 
       const now = new Date();
       const [consumed] = await db

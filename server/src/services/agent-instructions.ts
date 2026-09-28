@@ -11,7 +11,8 @@ const FILE_KEY = "instructionsFilePath";
 const PROMPT_KEY = "promptTemplate";
 /** @deprecated Use the managed instructions bundle system instead. */
 const BOOTSTRAP_PROMPT_KEY = "bootstrapPromptTemplate";
-const LEGACY_PROMPT_TEMPLATE_PATH = "promptTemplate.legacy.md";
+/** The pseudo-file that stands for `adapterConfig.promptTemplate`; not a bundle file. */
+export const LEGACY_PROMPT_TEMPLATE_PATH = "promptTemplate.legacy.md";
 const IGNORED_INSTRUCTIONS_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "Desktop.ini"]);
 const IGNORED_INSTRUCTIONS_DIRECTORY_NAMES = new Set([
   ".git",

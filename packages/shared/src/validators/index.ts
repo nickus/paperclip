@@ -469,6 +469,7 @@ export {
   requestConfirmationResumeFailureSchema,
   requestConfirmationResultSchema,
   requestConfirmationSecretProposalPayloadSchema,
+  requestConfirmationInstructionsFileChangePayloadSchema,
   requestConfirmationSecretProposalResultSchema,
   requestCheckboxConfirmationOptionSchema,
   requestCheckboxConfirmationPayloadSchema,

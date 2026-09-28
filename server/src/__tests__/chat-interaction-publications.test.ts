@@ -20,7 +20,11 @@ import {
   toolConnections,
 } from "@paperclipai/db";
 import type { ChatProvider } from "@paperclipai/shared";
-import { enqueueTerminalIssueInteractionChatPublications } from "../services/chat-interaction-publications.js";
+import {
+  enqueueTerminalIssueInteractionChatPublications,
+  nativeTelegramConfirmation,
+} from "../services/chat-interaction-publications.js";
+import { nativePhotonInteraction } from "../services/photon/interactions.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -1245,3 +1249,33 @@ describeEmbeddedPostgres(
     });
   },
 );
+
+describe("native chat confirmations", () => {
+  function confirmation(payload: Record<string, unknown>) {
+    return {
+      id: randomUUID(),
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { version: 1, prompt: "Apply this change?", ...payload },
+    } as unknown as Parameters<typeof nativeTelegramConfirmation>[0];
+  }
+
+  it("keeps a card that allows an instruction change in Paperclip", () => {
+    const plain = confirmation({});
+    const instructionChange = confirmation({
+      detailsMarkdown: "```diff\n+New rule.\n```",
+      target: { type: "custom", key: "agent:agent-1:instructions" },
+      instructionsFileChange: {
+        version: 1,
+        path: "AGENTS.md",
+        contentSha256: "a".repeat(64),
+        clearLegacyPromptTemplate: false,
+      },
+    });
+
+    expect(nativeTelegramConfirmation(plain)).toBe(plain);
+    expect(nativePhotonInteraction(plain)).toBe(true);
+    expect(nativeTelegramConfirmation(instructionChange)).toBeNull();
+    expect(nativePhotonInteraction(instructionChange)).toBe(false);
+  });
+});

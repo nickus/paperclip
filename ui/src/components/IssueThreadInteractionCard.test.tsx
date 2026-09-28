@@ -582,6 +582,33 @@ describe("IssueThreadInteractionCard", () => {
     );
   });
 
+  it("shows the exact instruction file write a change-consent card allows", () => {
+    const hash = "0123456789abcdef".repeat(4);
+    const host = renderCard({
+      interaction: {
+        ...pendingRequestConfirmationInteraction,
+        payload: {
+          ...pendingRequestConfirmationInteraction.payload,
+          detailsMarkdown: "```diff\n--- a/AGENTS.md\n+++ b/AGENTS.md\n+New rule.\n```",
+          target: { type: "custom", key: "agent:agent-1:instructions" },
+          instructionsFileChange: {
+            version: 1,
+            path: "docs/AGENTS.md",
+            contentSha256: hash,
+            clearLegacyPromptTemplate: true,
+          },
+        },
+      },
+    });
+
+    const summary = host.querySelector('[data-testid="instructions-file-change"]');
+    expect(summary).toBeTruthy();
+    expect(summary?.textContent).toContain("docs/AGENTS.md");
+    expect(summary?.textContent).toContain(hash);
+    expect(summary?.textContent).toContain("Clears the agent's legacy prompt template");
+    expect(host.textContent).toContain("New rule.");
+  });
+
   it("invokes the confirm callback with pending request confirmations", async () => {
     const onAcceptInteraction = vi.fn(async () => undefined);
     const host = renderCard({

@@ -1284,6 +1284,69 @@ describeEmbeddedPostgres("attention service", () => {
     expect(interactionIds).not.toContain(olderConfirmationId);
   });
 
+  it("offers no one-click accept for a card that allows an instruction change", async () => {
+    const { companyId, workerId } = await seedCompany("ATI");
+    const changeIssueId = await insertIssue({
+      companyId,
+      identifier: "ATI-1",
+      title: "Instruction change",
+      status: "in_review",
+      assigneeAgentId: workerId,
+    });
+    const plainIssueId = await insertIssue({
+      companyId,
+      identifier: "ATI-2",
+      title: "Plain sign-off",
+      status: "in_review",
+      assigneeAgentId: workerId,
+    });
+    const changeCardId = randomUUID();
+    const plainCardId = randomUUID();
+    await db.insert(issueThreadInteractions).values([
+      {
+        id: changeCardId,
+        companyId,
+        issueId: changeIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee_on_accept",
+        createdByAgentId: workerId,
+        title: "Apply an instruction change",
+        payload: {
+          version: 1,
+          prompt: "Apply this instruction change?",
+          detailsMarkdown: "```diff\n+New rule.\n```",
+          target: { type: "custom", key: `agent:${workerId}:instructions` },
+          instructionsFileChange: {
+            version: 1,
+            path: "AGENTS.md",
+            contentSha256: "a".repeat(64),
+            clearLegacyPromptTemplate: false,
+          },
+        },
+      },
+      {
+        id: plainCardId,
+        companyId,
+        issueId: plainIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: workerId,
+        title: "Approve V1",
+        payload: { version: 1, prompt: "Approve V1?" },
+      },
+    ]);
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const verbIds = (id: string) =>
+      feed.items.find((item) => item.subject.id === id)?.decisionVerbs.map((verb) => verb.id);
+
+    // The card is accepted from its full view, which shows the write it allows.
+    expect(verbIds(changeCardId)).toEqual(["review"]);
+    expect(verbIds(plainCardId)).toEqual(["accept", "reject"]);
+  });
+
   it("uses inbox_dismissals with attention-prefixed dedup keys and resurfaces newer activity", async () => {
     const { companyId } = await seedCompany("ATD");
     const approvalId = randomUUID();

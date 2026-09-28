@@ -104,7 +104,7 @@ import {
   runWorkspaceIsFinalized,
 } from "./issues.js";
 import { questionResponseDeliveryValues } from "./question-response-delivery.js";
-import { isChangeConsentTargetKey } from "./change-consent-gate.js";
+import { isChangeConsentTargetKey, prepareChangeConsentPayload } from "./change-consent-gate.js";
 import {
   cancelPendingIssueInteractionChatPublications,
   enqueueIssueInteractionChatPublications,
@@ -841,10 +841,12 @@ function normalizeCreateInteractionInput(
     case "request_confirmation":
       return {
         ...input,
-        payload: {
+        // A card bound to an agent's instructions must name the exact file
+        // write it allows; this checks that and normalizes the proposal.
+        payload: prepareChangeConsentPayload({
           ...input.payload,
           supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
-        },
+        }),
       };
     case "request_checkbox_confirmation":
       return {

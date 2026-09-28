@@ -52,7 +52,10 @@ export function nativePhotonInteraction(
     interaction.kind === "request_confirmation" &&
     !interaction.payload.toolAction &&
     !interaction.payload.secretProposal &&
-    !interaction.payload.connectionAuthorization
+    !interaction.payload.connectionAuthorization &&
+    // An instruction change is reviewed and accepted in Paperclip, where the
+    // card shows the exact write it allows.
+    !interaction.payload.instructionsFileChange
   );
 }
 export function photonResponseCommand(text: string): {

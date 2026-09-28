@@ -239,8 +239,11 @@ import {
   agentInstructionsChangeTargetKey,
   agentProfileChangeTargetKey,
   changeConsentGateService,
+  instructionsFileChangeMatchesWrite,
+  instructionsFileContentSha256,
   touchesAgentProfileChangeConsentFields,
   type ChangeConsentReceipt,
+  type InstructionsFileWrite,
 } from "../services/change-consent-gate.js";
 import { displayedDiffCoversFileWrite } from "../services/change-consent-diff.js";
 import { agentRequestUsesPaperclipApiBridge } from "../services/run-api-bridge.js";
@@ -258,15 +261,24 @@ const BRIDGED_RUN_CHANGE_CONSENT_REQUIRED =
   + "and accepted by a board user.";
 const BRIDGED_RUN_INSTRUCTIONS_FILE_WRITES_ONLY =
   "Runs in a remote execution environment change agent instructions only by writing a bundle file "
-  + "(PUT /api/agents/{agentId}/instructions-bundle/file) under an accepted change consent whose diff shows the write.";
-const INSTRUCTION_FILE_CHANGE_CONSENT_REQUIREMENT =
-  "The accepted card must show this exact write in a fenced ```diff block of its detailsMarkdown: "
-  + "name the file with `--- a/<path>` and `+++ b/<path>` headers (lines before any header belong to the entry file), "
-  + "show every line the write adds as a `+` line and every line it removes as a `-` line, "
-  + "against the file as it is now, and show no change the write does not make.";
-const INSTRUCTION_FILE_CONSENT_CANNOT_CLEAR_LEGACY_PROMPT =
-  "A write applied under a change consent cannot set clearLegacyPromptTemplate: the card's diff does not show "
-  + "the legacy prompt template it would remove.";
+  + "(PUT /api/agents/{agentId}/instructions-bundle/file) under an accepted change consent that names the write.";
+const INSTRUCTIONS_CHANGE_CONSENT_FILE_WRITES_ONLY =
+  "A change consent for agent instructions allows only the one bundle file write it names "
+  + "(PUT /api/agents/{agentId}/instructions-bundle/file). Changing bundle settings or deleting instruction files "
+  + "needs a direct agents:configure grant.";
+const INSTRUCTION_FILE_CHANGE_CONSENT_MISMATCH =
+  "An accepted change consent for this agent's instructions exists, but none allows this exact write; none was consumed.";
+
+// What the accepted card must carry for one instruction file write.
+function instructionFileChangeConsentRequirement(write: InstructionsFileWrite) {
+  return `The accepted card must name this exact write in payload.instructionsFileChange (path "${write.path}", `
+    + `contentSha256 "${write.contentSha256}", the SHA-256 of the full content sent, and clearLegacyPromptTemplate `
+    + `${write.clearLegacyPromptTemplate}), and show it in a fenced \`\`\`diff block of its detailsMarkdown: `
+    + "name the file with `--- a/<path>` and `+++ b/<path>` headers (lines before any header belong to the entry file), "
+    + "show every line the write adds as a `+` line and every line it removes as a `-` line, "
+    + "against the file as it is now, and show no change the write does not make.";
+}
+
 // Adapter config keys that hold the prompt an adapter renders for every run.
 const PROMPT_TEMPLATE_CONFIG_KEYS = ["promptTemplate", "bootstrapPromptTemplate"] as const;
 
@@ -277,8 +289,10 @@ const PROMPT_TEMPLATE_CONFIG_KEYS = ["promptTemplate", "bootstrapPromptTemplate"
 interface ChangeConsentBinding {
   /** Appended to the refusal when no accepted card shows this change. */
   requirement: string;
-  /** Set when the change cannot be applied under a change consent at all. */
-  unbindable?: string | null;
+  /** The refusal when an accepted card exists but does not show this change. */
+  mismatch: string;
+  /** Added to the refusal's details, so the caller can compare its card. */
+  details?: Record<string, unknown>;
   /**
    * Builds the check that a card's payload shows this change. Called only
    * when the change needs a card, before any card is consumed.
@@ -2868,15 +2882,18 @@ export function agentRoutes(
 
     // From here on the change needs a card. Every check that can still refuse
     // it runs before a card is consumed, so a refused change never spends one.
+    //
+    // An instructions card names one bundle file write, so it can only apply
+    // that write: any other instructions change (bundle settings, deleting a
+    // file) cannot be made under a card.
     if (
-      bridged
-      && !options.consent
+      !options.consent
       && targetKeys.some((key) => key === agentInstructionsChangeTargetKey(targetAgent.id))
     ) {
-      throw forbidden(BRIDGED_RUN_INSTRUCTIONS_FILE_WRITES_ONLY, { reason: "deny_missing_consent" });
-    }
-    if (options.consent?.unbindable) {
-      throw forbidden(options.consent.unbindable, { reason: "deny_missing_consent" });
+      throw forbidden(
+        bridged ? BRIDGED_RUN_INSTRUCTIONS_FILE_WRITES_ONLY : INSTRUCTIONS_CHANGE_CONSENT_FILE_WRITES_ONLY,
+        { reason: "deny_missing_consent" },
+      );
     }
     let refusal: { explanation: string; details: Record<string, unknown> };
     if (decision.allowed) {
@@ -2893,23 +2910,33 @@ export function agentRoutes(
       }
       refusal = { explanation: decision.explanation, details: authorizationDeniedDetails(decision) };
     }
+    let mismatch: typeof refusal | undefined;
     if (options.consent) {
-      refusal = { ...refusal, explanation: `${refusal.explanation} ${options.consent.requirement}` };
+      const details = { ...refusal.details, ...options.consent.details };
+      mismatch = {
+        explanation: `${options.consent.mismatch} ${options.consent.requirement}`,
+        details: { ...details, code: "change_consent_mismatch" },
+      };
+      refusal = { explanation: `${refusal.explanation} ${options.consent.requirement}`, details };
     }
     const matchesChange = options.consent ? await options.consent.prepare() : undefined;
-    return consumeChangeConsentOrForbid(req, targetAgent.companyId, targetKeys, refusal, matchesChange);
+    return consumeChangeConsentOrForbid(req, targetAgent.companyId, targetKeys, refusal, matchesChange, mismatch);
   }
 
   // Consume a board-accepted change consent for `targetKeys` (one that
-  // `matchesChange` accepts, when given), or refuse the change with `refusal`.
+  // `matchesChange` accepts, when given), or refuse the change with `refusal`,
+  // or with `mismatch` when accepted cards exist but none shows this change.
+  // A refused change consumes no card.
   async function consumeChangeConsentOrForbid(
     req: Request,
     companyId: string,
     targetKeys: string[],
     refusal: { explanation: string; details: Record<string, unknown> },
     matchesChange?: (payload: RequestConfirmationPayload) => boolean,
+    mismatch?: { explanation: string; details: Record<string, unknown> },
   ): Promise<ChangeConsentReceipt> {
     let receipt: ChangeConsentReceipt | null = null;
+    let mismatched = false;
     try {
       receipt = await changeConsentGateService(db).consume({
         companyId,
@@ -2920,9 +2947,11 @@ export function agentRoutes(
       });
     } catch (err) {
       if (!(err instanceof HttpError && err.status === 403)) throw err;
+      mismatched = (err.details as { code?: unknown } | undefined)?.code === "change_consent_mismatch";
     }
     if (!receipt) {
-      throw forbidden(refusal.explanation, refusal.details);
+      const denial = mismatched && mismatch ? mismatch : refusal;
+      throw forbidden(denial.explanation, denial.details);
     }
     return receipt;
   }
@@ -2940,16 +2969,24 @@ export function agentRoutes(
     );
   }
 
-  // Binds a change consent to one instruction file write: the card's diff
-  // must show exactly this write (see services/change-consent-diff.ts).
+  // Binds a change consent to one instruction file write. The card must name
+  // exactly this write in payload.instructionsFileChange (file, SHA-256 of the
+  // full content, clearLegacyPromptTemplate), and its diff must show it
+  // (see services/change-consent-diff.ts).
   function instructionFileWriteConsent(
     targetAgent: Parameters<typeof instructions.readFile>[0],
     filePath: string,
     write: { content: string; clearLegacyPromptTemplate?: boolean },
   ): ChangeConsentBinding {
+    const fileWrite: InstructionsFileWrite = {
+      path: filePath,
+      contentSha256: instructionsFileContentSha256(write.content),
+      clearLegacyPromptTemplate: write.clearLegacyPromptTemplate === true,
+    };
     return {
-      requirement: INSTRUCTION_FILE_CHANGE_CONSENT_REQUIREMENT,
-      unbindable: write.clearLegacyPromptTemplate === true ? INSTRUCTION_FILE_CONSENT_CANNOT_CLEAR_LEGACY_PROMPT : null,
+      requirement: instructionFileChangeConsentRequirement(fileWrite),
+      mismatch: INSTRUCTION_FILE_CHANGE_CONSENT_MISMATCH,
+      details: { instructionsFileChange: fileWrite },
       prepare: async () => {
         const bundle = await instructions.getBundle(targetAgent);
         const entryFile = normalizeAgentInstructionsFilePath(bundle.entryFile || "AGENTS.md");
@@ -2961,13 +2998,14 @@ export function agentRoutes(
             throw err;
           },
         );
-        return (payload) => displayedDiffCoversFileWrite({
-          detailsMarkdown: payload.detailsMarkdown,
-          filePath,
-          entryFile,
-          previousContent,
-          nextContent: write.content,
-        });
+        return (payload) => instructionsFileChangeMatchesWrite(payload.instructionsFileChange, fileWrite)
+          && displayedDiffCoversFileWrite({
+            detailsMarkdown: payload.detailsMarkdown,
+            filePath,
+            entryFile,
+            previousContent,
+            nextContent: write.content,
+          });
       },
     };
   }

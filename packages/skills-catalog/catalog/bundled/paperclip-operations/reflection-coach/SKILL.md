@@ -147,7 +147,7 @@ Create a document attached to the **reflection issue** (never the target's issue
 ### 7) Write the actual drafts (files, not just prose)
 
 - **Skill surface** — draft a full `SKILL.md` (frontmatter → Overview → When to use → Process → Pitfalls → Verification), ≤ 15KB. Put it under `drafts/<skill-slug>/SKILL.md` and attach it to the reflection issue.
-- **AGENTS.md surface** — write a unified diff against the target's current `AGENTS.md`. Do not rewrite the whole file; quote 1–3 lines of context per change. Keep total growth ≤ +20%; split if you can't.
+- **AGENTS.md surface** — write a unified diff against the target's current `AGENTS.md`. Do not rewrite the whole file; quote 1–3 lines of context per change. Keep total growth ≤ +20%; split if you can't. Also keep the full new file: the acceptance card names it by its SHA-256, and the apply run writes exactly that content.
 
 ### 8) Benchmark-gate the proposal
 
@@ -159,7 +159,7 @@ From a reflection issue (assigned to the target's manager or the requester):
 
 1. Attach the proposal document: `PUT /api/issues/{issueId}/documents/reflection-proposal`.
 2. If a draft skill was written, commit it under `skills/<skill-slug>/` (or attach it) and link it in the proposal.
-3. Open the acceptance gate with a task interaction on the reflection issue. Mutations that change instructions, skills, or tool descriptions must use `request_confirmation`, show the diff in `payload.detailsMarkdown`, set `continuationPolicy: wake_assignee_on_accept`, and include the exact `payload.target.key` listed below.
+3. Open the acceptance gate with a task interaction on the reflection issue. Mutations that change instructions, skills, or tool descriptions must use `request_confirmation`, show the diff in `payload.detailsMarkdown`, set `continuationPolicy: wake_assignee_on_accept`, and include the exact `payload.target.key` listed below. A card for agent instructions must also name the one file write it allows in `payload.instructionsFileChange`: `{"path": "AGENTS.md", "contentSha256": "<lowercase hex SHA-256 of the full new file, UTF-8>", "clearLegacyPromptTemplate": false}`, with a ```` ```diff ```` block headed `--- a/<path>` / `+++ b/<path>` for that file. One card allows one write to one file; propose a change to several files as several cards.
 4. Leave a comment summarizing: target agent, window, clusters found, surfaces touched, link to the proposal, link to the interaction, and the next-step owner.
 
 Server-enforced mutation target keys:
@@ -175,11 +175,11 @@ Server-enforced mutation target keys:
 
 When the interaction resolves **accepted**, apply the change in a *separate* run:
 
-- **AGENTS.md** — update the target's managed instruction file exactly as the accepted diff specified.
+- **AGENTS.md** — write the target's managed instruction file (`PUT /api/agents/<targetAgentId>/instructions-bundle/file`) with the path, the exact content whose SHA-256 the accepted card names, and the same `clearLegacyPromptTemplate`. Any other write is refused and leaves the card unspent.
 - **Skill** — install/update the skill in the company library, then `POST /api/agents/<targetAgentId>/skills/sync` with `{"mode":"add","desiredSkills":["<skill-ref>"]}` when the target should receive it. Use `remove` only for the named assignments. Use `replace` only after explicit confirmation to overwrite the complete desired skill set.
 - **Tool description** — update the target agent's description/profile field that the accepted diff named.
 
-The server rejects Reflection Coach mutations unless the accepted `request_confirmation` was created by Reflection Coach in a previous run, has a displayed diff, and is bound to the resource by one of the target keys above. If the interaction was rejected or is still pending, apply nothing. If you were asked to apply without a reviewed diff and an accepted interaction, refuse and name the gate — no-same-run-apply is load-bearing.
+The server rejects these mutations unless the accepted `request_confirmation` was created by you in a previous run, was accepted by a board user, has a displayed diff, and is bound to the resource by one of the target keys above; an instruction file write must also be the exact write the card's `payload.instructionsFileChange` names. If the interaction was rejected or is still pending, apply nothing. If you were asked to apply without a reviewed diff and an accepted interaction, refuse and name the gate — no-same-run-apply is load-bearing.
 
 ## Pitfalls
 
