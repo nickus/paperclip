@@ -272,6 +272,11 @@ import {
 } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import {
+  deriveRunOrientationMetrics,
+  NULL_RUN_ORIENTATION_METRICS,
+  type RunOrientationMetrics,
+} from "./run-orientation-metrics.js";
+import {
   authorizeChatConversationForBoundRun,
   isExternalChatWaitAuthorizationContention,
 } from "./native-runtime/chat-attachment-reuse.js";
@@ -24446,6 +24451,32 @@ export function heartbeatService(
               } as Record<string, unknown>)
             : null;
 
+        // Best-effort run-orientation telemetry (how much the run explored
+        // before it made its first change). Computed from data already
+        // gathered above for this finalize (the adapter's own reported
+        // output, and the session-resume state resolved for `usageJson`).
+        // Must never affect the run outcome: on any unexpected shape, fall
+        // back to the all-null metrics object and keep finalizing normally.
+        let runOrientationMetrics: RunOrientationMetrics =
+          NULL_RUN_ORIENTATION_METRICS;
+        try {
+          runOrientationMetrics = deriveRunOrientationMetrics({
+            adapterType: agent.adapterType,
+            adapterResultJson: parseObject(adapterResult.resultJson),
+            sessionResumed:
+              runtimeForAdapter.sessionId != null ||
+              runtimeForAdapter.sessionDisplayId != null,
+            sessionResumeReason: readNonEmptyString(
+              parseObject(run.contextSnapshot).wakeReason,
+            ),
+          });
+        } catch (err) {
+          logger.debug(
+            { err, runId: run.id },
+            "failed to compute run orientation metrics",
+          );
+        }
+
         const persistedResultJson = mergeHeartbeatRunResultJson(
           mergeRunStopMetadataForAgent(agent, outcome, {
             resultJson: mergeAdapterRecoveryMetadata({
@@ -24458,6 +24489,7 @@ export function heartbeatService(
                   ? { executionRecovery: adapterResult.executionRecovery }
                   : {}),
                 configFreshness: configFreshnessResultMetadata,
+                metrics: runOrientationMetrics,
               },
               errorFamily: adapterResult.errorFamily ?? null,
               retryNotBefore: adapterResult.retryNotBefore ?? null,
