@@ -19016,9 +19016,95 @@ export function heartbeatService(
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  // A `deferred_issue_execution` wake only ever drains when a run finishes
+  // and releases its issue's execution lock (releaseIssueExecutionAndPromote
+  // below). If the issue instead reaches a terminal status (done/cancelled)
+  // while the wake sits deferred - the owning run was cancelled, the issue
+  // was closed out from under it, etc. - no run will ever finish to release
+  // that lock, so nothing drains it. Left alone, the loops further down
+  // (queued-comment-interrupt retry, stranded-queue promotion) keep
+  // reselecting the row on every scheduler tick and stamping `updatedAt`
+  // forever without ever resolving it. Finalize those rows here, before any
+  // other deferred-wake loop runs, so they stop being reselected.
+  async function finalizeDeferredWakesForTerminalIssues() {
+    const candidates = await db
+      .select({
+        id: agentWakeupRequests.id,
+        agentId: agentWakeupRequests.agentId,
+        companyId: agentWakeupRequests.companyId,
+        issueId: issues.id,
+        issueIdentifier: issues.identifier,
+        issueStatus: issues.status,
+      })
+      .from(agentWakeupRequests)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, agentWakeupRequests.companyId),
+          sql`${issues.id}::text = coalesce(
+            ${agentWakeupRequests.payload} ->> 'issueId',
+            ${agentWakeupRequests.payload} ->> 'taskId',
+            ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId',
+            ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId'
+          )`,
+        ),
+      )
+      .where(
+        and(
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          inArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .limit(200);
+
+    let finalized = 0;
+    for (const candidate of candidates) {
+      const now = new Date();
+      // Guard the update on the status just read: a concurrent sweep tick,
+      // or a legitimate dispatch that ran between the select above and here,
+      // may already have moved this row off `deferred_issue_execution`. Only
+      // one of them should win, and neither should clobber the other.
+      const updated = await db
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          finishedAt: now,
+          updatedAt: now,
+          error: `Deferred wake cancelled because issue ${candidate.issueIdentifier ?? candidate.issueId} reached a terminal status (${candidate.issueStatus})`,
+        })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, candidate.id),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      if (updated.length === 0) continue;
+      finalized += 1;
+      logger.warn(
+        {
+          wakeupRequestId: candidate.id,
+          agentId: candidate.agentId,
+          companyId: candidate.companyId,
+          issueId: candidate.issueId,
+          issueStatus: candidate.issueStatus,
+        },
+        "cancelled a deferred wake because its issue reached a terminal status",
+      );
+    }
+    return { checked: candidates.length, finalized };
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
+    const terminalWakes = await finalizeDeferredWakesForTerminalIssues().catch((err) => {
+      logger.error({ err }, "failed to finalize deferred wakes for terminal issues");
+      return { checked: 0, finalized: 0 };
+    });
+    if (terminalWakes.finalized > 0) {
+      logger.warn({ ...terminalWakes }, "resumeQueuedRuns finalized deferred wakes for terminal issues");
+    }
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
@@ -26612,6 +26698,7 @@ export function heartbeatService(
           }
 
           let continuationWait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+          const issueIsTerminal = issue.status === "done" || issue.status === "cancelled";
           const deferBlockedExecution = async (
             executionBlocker: NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>,
           ) => {
@@ -26622,6 +26709,27 @@ export function heartbeatService(
                 updatedAt: new Date(),
               }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
               return { kind: "deferred" as const };
+            }
+            // The issue already reached a terminal status. A
+            // `deferred_issue_execution` row only ever drains when a run
+            // finishes and releases that issue's execution lock, or when the
+            // periodic sweep finalizes it (see
+            // finalizeDeferredWakesForTerminalIssues) - nothing will ever run
+            // on a terminal issue, so don't create one here in the first
+            // place.
+            if (issueIsTerminal) {
+              await tx.insert(agentWakeupRequests).values({
+                ...durableReceiptFields,
+                companyId: agent.companyId, agentId, source, triggerDetail,
+                reason: "issue_terminal_status",
+                payload: { ...(payload ?? {}), issueId: issue.id, issueStatus: issue.status },
+                status: "skipped",
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+                finishedAt: new Date(),
+              });
+              return { kind: "skipped" as const };
             }
             if (durableRequest || wakeCommentId || hasInteractionContinuationWakeContext(enrichedContextSnapshot)) {
               await tx.insert(agentWakeupRequests).values({
@@ -29050,6 +29158,7 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    finalizeDeferredWakesForTerminalIssues,
 
     scheduleBoundedRetry: async (
       runId: string,
