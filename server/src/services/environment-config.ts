@@ -17,6 +17,7 @@ import type {
 import { unprocessable } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
 import { secretService } from "./secrets.js";
+import { environmentRuntimeSecretCache } from "./runtime-secret-value-cache.js";
 import {
   resolvePluginSandboxProviderDriverByKey,
   validatePluginEnvironmentDriverConfig,
@@ -325,18 +326,72 @@ async function resolveConfigSecretRefsForRuntime(input: {
     nextConfig = writeConfigValueAtPath(
       nextConfig,
       path,
-      await secrets.resolveSecretValue(input.companyId, trimmed, "latest", {
-        consumerType: "environment",
-        consumerId: input.context.consumerId,
-        actorType: "system",
-        actorId: null,
-        issueId: input.context.issueId ?? null,
-        heartbeatRunId: input.context.heartbeatRunId ?? null,
+      await resolveRuntimeSecretRefCached({
+        secrets,
+        companyId: input.companyId,
+        secretId: trimmed,
         configPath: path,
+        context: input.context,
       }),
     );
   }
   return nextConfig;
+}
+
+/**
+ * Resolve one environment-bound secret ref for runtime use through the
+ * process-local cache (see runtime-secret-value-cache.ts). Plugin sandbox
+ * leases re-resolve their provider config on every plugin RPC, so without the
+ * cache every exec/sync/capability call did a full audited secret read (many per
+ * second for the kubeconfig secret). A hit costs one indexed select
+ * (the fingerprint) and never decrypts, writes or records an access event.
+ */
+async function resolveRuntimeSecretRefCached(input: {
+  secrets: ReturnType<typeof secretService>;
+  companyId: string;
+  secretId: string;
+  configPath: string;
+  context: {
+    consumerId: string;
+    issueId?: string | null;
+    heartbeatRunId?: string | null;
+  };
+}): Promise<string> {
+  const cacheKey = {
+    companyId: input.companyId,
+    consumerId: input.context.consumerId,
+    configPath: input.configPath,
+    secretId: input.secretId,
+    version: "latest" as const,
+    issueId: input.context.issueId ?? null,
+    heartbeatRunId: input.context.heartbeatRunId ?? null,
+  };
+  // Fingerprint BEFORE resolving: if a rotation lands between the two reads we
+  // store the newer value under the older fingerprint, and the next call's
+  // fingerprint mismatch simply forces one more full resolution (never stale).
+  const fingerprint = await input.secrets.readRuntimeSecretFingerprint(
+    input.companyId,
+    input.secretId,
+    "latest",
+    { consumerType: "environment", consumerId: input.context.consumerId, configPath: input.configPath },
+  );
+  if (fingerprint) {
+    const cached = environmentRuntimeSecretCache.get(cacheKey, fingerprint);
+    if (cached !== null) return cached;
+  }
+  // Miss, expired, changed, or not resolvable: full audited resolution (this
+  // also raises the precise error for a missing binding / inactive secret).
+  const value = await input.secrets.resolveSecretValue(input.companyId, input.secretId, "latest", {
+    consumerType: "environment",
+    consumerId: input.context.consumerId,
+    actorType: "system",
+    actorId: null,
+    issueId: input.context.issueId ?? null,
+    heartbeatRunId: input.context.heartbeatRunId ?? null,
+    configPath: input.configPath,
+  });
+  if (fingerprint) environmentRuntimeSecretCache.set(cacheKey, fingerprint, value);
+  return value;
 }
 
 async function resolveConfigSecretRefsForProbe(input: {

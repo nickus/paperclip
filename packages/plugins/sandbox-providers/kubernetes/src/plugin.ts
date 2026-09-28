@@ -17,13 +17,18 @@ import type {
   PluginEnvironmentSyncResult,
   PluginEnvironmentValidateConfigParams,
   PluginEnvironmentValidationResult,
+  PluginDefinition,
 } from "@paperclipai/plugin-sdk";
 import {
   kubernetesProviderConfigSchema,
   type KubernetesProviderConfig,
   type KubernetesLeaseMetadata,
 } from "./types.js";
-import { createKubeConfig, makeKubeClients } from "./kube-client.js";
+import {
+  evictKubeConnectionOnAuthError,
+  getKubeConnection,
+  type KubeConnectionInput,
+} from "./kube-client-cache.js";
 import { getAdapterDefaults, buildAdapterEnv, resolveRunAdapterType } from "./adapter-defaults.js";
 import { resolveImage } from "./image-allowlist.js";
 import { buildJobManifest } from "./pod-spec-builder.js";
@@ -164,11 +169,8 @@ async function resolveSyncPodExec(
     );
   }
 
-  const kc = createKubeConfig({
-    inCluster: config.inCluster,
-    kubeconfig: config.kubeconfig,
-  });
-  const clients = makeKubeClients(kc);
+  // Reuse the parsed kubeconfig + API clients across RPCs (see kube-client-cache.ts).
+  const { kc, clients } = getKubeConnection(config);
   const timeoutMs = config.podActivityDeadlineSec * 1000;
 
   // Ensure the Sandbox pod is Ready (wait only the first time for this lease),
@@ -201,7 +203,46 @@ async function resolveSyncPodExec(
   return { exec, timeoutMs };
 }
 
-const plugin = definePlugin({
+/**
+ * Connection inputs straight from an RPC's raw `config` (pre-schema-parse), used
+ * to evict the matching cached connection. The schema leaves `inCluster` and
+ * `kubeconfig` untouched (apart from defaulting `inCluster`), and the cache key
+ * normalizes `inCluster` to a boolean, so this hits the same entry.
+ */
+function connectionInputFromRawConfig(raw: unknown): KubeConnectionInput {
+  const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  return {
+    inCluster: record.inCluster === true,
+    kubeconfig: typeof record.kubeconfig === "string" ? record.kubeconfig : undefined,
+  };
+}
+
+/**
+ * Wrap the cluster-touching RPC handlers so any thrown 401/403 evicts the cached
+ * KubeConfig/clients for that config; the host's next call then rebuilds them
+ * from the (possibly rotated) kubeconfig it resolves.
+ */
+function withAuthEviction(
+  handlers: PluginDefinition,
+  names: Array<keyof PluginDefinition>,
+): PluginDefinition {
+  const wrapped: Record<string, unknown> = { ...handlers };
+  for (const name of names) {
+    const original = handlers[name];
+    if (typeof original !== "function") continue;
+    wrapped[name as string] = async (params: { config?: unknown }, ...rest: unknown[]) => {
+      try {
+        return await (original as (...args: unknown[]) => Promise<unknown>)(params, ...rest);
+      } catch (err) {
+        evictKubeConnectionOnAuthError(connectionInputFromRawConfig(params?.config), err);
+        throw err;
+      }
+    };
+  }
+  return wrapped as unknown as PluginDefinition;
+}
+
+const plugin = definePlugin(withAuthEviction({
   async setup(ctx) {
     ctx.logger.info("Kubernetes sandbox provider plugin ready");
   },
@@ -255,11 +296,8 @@ const plugin = definePlugin({
     const namespace = deriveTenantNamespace(config, params.companyId);
 
     try {
-      const kc = createKubeConfig({
-        inCluster: config.inCluster,
-        kubeconfig: config.kubeconfig,
-      });
-      const clients = makeKubeClients(kc);
+      // Reuse the parsed kubeconfig + API clients across RPCs (see kube-client-cache.ts).
+      const { clients } = getKubeConnection(config);
       // Reachability check: list pods in the tenant namespace. If the namespace
       // doesn't exist yet this will throw a 404 which we treat as "reachable
       // but namespace not provisioned" — still a successful probe.
@@ -277,6 +315,8 @@ const plugin = definePlugin({
         metadata: { namespace, provider: "kubernetes" },
       };
     } catch (err) {
+      // A rejected credential must not stay cached for the next probe/RPC.
+      evictKubeConnectionOnAuthError(config, err);
       return {
         ok: false,
         summary: "Kubernetes cluster probe failed.",
@@ -326,11 +366,8 @@ const plugin = definePlugin({
       }
     }
 
-    const kc = createKubeConfig({
-      inCluster: config.inCluster,
-      kubeconfig: config.kubeconfig,
-    });
-    const clients = makeKubeClients(kc);
+    // Reuse the parsed kubeconfig + API clients across RPCs (see kube-client-cache.ts).
+    const { clients } = getKubeConnection(config);
 
     // Ensure the tenant namespace and all its RBAC / network policy resources
     // exist before we try to create the Job.
@@ -487,11 +524,8 @@ const plugin = definePlugin({
         ? params.leaseMetadata.secretName
         : `${params.providerLeaseId}-env`;
 
-    const kc = createKubeConfig({
-      inCluster: config.inCluster,
-      kubeconfig: config.kubeconfig,
-    });
-    const clients = makeKubeClients(kc);
+    // Reuse the parsed kubeconfig + API clients across RPCs (see kube-client-cache.ts).
+    const { clients } = getKubeConnection(config);
 
     const check = await checkLeaseResumable(clients, {
       namespace,
@@ -579,11 +613,8 @@ const plugin = definePlugin({
         ? params.leaseMetadata.namespace
         : deriveTenantNamespace(config, params.companyId);
 
-    const kc = createKubeConfig({
-      inCluster: config.inCluster,
-      kubeconfig: config.kubeconfig,
-    });
-    const clients = makeKubeClients(kc);
+    // Reuse the parsed kubeconfig + API clients across RPCs (see kube-client-cache.ts).
+    const { clients } = getKubeConnection(config);
 
     const leaseBackend =
       typeof params.leaseMetadata?.backend === "string"
@@ -636,11 +667,8 @@ const plugin = definePlugin({
     uploadInterceptorsByLease.delete(params.providerLeaseId);
     readySandboxesByLease.delete(params.providerLeaseId);
 
-    const kc = createKubeConfig({
-      inCluster: config.inCluster,
-      kubeconfig: config.kubeconfig,
-    });
-    const clients = makeKubeClients(kc);
+    // Reuse the parsed kubeconfig + API clients across RPCs (see kube-client-cache.ts).
+    const { clients } = getKubeConnection(config);
 
     // Forcibly delete everything acquireLease created (Sandbox CR / Job, pod,
     // per-run Secret). 404s are success — destroy must be idempotent.
@@ -682,11 +710,8 @@ const plugin = definePlugin({
         ? (lease.metadata.backend as "sandbox-cr" | "job")
         : config.backend;
 
-    const kc = createKubeConfig({
-      inCluster: config.inCluster,
-      kubeconfig: config.kubeconfig,
-    });
-    const clients = makeKubeClients(kc);
+    // Reuse the parsed kubeconfig + API clients across RPCs (see kube-client-cache.ts).
+    const { kc, clients } = getKubeConnection(config);
 
     const effectiveTimeoutMs =
       typeof timeoutMs === "number" && timeoutMs > 0
@@ -832,6 +857,8 @@ const plugin = definePlugin({
               flushTimeoutMs,
             );
           } catch (err) {
+            // Converted to a result below, so evict here rather than in the RPC wrapper.
+            evictKubeConnectionOnAuthError(config, err);
             return {
               exitCode: null,
               timedOut: true,
@@ -901,7 +928,9 @@ const plugin = definePlugin({
         );
       } catch (err) {
         // Watchdog-fired or WebSocket-setup error. Surface as a timeout so
-        // the caller can retry instead of hanging forever.
+        // the caller can retry instead of hanging forever. A 401/403 on the
+        // exec upgrade evicts the cached client so the retry rebuilds it.
+        evictKubeConnectionOnAuthError(config, err);
         return {
           exitCode: null,
           timedOut: true,
@@ -1031,6 +1060,14 @@ const plugin = definePlugin({
       timeoutMs,
     });
   },
-});
+}, [
+  "onEnvironmentAcquireLease",
+  "onEnvironmentResumeLease",
+  "onEnvironmentReleaseLease",
+  "onEnvironmentDestroyLease",
+  "onEnvironmentExecute",
+  "onEnvironmentSyncIn",
+  "onEnvironmentSyncOut",
+]));
 
 export default plugin;
