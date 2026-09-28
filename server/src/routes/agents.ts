@@ -1347,6 +1347,11 @@ export function agentRoutes(
         // matching what real agent runs use. Without this the test would
         // silently fall back to the base image.
         applyCustomImageTemplate: true,
+        // The adapter under test, as a heartbeat passes the agent's adapter:
+        // a provider that picks the runtime image per adapter (one environment
+        // serving several harnesses) must boot this adapter's image, not the
+        // environment's default one, or the probe finds no runtime command.
+        adapterType: input.adapterType,
       });
     } catch (err) {
       return {
