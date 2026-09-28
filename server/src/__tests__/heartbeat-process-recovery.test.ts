@@ -5534,37 +5534,64 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         };
       },
     );
-    const heartbeat = heartbeatService(db);
-
-    await heartbeat.resumeQueuedRuns();
-    await waitForRunToSettle(heartbeat, runId, 5_000);
-
-    // The run chose no issue disposition, so a disposition-repair run follows
-    // it on the same task.
-    const followUpRun = await waitForValue(async () => {
-      const rows = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.agentId, agentId));
-      return (
-        rows.find(
-          (row) =>
-            (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason ===
-            "issue_disposition_repair",
-        ) ?? null
-      );
-    }, 5_000);
-    await waitForRunToSettle(heartbeat, followUpRun!.id, 5_000);
-
-    // The follow-up must resume the whole session the first run saved, not
-    // only its id: a bare id carries no execution identity, so a remote
-    // adapter refuses to resume it.
-    const followUpInvocation = mockAdapterExecute.mock.calls
-      .map(([input]) => input as { runId?: string; runtime?: { sessionParams?: unknown } })
-      .find((input) => input.runId === followUpRun!.id);
-    expect(followUpInvocation?.runtime?.sessionParams).toMatchObject(
-      savedSessionParams,
+    // A wake that resumes from a run can copy the agent's task session when
+    // it is queued (an explicit resume, such as a successful-run handoff).
+    // Record, for each wake queued from here on, which run the agent's saved
+    // task session belonged to at that moment.
+    await db.execute(sql`create table test_wake_session_probe (reason text, session_last_run_id uuid)`);
+    await db.execute(
+      sql.raw(
+        `create function test_wake_session_probe() returns trigger language plpgsql as $$ begin insert into test_wake_session_probe select new.reason, (select last_run_id from agent_task_sessions where agent_id = new.agent_id order by updated_at desc limit 1); return new; end $$`,
+      ),
     );
+    await db.execute(
+      sql`create trigger test_wake_session_probe after insert on agent_wakeup_requests for each row execute function test_wake_session_probe()`,
+    );
+    let probe: Array<{ reason: string; session_last_run_id: string | null }> = [];
+    try {
+      const heartbeat = heartbeatService(db);
+
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, runId, 5_000);
+
+      // The run chose no issue disposition, so a disposition-repair run follows
+      // it on the same task.
+      const followUpRun = await waitForValue(async () => {
+        const rows = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId));
+        return (
+          rows.find(
+            (row) =>
+              (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason ===
+              "issue_disposition_repair",
+          ) ?? null
+        );
+      }, 5_000);
+      await waitForRunToSettle(heartbeat, followUpRun!.id, 5_000);
+
+      // The follow-up must resume the whole session the first run saved, not
+      // only its id: a bare id carries no execution identity, so a remote
+      // adapter refuses to resume it.
+      const followUpInvocation = mockAdapterExecute.mock.calls
+        .map(([input]) => input as { runId?: string; runtime?: { sessionParams?: unknown } })
+        .find((input) => input.runId === followUpRun!.id);
+      expect(followUpInvocation?.runtime?.sessionParams).toMatchObject(
+        savedSessionParams,
+      );
+      probe = [
+        ...(await db.execute(sql`select reason, session_last_run_id from test_wake_session_probe`)),
+      ] as typeof probe;
+    } finally {
+      await db.execute(sql`drop trigger test_wake_session_probe on agent_wakeup_requests`);
+      await db.execute(sql`drop function test_wake_session_probe()`);
+      await db.execute(sql`drop table test_wake_session_probe`);
+    }
+    // The finishing run saved its task session before it queued the
+    // follow-up, so a wake that copies the session at queue time gets this
+    // run's session rather than none.
+    expect(probe).toContainEqual({ reason: "issue_disposition_repair", session_last_run_id: runId });
   });
 
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {
