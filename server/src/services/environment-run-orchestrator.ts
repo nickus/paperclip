@@ -137,13 +137,18 @@ function formatProvisionFailureDetail(result: {
   stdout: string;
   stderr: string;
 }): string {
+  const detail = firstNonEmptyLine(result.stderr) ?? firstNonEmptyLine(result.stdout);
   if (result.timedOut) {
-    return "provision command timed out";
+    // A provider that bounds its own readiness wait separately from this
+    // command's overall timeout (e.g. a Kubernetes sandbox provider) can
+    // still explain WHY in stderr even though the call itself timed out
+    // (e.g. a pod-events summary for a pod stuck Pending). Surface it
+    // instead of the previous bare "timed out", which silently dropped it.
+    return detail ? `provision command timed out: ${detail}` : "provision command timed out";
   }
   const signal = typeof result.signal === "string" && result.signal.trim().length > 0
     ? ` (signal ${result.signal.trim()})`
     : "";
-  const detail = firstNonEmptyLine(result.stderr) ?? firstNonEmptyLine(result.stdout);
   const status = `exit code ${result.exitCode ?? "null"}${signal}`;
   return detail ? `${status}: ${detail}` : status;
 }

@@ -112,6 +112,12 @@ const manifest: PaperclipPluginManifestV1 = {
             description:
               "Fail a pod exec whose connection shows no sign of life (no output, pong or send progress) for this many seconds (default: 60; floored at two keepalive intervals). Quiet but connected commands keep answering pings and are not affected.",
           },
+          podReadyTimeoutSec: {
+            type: "integer",
+            minimum: 1,
+            description:
+              "Separate, shorter ceiling on how long a single command waits for its pod to become Ready/Running before scheduling or image pull is treated as stuck (default: 600). Never waits longer than podActivityDeadlineSec even when set higher. Only bounds the readiness/scheduling wait itself, not the run afterward.",
+          },
           adapterType: {
             type: "string",
             description:
