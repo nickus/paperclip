@@ -395,6 +395,10 @@ async function commandExists(command: string): Promise<boolean> {
   return (await resolveCommandPath(command)) !== null;
 }
 
+// sbin directories are often missing from a non-root PATH (Debian and Ubuntu
+// keep sshd in /usr/sbin), so look there too before giving up.
+const SYSTEM_SBIN_DIRS = ["/usr/local/sbin", "/usr/sbin", "/sbin"];
+
 async function resolveCommandPath(command: string): Promise<string | null> {
   try {
     const result = await execFileText("sh", ["-c", `command -v ${shellQuote(command)}`], {
@@ -402,10 +406,20 @@ async function resolveCommandPath(command: string): Promise<string | null> {
       maxBuffer: 8 * 1024,
     });
     const resolved = result.stdout.trim().split("\n")[0]?.trim() ?? "";
-    return resolved.length > 0 ? resolved : null;
+    if (resolved.length > 0) return resolved;
   } catch {
-    return null;
+    // Not on PATH; fall through to the sbin directories.
   }
+  for (const dir of SYSTEM_SBIN_DIRS) {
+    const candidate = path.join(dir, command);
+    try {
+      await fs.access(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch {
+      // Not in this directory.
+    }
+  }
+  return null;
 }
 
 async function withTempFile(

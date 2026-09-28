@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, type TestContext } from "vitest";
 import {
   buildSshSpawnTarget,
   buildSshEnvLabFixtureConfig,
@@ -108,7 +108,24 @@ async function findSshdPidByConfigPath(sshdConfigPath: string): Promise<number |
   return null;
 }
 
-async function startSshEnvLabFixtureOrSkip(statePath: string, label: string) {
+// Without a test context an unsupported environment makes the helper return
+// null and the caller returns early, so the test counts as passed. Tests whose
+// assertions are the only proof of a guarantee (the secret scans below) pass
+// their context instead and are then reported as skipped.
+async function startSshEnvLabFixtureOrSkip(
+  statePath: string,
+  label: string,
+  test: Pick<TestContext, "skip">,
+): Promise<SshEnvLabFixtureState>;
+async function startSshEnvLabFixtureOrSkip(
+  statePath: string,
+  label: string,
+): Promise<SshEnvLabFixtureState | null>;
+async function startSshEnvLabFixtureOrSkip(
+  statePath: string,
+  label: string,
+  test?: Pick<TestContext, "skip">,
+): Promise<SshEnvLabFixtureState | null> {
   // The teardown entry for this root directory must already exist: callers
   // create it with createFixtureRootDir() before they derive statePath, so
   // this only attaches the state to that entry instead of pushing a new
@@ -121,27 +138,31 @@ async function startSshEnvLabFixtureOrSkip(statePath: string, label: string) {
     );
   }
 
-  if (sshEnvLabUnsupportedReason) {
-    console.warn(`Skipping ${label}: ${sshEnvLabUnsupportedReason}`);
+  const skip = (reason: string): null => {
+    console.warn(`Skipping ${label}: ${reason}`);
+    if (test) test.skip(reason);
     return null;
+  };
+
+  if (sshEnvLabUnsupportedReason) {
+    return skip(sshEnvLabUnsupportedReason);
   }
 
   const support = await getSshEnvLabSupport();
   if (!support.supported) {
     sshEnvLabUnsupportedReason = support.reason ?? "unsupported environment";
-    console.warn(`Skipping ${label}: ${sshEnvLabUnsupportedReason}`);
-    return null;
+    return skip(sshEnvLabUnsupportedReason);
   }
 
+  let state: SshEnvLabFixtureState;
   try {
-    const state = await startSshEnvLabFixture({ statePath });
-    entry.state = state;
-    return state;
+    state = await startSshEnvLabFixture({ statePath });
   } catch (error) {
     sshEnvLabUnsupportedReason = error instanceof Error ? error.message : String(error);
-    console.warn(`Skipping ${label}: ${sshEnvLabUnsupportedReason}`);
-    return null;
+    return skip(sshEnvLabUnsupportedReason);
   }
+  entry.state = state;
+  return state;
 }
 
 interface ParsedProgressLine {
@@ -584,12 +605,11 @@ describe("ssh env-lab fixture", () => {
     await withoutEnv.cleanup();
   });
 
-  it("runs remote commands with env from stdin and never exposes a value in a process command line", async () => {
+  it("runs remote commands with env from stdin and never exposes a value in a process command line", async (ctx) => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
 
-    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH env over stdin test");
-    if (!started) return;
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH env over stdin test", ctx);
     const config = await buildSshEnvLabFixtureConfig(started);
     const token = `tok-${randomUUID()}`;
     const marker = path.posix.join(started.workspaceDir, `running-${randomUUID()}`);
@@ -625,12 +645,11 @@ describe("ssh env-lab fixture", () => {
     expect(noStdin.stdout).toBe(`done:${token}`);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
-  it("spawns remote agent processes with env from stdin, ahead of the caller's stdin", async () => {
+  it("spawns remote agent processes with env from stdin, ahead of the caller's stdin", async (ctx) => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
 
-    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH spawn env over stdin test");
-    if (!started) return;
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH spawn env over stdin test", ctx);
     const config = await buildSshEnvLabFixtureConfig(started);
     const spec = { ...config, remoteCwd: started.workspaceDir };
     const token = `tok-${randomUUID()}`;
@@ -677,12 +696,11 @@ describe("ssh env-lab fixture", () => {
     expect(noStdin.stdout).toBe(`done:${token}`);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
-  it("gives commands run through the SSH command runner their env over stdin", async () => {
+  it("gives commands run through the SSH command runner their env over stdin", async (ctx) => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
 
-    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH command runner env test");
-    if (!started) return;
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH command runner env test", ctx);
     const config = await buildSshEnvLabFixtureConfig(started);
     const runner = createSshCommandManagedRuntimeRunner({
       spec: { ...config, remoteCwd: started.workspaceDir },
