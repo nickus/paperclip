@@ -8,6 +8,7 @@ import type {
   CompanySecret,
   CompanySecretProviderConfig,
   RemoteSecretImportPreviewResult,
+  SecretAccessEvent,
   SecretProviderConfigDiscoveryPreviewResult,
   SecretProviderDescriptor,
   UserSecretCoverageSummary,
@@ -288,6 +289,34 @@ function makeCompanySecret(overrides: Partial<CompanySecret> = {}): CompanySecre
     referenceCount: 2,
     createdAt: new Date("2026-05-06T00:00:00.000Z"),
     updatedAt: new Date("2026-05-06T00:00:00.000Z"),
+    ...overrides,
+  };
+}
+
+function makeAccessEvent(overrides: Partial<SecretAccessEvent> = {}): SecretAccessEvent {
+  return {
+    id: "event-1",
+    companyId: "company-1",
+    secretId: "secret-openai",
+    userSecretDefinitionId: null,
+    secretScope: "company",
+    version: 1,
+    provider: "local_encrypted",
+    responsibleUserId: null,
+    credentialOwnerUserId: null,
+    credentialSubjectType: null,
+    credentialSubjectId: null,
+    actorType: "agent",
+    actorId: "agent-1",
+    consumerType: "agent",
+    consumerId: "agent-1",
+    configPath: "env.OPENAI_API_KEY",
+    issueId: null,
+    heartbeatRunId: null,
+    pluginId: null,
+    outcome: "success",
+    errorCode: null,
+    createdAt: new Date("2026-05-06T00:00:00.000Z"),
     ...overrides,
   };
 }
@@ -673,6 +702,75 @@ describe("Secrets page layout", () => {
     expect(copyLinkButton).not.toBeUndefined();
     const sheet = copyLinkButton?.closest("[role='dialog']");
     expect(sheet?.textContent).toContain("OPENAI_API_KEY");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("pages through access events with Load more instead of hiding history past the first page", async () => {
+    mockSecretsApi.list.mockResolvedValue([makeCompanySecret()]);
+    mockSecretsApi.usage.mockResolvedValue({ secretId: "secret-openai", bindings: [] });
+    mockSecretsApi.accessEvents.mockImplementation(
+      async (_id: string, options?: { limit?: number; cursor?: string | null }) => {
+        if (!options?.cursor) {
+          return { events: [makeAccessEvent({ id: "event-newest" })], nextCursor: "cursor-1" };
+        }
+        expect(options.cursor).toBe("cursor-1");
+        return { events: [makeAccessEvent({ id: "event-oldest" })], nextCursor: null };
+      },
+    );
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter initialEntries={["/company/settings/secrets?secret=secret-openai"]}>
+          <QueryClientProvider client={queryClient}>
+            <Secrets />
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const eventsTab = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Access events"),
+    ) as HTMLButtonElement | undefined;
+    // Radix's TabsTrigger switches tabs on mousedown (not click), so a plain
+    // .click() never activates it here.
+    await act(async () => {
+      eventsTab?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+    });
+    await waitForReact(() => document.body.textContent?.includes("Load more") ?? false);
+
+    // Only the first page is shown, and the button below proves more history exists.
+    expect(mockSecretsApi.accessEvents).toHaveBeenCalledWith("secret-openai", { cursor: undefined });
+    expect(mockSecretsApi.accessEvents).toHaveBeenCalledTimes(1);
+
+    const loadMoreButton = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Load more"),
+    ) as HTMLButtonElement | undefined;
+    expect(loadMoreButton).not.toBeUndefined();
+
+    await act(async () => {
+      loadMoreButton?.click();
+    });
+    await waitForReact(() => mockSecretsApi.accessEvents.mock.calls.length > 1);
+    await flushReact();
+
+    // The older page was fetched with the cursor from the first page and appended,
+    // and once the server reports no further cursor the button disappears.
+    expect(mockSecretsApi.accessEvents).toHaveBeenCalledWith("secret-openai", { cursor: "cursor-1" });
+    expect(
+      Array.from(document.body.querySelectorAll("button")).some((button) =>
+        button.textContent?.includes("Load more"),
+      ),
+    ).toBe(false);
 
     await act(async () => {
       root.unmount();
