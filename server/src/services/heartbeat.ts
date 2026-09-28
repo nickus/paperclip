@@ -9166,6 +9166,26 @@ export function resolveNextSessionState(input: {
   };
 }
 
+// Whether a finished run actually continued the session it was offered, for
+// the run-orientation-metrics `sessionResumed` field. This is deliberately
+// not just "was a previous session offered": `resolveNextSessionState` can
+// still come back with a *different* session than the one this run started
+// with (e.g. the adapter reported the offered session id as unknown and
+// ran a fresh one instead — see the opencode_local adapter's unknown-session
+// retry), and a run in that shape did not resume anything, whatever session
+// state it leaves behind for the next run.
+export function resolveRunOrientationSessionResumed(input: {
+  offeredSessionId: string | null;
+  offeredSessionDisplayId: string | null;
+  resolvedSessionId: string | null;
+  resolvedSessionDisplayId: string | null;
+}): boolean {
+  const offered = input.offeredSessionDisplayId ?? input.offeredSessionId;
+  if (offered == null) return false;
+  const resolved = input.resolvedSessionDisplayId ?? input.resolvedSessionId;
+  return resolved === offered;
+}
+
 export type HeartbeatEnvironmentRuntime = ReturnType<
   typeof environmentRuntimeService
 >;
@@ -24463,9 +24483,12 @@ export function heartbeatService(
           runOrientationMetrics = deriveRunOrientationMetrics({
             adapterType: agent.adapterType,
             adapterResultJson: parseObject(adapterResult.resultJson),
-            sessionResumed:
-              runtimeForAdapter.sessionId != null ||
-              runtimeForAdapter.sessionDisplayId != null,
+            sessionResumed: resolveRunOrientationSessionResumed({
+              offeredSessionId: runtimeForAdapter.sessionId,
+              offeredSessionDisplayId: runtimeForAdapter.sessionDisplayId,
+              resolvedSessionId: nextSessionState.legacySessionId,
+              resolvedSessionDisplayId: nextSessionState.displayId,
+            }),
             sessionResumeReason: readNonEmptyString(
               parseObject(run.contextSnapshot).wakeReason,
             ),
@@ -25134,6 +25157,16 @@ export function heartbeatService(
                     },
                   }
                 : {}),
+              // A run that fails before the adapter produces a result never
+              // reaches the normal finalize path's own metrics computation,
+              // but callers of resultJson.metrics should not have to also
+              // handle the key being absent entirely — carry forward
+              // whatever this run already had (from an earlier partial
+              // write), or the all-null baseline.
+              metrics:
+                (parseObject(stopSnapshot?.resultJson).metrics as
+                  | RunOrientationMetrics
+                  | undefined) ?? NULL_RUN_ORIENTATION_METRICS,
             },
           }),
           stdoutExcerpt,
@@ -25366,6 +25399,11 @@ export function heartbeatService(
         const setupFailureResultJson = {
           ...setupFailureDetails,
           executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          // See the adapter-exception failure write above: a run that never
+          // reaches adapter execution also never reaches the normal
+          // finalize path's metrics computation, but the key should still
+          // be present (as the all-null baseline) rather than absent.
+          metrics: NULL_RUN_ORIENTATION_METRICS,
         };
         const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
           error: message,

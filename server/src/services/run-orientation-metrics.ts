@@ -10,29 +10,40 @@
 //     woke up).
 //
 // Every field is independently optional. When the evidence needed for a
-// field is not available (a different adapter, a missing/oversized stdout
-// capture, or a stream with no tool calls at all), that field is `null`
-// rather than a guess. Callers must treat this module as pure and cheap:
-// no I/O, no throwing on malformed input, and a fixed cost cap on how much
-// of a stdout capture is inspected.
+// field is not available (a different adapter, a missing/possibly-truncated
+// stdout capture, or a stream with no tool calls at all), that field is
+// `null` rather than a guess. Callers must treat this module as pure and
+// cheap: no I/O, no throwing on malformed input, and a fixed cost cap on how
+// much of a stdout capture is inspected.
+//
+// opencode_local agents reach Paperclip's own API through `bash`/curl (see
+// skills/paperclip/SKILL.md), not through a dedicated MCP tool, and a
+// control-plane rejection of that call comes back as a normal HTTP response
+// body rather than a failed tool call. So, in addition to classifying named
+// tools, this module does a narrow, best-effort read of a shell tool's own
+// command and completed output — see `classifyMutatingBashCommand` and the
+// denial handling in `computeRunOrientationMetricsFromEvents`.
+
+import { MAX_CAPTURE_BYTES } from "@paperclipai/adapter-utils/server-utils";
 
 export interface RunOrientationMetrics {
   // Number of distinct tool calls the run made before its first mutating
   // one (see `classifyMutatingToolCall`). 0 means the very first tool call
   // was already a mutation. `null` means either there is no tool-call data
-  // to inspect, or the run never made a mutating call at all (there is no
-  // "before" to report).
+  // to inspect, or the run never made a confirmed mutating call at all
+  // (there is no "before" to report).
   stepsBeforeFirstMutation: number | null;
-  // Output (generated) tokens the model produced before that same first
-  // mutating tool call, summed from the run's own turn/step boundaries.
-  // Same `null` conditions as `stepsBeforeFirstMutation`.
+  // Output (generated) tokens the model produced before, and during, that
+  // same first mutating tool call's own step — i.e. everything the model
+  // generated up to and including the reasoning and arguments that produced
+  // the mutation. Same `null` conditions as `stepsBeforeFirstMutation`.
   genTokensBeforeFirstMutation: number | null;
   // Count of tool calls that loaded a skill. 0 is a real count (no skill
   // calls observed); `null` means there was no tool-call data to inspect.
   skillLoads: number | null;
-  // Count of tool results whose error text matches the control-plane
-  // denial the server itself returns to low-trust actors. Same `null`
-  // condition as `skillLoads`.
+  // Count of tool results carrying the control-plane denial the server
+  // itself returns to low-trust actors. Same `null` condition as
+  // `skillLoads`.
   controlPlaneDenials: number | null;
   // Whether this run continued an existing provider/task session rather
   // than starting fresh. `null` only when the caller could not resolve
@@ -81,7 +92,10 @@ const FILE_WRITE_TOOL_NAMES = new Set([
 // Tool names that address Paperclip's own control-plane API (as opposed to a
 // third-party MCP tool). Naming conventions vary slightly by adapter/runtime,
 // so this matches on a normalized (snake_case) prefix rather than one exact
-// string.
+// string. Only adapters that actually expose the Paperclip API as an MCP
+// server (e.g. paperclip_runner) surface tool names like this; opencode_local
+// agents reach the same API through a shell tool instead (see
+// `classifyMutatingBashCommand`).
 const CONTROL_PLANE_TOOL_PREFIXES = ["paperclip_", "mcp_paperclip", "mcp__paperclip"];
 
 // A mutating call against the control plane is one whose name carries a
@@ -100,6 +114,13 @@ const MUTATING_VERBS = [
 const MUTATING_VERB_TOKEN_PATTERN = new RegExp(
   `(^|_)(${MUTATING_VERBS.join("|")})(_|$)`,
 );
+
+// Shell-like tool names whose `input.command` (see `classifyMutatingBashCommand`)
+// and completed `output` (see the denial handling in
+// `computeRunOrientationMetricsFromEvents`) this module is willing to inspect.
+// Narrow and exact, like the allowlists above: this fork's coding-agent
+// adapters name the shell tool "bash".
+const SHELL_TOOL_NAMES = new Set(["bash"]);
 
 function normalizeToolName(toolName: string): string {
   return typeof toolName === "string" ? toolName.trim().toLowerCase() : "";
@@ -128,8 +149,10 @@ export function isControlPlaneToolName(toolName: string): boolean {
 
 /**
  * "Mutation" = the first tool call that writes files, or calls a mutating
- * Paperclip control-plane API. Read-only tool calls (search, read, list,
- * get-style control-plane calls, etc.) are not mutations.
+ * Paperclip control-plane API by name. Read-only tool calls (search, read,
+ * list, get-style control-plane calls, etc.) are not mutations. This does
+ * not cover a mutating Paperclip API call made through a shell tool (curl) —
+ * see `classifyMutatingBashCommand` for that path.
  */
 export function classifyMutatingToolCall(toolName: string): boolean {
   const normalized = normalizeToolName(toolName);
@@ -138,6 +161,43 @@ export function classifyMutatingToolCall(toolName: string): boolean {
   const snake = toSnakeCase(toolName);
   if (!CONTROL_PLANE_TOOL_PREFIXES.some((prefix) => snake.startsWith(prefix))) return false;
   return MUTATING_VERB_TOKEN_PATTERN.test(snake);
+}
+
+// A dry run never mutates, whatever else the command line contains.
+const DRY_RUN_FLAG_PATTERN = /--dry-run\b/;
+// The repo's own helper (`scripts/paperclip-issue-update.sh`) always writes
+// once invoked (absent --dry-run, handled above): it patches issue status
+// and/or posts a comment.
+const PAPERCLIP_ISSUE_UPDATE_HELPER_PATTERN = /paperclip-issue-update\.sh/;
+// The Paperclip API base URL every adapter is given as an env var (see
+// skills/paperclip/SKILL.md). A command that never references it isn't
+// talking to Paperclip's control plane at all.
+const PAPERCLIP_API_URL_REFERENCE_PATTERN = /\$\{?PAPERCLIP_API_URL\}?/;
+const HTTP_WRITE_METHOD_PATTERN =
+  /(?:-X|--request)\s*['"]?(?:POST|PATCH|PUT|DELETE)['"]?/i;
+const HTTP_DATA_FLAG_PATTERN =
+  /(?:^|\s)(?:-d\b|--data\b|--data-raw\b|--data-binary\b|--data-urlencode\b)/;
+
+/**
+ * Best-effort detection of a mutating Paperclip API call made from a shell
+ * tool's command text, rather than a dedicated tool name (see
+ * `classifyMutatingToolCall`). opencode_local agents call the Paperclip API
+ * with curl (per skills/paperclip/SKILL.md), so a bash tool call is only a
+ * control-plane mutation when its command both references the Paperclip API
+ * URL (or invokes the repo's own update helper script) and carries an HTTP
+ * write method or a request body. This is text matching, not a shell parse,
+ * so it can both miss unusual invocations and (rarely) match a command that
+ * merely echoes one — the same best-effort tradeoff as the tool-name
+ * allowlists above.
+ */
+export function classifyMutatingBashCommand(
+  command: string | null | undefined,
+): boolean {
+  if (typeof command !== "string" || !command.trim()) return false;
+  if (DRY_RUN_FLAG_PATTERN.test(command)) return false;
+  if (PAPERCLIP_ISSUE_UPDATE_HELPER_PATTERN.test(command)) return true;
+  if (!PAPERCLIP_API_URL_REFERENCE_PATTERN.test(command)) return false;
+  return HTTP_WRITE_METHOD_PATTERN.test(command) || HTTP_DATA_FLAG_PATTERN.test(command);
 }
 
 // The coding-agent adapters expose skill loading as a dedicated tool, named
@@ -150,13 +210,21 @@ export function isSkillLoadToolCall(toolName: string): boolean {
 }
 
 // The exact wording `assertLowTrustControlPlaneDenied` returns to a denied
-// low-trust actor. Matched case-insensitively and loosely on the
-// "control-plane"/"control plane" phrase so the classifier survives minor
-// message rewording.
-const CONTROL_PLANE_DENIAL_PATTERN = /control[-\s]?plane/i;
+// low-trust actor (server/src/routes/issues.ts). Matched as a
+// case-insensitive *substring*, not a loose "mentions control plane"
+// pattern: opencode_local agents only ever surface this text embedded in a
+// bash/curl tool's own reported output (a 403 JSON body), never as a
+// distinct error class, so a looser pattern would also count unrelated tool
+// errors that merely mention "control plane" (e.g. from cluster-management
+// tooling) as a Paperclip denial.
+const CONTROL_PLANE_DENIAL_TEXT =
+  "Low-trust actors cannot use this control-plane surface";
 
-export function isControlPlaneDenialErrorText(errorText: string): boolean {
-  return typeof errorText === "string" && CONTROL_PLANE_DENIAL_PATTERN.test(errorText);
+export function isControlPlaneDenialErrorText(text: string): boolean {
+  return (
+    typeof text === "string" &&
+    text.toLowerCase().includes(CONTROL_PLANE_DENIAL_TEXT.toLowerCase())
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -167,13 +235,27 @@ export interface OrientationToolCallEvent {
   kind: "tool_call";
   callId: string;
   toolName: string;
+  // The tool's own `command` argument, for shell-like tools only (see
+  // `SHELL_TOOL_NAMES`) — used solely to detect a mutating Paperclip API
+  // call made through curl (`classifyMutatingBashCommand`). `null` when not
+  // applicable or not present.
+  command: string | null;
 }
 
 export interface OrientationToolResultEvent {
   kind: "tool_result";
   callId: string;
+  // The originating call's tool name, carried onto the result so aggregation
+  // can decide whether this completed call's own output is safe to scan for
+  // an embedded control-plane denial (see `computeRunOrientationMetricsFromEvents`).
+  toolName: string;
   isError: boolean;
   errorText: string | null;
+  // The tool's own reported output when it completed without an
+  // opencode-level error. Only populated for shell-like tools (see
+  // `SHELL_TOOL_NAMES`): that is the only case this module needs it for
+  // (an HTTP response body a control-plane rejection can hide inside).
+  outputText: string | null;
 }
 
 export interface OrientationStepFinishEvent {
@@ -211,7 +293,25 @@ export function computeRunOrientationMetricsFromEvents(
   let controlPlaneDenials = 0;
   let firstMutationStepIndex: number | null = null;
   let firstMutationGenTokens: number | null = null;
+  // True from the moment the first mutation is confirmed (its tool_result
+  // arrived without an error) until the step_finish that closes out the
+  // step the mutating call happened in. That step's own output tokens — the
+  // reasoning and tool-call arguments that produced the mutation itself —
+  // are folded into `firstMutationGenTokens` exactly once when that
+  // step_finish arrives, so the count isn't systematically short by exactly
+  // the step where orientation ends.
+  let firstMutationStepTokensPending = false;
   const seenCallIds = new Set<string>();
+  // Tool calls classified as a plausible first mutation, keyed by call id,
+  // waiting on their own tool_result to confirm the call actually succeeded
+  // — an attempted write that errored (e.g. an edit whose anchor text wasn't
+  // found) isn't a mutation. Resolved as each tool_result arrives, which is
+  // call order for the single-threaded coding-agent adapters this module
+  // parses (one tool call in flight at a time).
+  const pendingMutationCandidates = new Map<
+    string,
+    { stepIndex: number; genTokensAtCall: number }
+  >();
 
   for (const event of events) {
     if (event.kind === "step_finish") {
@@ -222,6 +322,10 @@ export function computeRunOrientationMetricsFromEvents(
       peakContextTokens =
         peakContextTokens === null ? inputTokens : Math.max(peakContextTokens, inputTokens);
       genTokensSoFar += outputTokens;
+      if (firstMutationStepTokensPending) {
+        firstMutationGenTokens = (firstMutationGenTokens ?? 0) + outputTokens;
+        firstMutationStepTokensPending = false;
+      }
       continue;
     }
 
@@ -231,17 +335,48 @@ export function computeRunOrientationMetricsFromEvents(
 
       if (isSkillLoadToolCall(event.toolName)) skillLoads += 1;
 
-      if (firstMutationStepIndex === null && classifyMutatingToolCall(event.toolName)) {
-        firstMutationStepIndex = distinctSteps;
-        firstMutationGenTokens = genTokensSoFar;
+      if (firstMutationStepIndex === null && !pendingMutationCandidates.has(event.callId)) {
+        const isShellLike = SHELL_TOOL_NAMES.has(normalizeToolName(event.toolName));
+        const isMutationCandidate =
+          classifyMutatingToolCall(event.toolName) ||
+          (isShellLike && classifyMutatingBashCommand(event.command));
+        if (isMutationCandidate) {
+          pendingMutationCandidates.set(event.callId, {
+            stepIndex: distinctSteps,
+            genTokensAtCall: genTokensSoFar,
+          });
+        }
       }
       distinctSteps += 1;
       continue;
     }
 
     // event.kind === "tool_result"
-    if (event.isError && event.errorText && isControlPlaneDenialErrorText(event.errorText)) {
+    //
+    // A control-plane denial always looks like a normal error to a
+    // dedicated control-plane tool, but only looks like ordinary completed
+    // output to a shell tool that curled the API directly (see the module
+    // header) — a curl invocation that got a 403 body back still exits 0.
+    // So this has to be resolved *before* confirming a pending mutation
+    // candidate below: a bash call the control plane denied is not a
+    // mutation, even though opencode itself reports it as a successful
+    // (non-error) tool call.
+    const isShellLike = SHELL_TOOL_NAMES.has(normalizeToolName(event.toolName));
+    const isDeniedShellOutput =
+      isShellLike && !event.isError && isControlPlaneDenialErrorText(event.outputText ?? "");
+    const textToScan = event.isError ? event.errorText : isShellLike ? event.outputText : null;
+    if (textToScan && isControlPlaneDenialErrorText(textToScan)) {
       controlPlaneDenials += 1;
+    }
+
+    const candidate = pendingMutationCandidates.get(event.callId);
+    if (candidate) {
+      pendingMutationCandidates.delete(event.callId);
+      if (!event.isError && !isDeniedShellOutput && firstMutationStepIndex === null) {
+        firstMutationStepIndex = candidate.stepIndex;
+        firstMutationGenTokens = candidate.genTokensAtCall;
+        firstMutationStepTokensPending = true;
+      }
     }
   }
 
@@ -258,11 +393,11 @@ export function computeRunOrientationMetricsFromEvents(
 // opencode_local: parsing its raw stdout into the normalized event stream
 // ---------------------------------------------------------------------------
 
-// Upper bound on how much of a stdout capture this module will parse. Keeps
-// the finalize path cheap regardless of how large a run's log turns out to
-// be; runs whose captured stdout exceeds this are reported with tool-call
-// fields left null rather than partially scanned.
-export const RUN_ORIENTATION_MAX_STDOUT_BYTES = 4 * 1024 * 1024;
+// Upper bound on how much of a stdout capture this module will parse, kept
+// equal to (imported from, not duplicating) the cap the adapter's own
+// capture already enforces — see `deriveRunOrientationMetrics` for why that
+// matters.
+export const RUN_ORIENTATION_MAX_STDOUT_BYTES = MAX_CAPTURE_BYTES;
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -308,15 +443,32 @@ export function parseOpenCodeStdoutForOrientation(stdout: string): OrientationEv
       const toolName = asStr(part.tool);
       if (!toolName) continue;
       const callId = asStr(part.callID) || asStr(part.id) || toolName;
-      events.push({ kind: "tool_call", callId, toolName });
-
       const state = asRecord(part.state);
+      const input = asRecord(state.input);
+      const command = typeof input.command === "string" ? input.command : null;
+      events.push({ kind: "tool_call", callId, toolName, command });
+
       const status = asStr(state.status);
       if (status === "error") {
         const errorText = asStr(state.error).trim();
-        events.push({ kind: "tool_result", callId, isError: true, errorText: errorText || null });
+        events.push({
+          kind: "tool_result",
+          callId,
+          toolName,
+          isError: true,
+          errorText: errorText || null,
+          outputText: null,
+        });
       } else if (status === "completed") {
-        events.push({ kind: "tool_result", callId, isError: false, errorText: null });
+        const outputText = asStr(state.output).trim();
+        events.push({
+          kind: "tool_result",
+          callId,
+          toolName,
+          isError: false,
+          errorText: null,
+          outputText: outputText || null,
+        });
       }
       continue;
     }
@@ -327,7 +479,12 @@ export function parseOpenCodeStdoutForOrientation(stdout: string): OrientationEv
       const cache = asRecord(tokens.cache);
       events.push({
         kind: "step_finish",
-        inputTokens: asNum(tokens.input, 0) + asNum(cache.read, 0),
+        // Anthropic-style caching splits a turn's input into three buckets:
+        // freshly-processed tokens (`input`), tokens reused from cache
+        // (`cache.read`), and tokens newly written to cache this turn
+        // (`cache.write`) — all three were part of that turn's context, so
+        // all three count toward its size.
+        inputTokens: asNum(tokens.input, 0) + asNum(cache.read, 0) + asNum(cache.write, 0),
         outputTokens: asNum(tokens.output, 0) + asNum(tokens.reasoning, 0),
       });
       continue;
@@ -377,7 +534,17 @@ export function deriveRunOrientationMetrics(
 
   const stdout = input.adapterResultJson?.stdout;
   if (typeof stdout !== "string" || stdout.length === 0) return base;
-  if (stdout.length > RUN_ORIENTATION_MAX_STDOUT_BYTES) return base;
+  // The adapter's stdout capture is tail-truncated to exactly this cap once
+  // it grows past it (`appendWithCap` keeps only the *last* N characters),
+  // so its length can never exceed the cap — only ever reach it. A `>`
+  // check here would therefore never actually fire, and a long run
+  // would silently be measured from wherever the kept tail happens to
+  // start, as if that were the whole run. `>=` treats "exactly at the cap"
+  // as "possibly truncated" and reports null instead, which can only ever
+  // be over-cautious (a stream whose real length exactly equals the cap is
+  // vanishingly unlikely, and reporting null for it is still a safe,
+  // honest "don't know" rather than a wrong number presented as a real one).
+  if (stdout.length >= RUN_ORIENTATION_MAX_STDOUT_BYTES) return base;
 
   const events = parseOpenCodeStdoutForOrientation(stdout);
   const eventMetrics = computeRunOrientationMetricsFromEvents(events);
