@@ -1260,6 +1260,57 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  it("queues a POST human comment instead of cancelling a scheduled retry that is already running", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: "retry-run-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    // The retry timer fired and the run is already executing — this must be
+    // treated the same as any other live run, never as a still-pending retry.
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue({
+      runId: "retry-run-1",
+      status: "running",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      agentName: "CodexCoder",
+      retryOfRunId: "source-run-1",
+      scheduledRetryAt: new Date("2026-05-18T14:00:00.000Z"),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      error: null,
+      errorCode: null,
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "I added the missing detail; please continue." });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.updated",
+        details: expect.objectContaining({
+          scheduledRetrySupersededByComment: true,
+        }),
+      }),
+    );
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({
+          reason: "issue_commented",
+          payload: expect.objectContaining({
+            commentId: "comment-1",
+            mutation: "comment",
+          }),
+        }),
+      ),
+    );
+  });
+
   it("skips the assignee wakeup when the issue is concurrently cancelled while the comment is being written", async () => {
     const app = await installActor(createApp());
     // First call is the route's pre-insert fetch; second is the wake-decision
@@ -1967,6 +2018,101 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockLogActivity).not.toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ action: "issue.updated" }),
+    );
+  });
+
+  it("queues a PATCH human comment instead of cancelling a scheduled retry that is already running", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: "retry-run-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    // The retry timer fired and the run is already executing — this must be
+    // treated the same as any other live run, never as a still-pending retry.
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue({
+      runId: "retry-run-1",
+      status: "running",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      agentName: "CodexCoder",
+      retryOfRunId: "source-run-1",
+      scheduledRetryAt: new Date("2026-05-18T14:00:00.000Z"),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      error: null,
+      errorCode: null,
+    });
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Retry window is over; please continue." });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
+    );
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        details: expect.objectContaining({
+          scheduledRetrySupersededByComment: true,
+        }),
+      }),
+    );
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({
+          reason: "issue_commented",
+          payload: expect.objectContaining({
+            commentId: "comment-1",
+            mutation: "comment",
+          }),
+        }),
+      ),
+    );
+  });
+
+  it("never consults or supersedes a scheduled retry for an agent-authored comment", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: "retry-run-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "Still working on it.",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: "22222222-2222-4222-8222-222222222222",
+      authorUserId: null,
+    });
+
+    const res = await request(
+      await installActor(createApp(), agentActor()),
+    )
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "Still working on it." });
+
+    expect(res.status).toBe(200);
+    // Only human (board-user) comments can resume/supersede an in-progress
+    // scheduled retry, so an agent-authored comment must not even look one up.
+    expect(mockIssueService.getCurrentScheduledRetry).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
     );
   });
 

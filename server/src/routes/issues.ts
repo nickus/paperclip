@@ -2341,6 +2341,20 @@ function shouldHumanCommentResumeInProgressScheduledRetry(input: {
   );
 }
 
+// A comment must never cancel a run that is already executing — only a retry
+// that has not started yet may be superseded by it. "scheduled_retry" has no
+// process behind it yet, and a "queued" row observed here is, by construction,
+// not yet claimed: the claim that flips it to "running" happens atomically in
+// one transaction, so a plain read outside that transaction only ever sees the
+// row still queued (unclaimed) or already running, never in between. Once the
+// status is "running", the retry is a live run and a human comment on it must
+// fall back to the normal queued-comment path instead of tearing it down.
+function isUnstartedScheduledRetryStatus(
+  status: string | null | undefined,
+): boolean {
+  return status === "scheduled_retry" || status === "queued";
+}
+
 function isExplicitResumeCapableStatus(status: string | null | undefined) {
   return (
     status === "done" ||
@@ -12939,6 +12953,7 @@ export function issueRoutes(
           : null;
       const shouldResumeInProgressScheduledRetry =
         !!scheduledRetryForHumanComment &&
+        isUnstartedScheduledRetryStatus(scheduledRetryForHumanComment.status) &&
         scheduledRetryForHumanComment.agentId === requestedAssigneeAgentId;
       const assigneeSelfCommentOnTerminal =
         isAssigneeSelfCommentOnTerminalIssue({
@@ -17326,6 +17341,7 @@ export function issueRoutes(
           : null;
       const shouldResumeInProgressScheduledRetry =
         !!scheduledRetryForHumanComment &&
+        isUnstartedScheduledRetryStatus(scheduledRetryForHumanComment.status) &&
         scheduledRetryForHumanComment.agentId === issue.assigneeAgentId;
       const assigneeSelfCommentOnTerminal =
         isAssigneeSelfCommentOnTerminalIssue({
