@@ -13,6 +13,7 @@ import {
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
+import { assertProcessEnvelopeWithinLimits } from "./env-payload.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
   createRuntimeProgressReporter,
@@ -1274,6 +1275,14 @@ export async function runSshCommand(
     const sshArgs = [...auth.args];
     const envEntries = Object.entries(options.env ?? {})
       .filter((entry): entry is [string, string] => typeof entry[1] === "string");
+    // The remote command still receives these vars in its environment; fail
+    // with the variable's name instead of a remote E2BIG.
+    assertProcessEnvelopeWithinLimits({
+      command: "sh",
+      args: ["-c", remoteCommand],
+      env: Object.fromEntries(envEntries),
+      location: "ssh",
+    });
     // Env values go over stdin (see buildSshStdinEnvHandoff), never into argv.
     const envHandoff = buildSshStdinEnvHandoff(envEntries);
 

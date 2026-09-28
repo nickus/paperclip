@@ -50,6 +50,12 @@ import {
   type DurableChatWakeupRequest,
 } from "./durable-chat-wakeup.js";
 import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
+import { fitPaperclipWakePayloadToHardCap } from "./wake-payload-bounds.js";
+import {
+  ADAPTER_ENV_TOO_LARGE_ERROR_CODE,
+  isAdapterEnvTooLargeError,
+  isArgumentListTooLongError,
+} from "@paperclipai/adapter-utils/env-payload";
 import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubOperationLaunchers,
@@ -1131,7 +1137,28 @@ function readTransientRecoveryContractFromRun(
 
 function isSpawnLikeFailureMessage(value: unknown) {
   if (typeof value !== "string") return false;
+  // An oversized argv/env fails the same way on every attempt; it is not a
+  // transient spawn failure even though the message says "spawn E2BIG".
+  if (isArgumentListTooLongMessage(value)) return false;
   return /failed to start command|spawn\b|\bENOENT\b/i.test(value);
+}
+
+function isArgumentListTooLongMessage(value: string) {
+  return (
+    value.startsWith(`${ADAPTER_ENV_TOO_LARGE_ERROR_CODE}:`) ||
+    /\bE2BIG\b|argument list too long/i.test(value)
+  );
+}
+
+/**
+ * A process whose argv/env exceeds the kernel limits. Deterministic: every
+ * retry of the same run context fails the same way before any provider work,
+ * so it gets its own error code and no automatic retry.
+ */
+function adapterEnvTooLargeFailureCode(error: unknown): string | null {
+  return isAdapterEnvTooLargeError(error) || isArgumentListTooLongError(error)
+    ? ADAPTER_ENV_TOO_LARGE_ERROR_CODE
+    : null;
 }
 
 // A sandbox provider plugin's worker can be briefly down during its own
@@ -7619,6 +7646,30 @@ export async function attestReviewedExternalChatRun(input: {
   throw new Error("reviewed_chat_execution_binding_not_ready");
 }
 
+/**
+ * The adapter-facing copy of the wake payload: the persisted payload plus the
+ * run's execution continuation, redacted like the rest of the payload. The
+ * run snapshot stores the continuation only once (as `executionContinuation`),
+ * so the persisted wake payload does not duplicate it. The wake payload's hard
+ * cap applies to the combined copy, after redaction, so the limit covers
+ * everything the prompt receives from both.
+ */
+export async function attachExecutionContinuationToWakePayload(input: {
+  db: Db;
+  companyId: string;
+  issueId: string | null;
+  wakePayload: unknown;
+  executionContinuation: unknown;
+}): Promise<unknown> {
+  if (!input.executionContinuation || !input.issueId) return input.wakePayload;
+  const wake = parseObject(input.wakePayload);
+  if (Object.keys(wake).length === 0) return input.wakePayload;
+  const executionContinuation = await createRunSecretRedactionRegistry(
+    input.db,
+  ).redactForIssue(input.companyId, input.issueId, input.executionContinuation);
+  return fitPaperclipWakePayloadToHardCap({ ...wake, executionContinuation });
+}
+
 export async function buildPaperclipWakePayload(input: {
   db: Db;
   companyId: string;
@@ -8088,7 +8139,11 @@ export async function buildPaperclipWakePayload(input: {
   }
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
-    executionContinuation: input.contextSnapshot.executionContinuation ?? null,
+    // The run snapshot carries the continuation once, as
+    // `executionContinuation` next to this payload. The adapter-facing copy
+    // of the wake payload gets it at dispatch (see
+    // attachExecutionContinuationToWakePayload).
+    executionContinuation: null,
     attachmentOmissions,
     externalChatProvider,
     recovery:
@@ -8251,13 +8306,16 @@ export async function buildPaperclipWakePayload(input: {
     fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
     ...(runBrief ? { runBrief } : {}),
   };
+  // Every section above has its own limits; this is the ceiling for an issue
+  // that hits all of them at once.
+  const boundedPayload = fitPaperclipWakePayloadToHardCap(payload);
   return issueId
     ? createRunSecretRedactionRegistry(input.db).redactForIssue(
         input.companyId,
         issueId,
-        payload,
+        boundedPayload,
       )
-    : payload;
+    : boundedPayload;
 }
 
 function runTaskKey(run: typeof heartbeatRuns.$inferSelect) {
@@ -23265,14 +23323,22 @@ export function heartbeatService(
                     // Preserve every admitted pending chat request while also
                     // retaining newer user direction materialized by recovery.
                     // A file-only wake must not inherit an old task objective.
-                    const latestRequest =
+                    const latestRequestMessage =
                       executionContinuation?.messages.findLast(
                         (message) =>
                           message.authorType === "user" &&
                           !message.createdByRunId &&
                           !message.deleted &&
                           message.body.trim().length > 0,
-                      )?.body;
+                      );
+                    // A bounded continuation keeps only the start of a very
+                    // long message; its objective holds the longer copy of the
+                    // same latest request.
+                    const latestRequest =
+                      latestRequestMessage?.bodyTruncated === true &&
+                      executionContinuation?.objective
+                        ? executionContinuation.objective
+                        : latestRequestMessage?.body;
                     if (
                       latestRequest &&
                       !requests.some(
@@ -23589,6 +23655,13 @@ export function heartbeatService(
               runtimeConfig,
               runtimeSkillEntries,
             });
+            const nativeWakePayload = await attachExecutionContinuationToWakePayload({
+              db,
+              companyId: agent.companyId,
+              issueId: issueRef.id,
+              wakePayload: context.paperclipWake,
+              executionContinuation,
+            });
             const nativeExecutionWithCheckpoint =
               buildNativeExecutionWithCheckpoint({
                 previousRun: previousNativeRun,
@@ -23610,7 +23683,7 @@ export function heartbeatService(
                         ? `## Project repositories\nThe task workspace also contains these editable Git repositories:\n${projectRepositoryPaths.map((repo) => `- ${repo}`).join("\n")}`
                         : null,
                     ].filter(Boolean).join("\n\n"),
-                    wakePayload: context.paperclipWake,
+                    wakePayload: nativeWakePayload,
                     resumedSession,
                     conversationMode: context.conversationMode === true,
                     agentId: agent.id,
@@ -24401,12 +24474,22 @@ export function heartbeatService(
             // adapters need it in their prompt, but the authoritative answers
             // remain on the interaction instead of being duplicated in the
             // heartbeat run snapshot.
+            const adapterWakePayload = await attachExecutionContinuationToWakePayload({
+              db,
+              companyId: agent.companyId,
+              issueId: issueRef?.id ?? null,
+              wakePayload: context[PAPERCLIP_WAKE_PAYLOAD_KEY],
+              executionContinuation,
+            });
             const adapterContext: Record<string, unknown> = {
               ...context,
+              ...(adapterWakePayload !== context[PAPERCLIP_WAKE_PAYLOAD_KEY]
+                ? { [PAPERCLIP_WAKE_PAYLOAD_KEY]: adapterWakePayload }
+                : {}),
               ...(legacyQuestionResponse
                 ? {
                     [PAPERCLIP_WAKE_PAYLOAD_KEY]: {
-                      ...parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]),
+                      ...parseObject(adapterWakePayload),
                       questionResponse: legacyQuestionResponse,
                     },
                   }
@@ -25661,6 +25744,7 @@ export function heartbeatService(
           nonRetryablePreflightFailureCode(err) ??
           recordedResponsibleUserDenialCode ??
           nativeTerminalFailureCode ??
+          adapterEnvTooLargeFailureCode(err) ??
           "adapter_failed";
         logger.error({ err, runId }, "heartbeat execution failed");
 
@@ -25792,8 +25876,11 @@ export function heartbeatService(
             // Native recovery owns the original heartbeat run through
             // exhaustion. Once its durable coordinator has classified a
             // terminal failure, generic issue recovery must not create a
-            // replacement retryOfRunId chain for the same provider work.
-            suppressImmediateRecovery: nativeTerminalFailureCode !== null,
+            // replacement retryOfRunId chain for the same provider work. An
+            // oversized process env fails identically on an immediate retry.
+            suppressImmediateRecovery:
+              nativeTerminalFailureCode !== null ||
+              failureErrorCode === ADAPTER_ENV_TOO_LARGE_ERROR_CODE,
           });
           await handleIssueReviewPathDisposition(livenessRun);
 
@@ -25921,6 +26008,7 @@ export function heartbeatService(
             : null) ??
           recordedResponsibleUserDenialCode ??
           nonRetryablePreflightCode ??
+          adapterEnvTooLargeFailureCode(outerErr) ??
           "setup_failed";
         logger.error(
           { err: outerErr, runId },
@@ -26060,6 +26148,7 @@ export function heartbeatService(
           }
           await releaseIssueExecutionAndPromote(livenessRun, {
             suppressImmediateRecovery:
+              setupFailureErrorCode === ADAPTER_ENV_TOO_LARGE_ERROR_CODE ||
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
               ) !== null ||

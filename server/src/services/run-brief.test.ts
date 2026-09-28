@@ -422,10 +422,12 @@ const support = await getEmbeddedPostgresTestSupport();
     // The only differences are the added fields; key order is untouched.
     const { priorRuns: _priorRuns, ...envelopeOnWithoutBrief } = envelopeOn;
     expect(JSON.stringify(envelopeOnWithoutBrief)).toBe(JSON.stringify(envelopeOff));
+    // The stored wake payload does not embed the continuation (the adapter
+    // copy receives it at dispatch), so only the brief differs.
+    expect(payloadOn?.executionContinuation).toBeNull();
     expect(
       JSON.stringify({
         ...payloadOn,
-        executionContinuation: envelopeOnWithoutBrief,
         runBrief: undefined,
       }),
     ).toBe(JSON.stringify(payloadOff));

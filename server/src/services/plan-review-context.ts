@@ -26,6 +26,21 @@ export const PLAN_REVIEW_CONTEXT_LIMITS = {
   maxAnchorTextChars: 500,
 } as const;
 
+/**
+ * Budget of the non-plan document review context across all of an issue's
+ * documents. Each document still observes the per-document
+ * PLAN_REVIEW_CONTEXT_LIMITS; these caps bound the total, so an issue with
+ * dozens of annotated documents does not produce an oversized wake payload.
+ * Documents beyond the thread budget are counted, not listed.
+ */
+export const DOCUMENT_REVIEW_CONTEXT_LIMITS = {
+  maxThreads: 8,
+  maxComments: 24,
+  maxBodyChars: PLAN_REVIEW_CONTEXT_LIMITS.maxBodyChars,
+  maxTotalBodyChars: 4_000,
+  maxAnchorTextChars: PLAN_REVIEW_CONTEXT_LIMITS.maxAnchorTextChars,
+} as const;
+
 type BuildPlanReviewContextInput = {
   db: Db;
   companyId: string;
@@ -369,15 +384,34 @@ export async function buildDocumentReviewContext(
     .orderBy(desc(issueDocuments.updatedAt), desc(issueDocuments.id));
   if (documentRows.length === 0) return null;
 
-  let remainingThreads = PLAN_REVIEW_CONTEXT_LIMITS.maxThreads;
-  let remainingComments = PLAN_REVIEW_CONTEXT_LIMITS.maxComments;
-  let remainingBodyChars = PLAN_REVIEW_CONTEXT_LIMITS.maxTotalBodyChars;
+  let remainingThreads: number = DOCUMENT_REVIEW_CONTEXT_LIMITS.maxThreads;
+  let remainingComments: number = DOCUMENT_REVIEW_CONTEXT_LIMITS.maxComments;
+  let remainingBodyChars: number = DOCUMENT_REVIEW_CONTEXT_LIMITS.maxTotalBodyChars;
   let totalOpenThreads = 0;
   let totalComments = 0;
   let includedThreads = 0;
   let includedComments = 0;
+  let omittedDocuments = 0;
   let truncated = false;
   const groupedDocuments: DocumentReviewContextDocument[] = [];
+
+  const countOpenThreadComments = async (document: (typeof documentRows)[number]) => {
+    const [{ count }] = await input.db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(documentAnnotationComments)
+      .innerJoin(documentAnnotationThreads, eq(documentAnnotationComments.threadId, documentAnnotationThreads.id))
+      .where(and(
+        eq(documentAnnotationComments.companyId, input.companyId),
+        eq(documentAnnotationComments.issueId, input.issueId),
+        eq(documentAnnotationComments.documentId, document.documentId),
+        eq(documentAnnotationThreads.companyId, input.companyId),
+        eq(documentAnnotationThreads.issueId, input.issueId),
+        eq(documentAnnotationThreads.documentId, document.documentId),
+        eq(documentAnnotationThreads.documentKey, document.documentKey),
+        eq(documentAnnotationThreads.status, "open"),
+      ));
+    return count;
+  };
 
   for (const document of documentRows) {
     const [{ count: openThreadCount }] = await input.db
@@ -391,6 +425,14 @@ export async function buildDocumentReviewContext(
         eq(documentAnnotationThreads.status, "open"),
       ));
     if (openThreadCount === 0) continue;
+    if (remainingThreads <= 0) {
+      // Thread budget spent: count this document's open threads, do not list it.
+      totalOpenThreads += openThreadCount;
+      totalComments += await countOpenThreadComments(document);
+      omittedDocuments += 1;
+      truncated = true;
+      continue;
+    }
 
     const perDocumentThreadLimit = Math.min(PLAN_REVIEW_CONTEXT_LIMITS.maxThreads, remainingThreads);
     const threadRows = perDocumentThreadLimit === 0 ? [] : await input.db
@@ -445,20 +487,7 @@ export async function buildDocumentReviewContext(
       .orderBy(asc(documentAnnotationComments.createdAt), asc(documentAnnotationComments.id))
       .limit(perDocumentCommentLimit);
 
-    const [{ count: commentCount }] = await input.db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(documentAnnotationComments)
-      .innerJoin(documentAnnotationThreads, eq(documentAnnotationComments.threadId, documentAnnotationThreads.id))
-      .where(and(
-        eq(documentAnnotationComments.companyId, input.companyId),
-        eq(documentAnnotationComments.issueId, input.issueId),
-        eq(documentAnnotationComments.documentId, document.documentId),
-        eq(documentAnnotationThreads.companyId, input.companyId),
-        eq(documentAnnotationThreads.issueId, input.issueId),
-        eq(documentAnnotationThreads.documentId, document.documentId),
-        eq(documentAnnotationThreads.documentKey, document.documentKey),
-        eq(documentAnnotationThreads.status, "open"),
-      ));
+    const commentCount = await countOpenThreadComments(document);
 
     const commentsByThread = new Map<string, typeof commentRows>();
     for (const comment of commentRows) {
@@ -563,7 +592,8 @@ export async function buildDocumentReviewContext(
       includedCommentCount: includedComments,
       omittedCommentCount: Math.max(0, totalComments - includedComments),
     },
-    limits: { ...PLAN_REVIEW_CONTEXT_LIMITS },
+    ...(omittedDocuments > 0 ? { omittedDocumentCount: omittedDocuments } : {}),
+    limits: { ...DOCUMENT_REVIEW_CONTEXT_LIMITS },
     truncated,
   };
 }

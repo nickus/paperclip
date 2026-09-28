@@ -189,6 +189,33 @@ async function countProcessesWithArgument(needle: string): Promise<number> {
   return count;
 }
 
+/**
+ * Local `ssh` client processes whose command line contains `commandNeedle`,
+ * and how many of them carry `envNeedle` in their environment. Only counts
+ * are returned; no command line or environment is ever printed.
+ */
+async function inspectLocalSshClients(
+  commandNeedle: string,
+  envNeedle: string,
+): Promise<{ clients: number; withEnvNeedle: number }> {
+  const commandBytes = Buffer.from(commandNeedle);
+  const envBytes = Buffer.from(envNeedle);
+  let clients = 0;
+  let withEnvNeedle = 0;
+  for (const entry of await readdir("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      if ((await readFile(`/proc/${entry}/comm`, "utf8")).trim() !== "ssh") continue;
+      if (!(await readFile(`/proc/${entry}/cmdline`)).includes(commandBytes)) continue;
+      clients += 1;
+      if ((await readFile(`/proc/${entry}/environ`)).includes(envBytes)) withEnvNeedle += 1;
+    } catch {
+      // The process exited or is not readable.
+    }
+  }
+  return { clients, withEnvNeedle };
+}
+
 async function waitForFile(filePath: string, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(filePath)) {
@@ -674,6 +701,11 @@ describe("ssh env-lab fixture", () => {
     if (existsSync("/proc/self/cmdline")) {
       expect(await countProcessesWithArgument(marker)).toBeGreaterThan(0);
       expect(await countProcessesWithArgument(token)).toBe(0);
+      // The local ssh client runs with this host's environment; the run's env
+      // reaches only the remote command, over stdin.
+      const sshClients = await inspectLocalSshClients(marker, token);
+      expect(sshClients.clients).toBeGreaterThan(0);
+      expect(sshClients.withEnvNeedle).toBe(0);
     }
     const result = await pending;
     expect(result.exitCode).toBe(0);
@@ -695,6 +727,45 @@ describe("ssh env-lab fixture", () => {
     );
     expect(noStdin.exitCode).toBe(0);
     expect(noStdin.stdout).toBe(`done:${token}`);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("hands an oversized JSON payload variable to the remote process as a file in the run scratch dir", async (ctx) => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH oversized env payload test", ctx);
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir };
+    const scratchDir = path.posix.join(started.workspaceDir, ".paperclip-runtime", "runs", "run-1", "scratch");
+    await mkdir(scratchDir, { recursive: true, mode: 0o700 });
+    // Far above the 128 KiB a single env string may have; as an env var of the
+    // local ssh process or of the remote command this fails with E2BIG.
+    const payload = JSON.stringify(Array.from({ length: 200 }, (_, index) => ({ workspaceId: `w${index}`, notes: "x".repeat(2_000) })));
+    const result = await runChildProcess(
+      `run-${randomUUID()}`,
+      "sh",
+      [
+        "-c",
+        'if [ -n "${PAPERCLIP_WORKSPACES_JSON+x}" ]; then echo inline; exit 3; fi; ' +
+          'printf "%s\n" "$PAPERCLIP_WORKSPACES_FILE"; wc -c < "$PAPERCLIP_WORKSPACES_FILE"; cat',
+      ],
+      {
+        cwd: rootDir,
+        env: { PAPERCLIP_WORKSPACES_JSON: payload, PAPERCLIP_RUN_SCRATCH_DIR: scratchDir },
+        stdin: "prompt on stdin\n",
+        timeoutSec: 30,
+        graceSec: 1,
+        onLog: async () => {},
+        remoteExecution: spec,
+      },
+    );
+    expect(result.exitCode).toBe(0);
+    const [filePath, byteCount, stdinEcho] = result.stdout.trim().split("\n").map((line) => line.trim());
+    expect(filePath!.startsWith(`${scratchDir}/paperclip-env-`)).toBe(true);
+    expect(Number(byteCount)).toBe(Buffer.byteLength(payload));
+    expect(stdinEcho).toBe("prompt on stdin");
+    // Removed once the remote command exited.
+    expect(existsSync(filePath!)).toBe(false);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("gives commands run through the SSH command runner their env over stdin", async (ctx) => {
