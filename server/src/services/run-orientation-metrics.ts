@@ -382,7 +382,13 @@ export function computeRunOrientationMetricsFromEvents(
 
   return {
     stepsBeforeFirstMutation: firstMutationStepIndex,
-    genTokensBeforeFirstMutation: firstMutationGenTokens,
+    // If the mutating step's own step_finish never arrived (the stream ends
+    // mid-turn -- a cancelled or timed-out run), `firstMutationGenTokens`
+    // only covers the fully-closed steps before the mutation and is missing
+    // the "during" component the field's contract promises. Report `null`
+    // rather than that understated number: a caller cannot tell "no more
+    // tokens were generated" from "we stopped listening before finding out".
+    genTokensBeforeFirstMutation: firstMutationStepTokensPending ? null : firstMutationGenTokens,
     skillLoads,
     controlPlaneDenials,
     peakContextTokens,

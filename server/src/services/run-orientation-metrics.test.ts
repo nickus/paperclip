@@ -225,11 +225,35 @@ describe("computeRunOrientationMetricsFromEvents", () => {
     expect(result.peakContextTokens).toBe(1200);
   });
 
-  it("reports 0 steps when the very first tool call is already a confirmed mutation", () => {
+  it("reports 0 steps when the very first tool call is already a confirmed mutation, but nulls the token count since its own step never closed", () => {
     const events: OrientationEvent[] = [toolCall("1", "write"), toolResult("1", "write")];
     const result = computeRunOrientationMetricsFromEvents(events);
     expect(result.stepsBeforeFirstMutation).toBe(0);
-    expect(result.genTokensBeforeFirstMutation).toBe(0);
+    // No step_finish followed the mutation's own tool_result, so the tokens
+    // generated during that step (reasoning + arguments) are unknown, not
+    // zero: the true "during" component was never observed.
+    expect(result.genTokensBeforeFirstMutation).toBeNull();
+  });
+
+  it("nulls genTokensBeforeFirstMutation when the run is cut off after the mutation confirms but before its own step_finish arrives", () => {
+    // A run that is cancelled or hits its timeout right after the mutating
+    // tool call's own result lands, but before the model finishes that turn
+    // and the adapter flushes the step's usage line. The prior, fully-closed
+    // step's tokens are known; the "during" component for the mutation's own
+    // step is not, and must not be silently reported as absent.
+    const events: OrientationEvent[] = [
+      toolCall("1", "read"),
+      toolResult("1", "read"),
+      stepFinish(900, 25),
+      toolCall("2", "write"),
+      toolResult("2", "write"),
+      // stream ends here: no closing step_finish for call "2"'s step
+    ];
+    const result = computeRunOrientationMetricsFromEvents(events);
+    expect(result.stepsBeforeFirstMutation).toBe(1);
+    expect(result.genTokensBeforeFirstMutation).toBeNull();
+    // peakContextTokens is unaffected: it only reflects steps that did close.
+    expect(result.peakContextTokens).toBe(900);
   });
 
   it("leaves both first-mutation fields null when the run never mutates", () => {
@@ -551,7 +575,9 @@ describe("deriveRunOrientationMetrics", () => {
     });
 
     expect(result.stepsBeforeFirstMutation).toBe(1);
-    expect(result.genTokensBeforeFirstMutation).toBe(20);
+    // The capture ends right after the write's own tool_result, with no
+    // closing step_finish for its step, so the "during" tokens are unknown.
+    expect(result.genTokensBeforeFirstMutation).toBeNull();
     expect(result.peakContextTokens).toBe(800);
     expect(result.skillLoads).toBe(0);
     expect(result.controlPlaneDenials).toBe(0);

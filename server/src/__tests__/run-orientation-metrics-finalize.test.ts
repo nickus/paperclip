@@ -101,7 +101,9 @@ describeEmbeddedPostgres(
       // `adapterResult.resultJson.stdout` carries it into the finalize
       // path: one read, then one write (the first mutating call), with a
       // step boundary in between reporting generated tokens and context
-      // size.
+      // size. The capture ends right after the write's own tool_result,
+      // with no closing step_finish for the step the write happened in —
+      // the same shape a cancelled or timed-out run leaves behind.
       const stdout = [
         JSON.stringify({
           type: "tool_use",
@@ -167,7 +169,11 @@ describeEmbeddedPostgres(
       const persistedResult = finished?.resultJson as Record<string, unknown> | null;
       expect(persistedResult?.metrics).toEqual({
         stepsBeforeFirstMutation: 1,
-        genTokensBeforeFirstMutation: 25,
+        // The write's own step never closed (no trailing step_finish in the
+        // capture above), so the tokens generated during that step are
+        // genuinely unknown, not zero — this must come back null, not an
+        // understated count of only the prior, fully-closed step.
+        genTokensBeforeFirstMutation: null,
         skillLoads: 0,
         controlPlaneDenials: 0,
         // A first-ever run for this agent offers no previous session, so
