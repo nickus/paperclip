@@ -364,7 +364,33 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
         .map(([, method, params]) => ({ method, params: params as Record<string, unknown> }));
     }
 
-    return { issueId, wakeAndSettle, readIssue, addIssue, countExecutionWorkspaces, leaseCalls, worker };
+    /** Every run of the agent in start order, with its task-session bookkeeping. */
+    async function runSessions() {
+      const rows = await db
+        .select({
+          id: heartbeatRuns.id,
+          createdAt: heartbeatRuns.createdAt,
+          sessionIdBefore: heartbeatRuns.sessionIdBefore,
+          sessionIdAfter: heartbeatRuns.sessionIdAfter,
+          resultJson: heartbeatRuns.resultJson,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return rows
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+        .map((row) => {
+          const session = ((row.resultJson?.configFreshness as Record<string, unknown> | undefined)?.session ??
+            null) as { reset?: unknown; changedCategories?: unknown } | null;
+          return {
+            sessionIdBefore: row.sessionIdBefore,
+            sessionIdAfter: row.sessionIdAfter,
+            reset: session?.reset ?? null,
+            changedCategories: session?.changedCategories ?? null,
+          };
+        });
+    }
+
+    return { issueId, wakeAndSettle, readIssue, addIssue, countExecutionWorkspaces, leaseCalls, worker, runSessions };
   }
 
   it("pins the task to its execution workspace so later runs resume the same sandbox", async () => {
@@ -396,6 +422,67 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
     expect(resumes.map((call) => call.params.providerLeaseId)).toEqual(resumes.map(() => "pc-sandbox-1"));
     expect(worker.sandboxes.size).toBe(1);
   }, 60_000);
+
+  it.each([
+    ["with the isolated workspace setting off", false],
+    ["with isolated workspaces enabled", true],
+  ])("resumes the agent session on the first follow-up after the task is pinned to its workspace (%s)", async (_label, isolatedWorkspaces) => {
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: isolatedWorkspaces });
+    // The adapter keeps whatever session it is handed and starts a new one
+    // only when it gets none, like a CLI agent resuming by session id.
+    let sessionsStarted = 0;
+    adapterExecute.mockImplementation((async (input: { runtime?: { sessionParams?: Record<string, unknown> | null } }) => {
+      const resumed = input?.runtime?.sessionParams?.sessionId;
+      const sessionId = typeof resumed === "string" ? resumed : `session-${++sessionsStarted}`;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        provider: "test",
+        model: "test-model",
+        sessionId,
+        sessionParams: { sessionId },
+        sessionDisplayId: sessionId,
+      };
+    }) as any);
+    try {
+      const { wakeAndSettle, readIssue, runSessions } = await seed({
+        reuseLease: true,
+        runnerIdleTimeoutMs: 86_400_000,
+      });
+
+      await wakeAndSettle();
+      // The first run pinned the task to its workspace; that write-back is
+      // bookkeeping, not a configuration change.
+      expect((await readIssue()).executionWorkspacePreference).toBe("reuse_existing");
+      await wakeAndSettle();
+      await wakeAndSettle();
+
+      const runs = await runSessions();
+      expect(runs.length).toBeGreaterThanOrEqual(3);
+      expect(runs[0].sessionIdBefore).toBeNull();
+      expect(runs[0].sessionIdAfter).toBe("session-1");
+      for (const run of runs.slice(1)) {
+        expect(run).toEqual({
+          sessionIdBefore: "session-1",
+          sessionIdAfter: "session-1",
+          reset: false,
+          changedCategories: [],
+        });
+      }
+      expect(sessionsStarted).toBe(1);
+    } finally {
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+      adapterExecute.mockReset();
+      adapterExecute.mockImplementation(async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        provider: "test",
+        model: "test-model",
+      }));
+    }
+  }, 90_000);
 
   it("gives each task its own execution workspace and sandbox and never resumes another task's sandbox", async () => {
     const { issueId, wakeAndSettle, readIssue, addIssue, countExecutionWorkspaces, leaseCalls, worker } = await seed({
