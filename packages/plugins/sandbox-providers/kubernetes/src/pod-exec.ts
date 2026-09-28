@@ -273,14 +273,21 @@ export function shQuote(segment: string): string {
 // becomes the argument of any process. The prologue is a line count followed by
 // exactly that many lines; a malformed or short prologue fails the command with
 // exit code 125 instead of running it without its env.
+//
+// The script is kept on a single line, taking its newline from printf, like
+// the SSH env reader in @paperclipai/adapter-utils (buildSshStdinEnvHandoff).
+// The exec API passes it to `sh -c` as one argument without re-parsing it, so a
+// literal newline would work here too, but the SSH reader goes through the
+// remote login shell first, where it does not; one form keeps them
+// interchangeable.
 const STDIN_ENV_READER = [
   "{ IFS= read -r __pc_env_n",
   "&& case $__pc_env_n in ''|*[!0-9]*) false;; esac",
-  "&& __pc_env=",
-  `&& while [ "$__pc_env_n" -gt 0 ]; do IFS= read -r __pc_env_l || exit 125; __pc_env="$__pc_env$__pc_env_l\n"; __pc_env_n=$((__pc_env_n - 1)); done; }`,
+  "&& __pc_env= && __pc_nl=$(printf '\\nx') && __pc_nl=${__pc_nl%x}",
+  `&& while [ "$__pc_env_n" -gt 0 ]; do IFS= read -r __pc_env_l || exit 125; __pc_env="$__pc_env$__pc_env_l$__pc_nl"; __pc_env_n=$((__pc_env_n - 1)); done; }`,
   "|| { echo 'paperclip: could not read the command environment from stdin' >&2; exit 125; };",
   'eval "$__pc_env" || exit 125;',
-  "unset __pc_env __pc_env_l __pc_env_n;",
+  "unset __pc_env __pc_env_l __pc_env_n __pc_nl;",
 ].join(" ");
 
 // Give a command the caller's env vars without putting any value on a command

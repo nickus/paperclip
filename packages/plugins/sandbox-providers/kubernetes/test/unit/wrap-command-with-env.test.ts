@@ -119,6 +119,8 @@ describe("wrapCommandWithEnv", () => {
     expect(stdin.endsWith("the prompt")).toBe(true);
     expect(out.command.slice(0, 2)).toEqual(["/bin/sh", "-c"]);
     expect(out.command[2]).toContain("exec 'opencode' 'run' '--model' 'anthropic/x'");
+    // Same single-line form as the SSH env reader.
+    expect(out.command[2]).not.toContain("\n");
   });
 
   it("never propagates PATH (would break command resolution in the sandbox image)", () => {
@@ -185,7 +187,7 @@ describe.each(shells)("env over stdin through execInPod (%s)", (_label, shell, a
 
   maybeIt("keeps the command's exit status and does not export the reader's own variables", async () => {
     const result = await withShell(() =>
-      runInPod(["sh", "-c", 'env | grep -c "^__pc_env" ; exit 7'], { TOKEN: SECRET }),
+      runInPod(["sh", "-c", 'env | grep -c "^__pc_" ; exit 7'], { TOKEN: SECRET }),
     );
     expect(result.exitCode).toBe(7);
     expect(result.stdout.trim()).toBe("0");
