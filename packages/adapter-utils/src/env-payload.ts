@@ -13,13 +13,15 @@ import path from "node:path";
  * way on every attempt, yet the failure looks like a transient spawn error.
  *
  * The wake payload itself travels in the prompt. The JSON variables that
- * adapters still export (PAPERCLIP_ENV_PAYLOAD_KEYS) stay inline while they
- * are small, for compatibility with readers that only know the inline
- * variable. Above ENV_PAYLOAD_INLINE_MAX_BYTES the value is written to a
- * private file on the machine that runs the process (mode 0600 in a 0700
- * directory) and the variable is replaced by `<NAME>_FILE`
- * (`PAPERCLIP_WORKSPACES_FILE`, ...) holding that file's path. Readers accept
- * either variant; see readPaperclipEnvPayload.
+ * adapters still export (PAPERCLIP_ENV_PAYLOAD_KEYS) stay inline whenever a
+ * launch can carry them, so a reader that only knows the inline variable sees
+ * exactly what it saw before for every launch that used to start. Only a
+ * value above ENV_PAYLOAD_INLINE_MAX_BYTES, too large to pass inline, is
+ * written to a private file on the machine that runs the process (mode 0600
+ * in a 0700 directory); the variable is then replaced by `<NAME>_FILE`
+ * (`PAPERCLIP_WORKSPACES_FILE`, ...) holding that file's path. The process
+ * still gets the whole value instead of failing to start. readPaperclipEnvPayload
+ * reads either form.
  *
  * assertProcessEnvelopeWithinLimits is the last-resort guard for everything
  * else, including prompts passed as command-line arguments: it names the
@@ -27,10 +29,14 @@ import path from "node:path";
  * kernel fail the spawn with an opaque E2BIG.
  */
 
-/** Payload variables above this size are delivered as files. */
-export const ENV_PAYLOAD_INLINE_MAX_BYTES = 32 * 1024;
 /** A single argv or env string must stay below Linux's 128 KiB MAX_ARG_STRLEN. */
 export const PROCESS_SINGLE_STRING_MAX_BYTES = 120 * 1024;
+/**
+ * Payload variables above this size are delivered as files. It sits just
+ * below the single-string guard (leaving room for the `NAME=` prefix), so a
+ * value moves to a file only when it could not have been passed inline.
+ */
+export const ENV_PAYLOAD_INLINE_MAX_BYTES = PROCESS_SINGLE_STRING_MAX_BYTES - 1024;
 /** argv + env together must stay well below the common 2 MiB ARG_MAX. */
 export const PROCESS_TOTAL_MAX_BYTES = 1.5 * 1024 * 1024;
 /** Run error code for a process whose argv/env would exceed the kernel limits. */
@@ -269,6 +275,21 @@ export interface ExternalizedEnvPayloads {
 }
 
 const NOOP_CLEANUP = async () => {};
+
+/**
+ * A run-log line per payload that was moved into a file, so an operator can
+ * see why the process has `<NAME>_FILE` instead of `<NAME>_JSON`. Names and
+ * sizes only; never the value or the path's contents.
+ */
+export function describeExternalizedEnvPayloads(files: ReadonlyArray<OversizedEnvPayload>): string {
+  return files
+    .map(
+      (file) =>
+        `[paperclip] ${file.key} is ${file.bytes} bytes, too large to pass inline; ` +
+        `the process reads it from the file named by ${file.fileKey}.\n`,
+    )
+    .join("");
+}
 
 /**
  * The shared helper every adapter's process launch goes through: moves each

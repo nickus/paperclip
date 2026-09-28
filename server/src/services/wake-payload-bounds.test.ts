@@ -56,4 +56,47 @@ describe("fitPaperclipWakePayloadToHardCap", () => {
     expect(fitted.comments[0]!.body).toHaveLength(1_000);
     expect(fitted.issue).toMatchObject({ descriptionTruncated: true });
   });
+
+  it("shortens an attached continuation's message bodies last, keeping each full length", () => {
+    const message = (index: number, body: string, extra: Record<string, unknown> = {}) => ({
+      id: `m${index}`,
+      authorType: "user",
+      authorId: "u1",
+      body,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      deleted: false,
+      sourceTrust: null,
+      ...extra,
+    });
+    const messages = [
+      // Already cut by the continuation's own bounds: its full length stays.
+      message(0, "a".repeat(8_000), { bodyTruncated: true, bodyChars: 20_000 }),
+      ...Array.from({ length: 12 }, (_, index) => message(index + 1, "m".repeat(6_000))),
+    ];
+    const payload = {
+      reason: "issue_commented",
+      comments: [{ id: "c1", body: "short" }],
+      executionContinuation: {
+        version: 1,
+        messages,
+        resumeDelta: { baseRunId: "run-0", messages: messages.slice(-2) },
+        completedWork: "w".repeat(5_000),
+        coverage: { kind: "recent_task_history", omittedMessageCount: 40 },
+      },
+    };
+    expect(paperclipWakePayloadBytes(payload)).toBeGreaterThan(PAPERCLIP_WAKE_PAYLOAD_HARD_CAP_BYTES);
+    const fitted = fitPaperclipWakePayloadToHardCap(payload);
+    expect(paperclipWakePayloadBytes(fitted)).toBeLessThanOrEqual(PAPERCLIP_WAKE_PAYLOAD_HARD_CAP_BYTES);
+    expect(fitted).toMatchObject({ truncated: true, fallbackFetchNeeded: true });
+    const continuation = fitted.executionContinuation;
+    expect(continuation.messages.map((row) => row.id)).toEqual(messages.map((row) => row.id));
+    expect(continuation.messages[0]).toMatchObject({ bodyTruncated: true, bodyChars: 20_000 });
+    expect(continuation.messages[1]).toMatchObject({ bodyTruncated: true, bodyChars: 6_000 });
+    expect(continuation.messages[1]!.body).toHaveLength(500);
+    expect(continuation.resumeDelta.messages[1]).toMatchObject({ bodyTruncated: true, bodyChars: 6_000 });
+    expect(continuation.completedWork).toMatch(/^w{1000}\n\[truncated: 4000 more characters\]$/);
+    expect(continuation.coverage).toEqual(payload.executionContinuation.coverage);
+    expect(fitted.comments[0]!.body).toBe("short");
+  });
 });

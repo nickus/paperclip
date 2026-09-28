@@ -7650,7 +7650,9 @@ export async function attestReviewedExternalChatRun(input: {
  * The adapter-facing copy of the wake payload: the persisted payload plus the
  * run's execution continuation, redacted like the rest of the payload. The
  * run snapshot stores the continuation only once (as `executionContinuation`),
- * so the persisted wake payload does not duplicate it.
+ * so the persisted wake payload does not duplicate it. The wake payload's hard
+ * cap applies to the combined copy, after redaction, so the limit covers
+ * everything the prompt receives from both.
  */
 export async function attachExecutionContinuationToWakePayload(input: {
   db: Db;
@@ -7665,7 +7667,7 @@ export async function attachExecutionContinuationToWakePayload(input: {
   const executionContinuation = await createRunSecretRedactionRegistry(
     input.db,
   ).redactForIssue(input.companyId, input.issueId, input.executionContinuation);
-  return { ...wake, executionContinuation };
+  return fitPaperclipWakePayloadToHardCap({ ...wake, executionContinuation });
 }
 
 export async function buildPaperclipWakePayload(input: {

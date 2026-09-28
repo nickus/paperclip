@@ -77,6 +77,7 @@ import {
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import {
   createLocalEnvPayloadFileStore,
+  describeExternalizedEnvPayloads,
   externalizeEnvPayloads,
   omitOversizedEnvPayloads,
 } from "@paperclipai/adapter-utils/env-payload";
@@ -2494,6 +2495,9 @@ async function buildRuntime(input: {
     );
     runtimeEnv = externalized.env;
     envPayloadCleanup = externalized.directory ? externalized.cleanup : null;
+    if (externalized.files.length > 0) {
+      await input.ctx.onLog("stdout", describeExternalizedEnvPayloads(externalized.files)).catch(() => undefined);
+    }
   }
   // The relay runs on the host with the sanitized remote launch environment.
   // Its /usr/bin/env node shebang cannot rely on that environment's PATH.

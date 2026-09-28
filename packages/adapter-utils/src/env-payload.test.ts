@@ -10,10 +10,12 @@ import {
   ENV_PAYLOAD_INLINE_MAX_BYTES,
   PROCESS_SINGLE_STRING_MAX_BYTES,
   PROCESS_TOTAL_MAX_BYTES,
+  PAPERCLIP_ENV_PAYLOAD_KEYS,
   assertProcessEnvelopeWithinLimits,
   createLocalEnvPayloadFileStore,
   createShellEnvPayloadFileStore,
   externalizeEnvPayloads,
+  findOversizedEnvPayloads,
   isAdapterEnvTooLargeError,
   isArgumentListTooLongError,
   omitOversizedEnvPayloads,
@@ -142,6 +144,35 @@ describe("externalizeEnvPayloads", () => {
     expect(result.directory).toBeNull();
   });
 
+  it("keeps every payload inline that a launch can carry", async () => {
+    const store = {
+      location: "local" as const,
+      writeFiles: async () => {
+        throw new Error("must not write");
+      },
+      removeDirectory: async () => {},
+    };
+    // A value well above a few KiB still reaches readers that only know the
+    // inline variable, exactly as it did before files existed.
+    const medium = { PAPERCLIP_WORKSPACES_JSON: largePayload(64 * 1024) };
+    expect((await externalizeEnvPayloads(medium, store)).env).toEqual(medium);
+    // At the threshold every payload variable (the longest name included)
+    // stays inline and the launch passes the single-string guard.
+    const atThreshold = Object.fromEntries(
+      PAPERCLIP_ENV_PAYLOAD_KEYS.map((key) => [key, "x".repeat(ENV_PAYLOAD_INLINE_MAX_BYTES)]),
+    );
+    expect(findOversizedEnvPayloads(atThreshold)).toEqual([]);
+    expect(() =>
+      assertProcessEnvelopeWithinLimits({ command: "agent", args: [], env: atThreshold, location: "local" }),
+    ).not.toThrow();
+    // One byte more and the value moves to a file.
+    expect(
+      findOversizedEnvPayloads({ PAPERCLIP_WORKSPACES_JSON: "x".repeat(ENV_PAYLOAD_INLINE_MAX_BYTES + 1) }).map(
+        (payload) => payload.fileKey,
+      ),
+    ).toEqual(["PAPERCLIP_WORKSPACES_FILE"]);
+  });
+
   it("moves an oversized payload into a private local file and removes it on cleanup", async () => {
     const scratch = await tempDir("paperclip-env-payload-scratch-");
     const payload = largePayload();
@@ -231,12 +262,15 @@ describe("runChildProcess with an oversized payload variable", () => {
   it("delivers the payload as a file to a local process and removes the file afterwards", async () => {
     const scratch = await tempDir("paperclip-env-payload-run-");
     const payload = largePayload();
+    const logs: string[] = [];
     const result = await runChildProcess("env-payload-local", process.execPath, ["-e", READ_PAYLOAD_SCRIPT], {
       cwd: scratch,
       env: { PAPERCLIP_WORKSPACES_JSON: payload, PAPERCLIP_RUN_SCRATCH_DIR: scratch },
       timeoutSec: 30,
       graceSec: 5,
-      onLog: async () => {},
+      onLog: async (_stream, chunk) => {
+        logs.push(chunk);
+      },
     });
     expect(result.exitCode).toBe(0);
     const seen = JSON.parse(result.stdout) as { inline: boolean; file: string; items: number };
@@ -244,6 +278,11 @@ describe("runChildProcess with an oversized payload variable", () => {
     expect(seen.items).toBe(JSON.parse(payload).length);
     expect(seen.file.startsWith(`${scratch}${path.sep}`)).toBe(true);
     expect(existsSync(seen.file)).toBe(false);
+    // The run log says where the value went, by name and size only.
+    const notice = logs.find((chunk) => chunk.startsWith("[paperclip] PAPERCLIP_WORKSPACES_JSON is "));
+    expect(notice).toContain(`${Buffer.byteLength(payload)} bytes`);
+    expect(notice).toContain("PAPERCLIP_WORKSPACES_FILE");
+    expect(notice!.length).toBeLessThan(300);
   });
 
   it("fails with adapter_env_too_large instead of E2BIG for other oversized variables", async () => {

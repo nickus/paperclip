@@ -955,18 +955,27 @@ the rest as `coverage.omittedMessageCount`, the most recent omitted ids and
 `coverage.historyPath` (the comments API). Interaction results, tool receipts,
 recovery decisions and the completed-work summary are bounded the same way;
 64 KiB is the hard cap. The run snapshot stores the continuation once; the wake
-payload handed to the adapter receives it at dispatch. The wake payload has its
-own 64 KiB hard cap: past it, review-context detail is dropped first, then
-comment bodies and the issue brief are shortened, with truncation markers and
-`fallbackFetchNeeded`.
+payload handed to the adapter receives it at dispatch. The wake payload has a
+64 KiB hard cap, applied when it is built and again to the adapter-facing copy
+with the continuation attached, so it bounds both together: past it,
+review-context detail is dropped first, then comment bodies and the issue brief
+are shortened, and last the continuation's message bodies, with truncation
+markers and `fallbackFetchNeeded`.
 
 The remaining JSON environment variables (`PAPERCLIP_WORKSPACES_JSON`,
 `PAPERCLIP_RUNTIME_SERVICES_JSON`, `PAPERCLIP_RUNTIME_SERVICE_INTENTS_JSON`) stay
-inline up to 32 KiB. A larger value is written to a private file (mode 0600,
-in the run scratch directory when there is one) on the machine that runs the
-process and replaced by the matching `*_FILE` variable holding its path; the
-file is removed when the process exits. `readPaperclipEnvPayload` in
+inline whenever a launch can carry them (up to 119 KiB), so tools that read only
+the inline variable see no change for any launch that used to start. A larger
+value, which would otherwise stop the process from starting, is written to a
+private file (mode 0600, in the run scratch directory when there is one) on the
+machine that runs the process and replaced by the matching `*_FILE` variable
+holding its path; the run log names the variable and its size, and the file is
+removed when the process exits. `readPaperclipEnvPayload` in
 `@paperclipai/adapter-utils/env-payload` reads either form.
+
+For SSH execution the run's environment reaches the remote command only through
+the stdin handoff; the local `ssh` client runs with the server's own
+environment.
 
 As a last resort, every local spawn and remote exec checks its arguments and
 environment first. A single string over 120 KiB or a total over 1.5 MiB fails the

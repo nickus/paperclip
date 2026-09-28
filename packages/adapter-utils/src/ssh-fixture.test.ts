@@ -189,6 +189,33 @@ async function countProcessesWithArgument(needle: string): Promise<number> {
   return count;
 }
 
+/**
+ * Local `ssh` client processes whose command line contains `commandNeedle`,
+ * and how many of them carry `envNeedle` in their environment. Only counts
+ * are returned; no command line or environment is ever printed.
+ */
+async function inspectLocalSshClients(
+  commandNeedle: string,
+  envNeedle: string,
+): Promise<{ clients: number; withEnvNeedle: number }> {
+  const commandBytes = Buffer.from(commandNeedle);
+  const envBytes = Buffer.from(envNeedle);
+  let clients = 0;
+  let withEnvNeedle = 0;
+  for (const entry of await readdir("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      if ((await readFile(`/proc/${entry}/comm`, "utf8")).trim() !== "ssh") continue;
+      if (!(await readFile(`/proc/${entry}/cmdline`)).includes(commandBytes)) continue;
+      clients += 1;
+      if ((await readFile(`/proc/${entry}/environ`)).includes(envBytes)) withEnvNeedle += 1;
+    } catch {
+      // The process exited or is not readable.
+    }
+  }
+  return { clients, withEnvNeedle };
+}
+
 async function waitForFile(filePath: string, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(filePath)) {
@@ -674,6 +701,11 @@ describe("ssh env-lab fixture", () => {
     if (existsSync("/proc/self/cmdline")) {
       expect(await countProcessesWithArgument(marker)).toBeGreaterThan(0);
       expect(await countProcessesWithArgument(token)).toBe(0);
+      // The local ssh client runs with this host's environment; the run's env
+      // reaches only the remote command, over stdin.
+      const sshClients = await inspectLocalSshClients(marker, token);
+      expect(sshClients.clients).toBeGreaterThan(0);
+      expect(sshClients.withEnvNeedle).toBe(0);
     }
     const result = await pending;
     expect(result.exitCode).toBe(0);

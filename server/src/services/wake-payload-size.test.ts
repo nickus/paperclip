@@ -219,5 +219,35 @@ const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value) ?? "",
     expect(Buffer.byteLength(prompt)).toBeLessThan(PROCESS_SINGLE_STRING_MAX_BYTES);
     expect(prompt).toContain("Request 148:");
     expect(prompt).toContain("`coverage.omittedMessageCount` older messages are not included");
+
+    // The wake payload and the continuation each have their own cap; the
+    // adapter-facing copy of both together has the wake payload's cap too.
+    // A wake payload right under its own cap makes room by dropping review
+    // detail, and the continuation stays whole.
+    const reviewPadding = 64 * 1024 - bytes(wake) - 1_024;
+    const fullWake = {
+      ...wake!,
+      planReviewContext: {
+        threads: [{ id: "thread-1", comments: [{ id: "review-1", body: "r".repeat(reviewPadding) }] }],
+        truncated: false,
+      },
+    };
+    expect(bytes(fullWake)).toBeLessThanOrEqual(64 * 1024);
+    expect(bytes({ ...fullWake, executionContinuation: continuation })).toBeGreaterThan(64 * 1024);
+    const combined = (await attachExecutionContinuationToWakePayload({
+      db,
+      companyId,
+      issueId,
+      wakePayload: fullWake,
+      executionContinuation: continuation,
+    })) as Record<string, unknown>;
+    expect(bytes(combined)).toBeLessThanOrEqual(64 * 1024);
+    expect(combined).toMatchObject({
+      truncated: true,
+      fallbackFetchNeeded: true,
+      planReviewContext: { threads: [], truncated: true },
+    });
+    expect(combined.executionContinuation).toEqual(continuation);
+    expect(renderPaperclipWakePrompt(combined, { resumedSession: false })).toContain("Request 148:");
   });
 });

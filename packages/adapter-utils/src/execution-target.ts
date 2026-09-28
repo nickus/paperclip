@@ -87,6 +87,7 @@ import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
   assertProcessEnvelopeWithinLimits,
   createShellEnvPayloadFileStore,
+  describeExternalizedEnvPayloads,
   externalizeEnvPayloads,
   omitOversizedEnvPayloads,
   type EnvPayloadShellExec,
@@ -969,6 +970,9 @@ export async function runAdapterExecutionTargetProcess(
       sanitizeRemoteExecutionEnv(options.env),
       () => createShellEnvPayloadFileStore(sandboxEnvPayloadShellExec(target, runner)),
     );
+    if (payloads.files.length > 0) {
+      await options.onLog("stdout", describeExternalizedEnvPayloads(payloads.files)).catch(() => undefined);
+    }
     try {
       return await runSandboxTargetProcess(target, runner, command, args, payloads.env, options);
     } finally {

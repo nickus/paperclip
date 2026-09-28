@@ -16,6 +16,7 @@ import {
   assertProcessEnvelopeWithinLimits,
   createLocalEnvPayloadFileStore,
   createShellEnvPayloadFileStore,
+  describeExternalizedEnvPayloads,
   externalizeEnvPayloads,
   isArgumentListTooLongError,
   measureProcessEnvelope,
@@ -4698,9 +4699,11 @@ export async function runChildProcess(
   opts: RunChildProcessOptions,
 ): Promise<RunProcessResult> {
   // Oversized payload variables become <NAME>_FILE before anything else sees
-  // the env: the local spawn (of the agent CLI or of ssh) and the remote env
-  // handoff both stay small.
+  // the env: the local agent spawn and the remote env handoff both stay small.
   const payloads = await externalizeEnvPayloads(opts.env, () => childProcessEnvPayloadStore(opts));
+  if (payloads.files.length > 0) {
+    await opts.onLog("stdout", describeExternalizedEnvPayloads(payloads.files)).catch(() => undefined);
+  }
   const localPayloadDir = !opts.remoteExecution ? payloads.directory : null;
   const localProcessSandbox =
     opts.localProcessSandbox && localPayloadDir
@@ -4733,10 +4736,15 @@ async function runChildProcessWithPreparedEnv(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
-    const rawMerged: NodeJS.ProcessEnv = {
-      ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
-    };
+    // A remote command receives opts.env through the stdin handoff only. The
+    // local ssh client runs with this host's own environment, so the run's
+    // credentials and payloads never sit in its argv or environment.
+    const rawMerged: NodeJS.ProcessEnv = opts.remoteExecution
+      ? { ...sanitizeInheritedPaperclipEnv(process.env) }
+      : {
+          ...sanitizeInheritedPaperclipEnv(process.env),
+          ...opts.env,
+        };
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
     // don't refuse to start with "cannot be launched inside another session".

@@ -9,6 +9,11 @@
  * payload exceeds the hard cap, the bulkiest optional detail is dropped step
  * by step, each step leaves a truncation marker, and `fallbackFetchNeeded`
  * tells the agent to read the rest through the API.
+ *
+ * The cap applies again to the adapter-facing copy after the execution
+ * continuation is attached at dispatch, so it bounds the wake payload and the
+ * continuation together. The continuation's message bodies are the last thing
+ * shortened.
  */
 
 export const PAPERCLIP_WAKE_PAYLOAD_TARGET_BYTES = 32 * 1024;
@@ -27,6 +32,22 @@ function capText(record: Json, key: string, flagKey: string, maxChars: number): 
   const value = record[key];
   if (typeof value !== "string" || value.length <= maxChars) return record;
   return { ...record, [key]: value.slice(0, maxChars), [flagKey]: true };
+}
+
+/** Keeps the continuation's `bodyTruncated` / `bodyChars` (full length) contract. */
+function capContinuationMessage(message: unknown, maxChars: number): unknown {
+  if (!isRecord(message) || typeof message.body !== "string" || message.body.length <= maxChars) return message;
+  return {
+    ...message,
+    body: message.body.slice(0, maxChars),
+    bodyTruncated: true,
+    // A body the continuation already cut keeps its recorded full length.
+    bodyChars: typeof message.bodyChars === "number" ? message.bodyChars : message.body.length,
+  };
+}
+
+function capContinuationMessages(messages: unknown, maxChars: number): unknown {
+  return Array.isArray(messages) ? messages.map((message) => capContinuationMessage(message, maxChars)) : messages;
 }
 
 const steps: Array<(payload: Json) => Json> = [
@@ -80,6 +101,27 @@ const steps: Array<(payload: Json) => Json> = [
       : payload.unresolvedBlockerSummaries,
     agentMessage: isRecord(payload.agentMessage) ? capText(payload.agentMessage, "text", "textTruncated", 4_000) : payload.agentMessage,
   }),
+  // The attached execution continuation (already bounded on its own): shorten
+  // its message bodies and the completed-work summary.
+  (payload) => {
+    const continuation = payload.executionContinuation;
+    if (!isRecord(continuation)) return payload;
+    const resumeDelta = isRecord(continuation.resumeDelta)
+      ? { ...continuation.resumeDelta, messages: capContinuationMessages(continuation.resumeDelta.messages, 500) }
+      : continuation.resumeDelta;
+    const completedWork = continuation.completedWork;
+    return {
+      ...payload,
+      executionContinuation: {
+        ...continuation,
+        messages: capContinuationMessages(continuation.messages, 500),
+        ...(resumeDelta !== undefined ? { resumeDelta } : {}),
+        ...(typeof completedWork === "string" && completedWork.length > 1_000
+          ? { completedWork: `${completedWork.slice(0, 1_000)}\n[truncated: ${completedWork.length - 1_000} more characters]` }
+          : {}),
+      },
+    };
+  },
 ];
 
 /**
