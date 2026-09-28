@@ -1903,6 +1903,37 @@ describe("sandbox adapter execution targets", () => {
     }));
   });
 
+  it("surfaces the probe's own stderr when the command-resolvability probe itself times out", async () => {
+    // A sandbox provider whose exec bounds its own readiness wait separately
+    // from this probe's timeout (e.g. a pod stuck Pending) can still explain
+    // WHY in the timed-out exec result's stderr. That detail must reach the
+    // thrown error instead of being silently dropped.
+    const runner = {
+      execute: vi.fn().mockResolvedValue({
+        exitCode: null,
+        signal: null,
+        timedOut: true,
+        stdout: "",
+        stderr: "Sandbox pod did not become Ready within 30000ms — recent pod events: FailedScheduling: 0/3 nodes are available",
+        pid: null,
+        startedAt: new Date().toISOString(),
+      }),
+    };
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      remoteCwd: "/workspace",
+      timeoutMs: 300_000,
+      runner,
+    };
+
+    await expect(
+      ensureAdapterExecutionTargetCommandResolvable("opencode", target, "/local/workspace", {}),
+    ).rejects.toThrow(
+      /Timed out checking command "opencode" on sandbox target\. probe stderr: Sandbox pod did not become Ready.*FailedScheduling/,
+    );
+  });
+
   it("runs shell commands through the same runner", async () => {
     const runner = {
       execute: vi.fn(async () => ({
