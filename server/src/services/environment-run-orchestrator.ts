@@ -384,6 +384,9 @@ export function environmentRunOrchestrator(
     // Step 2: Realize workspace in the environment via the runtime driver
     let workspaceRealization: Record<string, unknown> = {};
     let realizedWorkspaceCwd: string | null = null;
+    // The remote workspace dir the provider reports for this lease (`remoteCwd`
+    // in the realize result metadata), if it reports one.
+    let providerRemoteCwd: string | null = null;
     if (ENVIRONMENT_DRIVER_TRAITS[environment.driver].realizesWorkspace) {
       try {
         const remoteCwd =
@@ -407,6 +410,11 @@ export function environmentRunOrchestrator(
             ? workspaceRealizationResult.cwd.trim()
             : null;
         workspaceRealization = parseObject(workspaceRealizationResult.metadata?.workspaceRealization);
+        const reportedRemoteCwd = workspaceRealizationResult.metadata?.remoteCwd;
+        providerRemoteCwd =
+          typeof reportedRemoteCwd === "string" && reportedRemoteCwd.trim().length > 0
+            ? reportedRemoteCwd.trim()
+            : null;
       } catch (err) {
         throw new EnvironmentRunError(
           "workspace_realization_failed",
@@ -485,26 +493,40 @@ export function environmentRunOrchestrator(
     }
 
     // Step 3: Persist realization metadata on lease and execution workspace
-    if (Object.keys(workspaceRealization).length > 0) {
+    //
+    // A provider that realizes the workspace reports the remote dir it realized
+    // as `remoteCwd`. Record it on a lease that does not carry one yet, so every
+    // later reader of the lease sees the realized dir: the execution target takes
+    // its remote cwd from it, and a provider's native file sync confines every
+    // transfer to it (and refuses to sync without it). A lease whose provider
+    // already pinned a dir at acquire keeps that dir.
+    const leaseRemoteCwd =
+      typeof lease.metadata?.remoteCwd === "string" && lease.metadata.remoteCwd.trim().length > 0
+        ? lease.metadata.remoteCwd
+        : null;
+    const remoteCwdToRecord = leaseRemoteCwd === null ? providerRemoteCwd : null;
+    const hasWorkspaceRealization = Object.keys(workspaceRealization).length > 0;
+    if (hasWorkspaceRealization || remoteCwdToRecord) {
       const nextLeaseMetadata = {
         ...(lease.metadata ?? {}),
-        workspaceRealization,
+        ...(hasWorkspaceRealization ? { workspaceRealization } : {}),
+        ...(remoteCwdToRecord ? { remoteCwd: remoteCwdToRecord } : {}),
       };
       const updatedLease = await environmentsSvc.updateLeaseMetadata(lease.id, nextLeaseMetadata);
       if (updatedLease) {
         lease = updatedLease;
       }
-      if (persistedExecutionWorkspace) {
-        const updatedEw = await executionWorkspacesSvc.update(persistedExecutionWorkspace.id, {
-          metadata: {
-            ...(persistedExecutionWorkspace.metadata ?? {}),
-            workspaceRealizationRequest,
-            workspaceRealization,
-          },
-        });
-        if (updatedEw) {
-          persistedExecutionWorkspace = updatedEw;
-        }
+    }
+    if (hasWorkspaceRealization && persistedExecutionWorkspace) {
+      const updatedEw = await executionWorkspacesSvc.update(persistedExecutionWorkspace.id, {
+        metadata: {
+          ...(persistedExecutionWorkspace.metadata ?? {}),
+          workspaceRealizationRequest,
+          workspaceRealization,
+        },
+      });
+      if (updatedEw) {
+        persistedExecutionWorkspace = updatedEw;
       }
     }
 
