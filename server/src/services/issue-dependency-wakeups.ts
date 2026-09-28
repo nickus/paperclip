@@ -1,7 +1,8 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests } from "@paperclipai/db";
+import { agentWakeupRequests, agents } from "@paperclipai/db";
+import { logger as defaultLogger } from "../middleware/logger.js";
 
 export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
 
@@ -236,4 +237,130 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
     }),
   );
   return covering ?? null;
+}
+
+/** Receipt statuses written when a wake was not dispatched now. */
+const UNDELIVERED_WAKE_STATUSES = ["skipped", "deferred_issue_execution"] as const;
+
+export type SkippedDependencyWakeReport = {
+  issueId: string | null;
+  agentId: string;
+  reason: string;
+  recoveryActionId: string | null;
+  wakeRequestId: string | null;
+  wakeStatus: string | null;
+  coalescedCount: number | null;
+  idempotencyKey: string | null;
+  error?: string;
+};
+
+type ReportLogger = Pick<typeof defaultLogger, "info" | "warn">;
+
+function readObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+/**
+ * Emit one structured line for a dependency wake that admission did not
+ * dispatch. Dependency readiness is level-triggered and its backstop retries
+ * quietly, so without this line a held dependency wake leaves no trace outside
+ * the wake table. The receipt written by admission supplies the gate: its
+ * reason, and for an execution recovery hold the recovery action id.
+ * Never throws; reporting must not change wake behaviour.
+ */
+export async function reportSkippedDependencyWake(
+  db: Db,
+  input: {
+    agentId: string;
+    issueId: string | null;
+    idempotencyKey?: string | null;
+    /** Receipts written or coalesced at or after this instant belong to this wake. */
+    observedFrom: Date;
+    error?: unknown;
+  },
+  log: ReportLogger = defaultLogger,
+): Promise<SkippedDependencyWakeReport | null> {
+  try {
+    let receipt: {
+      id: string;
+      status: string;
+      reason: string | null;
+      payload: Record<string, unknown> | null;
+      coalescedCount: number;
+    } | null = null;
+    if (input.issueId) {
+      const [agent] = await db
+        .select({ companyId: agents.companyId })
+        .from(agents)
+        .where(eq(agents.id, input.agentId))
+        .limit(1);
+      if (agent) {
+        [receipt] = await db
+          .select({
+            id: agentWakeupRequests.id,
+            status: agentWakeupRequests.status,
+            reason: agentWakeupRequests.reason,
+            payload: agentWakeupRequests.payload,
+            coalescedCount: agentWakeupRequests.coalescedCount,
+          })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, input.agentId),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
+              inArray(agentWakeupRequests.status, [...UNDELIVERED_WAKE_STATUSES]),
+              gte(agentWakeupRequests.updatedAt, input.observedFrom),
+            ),
+          )
+          .orderBy(desc(agentWakeupRequests.updatedAt))
+          .limit(1);
+      }
+    }
+    const payload = readObject(receipt?.payload);
+    const executionWait = readObject(payload.executionWait);
+    const heartbeatSkip = readObject(payload.heartbeatSkip);
+    const report: SkippedDependencyWakeReport = {
+      issueId: input.issueId,
+      agentId: input.agentId,
+      reason:
+        receipt?.reason ??
+        (input.error ? "wake_rejected" : "not_recorded"),
+      recoveryActionId: readString(executionWait.recoveryActionId),
+      wakeRequestId: receipt?.id ?? null,
+      wakeStatus: receipt?.status ?? null,
+      coalescedCount: receipt?.coalescedCount ?? null,
+      idempotencyKey: input.idempotencyKey ?? null,
+      ...(input.error
+        ? { error: input.error instanceof Error ? input.error.message.slice(0, 200) : String(input.error).slice(0, 200) }
+        : {}),
+    };
+    const detail = readString(executionWait.reason) ?? readString(heartbeatSkip.reason);
+    const fields = {
+      event: "dependency_wake_skipped",
+      wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+      ...report,
+      ...(detail ? { detail } : {}),
+    };
+    // A recovery hold keeps dependency-ready work parked until someone acts.
+    if (report.recoveryActionId) log.warn(fields, "dependency wake held by execution recovery");
+    else log.info(fields, "dependency wake skipped");
+    return report;
+  } catch (err) {
+    try {
+      log.warn(
+        { event: "dependency_wake_skipped", agentId: input.agentId, issueId: input.issueId, err },
+        "dependency wake skipped; receipt lookup failed",
+      );
+    } catch {
+      // Reporting is best effort.
+    }
+    return null;
+  }
 }

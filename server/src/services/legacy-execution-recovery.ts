@@ -12,6 +12,11 @@ import { isSupersededConversationRun } from "./agent-conversations.js";
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
+/** One terminal run is one incident; its recovery identity is the run id. */
+export function legacyExecutionRecoveryFingerprint(runId: string) {
+  return `legacy-execution:${runId}`;
+}
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
@@ -118,24 +123,43 @@ export async function terminalizeLegacyExecution(input: {
       (task.assigneeAgentId === run.agentId || isCurrentReviewer) &&
       !["done", "cancelled"].includes(task.status)
     ) {
-      // Periodic stranded-work checks may revisit this terminal run before its
-      // reconciled continuation is dispatched. Preserve the recorded decision
-      // and an existing unsafe-workspace hold instead of creating another one.
-      const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
+      const fingerprint = legacyExecutionRecoveryFingerprint(run.id);
+      // Periodic stranded-work checks, retry paths and late finalizers may
+      // revisit this terminal run. Its incident is recorded once. A closed
+      // record (reconciled, settled without replay, cancelled or superseded)
+      // already carries the decision for this exact run; a second row would
+      // be a second hold that must be cleared on its own. Only an open record
+      // is refreshed in place. The issue row lock above serializes callers.
+      const recorded = await tx.select({
+        status: issueRecoveryActions.status,
+        reconciled: sql<boolean>`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+      })
         .from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.companyId, run.companyId),
           eq(issueRecoveryActions.sourceIssueId, task.id),
-          eq(issueRecoveryActions.status, "resolved"),
           or(
-            sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
             and(
+              eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+              eq(issueRecoveryActions.fingerprint, fingerprint),
+            ),
+            and(
+              eq(issueRecoveryActions.status, "resolved"),
+              sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+            ),
+            // A run whose workspace restore was refused as unsafe is settled
+            // without replay; its record stands like any other closed one.
+            and(
+              eq(issueRecoveryActions.status, "resolved"),
               sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
               sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
               sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
             ),
           ),
-        )).limit(1);
-      if (reconciled) return updated;
+        ));
+      const open = recorded.some((row) => ["active", "escalated"].includes(row.status));
+      // A recorded operator decision for this run always stands.
+      const reconciled = recorded.some((row) => row.status === "resolved" && row.reconciled === true);
+      if (reconciled || (recorded.length > 0 && !open)) return updated;
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId,
         sourceIssueId: task.id,
@@ -143,7 +167,7 @@ export async function terminalizeLegacyExecution(input: {
         ownerType: "board",
         returnOwnerAgentId: task.assigneeAgentId,
         cause: LEGACY_RECOVERY_CAUSE,
-        fingerprint: `legacy-execution:${run.id}`,
+        fingerprint,
         evidence: {
           runId: run.id,
           ...(isCurrentReviewer ? { reviewParticipantAgentId: run.agentId } : {}),

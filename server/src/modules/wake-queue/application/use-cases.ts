@@ -120,6 +120,12 @@ export type ReleaseIssueExecutionInput = {
   runId: string;
   now: Date;
   suppressImmediateRecovery?: boolean;
+  /**
+   * The run's execution recovery hold has ended. The release the run skipped
+   * while its outcome awaited reconciliation may drain the queue now; every
+   * other gate, including a new hold on the issue, still applies.
+   */
+  afterExecutionHold?: boolean;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -957,7 +963,12 @@ export function createReleaseIssueExecution(deps: {
     input: ReleaseIssueExecutionInput,
   ): Promise<{ outcome: ReleaseOutcome; postCommitEffects: PostCommitEffect[] }> {
     const result = await deps.issueLock.withIssueExecutionLock(
-      { companyId: input.companyId, runId: input.runId, now: input.now },
+      {
+        companyId: input.companyId,
+        runId: input.runId,
+        now: input.now,
+        ...(input.afterExecutionHold ? { afterExecutionHold: true } : {}),
+      },
       (locked, ports) => runReleaseDrain(locked, ports, input),
     );
 

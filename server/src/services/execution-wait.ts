@@ -38,7 +38,9 @@ export async function recordExecutionWait(
     if (existing) {
       await tx.update(agentWakeupRequests).set({
         coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
-        updatedAt: new Date(),
+        // The database clock, like the row's insert default and a run's
+        // createdAt: a held signal is compared with later runs.
+        updatedAt: sql`now()`,
       }).where(and(
         eq(agentWakeupRequests.companyId, request.companyId),
         eq(agentWakeupRequests.id, existing.id),

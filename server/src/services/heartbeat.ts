@@ -431,7 +431,10 @@ import {
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import {
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  reportSkippedDependencyWake,
+} from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -26957,7 +26960,7 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; afterExecutionHold?: boolean } = {},
   ) {
     try {
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
@@ -26965,6 +26968,7 @@ export function heartbeatService(
         runId: run.id,
         now: new Date(),
         suppressImmediateRecovery: options.suppressImmediateRecovery,
+        ...(options.afterExecutionHold ? { afterExecutionHold: true } : {}),
       });
       await applyWakeQueuePostCommitEffects(postCommitEffects);
       const completed = await getRun(run.id);
@@ -26988,7 +26992,67 @@ export function heartbeatService(
     }
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+  /**
+   * Wakes saved behind an execution recovery hold that nothing else will
+   * deliver (mentions of other agents, answers to an agent's question) wait
+   * for the held run's queue drain, which stood down for the hold. Once the
+   * hold is closed, run that drain. It never retries the held run itself, and
+   * it stands down again while any hold or another execution owns the task.
+   */
+  async function promoteDeferredWakesAfterExecutionHold(input: {
+    companyId: string;
+    issueId: string;
+    runId: string;
+  }) {
+    const run = await getRun(input.runId);
+    if (
+      !run ||
+      run.companyId !== input.companyId ||
+      // Only a legacy run's release stands down for its hold; a native run's
+      // release records its own recovery and must not be replayed.
+      run.runtimeMode === "native" ||
+      !isHeartbeatRunTerminalStatus(run.status) ||
+      (run.nativeIssueId ?? readNonEmptyString(parseObject(run.contextSnapshot).issueId)) !== input.issueId
+    )
+      return false;
+    await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true, afterExecutionHold: true });
+    return true;
+  }
+
+  // A dependency wake that admission does not dispatch leaves only a receipt;
+  // report each one with the gate (and recovery action) that held it.
+  async function enqueueWakeup(
+    agentId: string,
+    opts: WakeupOptions = {},
+    executionWaitRequestId?: string,
+  ): ReturnType<typeof enqueueWakeupUnreported> {
+    if (opts.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON)
+      return enqueueWakeupUnreported(agentId, opts, executionWaitRequestId);
+    // Receipts are stamped by the database clock; allow for skew.
+    const observedFrom = new Date(Date.now() - 5_000);
+    const issueId =
+      readNonEmptyString(opts.payload?.issueId) ??
+      readNonEmptyString(opts.contextSnapshot?.issueId);
+    const report = (error?: unknown) =>
+      reportSkippedDependencyWake(db, {
+        agentId,
+        issueId,
+        idempotencyKey: opts.idempotencyKey ?? null,
+        observedFrom,
+        error,
+      });
+    let run: Awaited<ReturnType<typeof enqueueWakeupUnreported>>;
+    try {
+      run = await enqueueWakeupUnreported(agentId, opts, executionWaitRequestId);
+    } catch (error) {
+      await report(error);
+      throw error;
+    }
+    if (!run) await report();
+    return run;
+  }
+
+  async function enqueueWakeupUnreported(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -30418,6 +30482,7 @@ export function heartbeatService(
       }),
 
     wakeup: trackWakeup,
+    promoteDeferredWakesAfterExecutionHold,
     dispatchPendingNativeStatusWakeups,
     triggerIssueMonitor,
 

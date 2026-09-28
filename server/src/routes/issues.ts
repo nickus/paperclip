@@ -9,6 +9,7 @@ import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
 } from "../services/execution-recovery-resolution.js";
+import { releaseHeldExecutionWaits } from "../services/execution-wait-release.js";
 import {
   storedSteeringAcknowledgement,
   reconcileSteeredIdentity,
@@ -9718,6 +9719,24 @@ export function issueRoutes(
               agentId: result.issue.assigneeAgentId,
             },
             "failed to wake agent after recovery action restored issue",
+          );
+        }
+      }
+
+      if (requiresExecutionReconciliation(result.recoveryAction.cause)) {
+        // Closing the last execution hold releases the wakes it kept back, once,
+        // to the current assignee. A reconciled continuation or chat retry
+        // owns the next turn instead; the periodic sweep retries on failure.
+        try {
+          await releaseHeldExecutionWaits(db, enqueueRecoveryActionWakeup, {
+            companyId: result.issue.companyId,
+            issueId: result.issue.id,
+            promote: heartbeat.promoteDeferredWakesAfterExecutionHold,
+          });
+        } catch (err) {
+          logger.warn(
+            { err, issueId: result.issue.id, recoveryActionId: result.recoveryAction.id },
+            "held execution wait release after recovery resolution deferred to the sweep",
           );
         }
       }
