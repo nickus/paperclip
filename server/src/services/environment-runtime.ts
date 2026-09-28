@@ -2902,10 +2902,13 @@ function createSandboxEnvironmentDriver(
       const config = stripSandboxProviderEnvelope(await resolvePluginSandboxRuntimeConfig({
         environment: input.environment, lease: input.lease, provider: providerKey,
       }) as SandboxEnvironmentConfig);
+      // Captured outside the eviction closure, where the narrowing is lost.
+      const providerLeaseId = input.lease.providerLeaseId;
+      const workerManager = pluginWorkerManager;
       // config came through the runtime secret cache: a 401/403 evicts it.
-      const resumed = await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(pluginId, "environmentResumeLease", {
+      const resumed = await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => workerManager.call(pluginId, "environmentResumeLease", {
         driverKey: providerKey, companyId: input.lease.companyId, environmentId: input.environment.id,
-        issueId: input.lease.issueId, config, providerLeaseId: input.lease.providerLeaseId,
+        issueId: input.lease.issueId, config, providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       }, Math.min(resolvePluginSandboxRpcTimeoutMs(config) ?? 60_000, 60_000)));
       if (resumed?.providerLeaseId !== input.lease.providerLeaseId) {
