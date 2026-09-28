@@ -73,21 +73,42 @@ function stripMarkdownCode(markdown: string): string {
   return output;
 }
 
-function trimTrailingPunctuation(token: string): string {
-  let trimmed = token;
-  while (trimmed.length > 0) {
-    const last = trimmed[trimmed.length - 1]!;
-    if (!".,!?;:".includes(last) && last !== ")" && last !== "]") break;
+const TRAILING_TRIM_CHARS = ".,!?;:)]";
 
-    if (
-      (last === ")" && (trimmed.match(/\(/g)?.length ?? 0) >= (trimmed.match(/\)/g)?.length ?? 0))
-      || (last === "]" && (trimmed.match(/\[/g)?.length ?? 0) >= (trimmed.match(/\]/g)?.length ?? 0))
-    ) {
-      break;
+function trimTrailingPunctuation(token: string): string {
+  // '(' and '[' are never trimmed by this function, so their counts over the
+  // whole token stay constant while we walk backwards; ')' and ']' only ever
+  // get removed (never added), so a running count avoids re-scanning the
+  // shrinking string on every iteration (that used to make this O(n^2) on
+  // input like a URL followed by many trailing ')' characters).
+  let openParen = 0;
+  let closeParen = 0;
+  let openBracket = 0;
+  let closeBracket = 0;
+  for (let i = 0; i < token.length; i += 1) {
+    switch (token[i]) {
+      case "(": openParen += 1; break;
+      case ")": closeParen += 1; break;
+      case "[": openBracket += 1; break;
+      case "]": closeBracket += 1; break;
     }
-    trimmed = trimmed.slice(0, -1);
   }
-  return trimmed;
+
+  let end = token.length;
+  while (end > 0) {
+    const last = token[end - 1]!;
+    if (!TRAILING_TRIM_CHARS.includes(last)) break;
+
+    if (last === ")") {
+      if (openParen >= closeParen) break;
+      closeParen -= 1;
+    } else if (last === "]") {
+      if (openBracket >= closeBracket) break;
+      closeBracket -= 1;
+    }
+    end -= 1;
+  }
+  return token.slice(0, end);
 }
 
 function sha256Hex(value: string): string {

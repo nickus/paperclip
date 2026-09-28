@@ -14251,7 +14251,11 @@ export function issueRoutes(
             sourceTrust: await sourceTrustForActorWrite(issue, actor),
           },
         );
-        await issueReferencesSvc.syncComment(comment.id);
+        try {
+          await issueReferencesSvc.syncComment(comment.id);
+        } catch (err) {
+          logger.warn({ err, issueId: issue.id, commentId: comment.id }, "could not sync issue reference mentions for comment");
+        }
         await externalObjectsSvc.syncCommentSafely(comment.id);
         if (
           issue.assigneeAgentId &&
@@ -17206,7 +17210,11 @@ export function issueRoutes(
           return saved;
         });
         for (const publication of publications) publishActivity(publication);
-        await issueReferencesSvc.syncComment(comment.id);
+        try {
+          await issueReferencesSvc.syncComment(comment.id);
+        } catch (err) {
+          logger.warn({ err, issueId: issue.id, commentId: comment.id }, "could not sync issue reference mentions for comment");
+        }
         await deliverConversationComments(db, issue, heartbeat.wakeup);
         res.status(201).json(comment);
         return;
@@ -17716,7 +17724,11 @@ export function issueRoutes(
           : await add();
       }
 
-      await issueReferencesSvc.syncComment(comment.id);
+      try {
+        await issueReferencesSvc.syncComment(comment.id);
+      } catch (err) {
+        logger.warn({ err, issueId: currentIssue.id, commentId: comment.id }, "could not sync issue reference mentions for comment");
+      }
       await externalObjectsSvc.syncCommentSafely(comment.id);
       if (
         currentIssue.assigneeAgentId &&
