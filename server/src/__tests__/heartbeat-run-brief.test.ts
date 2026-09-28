@@ -124,6 +124,14 @@ suite("run brief on a heartbeat run", () => {
       },
       { timeout: 15_000 },
     );
+    // heartbeatRuns flips to "succeeded" (with its own sessionIdAfter) well
+    // before the finalize path's later upsertTaskSession call lands the same
+    // session in agentTaskSessions, the table the *next* wake's environment
+    // line reads to decide resumed/fresh. Waiting on run status alone races
+    // that later write; drainActiveRunExecutions only returns once executeRun
+    // itself has settled, which is after that upsert, so the task session a
+    // following runWake() call resolves is always the one this run produced.
+    await heartbeat.drainActiveRunExecutions();
     const call = execute.mock.calls.find(([input]) => input.runId === run!.id);
     expect(call).toBeDefined();
     return call![0].context.paperclipWake as Record<string, any>;
