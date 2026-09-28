@@ -1,9 +1,11 @@
+import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fsPromises } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
@@ -19,6 +21,25 @@ import {
   withDirectoryMergeLock,
   WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE,
 } from "./workspace-restore-merge.js";
+
+const execFile = promisify(execFileCallback);
+
+// Round-trip `sourceDir` through tar the way a restore brings a remote
+// workspace back: extracted by an unprivileged tar under `umask`, which
+// narrows every extracted file's permission bits.
+async function tarRoundTripUnderUmask(sourceDir: string, targetDir: string, umask: string): Promise<void> {
+  const archivePath = `${targetDir}.tar`;
+  await mkdir(targetDir, { recursive: true });
+  await execFile("tar", ["-cf", archivePath, "-C", sourceDir, "."]);
+  await execFile("sh", [
+    "-c",
+    `umask ${umask} && tar --no-same-permissions -xf "$1" -C "$2"`,
+    "sh",
+    archivePath,
+    targetDir,
+  ]);
+  await rm(archivePath, { force: true });
+}
 
 describe("workspace restore merge", () => {
   const cleanupDirs: string[] = [];
@@ -121,6 +142,123 @@ describe("workspace restore merge", () => {
       expect(await readFile(path.join(targetDir, "replaced"), "utf8")).toBe("host change");
       expect(await readFile(path.join(targetDir, "other.txt"), "utf8")).toBe("sandbox change");
     } finally { await disposeDirectorySnapshot(baseline); }
+  });
+
+  it("leaves unchanged files alone when the restored copy was extracted under a restrictive umask", async () => {
+    if (process.platform === "win32") return;
+
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-umask-"));
+    cleanupDirs.push(rootDir);
+    const targetDir = path.join(rootDir, "target");
+    const sourceDir = path.join(rootDir, "source");
+    await mkdir(path.join(targetDir, "docs"), { recursive: true });
+    await writeFile(path.join(targetDir, "docs", "notes.md"), "base\n", "utf8");
+    await writeFile(path.join(targetDir, "untouched.txt"), "same\n", "utf8");
+    await chmod(path.join(targetDir, "docs", "notes.md"), 0o644);
+    await chmod(path.join(targetDir, "untouched.txt"), 0o644);
+
+    const baseline = await captureDirectorySnapshot(targetDir, { exclude: [] });
+    // The run changed nothing; its copy comes back with narrowed modes.
+    await tarRoundTripUnderUmask(targetDir, sourceDir, "027");
+    expect((await stat(path.join(sourceDir, "untouched.txt"))).mode & 0o777).toBe(0o640);
+    // The host writes a file while the run is still going.
+    await writeFile(path.join(targetDir, "docs", "notes.md"), "concurrent host edit\n", "utf8");
+    const untouchedBefore = await stat(path.join(targetDir, "untouched.txt"));
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir });
+
+    await expect(readFile(path.join(targetDir, "docs", "notes.md"), "utf8")).resolves.toBe(
+      "concurrent host edit\n",
+    );
+    const untouchedAfter = await stat(path.join(targetDir, "untouched.txt"));
+    expect(untouchedAfter.ino).toBe(untouchedBefore.ino);
+    expect(untouchedAfter.mode & 0o777).toBe(0o644);
+  });
+
+  it("applies a run's edits without taking the extracting umask, but keeps an executable-bit change", async () => {
+    if (process.platform === "win32") return;
+
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-umask-"));
+    cleanupDirs.push(rootDir);
+    const targetDir = path.join(rootDir, "target");
+    const remoteDir = path.join(rootDir, "remote");
+    const sourceDir = path.join(rootDir, "source");
+    await mkdir(targetDir, { recursive: true });
+    for (const name of ["edited.txt", "run.sh"]) {
+      await writeFile(path.join(targetDir, name), "base\n", "utf8");
+      await chmod(path.join(targetDir, name), 0o644);
+    }
+    const baseline = await captureDirectorySnapshot(targetDir, { exclude: [] });
+
+    // The run edits one file and makes another executable.
+    await mkdir(remoteDir, { recursive: true });
+    await writeFile(path.join(remoteDir, "edited.txt"), "edited by the run\n", "utf8");
+    await writeFile(path.join(remoteDir, "run.sh"), "base\n", "utf8");
+    await chmod(path.join(remoteDir, "edited.txt"), 0o644);
+    await chmod(path.join(remoteDir, "run.sh"), 0o755);
+    await tarRoundTripUnderUmask(remoteDir, sourceDir, "027");
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir });
+
+    await expect(readFile(path.join(targetDir, "edited.txt"), "utf8")).resolves.toBe("edited by the run\n");
+    expect((await stat(path.join(targetDir, "edited.txt"))).mode & 0o777).toBe(0o644);
+    expect((await stat(path.join(targetDir, "run.sh"))).mode & 0o100).toBe(0o100);
+  });
+
+  it("keeps a file the run deleted when the host changed only its permission bits meanwhile", async () => {
+    if (process.platform === "win32") return;
+
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-umask-"));
+    cleanupDirs.push(rootDir);
+    const targetDir = path.join(rootDir, "target");
+    const remoteDir = path.join(rootDir, "remote");
+    const sourceDir = path.join(rootDir, "source");
+    await mkdir(targetDir, { recursive: true });
+    await writeFile(path.join(targetDir, "private.txt"), "private\n", "utf8");
+    await writeFile(path.join(targetDir, "keep.txt"), "keep\n", "utf8");
+    await chmod(path.join(targetDir, "private.txt"), 0o644);
+    await chmod(path.join(targetDir, "keep.txt"), 0o644);
+    const baseline = await captureDirectorySnapshot(targetDir, { exclude: [] });
+
+    // The run deletes the file; the host locks it down while the run is going.
+    await mkdir(remoteDir, { recursive: true });
+    await writeFile(path.join(remoteDir, "keep.txt"), "keep\n", "utf8");
+    await chmod(path.join(remoteDir, "keep.txt"), 0o644);
+    await tarRoundTripUnderUmask(remoteDir, sourceDir, "027");
+    await chmod(path.join(targetDir, "private.txt"), 0o600);
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir });
+
+    // A host change to the file, even to its permission bits only, wins over the deletion.
+    await expect(readFile(path.join(targetDir, "private.txt"), "utf8")).resolves.toBe("private\n");
+    expect((await stat(path.join(targetDir, "private.txt"))).mode & 0o777).toBe(0o600);
+  });
+
+  it("gives a file the run created the mode it was extracted with", async () => {
+    if (process.platform === "win32") return;
+
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-umask-"));
+    cleanupDirs.push(rootDir);
+    const targetDir = path.join(rootDir, "target");
+    const remoteDir = path.join(rootDir, "remote");
+    const sourceDir = path.join(rootDir, "source");
+    await mkdir(targetDir, { recursive: true });
+    const baseline = await captureDirectorySnapshot(targetDir, { exclude: [] });
+
+    // The run creates a plain file and an executable one.
+    await mkdir(remoteDir, { recursive: true });
+    await writeFile(path.join(remoteDir, "new.txt"), "new\n", "utf8");
+    await writeFile(path.join(remoteDir, "new.sh"), "#!/bin/sh\n", "utf8");
+    await chmod(path.join(remoteDir, "new.txt"), 0o644);
+    await chmod(path.join(remoteDir, "new.sh"), 0o755);
+    await tarRoundTripUnderUmask(remoteDir, sourceDir, "027");
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir });
+
+    // New files have no host mode to keep: they land with the run's mode
+    // narrowed by the extracting umask, and keep their executable bit.
+    expect((await stat(path.join(targetDir, "new.txt"))).mode & 0o777).toBe(0o640);
+    expect((await stat(path.join(targetDir, "new.sh"))).mode & 0o777).toBe(0o750);
   });
 
   it("ignores non-file entries when capturing snapshots", async () => {

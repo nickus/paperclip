@@ -539,6 +539,50 @@ describe("sandbox managed runtime", () => {
     ).resolves.toBe("durable pre-turn bytes\n");
   });
 
+  it("keeps nested .git internals and AppleDouble files on the host after a run that changed nothing", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-nested-excludes-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    // The archives leave these out at any depth, so the sandbox never sees them.
+    const hostOnlyFiles = [
+      "third_party/lib/.git/HEAD",
+      "third_party/lib/.git/objects/ab/cdef",
+      "._top-level-sidecar",
+      "docs/._notes.md",
+      "docs/._resources/data.bin",
+    ];
+    for (const relative of [...hostOnlyFiles, "third_party/lib/index.js", "docs/notes.md"]) {
+      await mkdir(path.dirname(path.join(localWorkspaceDir, relative)), { recursive: true });
+      await writeFile(path.join(localWorkspaceDir, relative), `${relative}\n`, "utf8");
+    }
+
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: {
+        transport: "sandbox",
+        provider: "test",
+        sandboxId: "sandbox-nested-excludes",
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+        apiKey: null,
+      },
+      adapterKey: "test-adapter",
+      client: makeFilesystemClient(),
+      workspaceLocalDir: localWorkspaceDir,
+    });
+    await expect(readFile(path.join(remoteWorkspaceDir, "third_party", "lib", "index.js"), "utf8")).resolves.toBe(
+      "third_party/lib/index.js\n",
+    );
+    await expect(stat(path.join(remoteWorkspaceDir, "third_party", "lib", ".git"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(path.join(remoteWorkspaceDir, "docs", "._notes.md"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    await prepared.restoreWorkspace();
+
+    for (const relative of [...hostOnlyFiles, "third_party/lib/index.js", "docs/notes.md"]) {
+      await expect(readFile(path.join(localWorkspaceDir, relative), "utf8")).resolves.toBe(`${relative}\n`);
+    }
+  });
+
   it("preserves excluded local workspace artifacts during restore mirroring", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-restore-"));
     cleanupDirs.push(rootDir);

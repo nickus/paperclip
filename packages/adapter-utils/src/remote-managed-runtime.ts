@@ -1,5 +1,6 @@
 import path from "node:path";
 import { GIT_ARCHIVE_EXCLUDES } from "./git-workspace-sync.js";
+import { APPLEDOUBLE_EXCLUDES, NESTED_GIT_EXCLUDES } from "./exclude-patterns.js";
 import {
   type SshRemoteExecutionSpec,
   prepareWorkspaceForSshExecution,
@@ -143,9 +144,11 @@ export async function prepareRemoteManagedRuntime(input: {
     : null;
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
+        // The same paths the SSH workspace archives leave out, at any depth
+        // (see NESTED_GIT_EXCLUDES and APPLEDOUBLE_EXCLUDES).
         exclude: preparedWorkspace.gitBacked
-          ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"]
-          : [".paperclip-runtime"],
+          ? [...GIT_ARCHIVE_EXCLUDES, ...NESTED_GIT_EXCLUDES, ...APPLEDOUBLE_EXCLUDES, ".paperclip-runtime"]
+          : [...APPLEDOUBLE_EXCLUDES, ".paperclip-runtime"],
       })
     : null;
 

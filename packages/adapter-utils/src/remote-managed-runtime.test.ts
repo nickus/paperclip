@@ -95,6 +95,46 @@ describe("remote managed runtime", () => {
     expect(restoredAuth).toBe('{"token":"remote"}\n');
   });
 
+  it.each([
+    ["git-backed", true],
+    ["plain", false],
+  ] as const)("leaves out of the %s workspace baseline what the SSH archives leave out at any depth", async (_label, gitBacked) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-baseline-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    for (const relative of ["src/index.js", "third_party/lib/.git/HEAD", "docs/._notes.md"]) {
+      await mkdir(path.dirname(path.join(workspaceDir, relative)), { recursive: true });
+      await writeFile(path.join(workspaceDir, relative), "x\n", "utf8");
+    }
+    prepareWorkspaceForSshExecution.mockResolvedValueOnce({ gitBacked });
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: {
+        host: "127.0.0.1",
+        port: 2222,
+        username: "fixture",
+        remoteWorkspacePath: "/app",
+        remoteCwd: "/app",
+        privateKey: "PRIVATE KEY",
+        knownHosts: "KNOWN HOSTS",
+        strictHostKeyChecking: true,
+      },
+      runId: "run-baseline",
+      adapterKey: "codex",
+      workspaceLocalDir: workspaceDir,
+    });
+    await prepared.restoreWorkspace();
+
+    const call = restoreWorkspaceFromSshExecution.mock.calls[0] as unknown as [
+      { baselineSnapshot: { entries: Map<string, unknown> } },
+    ];
+    const entries = [...call[0].baselineSnapshot.entries.keys()];
+    expect(entries).toContain("src/index.js");
+    // Every SSH archive drops `._*` at any depth; a git-backed one also drops `.git`.
+    expect(entries).not.toContain("docs/._notes.md");
+    expect(entries.includes("third_party/lib/.git/HEAD")).toBe(!gitBacked);
+  });
+
   it("stages each additional project into its own isolated SSH dir, isolating one failure", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-additional-"));
     cleanupDirs.push(rootDir);
