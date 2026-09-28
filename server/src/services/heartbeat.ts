@@ -20040,6 +20040,8 @@ export function heartbeatService(
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
     let runScratch: HeartbeatRunScratch | null = null;
     let remoteRunScratch: SshRunScratch | null = null;
+    // Env entries that point the run at remoteRunScratch.
+    let remoteRunScratchEnv: Record<string, string> | null = null;
     let sshWorkspaceReuseClaim: SshWorkspaceReuseClaim | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
@@ -22284,6 +22286,7 @@ export function heartbeatService(
               ...scratchEnv.env,
             },
           };
+          remoteRunScratchEnv = scratchEnv.env;
           context.paperclipScratch = {
             type: "heartbeat_run",
             location: "remote",
@@ -22293,6 +22296,7 @@ export function heartbeatService(
           };
         } catch (scratchPrepareError) {
           remoteRunScratch = null;
+          remoteRunScratchEnv = null;
           delete context.paperclipScratch;
           logger.warn(
             {
@@ -22881,7 +22885,7 @@ export function heartbeatService(
           config: hostExecutionWorkspaceConfig,
           // Runtime services run on this host; a scratch path on the SSH host
           // means nothing to them.
-          adapterEnv: omitRemoteRunScratchEnv(adapterEnv, remoteRunScratch),
+          adapterEnv: omitRemoteRunScratchEnv(adapterEnv, remoteRunScratchEnv),
           onLog,
           recorder: workspaceOperationRecorder,
         });

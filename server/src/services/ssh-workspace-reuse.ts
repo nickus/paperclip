@@ -197,11 +197,21 @@ export async function cleanupSshRunScratch(input: {
   return { removed: true, dir: expected };
 }
 
-/** Removes env keys that point at a remote scratch directory, for processes that run on this host. */
+/**
+ * Drops the entries that the remote run scratch env added (`scratchEnv`, as
+ * returned by buildRunScratchEnvForDir) from `env`, for processes that run on
+ * this host. Only those keys are dropped, and only while they still hold the
+ * value the scratch env gave them: a temp key the agent config sets itself, or
+ * any other key that happens to hold the same path, is kept.
+ */
 export function omitRemoteRunScratchEnv(
   env: Record<string, string>,
-  scratch: { dir: string } | null | undefined,
+  scratchEnv: Readonly<Record<string, string>> | null | undefined,
 ): Record<string, string> {
-  if (!scratch) return env;
-  return Object.fromEntries(Object.entries(env).filter(([, value]) => value !== scratch.dir));
+  if (!scratchEnv) return env;
+  return Object.fromEntries(
+    Object.entries(env).filter(
+      ([key, value]) => !(Object.hasOwn(scratchEnv, key) && scratchEnv[key] === value),
+    ),
+  );
 }

@@ -174,13 +174,27 @@ describe("remote run scratch", () => {
   });
 
   it("keeps remote scratch paths away from processes that run on this host", () => {
+    // The agent config sets TMP itself, so the scratch env leaves it alone.
+    const scratchEnv = buildRunScratchEnvForDir({ TMP: "/custom" }, "/remote/scratch").env;
     const env = {
-      PAPERCLIP_SCRATCH_DIR: "/remote/scratch",
-      TMPDIR: "/remote/scratch",
+      ...scratchEnv,
       TMP: "/custom",
+      // Not a scratch key, even though it names the same path.
+      BUILD_OUTPUT_DIR: "/remote/scratch",
       OTHER: "value",
     };
-    expect(omitRemoteRunScratchEnv(env, { dir: "/remote/scratch" })).toEqual({ TMP: "/custom", OTHER: "value" });
+    expect(omitRemoteRunScratchEnv(env, scratchEnv)).toEqual({
+      TMP: "/custom",
+      BUILD_OUTPUT_DIR: "/remote/scratch",
+      OTHER: "value",
+    });
+    // A scratch key that something later set to another value is kept.
+    expect(omitRemoteRunScratchEnv({ ...env, TMPDIR: "/elsewhere" }, scratchEnv)).toEqual({
+      TMP: "/custom",
+      TMPDIR: "/elsewhere",
+      BUILD_OUTPUT_DIR: "/remote/scratch",
+      OTHER: "value",
+    });
     expect(omitRemoteRunScratchEnv(env, null)).toBe(env);
   });
 });
