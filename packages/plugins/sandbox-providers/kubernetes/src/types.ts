@@ -34,6 +34,18 @@ export const kubernetesProviderConfigSchema = z
     podActivityDeadlineSec: z.number().int().positive().default(3600),
 
     /**
+     * Upper bound (seconds) on a single "wait for pod ready" poll, separate
+     * from the overall run budget (`podActivityDeadlineSec`, or a caller's
+     * per-execute `timeoutMs`). The effective wait is always
+     * `min(runBudget, podReadyTimeoutSec ?? 600)`: a pod that cannot schedule
+     * or pull its image fails fast with its recent events instead of quietly
+     * consuming the whole run budget. Raise this for clusters where slow
+     * autoscaling or large images routinely need more than ten minutes to
+     * bring a pod up.
+     */
+    podReadyTimeoutSec: z.number().int().positive().optional(),
+
+    /**
      * The adapter type that Jobs in this environment will run.
      * Each Kubernetes environment is bound to one adapter; create multiple
      * environments for different adapters.

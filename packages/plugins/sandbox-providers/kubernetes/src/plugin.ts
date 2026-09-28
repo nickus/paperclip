@@ -39,6 +39,7 @@ import {
 import { execInPod, execInPodStreaming, wrapCommandWithEnv } from "./pod-exec.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
 import { checkLeaseResumable, destroyLeaseResources } from "./lease-lifecycle.js";
+import { resolvePodReadyTimeoutMs, summarizeRecentPodEvents } from "./pod-ready-deadline.js";
 import {
   appendNetworkEgressDenyHint,
   createScopedNetworkEgressPolicyOrReleaseWorkload,
@@ -169,16 +170,40 @@ async function resolveSyncPodExec(
     kubeconfig: config.kubeconfig,
   });
   const clients = makeKubeClients(kc);
+  // `timeoutMs` is the budget handed back to the caller for the sync
+  // operation itself (the whole run budget) — it must stay the full
+  // podActivityDeadlineSec. Only the readiness POLL below is bounded
+  // separately by podReadyTimeoutSec, so a pod that can never come up fails
+  // fast instead of burning the sync operation's entire budget.
   const timeoutMs = config.podActivityDeadlineSec * 1000;
+  const podReadyTimeoutMs = resolvePodReadyTimeoutMs(config, timeoutMs);
 
   // Ensure the Sandbox pod is Ready (wait only the first time for this lease),
   // then resolve the pod name — mirrors the onEnvironmentExecute resolution.
   if (!readySandboxesByLease.has(lease.providerLeaseId)) {
-    await sandboxCrOrchestrator.waitForCompletion(clients, namespace, lease.providerLeaseId, {
-      timeoutMs,
-      pollMs: 2000,
-    });
-    readySandboxesByLease.add(lease.providerLeaseId);
+    try {
+      await sandboxCrOrchestrator.waitForCompletion(clients, namespace, lease.providerLeaseId, {
+        timeoutMs: podReadyTimeoutMs,
+        pollMs: 2000,
+      });
+      readySandboxesByLease.add(lease.providerLeaseId);
+    } catch (err) {
+      if (err instanceof SandboxCrTimeoutError) {
+        // A thrown Error (rather than a structured "failed" result) is how
+        // this plugin's sync hooks already signal a retryable provider
+        // failure — see onEnvironmentSyncOut's DaytonaNotFoundError handling
+        // in the sibling daytona plugin for the same convention: only a
+        // specific, stable "this is gone for good" error is terminal, and
+        // every other thrown error remains retryable. Enrich the message
+        // with the pod's recent events so the retry (or the operator) knows
+        // WHY it wasn't ready, without changing that retryable contract.
+        const { summary } = await summarizeRecentPodEvents(clients, namespace, lease.providerLeaseId);
+        throw new Error(
+          summary ? `${err.message} (recent pod events: ${summary})` : err.message,
+        );
+      }
+      throw err;
+    }
   }
 
   const podName =
@@ -714,27 +739,61 @@ const plugin = definePlugin({
       // block for up to twice the requested timeout.
       const executeStartedAt = Date.now();
 
+      // Bound the readiness poll itself to min(run budget, podReadyTimeoutSec
+      // ?? 600s) — separately from effectiveTimeoutMs, which remains the
+      // budget for the whole call (readiness wait + exec). A pod stuck
+      // Pending (no capacity, bad node selector, an image that will never
+      // pull) would otherwise silently consume the entire run budget before
+      // failing; this makes that failure fast and diagnosable instead.
+      const podReadyTimeoutMs = resolvePodReadyTimeoutMs(config, effectiveTimeoutMs);
+
       if (!podAlreadyKnownReady) {
         try {
           await sandboxCrOrchestrator.waitForCompletion(
             clients,
             namespace,
             lease.providerLeaseId,
-            { timeoutMs: effectiveTimeoutMs, pollMs: 2000 },
+            { timeoutMs: podReadyTimeoutMs, pollMs: 2000 },
           );
           readySandboxesByLease.add(lease.providerLeaseId);
         } catch (err) {
           if (err instanceof SandboxCrTimeoutError) {
+            // Best-effort pod-name resolution purely to target the event
+            // lookup — the Sandbox CR's own name is a reasonable fallback
+            // (agent-sandbox v0.4.x names the pod exactly after the CR; see
+            // findPodForSandbox).
+            const eventPodName =
+              podName ??
+              (await sandboxCrOrchestrator
+                .findPod(clients, namespace, lease.providerLeaseId)
+                .catch(() => null)) ??
+              lease.providerLeaseId;
+            const { summary, events } = await summarizeRecentPodEvents(
+              clients,
+              namespace,
+              eventPodName,
+            );
             return {
+              // exitCode: null + timedOut: true is this file's existing
+              // convention for a transient/retryable provider failure (the
+              // exec-call watchdog timeout below uses the identical shape) —
+              // callers already treat it as retryable, so no separate
+              // classification is needed. `metadata.transient` documents
+              // that intent explicitly for any consumer inspecting metadata.
               exitCode: null,
               timedOut: true,
               stdout: "",
-              stderr: `Sandbox pod did not become Ready within ${effectiveTimeoutMs}ms`,
+              stderr: summary
+                ? `Sandbox pod did not become Ready within ${podReadyTimeoutMs}ms — recent pod events: ${summary}`
+                : `Sandbox pod did not become Ready within ${podReadyTimeoutMs}ms`,
               metadata: {
                 provider: "kubernetes",
                 backend: "sandbox-cr",
                 namespace,
                 sandboxName: lease.providerLeaseId,
+                transient: true,
+                podReadyTimeoutMs,
+                podEvents: events,
               },
             };
           }
@@ -938,6 +997,16 @@ const plugin = definePlugin({
       //
       // params.command / params.args / params.stdin are intentionally ignored.
 
+      // Bound the wait the same way as the sandbox-cr backend: min(run
+      // budget, podReadyTimeoutSec ?? 600s). NOTE this caps the Job's whole
+      // completion wait, not just its scheduling — the Job backend has no
+      // separate "pod is scheduled" signal distinct from "Job finished" (see
+      // getJobStatus), so a long-running Job now needs podReadyTimeoutSec
+      // raised past its expected runtime, or it will time out the same way a
+      // pod stuck Pending would. Operators on the Job backend running jobs
+      // longer than ten minutes must set podReadyTimeoutSec accordingly.
+      const podReadyTimeoutMs = resolvePodReadyTimeoutMs(config, effectiveTimeoutMs);
+
       let status;
       let timedOut = false;
       try {
@@ -945,7 +1014,7 @@ const plugin = definePlugin({
           clients,
           namespace,
           lease.providerLeaseId,
-          { timeoutMs: effectiveTimeoutMs, pollMs: 2000 },
+          { timeoutMs: podReadyTimeoutMs, pollMs: 2000 },
         );
       } catch (err) {
         if (err instanceof JobTimeoutError) {
@@ -981,11 +1050,24 @@ const plugin = definePlugin({
         );
       }
 
+      // On timeout, fetch the pod's recent events (FailedScheduling,
+      // ImagePullBackOff, etc.) so the caller knows WHY the Job never
+      // finished, not just that it didn't. timedOut already carries this
+      // file's transient/retryable classification (exitCode: null,
+      // timedOut: true, mirrored by metadata.transient below).
+      const timeoutEventSummary = timedOut
+        ? await summarizeRecentPodEvents(clients, namespace, podName ?? lease.providerLeaseId)
+        : null;
+
+      const stderrText = appendNetworkEgressDenyHint(stderrChunks.join(""), scopedNetworkEgress);
       return {
         exitCode: timedOut ? null : status?.phase === "Succeeded" ? 0 : 1,
         timedOut,
         stdout: stdoutChunks.join(""),
-        stderr: appendNetworkEgressDenyHint(stderrChunks.join(""), scopedNetworkEgress),
+        stderr:
+          timeoutEventSummary?.summary
+            ? `${stderrText}${stderrText ? "\n" : ""}Job did not complete within ${podReadyTimeoutMs}ms — recent pod events: ${timeoutEventSummary.summary}`
+            : stderrText,
         metadata: {
           provider: "kubernetes",
           backend: "job",
@@ -993,6 +1075,13 @@ const plugin = definePlugin({
           jobName: lease.providerLeaseId,
           podName: podName ?? null,
           phase: status?.phase ?? null,
+          ...(timedOut
+            ? {
+                transient: true,
+                podReadyTimeoutMs,
+                podEvents: timeoutEventSummary?.events ?? [],
+              }
+            : {}),
         },
       };
     }
