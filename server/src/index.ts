@@ -1162,11 +1162,15 @@ async function startServerWithDatabaseTeardown(
   const executionControlSweeps = [
     ["finalization", () => reconcileAbandonedExecutionControl(db)],
     ["replacement", () => heartbeat ? reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run) }) : undefined],
-    ["reconciliation_delivery", () => heartbeat ? deliverReconciledExecutions(db, heartbeat.wakeup) : undefined],
+    ["reconciliation_delivery", () => heartbeat ? deliverReconciledExecutions(db, heartbeat.wakeup, {
+      promote: heartbeat.promoteDeferredWakesAfterExecutionHold,
+    }) : undefined],
     ["status_delivery", () => deliverExecutionStatuses(db)],
     ["automatic_disposition", () => settleUnrecoverableExecutions(db)],
     ["inert_reconciliation", () => reconcileInertLegacyExecutions(db)],
-    ["held_wait_release", () => heartbeat ? deliverReleasedExecutionWaits(db, heartbeat.wakeup) : undefined],
+    ["held_wait_release", () => heartbeat ? deliverReleasedExecutionWaits(db, heartbeat.wakeup, new Date(), {
+      promote: heartbeat.promoteDeferredWakesAfterExecutionHold,
+    }) : undefined],
     ["local_ai_login_cleanup", () => localAiLoginService(db).reapExpired()],
   ] as const;
   const sweepExecutionControl = () => {

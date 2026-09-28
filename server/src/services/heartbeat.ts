@@ -25680,7 +25680,7 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; afterExecutionHold?: boolean } = {},
   ) {
     try {
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
@@ -25688,6 +25688,7 @@ export function heartbeatService(
         runId: run.id,
         now: new Date(),
         suppressImmediateRecovery: options.suppressImmediateRecovery,
+        ...(options.afterExecutionHold ? { afterExecutionHold: true } : {}),
       });
       await applyWakeQueuePostCommitEffects(postCommitEffects);
     } catch (error) {
@@ -25701,6 +25702,33 @@ export function heartbeatService(
       }
       throw error;
     }
+  }
+
+  /**
+   * Wakes saved behind an execution recovery hold that nothing else will
+   * deliver (mentions of other agents, answers to an agent's question) wait
+   * for the held run's queue drain, which stood down for the hold. Once the
+   * hold is closed, run that drain. It never retries the held run itself, and
+   * it stands down again while any hold or another execution owns the task.
+   */
+  async function promoteDeferredWakesAfterExecutionHold(input: {
+    companyId: string;
+    issueId: string;
+    runId: string;
+  }) {
+    const run = await getRun(input.runId);
+    if (
+      !run ||
+      run.companyId !== input.companyId ||
+      // Only a legacy run's release stands down for its hold; a native run's
+      // release records its own recovery and must not be replayed.
+      run.runtimeMode === "native" ||
+      !isHeartbeatRunTerminalStatus(run.status) ||
+      (run.nativeIssueId ?? readNonEmptyString(parseObject(run.contextSnapshot).issueId)) !== input.issueId
+    )
+      return false;
+    await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true, afterExecutionHold: true });
+    return true;
   }
 
   // A dependency wake that admission does not dispatch leaves only a receipt;
@@ -29060,6 +29088,7 @@ export function heartbeatService(
       }),
 
     wakeup: trackWakeup,
+    promoteDeferredWakesAfterExecutionHold,
     dispatchPendingNativeStatusWakeups,
     triggerIssueMonitor,
 

@@ -9585,6 +9585,7 @@ export function issueRoutes(
           await releaseHeldExecutionWaits(db, enqueueRecoveryActionWakeup, {
             companyId: result.issue.companyId,
             issueId: result.issue.id,
+            promote: heartbeat.promoteDeferredWakesAfterExecutionHold,
           });
         } catch (err) {
           logger.warn(

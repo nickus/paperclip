@@ -38,6 +38,7 @@ import { getExecutionBlocker } from "../services/execution-blocker.js";
 import {
   deliverReleasedExecutionWaits,
   HELD_EXECUTION_WAIT_RELEASE_ENV,
+  HELD_EXECUTION_WAIT_RELEASE_LOOKBACK_MS,
   HELD_EXECUTION_WAIT_RELEASE_RETRY_MS,
   heldExecutionWaitReleaseIdempotencyKey,
   releaseHeldExecutionWaits,
@@ -90,6 +91,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
+    await db.update(issues).set({ checkoutRunId: null, executionRunId: null });
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueRelations);
@@ -520,6 +522,27 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       expect(wake).toHaveBeenCalledTimes(26);
     });
 
+    it("leaves a continuation out of the delivery batch while a first-class blocker is unresolved", async () => {
+      const { companyId, agentId, issueId } = await seedCompany();
+      await seedStoppedRun({ companyId, agentId, issueId });
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
+      // A blocker added after the reconciliation.
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId, companyId, title: "Blocker", status: "todo", priority: "medium",
+        issueNumber: 2, identifier: `BLK-${blockerId.slice(0, 4)}`,
+      });
+      await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      await deliverReconciledExecutions(db, wake);
+      expect(wake).not.toHaveBeenCalled();
+      expect((await legacyActions(issueId))[0]!.evidence).toMatchObject({ continuationDelivery: "pending" });
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
+      await deliverReconciledExecutions(db, wake);
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect(wake).toHaveBeenCalledWith(agentId, expect.objectContaining({ reason: "issue_recovery_action_restored" }));
+    });
+
     it("does not chain automatic continuations", async () => {
       const { companyId, agentId, issueId } = await seedCompany();
       await seedStoppedRun({
@@ -882,9 +905,23 @@ describeEmbeddedPostgres("execution recovery holds", () => {
 
     const releaseKeyPrefix = (issueId: string, agentId: string) => `execution-hold-released:${issueId}:${agentId}:`;
 
+    /** Stands in for admission: queues a run and adopts the agent's saved comments. */
+    function admittingWake() {
+      return vi.fn(async (agentId: string, opts: { payload?: Record<string, unknown> }) => {
+        const runId = randomUUID();
+        await db.update(agentWakeupRequests).set({ status: "coalesced", runId, finishedAt: new Date() }).where(and(
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          eq(agentWakeupRequests.reason, "issue_commented"),
+          sql`${agentWakeupRequests.payload}->>'issueId' = ${String(opts.payload?.issueId)}`,
+        ));
+        return { id: runId } as never;
+      });
+    }
+
     it("releases once when an operator cancels the hold through the resolve route", async () => {
       const { companyId, agentId, issueId, action, receipt, queue } = await heldTask();
-      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      const wake = admittingWake();
       const app = createApp(wake);
       await request(app).post(`/api/issues/${issueId}/recovery-actions/resolve`)
         .send({ actionId: action.id, outcome: "cancelled", sourceIssueStatus: "in_review" })
@@ -916,7 +953,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
 
     it("releases once when an operator restores the task for review through the route", async () => {
       const { agentId, issueId, action } = await heldTask();
-      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      const wake = admittingWake();
       await request(createApp(wake)).post(`/api/issues/${issueId}/recovery-actions/resolve`)
         .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "in_review" })
         .expect(200);
@@ -1191,7 +1228,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       await seedStoppedRun({ companyId, agentId, issueId, overrides: workedRun });
       const newer = (await legacyActions(issueId)).find((candidate) => candidate.status === "active")!;
       expect(newer.id).not.toBe(action.id);
-      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      const wake = admittingWake();
       expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "held" });
       expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ delivered: 0 });
       expect(wake).not.toHaveBeenCalled();
@@ -1218,7 +1255,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
     it("releases again, once, for a new hold on the same task", async () => {
       const { companyId, agentId, issueId, action } = await heldTask();
       await closeHold(action.id);
-      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      const wake = admittingWake();
       expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "delivered" });
       // A later incident holds a new signal.
       await seedStoppedRun({ companyId, agentId, issueId, overrides: workedRun });
@@ -1228,7 +1265,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "delivered" });
       expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "no_held_wakes" });
       expect(wake).toHaveBeenCalledTimes(2);
-      const [first, second] = wake.mock.calls.map((call) => (call[1] as { idempotencyKey: string }).idempotencyKey);
+      const [first, second] = wake.mock.calls.map((call) => (call[1] as unknown as { idempotencyKey: string }).idempotencyKey);
       expect(second).not.toBe(first);
     });
 
@@ -1248,6 +1285,183 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       expect(wake).toHaveBeenCalledWith(agentId, expect.anything());
       await deliverReleasedExecutionWaits(db, wake);
       expect(wake).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps a paused owner's held wakes past the lookback and delivers them once it is resumed", async () => {
+      const { agentId, issueId, action, receipt, queue } = await heldTask();
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+      await closeHold(action.id);
+      const wake = admittingWake();
+      expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ checked: 1, delivered: 0 });
+      // No wake is spent on an owner that would only decline it.
+      expect(wake).not.toHaveBeenCalled();
+      expect((await legacyActions(issueId))[0]!.evidence).toMatchObject({
+        heldWakeRelease: { state: "retry", reason: "owner_unavailable" },
+      });
+
+      // Paused for longer than the lookback: still retried, still kept.
+      const dayLater = new Date(Date.now() + HELD_EXECUTION_WAIT_RELEASE_LOOKBACK_MS + 60 * 60_000);
+      expect(await deliverReleasedExecutionWaits(db, wake, dayLater)).toMatchObject({ checked: 1, delivered: 0 });
+      expect(await row(queue.id)).toMatchObject({ status: "deferred_issue_execution" });
+
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
+      const resumed = new Date(dayLater.getTime() + HELD_EXECUTION_WAIT_RELEASE_RETRY_MS + 1_000);
+      expect(await deliverReleasedExecutionWaits(db, wake, resumed)).toMatchObject({ delivered: 1 });
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect(await row(queue.id)).toMatchObject({ status: "coalesced" });
+      expect((await row(receipt.id)).payload).toMatchObject({
+        executionWait: { releaseOutcome: "delivered", releasedSignalCount: 2 },
+      });
+      await deliverReleasedExecutionWaits(db, wake, new Date(resumed.getTime() + HELD_EXECUTION_WAIT_RELEASE_LOOKBACK_MS));
+      expect(wake).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps retrying a declined delivery past the lookback, backing off, then delivers once", async () => {
+      const { issueId, action, receipt } = await heldTask();
+      await closeHold(action.id);
+      let declining = true;
+      const admit = admittingWake();
+      const wake = vi.fn(async (agentId: string, opts: { payload?: Record<string, unknown> }) => {
+        if (declining) throw new Error("Budget limit reached");
+        return admit(agentId, opts);
+      });
+      expect(await deliverReleasedExecutionWaits(db, wake as never)).toMatchObject({ retried: 1 });
+      const dayLater = new Date(Date.now() + HELD_EXECUTION_WAIT_RELEASE_LOOKBACK_MS + 60 * 60_000);
+      expect(await deliverReleasedExecutionWaits(db, wake as never, dayLater)).toMatchObject({ retried: 1 });
+      expect((await legacyActions(issueId))[0]!.evidence).toMatchObject({
+        heldWakeRelease: { state: "retry", reason: "retry", backoff: 2 },
+      });
+      declining = false;
+      // Two retries in a row: the next attempt waits two retry intervals.
+      const tooSoon = new Date(dayLater.getTime() + HELD_EXECUTION_WAIT_RELEASE_RETRY_MS + 60_000);
+      expect(await deliverReleasedExecutionWaits(db, wake as never, tooSoon)).toMatchObject({ checked: 0 });
+      const due = new Date(dayLater.getTime() + 2 * HELD_EXECUTION_WAIT_RELEASE_RETRY_MS + 1_000);
+      expect(await deliverReleasedExecutionWaits(db, wake as never, due)).toMatchObject({ delivered: 1 });
+      expect(wake).toHaveBeenCalledTimes(3);
+      const keys = wake.mock.calls.map((call) => (call[1] as unknown as { idempotencyKey: string }).idempotencyKey);
+      expect(new Set(keys).size).toBe(1);
+      expect((await row(receipt.id)).payload).toMatchObject({ executionWait: { releaseOutcome: "delivered" } });
+    });
+
+    it("finalizes a terminated owner's held wakes instead of retrying them", async () => {
+      const { companyId, agentId, issueId, action, receipt, queue } = await heldTask();
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+      await closeHold(action.id);
+      const wake = admittingWake();
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({
+        state: "not_applicable", agentId,
+      });
+      expect(wake).not.toHaveBeenCalled();
+      expect((await row(receipt.id)).payload).toMatchObject({
+        executionWait: { releaseOutcome: "not_applicable", releaseReason: "owner_not_invokable" },
+      });
+      expect(await row(queue.id)).toMatchObject({ status: "cancelled" });
+      expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ checked: 1, retried: 0 });
+      expect((await legacyActions(issueId))[0]!.evidence).toMatchObject({ heldWakeRelease: { state: "no_held_wakes" } });
+      expect(wake).not.toHaveBeenCalled();
+    });
+
+    it("keeps a saved comment held when admission does not adopt it", async () => {
+      const { companyId, issueId, action, receipt, queue } = await heldTask();
+      await closeHold(action.id);
+      // A gate declines the wake and records its own receipt.
+      const gated = vi.fn(async () => null);
+      expect(await releaseHeldExecutionWaits(db, gated as never, { companyId, issueId })).toMatchObject({ state: "retry" });
+      // That receipt owns the automatic signals; the saved comment is still waiting.
+      expect((await row(receipt.id)).payload).toMatchObject({ executionWait: { releaseOutcome: "delivered" } });
+      expect(await row(queue.id)).toMatchObject({
+        status: "deferred_issue_execution",
+        payload: { executionWait: expect.not.objectContaining({ releasedAt: expect.anything() }) },
+      });
+
+      const wake = admittingWake();
+      const later = new Date(Date.now() + HELD_EXECUTION_WAIT_RELEASE_RETRY_MS + 1_000);
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId, now: later })).toMatchObject({
+        state: "delivered", deliveredWaitIds: [queue.id],
+      });
+      expect(await row(queue.id)).toMatchObject({
+        status: "coalesced", payload: { executionWait: { releaseOutcome: "delivered" } },
+      });
+    });
+
+    it("delivers the held wakes of the agent a pending review stage waits on", async () => {
+      const { companyId, agentId, issueId } = await seedCompany();
+      const reviewerId = await addAgent(companyId, "Reviewer");
+      await db.update(issues).set({
+        status: "in_review",
+        executionState: {
+          status: "pending", currentStageId: randomUUID(), currentStageIndex: 0, currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerId, userId: null },
+          returnAssignee: { type: "agent", agentId, userId: null },
+          completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        },
+      }).where(eq(issues.id, issueId));
+      await seedStoppedRun({ companyId, agentId: reviewerId, issueId, overrides: workedRun });
+      const [action] = await legacyActions(issueId);
+      expect(action).toMatchObject({ returnOwnerAgentId: agentId, evidence: { reviewParticipantAgentId: reviewerId } });
+      await holdSignal(reviewerId, issueId);
+      const [receipt] = (await wakeRows(issueId, HELD)).filter((wake) => wake.agentId === reviewerId);
+      expect(receipt).toBeDefined();
+      const { queue } = await saveCommentQueue({ companyId, agentId: reviewerId, issueId, actionId: action!.id });
+      await closeHold(action!.id);
+
+      const wake = admittingWake();
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({
+        state: "delivered", agentId: reviewerId,
+      });
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect((wake.mock.calls[0] as unknown as [string])[0]).toBe(reviewerId);
+      expect((await row(receipt!.id)).payload).toMatchObject({ executionWait: { releaseOutcome: "delivered" } });
+      // The review stage still waits on this agent: its saved comment is delivered, not cancelled.
+      expect(await row(queue.id)).toMatchObject({ status: "coalesced" });
+    });
+
+    it("promotes a mention saved behind the hold when the assignee had nothing held", async () => {
+      const { companyId, agentId, issueId } = await seedCompany();
+      const userId = await prepareRealAdmission(companyId, agentId);
+      const reviewerId = await addAgent(companyId, "Reviewer");
+      await prepareRealAdmission(companyId, reviewerId);
+      await seedStoppedRun({ companyId, agentId, issueId, overrides: workedRun });
+      const [action] = await legacyActions(issueId);
+      const [comment] = await db.insert(issueComments).values({
+        companyId, issueId, authorType: "user", authorUserId: userId, body: "@Reviewer please take a look.",
+      }).returning();
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      expect(await heartbeat.wakeup(reviewerId, {
+        source: "automation", triggerDetail: "system", reason: "issue_comment_mentioned",
+        payload: { issueId, commentId: comment!.id }, requestedByActorType: "user", requestedByActorId: userId,
+        contextSnapshot: {
+          issueId, taskId: issueId, commentId: comment!.id, wakeCommentId: comment!.id,
+          wakeReason: "issue_comment_mentioned",
+        },
+      })).toBeNull();
+      const [mention] = (await wakeRows(issueId)).filter((wake) => wake.agentId === reviewerId);
+      expect(mention).toMatchObject({
+        status: "deferred_issue_execution", payload: { executionWait: { recoveryActionId: action!.id } },
+      });
+
+      // Still held: nothing is promoted.
+      const promote = heartbeat.promoteDeferredWakesAfterExecutionHold;
+      const wake = vi.fn(heartbeat.wakeup);
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId, promote })).toMatchObject({ state: "held" });
+      expect(await row(mention!.id)).toMatchObject({ status: "deferred_issue_execution" });
+
+      await closeHold(action!.id);
+      expect(await deliverReleasedExecutionWaits(db, wake, new Date(), { promote })).toMatchObject({ checked: 1 });
+      expect(wake).not.toHaveBeenCalled();
+      const promoted = await row(mention!.id);
+      expect(promoted.status).not.toBe("deferred_issue_execution");
+      const reviewerRuns = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, reviewerId)))
+        .filter((run) => run.contextSnapshot?.issueId === issueId);
+      expect(reviewerRuns).toHaveLength(1);
+      expect(reviewerRuns[0]).toMatchObject({ id: promoted.runId, status: "queued" });
+      // The held run itself is not retried.
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+        .filter((run) => run.contextSnapshot?.issueId === issueId)).toHaveLength(1);
+
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId, promote })).toMatchObject({
+        state: "no_held_wakes", promotedDeferredWakes: false,
+      });
     });
   });
 
@@ -1329,7 +1543,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       expect(await reconcileInertLegacyExecutions(db, later)).toMatchObject({ reconciled: 1 });
     });
 
-    it("keeps the task blocked when a first-class blocker still applies", async () => {
+    it("waits for an unresolved first-class blocker before continuing the task", async () => {
       const fixture = await seedCompany();
       const blockerId = randomUUID();
       await db.insert(issues).values({
@@ -1341,8 +1555,25 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       });
       await seedStoppedRun({ ...fixture, finishedAt: new Date(Date.now() - INERT_RUN_SETTLE_GRACE_MS - 60_000) });
       await settleUnrecoverableExecutions(db, new Date());
-      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
+      // Its continuation could not be admitted yet: nothing is reconciled, and
+      // no pending continuation is left to retry on every sweep.
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 0, deferred: 1 });
+      const [waiting] = await legacyActions(fixture.issueId);
+      expect(waiting).toMatchObject({
+        status: "resolved",
+        evidence: {
+          automaticRecovery: { replay: "blocked" },
+          inertRunAssessment: { verdict: "deferred", reason: "first_class_blocker_unresolved" },
+        },
+      });
+      expect(waiting!.evidence).not.toHaveProperty("continuationDelivery");
       expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!.status).toBe("blocked");
+      // Rechecked at a bounded pace, and continued once the blocker is done.
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 0 });
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
+      const later = new Date(Date.now() + INERT_RUN_RELEASE_RECHECK_MS + 1_000);
+      expect(await reconcileInertLegacyExecutions(db, later)).toMatchObject({ reconciled: 1 });
+      expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!.status).toBe("todo");
     });
 
     it("keeps a task that was blocked before the hold blocked", async () => {
@@ -1355,6 +1586,77 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       });
       expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
       expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!.status).toBe("blocked");
+    });
+
+    it("keeps a blocked task blocked when the status before the hold was not recorded", async () => {
+      const fixture = await seedCompany();
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
+      await seedStoppedRun({ ...fixture, finishedAt: new Date(Date.now() - INERT_RUN_SETTLE_GRACE_MS - 60_000) });
+      await settleUnrecoverableExecutions(db, new Date());
+      // Holds settled by an earlier version carry no status from before the hold.
+      const [settled] = await legacyActions(fixture.issueId);
+      const { issueStatusBefore, ...automaticRecovery } = settled!.evidence.automaticRecovery as Record<string, unknown>;
+      expect(issueStatusBefore).toBe("blocked");
+      await db.update(issueRecoveryActions).set({ evidence: { ...settled!.evidence, automaticRecovery } })
+        .where(eq(issueRecoveryActions.id, settled!.id));
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
+      expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!.status).toBe("blocked");
+    });
+
+    it("leaves a settled hold to an operator once the board parks its task, and continues it back in work", async () => {
+      const { companyId, issueId, settled } = await settledInertHold();
+      await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, issueId));
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 0, deferred: 1 });
+      const wake = vi.fn();
+      await deliverReconciledExecutions(db, wake as never);
+      expect(wake).not.toHaveBeenCalled();
+      expect((await legacyActions(issueId))[0]).toMatchObject({
+        status: "resolved",
+        evidence: {
+          automaticRecovery: { replay: "blocked" },
+          inertRunAssessment: { verdict: "deferred", reason: "status_changed:backlog" },
+        },
+      });
+      expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: settled.id });
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("backlog");
+
+      // Rechecked at a bounded pace; back in work, it is continued as is.
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 0 });
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+      const later = new Date(Date.now() + INERT_RUN_RELEASE_RECHECK_MS + 1_000);
+      expect(await reconcileInertLegacyExecutions(db, later)).toMatchObject({ reconciled: 1 });
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("in_progress");
+    });
+
+    it("does not let settled holds of tasks another run took over fill the batch", async () => {
+      const busy = await seedCompany();
+      const finishedAt = new Date(Date.now() - INERT_RUN_SETTLE_GRACE_MS - 60_000);
+      for (let i = 0; i < 25; i += 1) {
+        const issueId = randomUUID();
+        await db.insert(issues).values({
+          id: issueId, companyId: busy.companyId, title: `Task ${i}`, status: "in_progress",
+          priority: "medium", assigneeAgentId: busy.agentId, issueNumber: 10 + i,
+          identifier: `TK-${i}-${issueId.slice(0, 4)}`,
+        });
+        // Another run still holds the task's checkout.
+        const holderId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: holderId, companyId: busy.companyId, agentId: busy.agentId, invocationSource: "assignment",
+          status: "failed", runtimeMode: "legacy", contextSnapshot: { issueId: randomUUID() },
+        });
+        await db.update(issues).set({ checkoutRunId: holderId }).where(eq(issues.id, issueId));
+        await seedStoppedRun({ companyId: busy.companyId, agentId: busy.agentId, issueId, finishedAt });
+        await settleUnrecoverableExecutions(db, new Date());
+        expect((await legacyActions(issueId))[0]).toMatchObject({
+          status: "resolved", outcome: "cancelled", evidence: { automaticRecovery: { replay: "blocked" } },
+        });
+      }
+      // A new hold of a run stopped moments ago.
+      const fresh = await seedCompany();
+      await seedStoppedRun({ ...fresh });
+      expect((await legacyActions(fresh.issueId))[0]).toMatchObject({ status: "active" });
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 1, reconciled: 1 });
+      expect((await legacyActions(fresh.issueId))[0]).toMatchObject({ outcome: "restored" });
     });
 
     it.each([
