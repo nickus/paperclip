@@ -35,7 +35,10 @@ export type {
 import {
   createCommandManagedSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAsset,
+  createSandboxCallbackBridgeAuthorizer,
   createSandboxCallbackBridgeToken,
+  normalizeSandboxCallbackBridgePolicy,
+  type SandboxCallbackBridgePolicy,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
   HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
   SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT,
@@ -134,7 +137,26 @@ export interface AdapterLocalExecutionTarget extends AdapterExecutionTargetWorks
   leaseId?: string | null;
 }
 
-export interface AdapterSshExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
+/**
+ * Host-only settings for the Paperclip API bridge of a remote target. The host
+ * stamps them from the environment config; they are never written into the
+ * remote environment.
+ */
+interface AdapterRemoteExecutionTargetBridgeSettings {
+  /**
+   * Route policy for this run's Paperclip API bridge. Absent or any value
+   * other than `"agent"` keeps the restricted allowlist.
+   */
+  paperclipApiBridgePolicy?: SandboxCallbackBridgePolicy | null;
+  /**
+   * The company the run belongs to. The `agent` bridge policy refuses
+   * company-scoped paths for any other company.
+   */
+  paperclipApiBridgeCompanyId?: string | null;
+}
+
+export interface AdapterSshExecutionTarget
+  extends AdapterExecutionTargetWorkspaceMetadata, AdapterRemoteExecutionTargetBridgeSettings {
   kind: "remote";
   transport: "ssh";
   environmentId?: string | null;
@@ -177,7 +199,8 @@ export interface SandboxLeaseAcquisition {
   reason?: "not_found" | "expired" | "identity_mismatch" | "resume_failed";
 }
 
-export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
+export interface AdapterSandboxExecutionTarget
+  extends AdapterExecutionTargetWorkspaceMetadata, AdapterRemoteExecutionTargetBridgeSettings {
   kind: "remote";
   transport: "sandbox";
   providerKey?: string | null;
@@ -543,6 +566,30 @@ export function adapterExecutionTargetUsesPaperclipBridge(
   target: AdapterExecutionTarget | null | undefined,
 ): boolean {
   return target?.kind === "remote";
+}
+
+/**
+ * Read the Paperclip API bridge route policy off a target. Only a remote
+ * target stamped with the literal `"agent"` returns `"agent"`; everything else
+ * fails closed to `"restricted"`.
+ */
+export function adapterExecutionTargetPaperclipApiBridgePolicy(
+  target: AdapterExecutionTarget | null | undefined,
+): SandboxCallbackBridgePolicy {
+  return target?.kind === "remote"
+    ? normalizeSandboxCallbackBridgePolicy(target.paperclipApiBridgePolicy)
+    : "restricted";
+}
+
+function readBridgeSettingsFromParsedTarget(
+  parsed: Record<string, unknown>,
+): AdapterRemoteExecutionTargetBridgeSettings {
+  return {
+    ...(parsed.paperclipApiBridgePolicy === "agent" ? { paperclipApiBridgePolicy: "agent" as const } : {}),
+    ...(typeof parsed.paperclipApiBridgeCompanyId === "string" && parsed.paperclipApiBridgeCompanyId.trim()
+      ? { paperclipApiBridgeCompanyId: parsed.paperclipApiBridgeCompanyId.trim() }
+      : {}),
+  };
 }
 
 export function describeAdapterExecutionTarget(
@@ -1353,6 +1400,7 @@ export function parseAdapterExecutionTarget(value: unknown): AdapterExecutionTar
       leaseId: readStringMeta(parsed, "leaseId"),
       remoteCwd: spec.remoteCwd,
       spec,
+      ...readBridgeSettingsFromParsedTarget(parsed),
     };
   }
 
@@ -1373,6 +1421,7 @@ export function parseAdapterExecutionTarget(value: unknown): AdapterExecutionTar
       // or any other value parses as no grant, so a round-trip never invents one.
       enableSandboxDuplexBridge: parsed.enableSandboxDuplexBridge === true,
       ...(effectiveCapabilities ? { effectiveCapabilities } : {}),
+      ...readBridgeSettingsFromParsedTarget(parsed),
     };
   }
 
@@ -1753,6 +1802,13 @@ function buildBridgeResponseHeaders(response: Response): Record<string, string> 
 
 function buildBridgeForwardUrl(baseUrl: string, request: { path: string; query: string }): URL {
   const url = new URL(request.path, baseUrl);
+  // The bridge attaches the run token to this request. A network-path
+  // reference such as `//other-host/...` resolves to another origin, so never
+  // forward anywhere but the configured API origin, whatever the authorizer
+  // in front of this call admitted.
+  if (url.origin !== new URL(baseUrl).origin) {
+    throw new Error("Bridge request path resolves outside the Paperclip API origin.");
+  }
   const query = request.query.trim();
   url.search = query.startsWith("?") ? query.slice(1) : query;
   return url;
@@ -4210,6 +4266,13 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // forward budget (30 s) when the caller sets no option, so current behavior
   // does not change.
   const forwardTimeoutMs = input.forwardTimeoutMs ?? DEFAULT_DUPLEX_BROKER_BUDGETS.forwardTimeoutMs;
+  // One route authorizer for both transports, bound to the policy and company
+  // the host stamped on the target. An unstamped target keeps the restricted
+  // allowlist.
+  const authorizeBridgeRequest = createSandboxCallbackBridgeAuthorizer({
+    policy: adapterExecutionTargetPaperclipApiBridgePolicy(target),
+    companyId: target.paperclipApiBridgeCompanyId ?? null,
+  });
 
   const runtimeRootDir =
     input.runtimeRootDir?.trim().length
@@ -4622,6 +4685,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             bridgeToken,
             forwardRequest: http2ForwardRequest,
             routes: HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
+            authorizeRequest: authorizeBridgeRequest,
             // The same resolved limit the launch environment hands the
             // sandbox-side gateway (`PAPERCLIP_BRIDGE_MAX_BODY_BYTES`,
             // below), so the host check and the gateway check enforce one
@@ -4735,6 +4799,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       client,
       queueDir,
       maxBodyBytes,
+      authorizeRequest: authorizeBridgeRequest,
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
       // The worker encodes binary bodies only at the queue boundary.

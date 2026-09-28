@@ -773,6 +773,13 @@ export interface CreateHttp2BridgeServerOptions {
   forwardRequest: Http2BridgeForwardHandler;
   /** The route allowlist. The default is {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST}. */
   routes?: readonly SandboxCallbackBridgeRouteRule[];
+  /**
+   * A route authorizer that replaces `routes` when set, for example one built
+   * by `createSandboxCallbackBridgeAuthorizer` for a bridge route policy. It
+   * receives the canonical method and pathname and returns null to forward
+   * the request, or the denial message for a 403.
+   */
+  authorizeRequest?: (request: { method: string; path: string }) => string | null;
   /** The header allowlist. The default is {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST}. */
   headerAllowlist?: readonly string[];
   /** The maximum request body size, in bytes. The default is {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES}. */
@@ -1203,10 +1210,12 @@ export function createHttp2BridgeServer(options: CreateHttp2BridgeServerOptions)
       }
       const method = normalizeStreamMethod(headers[":method"]);
 
-      const denialReason = authorizeSandboxCallbackBridgeRequestWithRoutes(
-        { method, path: parsedPath.value.pathname },
-        routes,
-      );
+      const denialReason = options.authorizeRequest
+        ? options.authorizeRequest({ method, path: parsedPath.value.pathname })
+        : authorizeSandboxCallbackBridgeRequestWithRoutes(
+          { method, path: parsedPath.value.pathname },
+          routes,
+        );
       if (denialReason) {
         denyRequest(stream, 403, { error: denialReason }, bodyBounds);
         return;

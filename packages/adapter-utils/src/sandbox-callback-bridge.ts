@@ -22,6 +22,9 @@ import {
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import type { RunProcessResult } from "./server-utils.js";
+import type { SandboxCallbackBridgePolicy } from "@paperclipai/shared";
+
+export type { SandboxCallbackBridgePolicy };
 
 const DEFAULT_BRIDGE_TOKEN_BYTES = 24;
 const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 100;
@@ -439,6 +442,281 @@ export function authorizeSandboxCallbackBridgeRequestWithRoutes(
   return routes.some((route) => route.method === method && route.path.test(request.path))
     ? null
     : `Route not allowed: ${method} ${request.path}`;
+}
+
+// ---------------------------------------------------------------------------
+// Route policies
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a bridge route policy from untrusted config. Only the literal
+ * `"agent"` selects the wider policy; every other value, including a missing
+ * one, keeps the `restricted` allowlist, so a typo never widens access.
+ */
+export function normalizeSandboxCallbackBridgePolicy(value: unknown): SandboxCallbackBridgePolicy {
+  return value === "agent" ? "agent" : "restricted";
+}
+
+const CANONICAL_PATH_CHECK_BASE = "http://bridge.invalid";
+
+/**
+ * Return why a bridge request path is not in canonical origin form, or null
+ * when it is. The host forwards `path` with `new URL(path, apiBase)`, and the
+ * server routes on the normalized result, so a path that normalization would
+ * change (`//other-host/...`, `.`/`..` segments, their percent-encoded forms,
+ * backslashes, control characters) could send the run token to another
+ * origin or reach a route other than the one the policy matched. The in-sandbox
+ * gateway already sends canonical paths, so only a forged request fails here.
+ */
+export function describeNonCanonicalSandboxCallbackBridgePath(path: string): string | null {
+  if (typeof path !== "string" || !path.startsWith("/")) return "path must start with /";
+  if (path.includes("//")) return "empty path segment";
+  if (path.includes("\\")) return "backslash in path";
+  // Printable ASCII only: no spaces, control characters, or raw non-ASCII.
+  if (/[^\x21-\x7e]/.test(path)) return "non-printable or non-ASCII character in path";
+  if (/%(?:2e|2f|5c|00)/i.test(path)) return "percent-encoded dot, slash, backslash, or NUL in path";
+  if (path.split("/").some((segment) => segment === "." || segment === "..")) return "dot segment in path";
+  let parsed: URL;
+  try {
+    parsed = new URL(path, CANONICAL_PATH_CHECK_BASE);
+  } catch {
+    return "path does not parse as a URL path";
+  }
+  // The origin check catches a network-path reference; the pathname check
+  // catches anything URL normalization would rewrite, including `?` and `#`.
+  if (parsed.origin !== CANONICAL_PATH_CHECK_BASE || parsed.pathname !== path) {
+    return "path changes under URL normalization";
+  }
+  return null;
+}
+
+interface AgentBridgeRouteRule {
+  methods: readonly string[];
+  // Matched against the lower-cased path with any trailing slash removed.
+  path: RegExp;
+}
+
+const ALL_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
+const WRITE_METHODS = ["POST", "PUT", "PATCH", "DELETE"] as const;
+
+/**
+ * Routes the `agent` policy refuses even when an allow rule below would match.
+ * Each one either returns credential material, or lets a run change where or
+ * with which secrets later runs execute (an agent's own record, its config
+ * revisions, environments), which the server would otherwise allow for some
+ * agents. Deny rules run before allow rules.
+ */
+export const AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRouteRule[] = [
+  // Any path segment that names secrets: secret values, proposals, provider
+  // configs, user secrets, environment secret refs, trigger secret rotation.
+  { methods: ALL_METHODS, path: /(?:^|\/)[^/]*secret[^/]*(?:\/|$)/ },
+  // Agent API keys, tool and OAuth connection tokens, raw provider traces.
+  { methods: ALL_METHODS, path: /^\/api\/agents\/[^/]+\/keys(?:\/|$)/ },
+  { methods: ALL_METHODS, path: /^\/api\/agents\/[^/]+\/(?:connections|tools|tool-[^/]+)(?:\/|$)/ },
+  { methods: ALL_METHODS, path: /(?:^|\/)provider-traces?(?:\/|$)/ },
+  // The agent record, its permissions, budgets, lifecycle, and config
+  // history. Changing them can move later runs to another environment.
+  { methods: WRITE_METHODS, path: /^\/api\/agents\/[^/]+$/ },
+  {
+    methods: WRITE_METHODS,
+    path: /^\/api\/agents\/[^/]+\/(?:permissions|budgets|pause|resume|approve|terminate|clear-error|claude-login|heartbeat|runtime-state|config-revisions|instructions-bundle)(?:\/|$)/,
+  },
+  // Board-only issue recovery and host workspace file reads.
+  { methods: ALL_METHODS, path: /^\/api\/issues\/[^/]+\/admin(?:\/|$)/ },
+  { methods: ALL_METHODS, path: /^\/api\/issues\/[^/]+\/file-resources(?:\/|$)/ },
+];
+
+const COMPANY = "^\\/api\\/companies\\/[^/]+";
+const SEGMENTS = "(?:\\/[^/]+)*";
+
+// Company-scoped read families. Anything else under a company (environments,
+// secrets, tools, adapters, AI connections, invites, members' writes, budgets,
+// exports) stays unreachable.
+const AGENT_COMPANY_READ_FAMILIES = [
+  "dashboard",
+  "agents",
+  "org",
+  "org\\.png",
+  "org\\.svg",
+  "issues",
+  "search",
+  "projects",
+  "project-repositories",
+  "goals",
+  "approvals",
+  "routines",
+  "skills",
+  "labels",
+  "activity",
+  "audit",
+  "artifacts",
+  "timeline",
+  "execution-workspaces",
+  "workspace-overview",
+  "status-cards",
+  "costs",
+  "user-directory",
+  "members",
+  "agent-configurations",
+  "heartbeat-runs",
+  "live-runs",
+  "summary-slots",
+  "built-in-agents",
+  "feedback-traces",
+].join("|");
+
+/**
+ * Route families the `agent` policy forwards. The server still authorizes
+ * every forwarded call for the agent (company scope, issue visibility and
+ * mutation grants, the cross-issue write cap, "own routines only", board-only
+ * approval decisions, and so on); this list only bounds what a run can reach
+ * at all. It is a superset of the restricted allowlist.
+ */
+export const AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRouteRule[] = [
+  // Agents: every read, self-wake, and the skill/instructions-path calls the
+  // restricted list already carries.
+  { methods: ["GET"], path: new RegExp(`^\\/api\\/agents${SEGMENTS}$`) },
+  { methods: ["POST"], path: /^\/api\/agents\/[^/]+\/wakeup$/ },
+  { methods: ["POST"], path: /^\/api\/agents\/[^/]+\/skills\/sync$/ },
+  { methods: ["PATCH"], path: /^\/api\/agents\/[^/]+\/instructions-path$/ },
+
+  // Issues and everything under them: comments, documents, checkout and
+  // release, children, interactions, work products, attachments, approvals,
+  // recovery actions, watchdogs, tree holds.
+  { methods: ALL_METHODS, path: new RegExp(`^\\/api\\/issues${SEGMENTS}$`) },
+  { methods: ["PATCH", "DELETE"], path: /^\/api\/work-products\/[^/]+$/ },
+  { methods: ["GET"], path: /^\/api\/attachments\/[^/]+\/content$/ },
+  { methods: ["DELETE"], path: /^\/api\/attachments\/[^/]+$/ },
+  { methods: ["DELETE"], path: /^\/api\/labels\/[^/]+$/ },
+
+  // Company-scoped reads and the company-scoped creates agents use.
+  { methods: ["GET"], path: new RegExp(`${COMPANY}$`) },
+  { methods: ["GET"], path: new RegExp(`${COMPANY}\\/(?:${AGENT_COMPANY_READ_FAMILIES})${SEGMENTS}$`) },
+  { methods: ["GET"], path: new RegExp(`${COMPANY}\\/budgets\\/overview$`) },
+  { methods: ["GET"], path: new RegExp(`${COMPANY}\\/email\\/(?:inboxes|tasks\\/[^/]+|deliveries\\/[^/]+)$`) },
+  { methods: ["POST"], path: new RegExp(`${COMPANY}\\/(?:issues|labels|routines|approvals|agent-hires)$`) },
+  { methods: ["POST"], path: new RegExp(`${COMPANY}\\/issues\\/[^/]+\\/attachments$`) },
+  { methods: ["POST"], path: new RegExp(`${COMPANY}\\/email\\/send$`) },
+  { methods: ["PUT"], path: new RegExp(`${COMPANY}\\/summary-slots\\/[^/]+\\/[^/]+$`) },
+  { methods: ["POST"], path: new RegExp(`${COMPANY}\\/summary-slots\\/[^/]+\\/[^/]+\\/generate$`) },
+
+  // Runs and their trajectories.
+  {
+    methods: ["GET"],
+    path: /^\/api\/heartbeat-runs\/[^/]+(?:\/(?:events|log|issues|workspace-operations))?$/,
+  },
+  { methods: ["GET"], path: /^\/api\/workspace-operations\/[^/]+\/log$/ },
+
+  // Routines the agent owns (the server enforces ownership) and approvals
+  // (the server keeps approve/reject board-only).
+  { methods: ALL_METHODS, path: new RegExp(`^\\/api\\/routines\\/[^/]+${SEGMENTS}$`) },
+  { methods: ["PATCH", "DELETE"], path: /^\/api\/routine-triggers\/[^/]+$/ },
+  { methods: ALL_METHODS, path: new RegExp(`^\\/api\\/approvals\\/[^/]+${SEGMENTS}$`) },
+
+  // Read-only context.
+  { methods: ["GET"], path: new RegExp(`^\\/api\\/projects\\/[^/]+${SEGMENTS}$`) },
+  { methods: ["GET"], path: /^\/api\/goals\/[^/]+$/ },
+  {
+    methods: ["GET"],
+    path: /^\/api\/execution-workspaces\/[^/]+(?:\/(?:close-readiness|workspace-operations))?$/,
+  },
+  { methods: ["POST"], path: /^\/api\/execution-workspaces\/[^/]+\/runtime-services\/(?:start|stop|restart)$/ },
+  { methods: ["GET"], path: new RegExp(`^\\/api\\/status-cards\\/[^/]+${SEGMENTS}$`) },
+  { methods: ["GET"], path: /^\/api\/feedback-traces\/[^/]+(?:\/bundle)?$/ },
+  { methods: ["GET"], path: /^\/api\/assets\/[^/]+\/content$/ },
+  { methods: ["GET"], path: new RegExp(`^\\/api\\/skills${SEGMENTS}$`) },
+  { methods: ["GET"], path: /^\/api\/health$/ },
+  { methods: ["GET"], path: /^\/api\/openapi\.json$/ },
+  { methods: ["GET"], path: /^(?:\/api)?\/llms(?:\/[^/]+)+$/ },
+
+  // Plugin tools; the tool gateway applies the agent's tool policy.
+  { methods: ["GET"], path: /^\/api\/plugins\/tools$/ },
+  { methods: ["POST"], path: /^\/api\/plugins\/tools\/execute$/ },
+
+  // Runtime capability authentication is independently checked by the controller.
+  { methods: ["POST"], path: /^\/runtime-tools\/github\/credentials$/ },
+];
+
+function agentPolicyRouteMatches(rules: readonly AgentBridgeRouteRule[], method: string, path: string): boolean {
+  return rules.some((rule) => rule.methods.includes(method) && rule.path.test(path));
+}
+
+function agentPolicyDenial(method: string, path: string): string {
+  return (
+    `Route not allowed (bridge policy "agent"): ${method} ${path}. ` +
+    "Secret values, credentials, environment configuration and administration APIs are not reachable " +
+    "from isolated agent runs; retrying this route will not succeed."
+  );
+}
+
+export interface SandboxCallbackBridgeAuthorizerOptions {
+  /** The route policy. Absent or unknown values mean `restricted`. */
+  policy?: SandboxCallbackBridgePolicy | string | null;
+  /**
+   * The company the run belongs to. Under the `agent` policy a
+   * `/api/companies/:companyId/...` path for any other company is refused at
+   * the bridge, in addition to the server's own company check.
+   */
+  companyId?: string | null;
+}
+
+/**
+ * Authorize one bridge request under a route policy. Returns null to forward
+ * the request, or the denial message the bridge sends back with a 403.
+ *
+ * Both policies first require a canonical path (see
+ * {@link describeNonCanonicalSandboxCallbackBridgePath}). `restricted` then
+ * applies {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST} unchanged.
+ * `agent` matches case-insensitively and ignores one trailing slash, the way
+ * the server's router does; it applies the deny rules, then the company
+ * check, then the allow families, and refuses everything else.
+ */
+export function authorizeSandboxCallbackBridgeRequestForPolicy(
+  request: Pick<SandboxCallbackBridgeRequest, "method" | "path">,
+  options: SandboxCallbackBridgeAuthorizerOptions = {},
+): string | null {
+  const method = normalizeMethod(request.method);
+  const problem = describeNonCanonicalSandboxCallbackBridgePath(request.path);
+  if (problem) {
+    return `Route not allowed: ${method} ${request.path} (${problem})`;
+  }
+  const policy = normalizeSandboxCallbackBridgePolicy(options.policy);
+  if (policy === "restricted") {
+    return authorizeSandboxCallbackBridgeRequestWithRoutes(request, DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST);
+  }
+
+  // Percent-encoding could spell a denied segment in a form the rules do not
+  // see (the router matches literal routes on the raw path, but decodes
+  // parameters), so the wider policy accepts no encoded characters at all.
+  if (request.path.includes("%")) {
+    return agentPolicyDenial(method, request.path);
+  }
+  const lowered = request.path.toLowerCase();
+  const matchPath = lowered.length > 1 && lowered.endsWith("/") ? lowered.slice(0, -1) : lowered;
+  if (agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES, method, matchPath)) {
+    return agentPolicyDenial(method, request.path);
+  }
+  const companyId = options.companyId?.trim().toLowerCase();
+  const companyMatch = /^\/api\/companies\/([^/]+)/.exec(matchPath);
+  if (companyId && companyMatch && companyMatch[1] !== companyId) {
+    return `Route not allowed (bridge policy "agent"): ${method} ${request.path}. ` +
+      "Runs can only reach their own company.";
+  }
+  if (agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, method, matchPath)) {
+    return null;
+  }
+  return agentPolicyDenial(method, request.path);
+}
+
+/** Build a request authorizer bound to one policy and run company. */
+export function createSandboxCallbackBridgeAuthorizer(
+  options: SandboxCallbackBridgeAuthorizerOptions = {},
+): (request: Pick<SandboxCallbackBridgeRequest, "method" | "path">) => string | null {
+  const bound: SandboxCallbackBridgeAuthorizerOptions = {
+    policy: normalizeSandboxCallbackBridgePolicy(options.policy),
+    companyId: options.companyId ?? null,
+  };
+  return (request) => authorizeSandboxCallbackBridgeRequestForPolicy(request, bound);
 }
 
 export function sanitizeSandboxCallbackBridgeHeaders(
@@ -878,8 +1156,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
   const settledPromise = new Promise<void>((resolve) => {
     settleResolve = resolve;
   });
+  // The default is the restricted allowlist behind the canonical-path check.
   const authorizeRequest = input.authorizeRequest ??
-    ((request: SandboxCallbackBridgeRequest) => authorizeSandboxCallbackBridgeRequestWithRoutes(request));
+    ((request: SandboxCallbackBridgeRequest) =>
+      authorizeSandboxCallbackBridgeRequestForPolicy(request, { policy: "restricted" }));
   const buildWorkerFailureMessage = (error: unknown) =>
     `Sandbox callback bridge worker failed: ${error instanceof Error ? error.message : String(error)}`;
 

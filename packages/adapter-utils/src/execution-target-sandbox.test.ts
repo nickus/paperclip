@@ -2157,6 +2157,91 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
+  it("applies the target's bridge route policy to forwarded requests", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-policy-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
+    await mkdir(runtimeRootDir, { recursive: true });
+
+    const forwarded: string[] = [];
+    const apiServer = createServer((req, res) => {
+      forwarded.push(`${req.method ?? "GET"} ${req.url ?? "/"}`);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      apiServer.once("error", reject);
+      apiServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = apiServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected the bridge test API server to listen on a TCP port.");
+    }
+    const apiPort = address.port;
+
+    const baseTarget: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+      timeoutMs: 30_000,
+      streamRunLogs: false,
+    };
+
+    async function statusesThroughBridge(target: AdapterSandboxExecutionTarget, runId: string) {
+      const bridge = await startAdapterExecutionTargetPaperclipBridge({
+        runId,
+        target,
+        runtimeRootDir,
+        adapterKey: "codex",
+        hostApiToken: "real-run-jwt",
+        hostApiUrl: `http://127.0.0.1:${apiPort}`,
+      });
+      try {
+        const results: Array<{ status: number; error: string | null }> = [];
+        for (const route of [
+          "/api/companies/co-1/heartbeat-runs",
+          "/api/agents/me/secrets",
+          "/api/companies/co-2/issues",
+        ]) {
+          const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}${route}`, {
+            headers: { authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`, accept: "application/json" },
+          });
+          const body = await response.json() as { error?: string };
+          results.push({ status: response.status, error: body.error ?? null });
+        }
+        return results;
+      } finally {
+        await bridge?.stop();
+      }
+    }
+
+    try {
+      const restricted = await statusesThroughBridge(baseTarget, "run-bridge-restricted");
+      // The restricted list forwards company issue lists for any company id and
+      // leaves the company check to the server.
+      expect(restricted.map((result) => result.status)).toEqual([403, 403, 200]);
+      expect(restricted[0]!.error).toBe("Route not allowed: GET /api/companies/co-1/heartbeat-runs");
+      expect(forwarded).toEqual(["GET /api/companies/co-2/issues"]);
+      forwarded.length = 0;
+
+      const widened = await statusesThroughBridge(
+        { ...baseTarget, paperclipApiBridgePolicy: "agent", paperclipApiBridgeCompanyId: "co-1" },
+        "run-bridge-agent",
+      );
+      expect(widened.map((result) => result.status)).toEqual([200, 403, 403]);
+      expect(widened[1]!.error).toContain('bridge policy "agent"');
+      expect(widened[2]!.error).toContain("Runs can only reach their own company");
+      expect(forwarded).toEqual(["GET /api/companies/co-1/heartbeat-runs"]);
+    } finally {
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
   it("creates a sandbox run log tail factory when bridge streaming is enabled", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-stream-"));
     cleanupDirs.push(rootDir);
