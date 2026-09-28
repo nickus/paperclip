@@ -122,6 +122,7 @@ import {
   refreshAdapterModels,
   requireServerAdapter,
 } from "../adapters/index.js";
+import { resolveAdapterEnvironmentSupportSubject } from "../adapters/environment-support.js";
 import {
   REDACTED_EVENT_VALUE,
   redactAgentAdapterConfig,
@@ -1367,6 +1368,11 @@ export function agentRoutes(
         // matching what real agent runs use. Without this the test would
         // silently fall back to the base image.
         applyCustomImageTemplate: true,
+        // The adapter under test, as a heartbeat passes the agent's adapter:
+        // a provider that picks the runtime image per adapter (one environment
+        // serving several harnesses) must boot this adapter's image, not the
+        // environment's default one, or the probe finds no runtime command.
+        adapterType: input.adapterType,
       });
     } catch (err) {
       return {
@@ -2315,12 +2321,15 @@ export function agentRoutes(
     return Object.hasOwn(value, key);
   }
 
+  // Read from the registered adapter module, so an external adapter plugin
+  // that declares remote-managed support can select SSH and sandbox
+  // environments like the built-in adapters do.
   function allowedEnvironmentDriversForAgent(adapterType: string): string[] {
-    return supportedEnvironmentDriversForAdapter(adapterType);
+    return supportedEnvironmentDriversForAdapter(resolveAdapterEnvironmentSupportSubject(adapterType));
   }
 
   function allowedSandboxProvidersForAgent(adapterType: string): string[] | undefined {
-    return supportedEnvironmentDriversForAdapter(adapterType).includes("sandbox") ? [] : [];
+    return supportedEnvironmentDriversForAdapter(resolveAdapterEnvironmentSupportSubject(adapterType)).includes("sandbox") ? [] : [];
   }
 
   async function resolveCompanyIdForAgentReference(req: Request): Promise<string | null> {

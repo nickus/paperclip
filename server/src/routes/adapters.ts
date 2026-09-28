@@ -52,6 +52,7 @@ import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { assertBoardOrgAccess, assertInstanceAdmin } from "./authz.js";
 import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
+import { adapterSupportsRemoteManagedEnvironments } from "@paperclipai/shared";
 
 const execFileAsync = promisify(execFile);
 
@@ -116,6 +117,11 @@ interface AdapterCapabilities {
   supportsLocalAgentJwt: boolean;
   requiresMaterializedRuntimeSkills: boolean;
   supportsAcp: boolean;
+  /**
+   * The adapter runs in SSH and sandbox environments: its own declaration, or
+   * the built-in list when it declares nothing.
+   */
+  supportsRemoteManagedEnvironments: boolean;
   /**
    * The projected login capability. It is present only when the adapter
    * declares an interactive login capability. It is absent otherwise.
@@ -182,6 +188,7 @@ export function buildAdapterCapabilities(adapter: ServerAdapterModule): AdapterC
     supportsLocalAgentJwt: adapter.supportsLocalAgentJwt ?? false,
     requiresMaterializedRuntimeSkills: adapter.requiresMaterializedRuntimeSkills ?? false,
     supportsAcp: Boolean(adapter.acp),
+    supportsRemoteManagedEnvironments: adapterSupportsRemoteManagedEnvironments(adapter),
     ...(login
       ? {
           login: {

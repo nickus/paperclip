@@ -611,9 +611,18 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     && !hideHostPaths
     && shouldShowLegacyWorkingDirectoryField({ isCreate, adapterConfig: config });
   const uiAdapter = useMemo(() => getUIAdapter(adapterType), [adapterType]);
+  // The adapter's own declaration (external adapter plugins opt in to SSH and
+  // sandbox environments this way) wins over the built-in list.
+  const adapterSupportsRemoteEnvironments = adapterCaps.supportsRemoteManagedEnvironments;
   const supportedEnvironmentDrivers = useMemo(
-    () => new Set(supportedEnvironmentDriversForAdapter(adapterType)),
-    [adapterType],
+    () =>
+      new Set(
+        supportedEnvironmentDriversForAdapter({
+          type: adapterType,
+          supportsRemoteManagedEnvironments: adapterSupportsRemoteEnvironments,
+        }),
+      ),
+    [adapterType, adapterSupportsRemoteEnvironments],
   );
   const val = isCreate ? props.values : null;
   const set = isCreate

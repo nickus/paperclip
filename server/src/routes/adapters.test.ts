@@ -75,3 +75,25 @@ describe("buildAdapterCapabilities login projection", () => {
     expect(caps.login).not.toHaveProperty("parsePrompt");
   });
 });
+
+describe("buildAdapterCapabilities remote-managed environment support", () => {
+  it("projects an external adapter's own declaration", () => {
+    expect(buildAdapterCapabilities(makeAdapter()).supportsRemoteManagedEnvironments).toBe(false);
+    expect(
+      buildAdapterCapabilities(makeAdapter({ supportsRemoteManagedEnvironments: true }))
+        .supportsRemoteManagedEnvironments,
+    ).toBe(true);
+  });
+
+  it("falls back to the built-in list for adapters that declare nothing", () => {
+    expect(buildAdapterCapabilities(requireServerAdapter("opencode_local")).supportsRemoteManagedEnvironments).toBe(true);
+    expect(buildAdapterCapabilities(requireServerAdapter("process")).supportsRemoteManagedEnvironments).toBe(false);
+  });
+
+  it("lets a declared false win over the built-in list", () => {
+    expect(
+      buildAdapterCapabilities(makeAdapter({ type: "codex_local", supportsRemoteManagedEnvironments: false }))
+        .supportsRemoteManagedEnvironments,
+    ).toBe(false);
+  });
+});

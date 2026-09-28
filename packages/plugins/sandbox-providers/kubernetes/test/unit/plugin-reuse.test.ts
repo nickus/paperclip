@@ -295,6 +295,65 @@ describe("acquire with reuseLease", () => {
   });
 });
 
+describe("acquire for an adapter named only in the environment's adapter registry", () => {
+  // An environment serves mixed harnesses: its registry lists an external
+  // adapter next to the environment's default one, and each run names its
+  // agent's adapter.
+  const REGISTRY_CONFIG = {
+    inCluster: true,
+    backend: "sandbox-cr",
+    adapterType: "opencode_local",
+    adapters: [
+      { adapterType: "opencode_local", runtimeImage: "ghcr.io/paperclipai/agent-runtime-opencode:v1" },
+      {
+        adapterType: "external_local",
+        runtimeImage: "registry.example.test/agent-runtime-external:v1",
+        envKeys: [],
+        allowFqdns: [],
+        probeCommand: ["external-runner", "-h"],
+      },
+    ],
+  };
+
+  it("validates a config whose registry lists an external adapter", async () => {
+    const result = await plugin.definition.onEnvironmentValidateConfig!({
+      driverKey: "kubernetes",
+      config: REGISTRY_CONFIG,
+    } as Parameters<NonNullable<typeof plugin.definition.onEnvironmentValidateConfig>>[0]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("runs the run's adapter on its registry entry's runtime image", async () => {
+    await acquire(REGISTRY_CONFIG, { adapterType: "external_local" });
+    const cr = createdSandbox();
+    expect(cr.spec.podTemplate.spec.containers[0].image).toBe("registry.example.test/agent-runtime-external:v1");
+    expect(cr.metadata.labels["paperclip.io/adapter"]).toBe("external_local");
+  });
+
+  it("keeps the environment's default adapter image for a run that names no adapter", async () => {
+    await acquire(REGISTRY_CONFIG);
+    const cr = createdSandbox();
+    expect(cr.spec.podTemplate.spec.containers[0].image).toBe("ghcr.io/paperclipai/agent-runtime-opencode:v1");
+    expect(cr.metadata.labels["paperclip.io/adapter"]).toBe("opencode_local");
+  });
+
+  it("keys a kept sandbox to the run's adapter", async () => {
+    const lease = await acquire({ ...REGISTRY_CONFIG, reuseLease: true }, { adapterType: "external_local" });
+    expect(lease.metadata).toMatchObject({
+      kubernetesReuse: {
+        key: computeReuseKey({ ...SCOPE, runAdapterType: "external_local" }),
+        runAdapterType: "external_local",
+      },
+    });
+  });
+
+  it("fails the lease for an adapter the registry does not list", async () => {
+    await expect(acquire(REGISTRY_CONFIG, { adapterType: "unlisted_local" })).rejects.toThrow(
+      'Adapter "unlisted_local" is not in the configured adapter registry',
+    );
+  });
+});
+
 describe("release with reuseLease", () => {
   it("stops the run's processes, marks the sandbox idle and keeps it", async () => {
     const lease = await acquire();

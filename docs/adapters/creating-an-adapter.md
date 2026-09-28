@@ -213,6 +213,7 @@ Adapters can declare what "local" capabilities they support by setting optional 
 | `supportsInstructionsBundle` | `boolean` | `false` | Managed instructions bundle (AGENTS.md) — server-side resolution + UI editor |
 | `instructionsPathKey` | `string` | `"instructionsFilePath"` | The `adapterConfig` key that holds the instructions file path |
 | `requiresMaterializedRuntimeSkills` | `boolean` | `false` | Whether runtime skill entries must be written to disk before execution |
+| `supportsRemoteManagedEnvironments` | `boolean` | `false` | Whether agents can select SSH and sandbox environments; runs then get a remote `ctx.executionTarget` |
 
 These flags are exposed via `GET /api/adapters` in a `capabilities` object, along with a derived `supportsSkills` flag (true when `listSkills` or `syncSkills` is defined).
 
@@ -239,6 +240,17 @@ export function createServerAdapter(): ServerAdapterModule {
 With these flags set, the Paperclip UI will automatically show the instructions bundle editor, skills management tab, and working directory field for agents using this adapter — no Paperclip source changes required.
 
 If capability flags are not set, the server falls back to legacy hardcoded lists for built-in adapter types. External adapters that omit the flags will default to `false` for all capabilities.
+
+### Remote-managed environments
+
+Set `supportsRemoteManagedEnvironments: true` only when `execute` (and `testEnvironment`) honor a remote `ctx.executionTarget`: the runtime must start inside the target, never on the Paperclip host. The helpers in `@paperclipai/adapter-utils/execution-target` cover what the built-in adapters do there:
+
+- `prepareAdapterExecutionTargetRuntime` syncs the workspace and runtime assets (such as skills) and returns the remote working directory; call `restoreWorkspace` when the run ends.
+- `runAdapterExecutionTargetProcess` starts the runtime in the target. Pass secrets in `env`; the SSH and sandbox transports deliver env over stdin, not as command-line arguments. Pass only the adapter's own env, not the host's `process.env`.
+- `startAdapterExecutionTargetPaperclipBridge` gives the runtime a run-scoped `PAPERCLIP_API_URL` / `PAPERCLIP_API_KEY` that reaches the Paperclip API from inside the target.
+- `adapterExecutionTargetSessionIdentity` / `adapterExecutionTargetSessionMatches` tie a saved session to the target, so a session is resumed only where it was created.
+
+Built-in adapter types keep their existing behavior when the flag is absent; an external adapter that replaces a built-in type describes its own module, so `false` restricts it to the local environment.
 
 ## Skills Injection
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   adapterSupportsRemoteManagedEnvironments,
   getEnvironmentCapabilities,
+  isEnvironmentDriverSupportedForAdapter,
   isSandboxProviderSupportedForAdapter,
   supportedEnvironmentDriversForAdapter,
 } from "./environment-support.js";
@@ -97,5 +98,51 @@ describe("getEnvironmentCapabilities reusable leases default", () => {
 
     // The built-in fake provider presents as false.
     expect(capabilities.sandboxProviders.fake.supportsReusableLeases).toBe(false);
+  });
+});
+
+describe("adapter-declared remote-managed environment support", () => {
+  const declaringPlugin = { type: "external_local", supportsRemoteManagedEnvironments: true };
+
+  it("lets an adapter outside the built-in list opt in", () => {
+    expect(adapterSupportsRemoteManagedEnvironments("external_local")).toBe(false);
+    expect(adapterSupportsRemoteManagedEnvironments(declaringPlugin)).toBe(true);
+    expect(supportedEnvironmentDriversForAdapter(declaringPlugin)).toEqual(["local", "ssh", "sandbox"]);
+    expect(isEnvironmentDriverSupportedForAdapter(declaringPlugin, "ssh")).toBe(true);
+    expect(isSandboxProviderSupportedForAdapter(declaringPlugin, "fake-plugin", ["fake-plugin"])).toBe(true);
+  });
+
+  it("lets a declared false restrict a built-in type to the local driver", () => {
+    const override = { type: "codex_local", supportsRemoteManagedEnvironments: false };
+    expect(adapterSupportsRemoteManagedEnvironments(override)).toBe(false);
+    expect(supportedEnvironmentDriversForAdapter(override)).toEqual(["local"]);
+    expect(isSandboxProviderSupportedForAdapter(override, "fake-plugin", ["fake-plugin"])).toBe(false);
+  });
+
+  it("falls back to the built-in list when the adapter declares nothing", () => {
+    expect(adapterSupportsRemoteManagedEnvironments({ type: "opencode_local" })).toBe(true);
+    expect(adapterSupportsRemoteManagedEnvironments({ type: "opencode_local", supportsRemoteManagedEnvironments: null })).toBe(true);
+    expect(adapterSupportsRemoteManagedEnvironments({ type: "external_local" })).toBe(false);
+  });
+
+  it("describes declared adapters in environment capabilities", () => {
+    const capabilities = getEnvironmentCapabilities(
+      ["codex_local", declaringPlugin, { type: "other_external" }],
+      { sandboxProviders: { "fake-plugin": { displayName: "Fake Plugin" } } },
+    );
+
+    expect(capabilities.adapters).toEqual([
+      expect.objectContaining({ adapterType: "codex_local", drivers: expect.objectContaining({ sandbox: "supported" }) }),
+      expect.objectContaining({
+        adapterType: "external_local",
+        drivers: expect.objectContaining({ local: "supported", ssh: "supported", sandbox: "supported" }),
+        sandboxProviders: expect.objectContaining({ "fake-plugin": "supported" }),
+      }),
+      expect.objectContaining({
+        adapterType: "other_external",
+        drivers: expect.objectContaining({ local: "supported", ssh: "unsupported", sandbox: "unsupported" }),
+        sandboxProviders: expect.objectContaining({ "fake-plugin": "unsupported" }),
+      }),
+    ]);
   });
 });

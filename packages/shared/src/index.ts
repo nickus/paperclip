@@ -2602,6 +2602,7 @@ export {
 
 export type {
   AdapterEnvironmentSupport,
+  AdapterEnvironmentSupportSubject,
   EnvironmentCapabilities,
   EnvironmentProviderCapability,
   EnvironmentSupportStatus,
