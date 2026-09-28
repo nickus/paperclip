@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
   AlertTriangle,
@@ -998,13 +998,20 @@ export function Secrets() {
     queryFn: () => secretsApi.usage(selectedSecret!.id),
     enabled: Boolean(selectedSecret),
   });
-  const eventsQuery = useQuery({
+  const eventsQuery = useInfiniteQuery({
     queryKey: selectedSecret
       ? queryKeys.secrets.accessEvents(selectedSecret.id)
       : ["secrets", "access-events", "__disabled__"],
-    queryFn: () => secretsApi.accessEvents(selectedSecret!.id),
+    queryFn: ({ pageParam }: { pageParam: string | null }) =>
+      secretsApi.accessEvents(selectedSecret!.id, { cursor: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage?.nextCursor ?? undefined,
     enabled: Boolean(selectedSecret),
   });
+  const eventsQueryEvents = useMemo(
+    () => eventsQuery.data?.pages.flatMap((page) => page?.events ?? []) ?? [],
+    [eventsQuery.data],
+  );
 
   const usageDialogQuery = useQuery({
     queryKey: usageDialogSecret
@@ -2371,8 +2378,11 @@ export function Secrets() {
                   <TabsContent value="events">
                     <SecretEventsTab
                       loading={eventsQuery.isPending}
-                      events={eventsQuery.data ?? []}
+                      events={eventsQueryEvents}
                       companyId={selectedCompanyId}
+                      hasMore={eventsQuery.hasNextPage}
+                      loadingMore={eventsQuery.isFetchingNextPage}
+                      onLoadMore={() => eventsQuery.fetchNextPage()}
                     />
                   </TabsContent>
                 </div>
@@ -4769,10 +4779,16 @@ export function SecretEventsTab({
   loading,
   events,
   companyId,
+  hasMore = false,
+  loadingMore = false,
+  onLoadMore,
 }: {
   loading: boolean;
   events: SecretAccessEvent[];
   companyId: string;
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
 }) {
   // Resolve responsible/owner user ids to human names for user-scoped events.
   const anyUserScoped = events.some(
@@ -4841,6 +4857,13 @@ export function SecretEventsTab({
           ) : null}
         </div>
       ))}
+      {hasMore ? (
+        <div className="flex justify-center pt-1">
+          <Button variant="outline" size="sm" onClick={onLoadMore} disabled={loadingMore}>
+            {loadingMore ? "Loading…" : "Load more"}
+          </Button>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -8,6 +8,7 @@ import type {
   CompanyPortabilityInclude,
   CompanySecret,
   EnvBinding,
+  SecretAccessEventPage,
   SecretProvider,
   SecretProviderDescriptor,
 } from "@paperclipai/shared";
@@ -521,10 +522,26 @@ export function registerSecretCommands(program: Command): void {
       .command("access-events")
       .description("List secret access events")
       .argument("<secretId>", "Secret ID")
-      .action(async (secretId: string, opts: BaseClientOptions) => {
+      .option("--limit <n>", "Max events to return (default 100, max 1000)")
+      .option("--cursor <cursor>", "Opaque cursor from a previous page's nextCursor")
+      .action(async (secretId: string, opts: BaseClientOptions & { limit?: string; cursor?: string }) => {
         try {
           const ctx = resolveCommandContext(opts);
-          printOutput(await ctx.api.get(apiPath`/api/secrets/${secretId}/access-events`), { json: ctx.json });
+          const params = new URLSearchParams();
+          if (opts.limit) params.set("limit", opts.limit);
+          if (opts.cursor) params.set("cursor", opts.cursor);
+          const query = params.toString();
+          const path = `${apiPath`/api/secrets/${secretId}/access-events`}${query ? `?${query}` : ""}`;
+          const page = await ctx.api.get<SecretAccessEventPage>(path);
+
+          if (ctx.json) {
+            printOutput(page, { json: true });
+            return;
+          }
+          printOutput(page.events, { json: false });
+          if (page.nextCursor) {
+            console.log(pc.dim(`More events available. Pass --cursor ${page.nextCursor} for the next page.`));
+          }
         } catch (err) {
           handleCommandError(err);
         }

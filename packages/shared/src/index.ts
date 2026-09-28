@@ -1377,6 +1377,7 @@ export type {
   CompanySecretUsageBinding,
   CompanySecretVersion,
   SecretAccessEvent,
+  SecretAccessEventPage,
   RemoteSecretImportCandidate,
   RemoteSecretImportCandidateStatus,
   RemoteSecretImportConflict,

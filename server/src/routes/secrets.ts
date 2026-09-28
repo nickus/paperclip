@@ -18,6 +18,7 @@ import {
 import { validate } from "../middleware/validate.js";
 import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource } from "./authz.js";
 import { logActivity, secretService } from "../services/index.js";
+import { SECRET_ACCESS_EVENTS_DEFAULT_LIMIT, SECRET_ACCESS_EVENTS_MAX_LIMIT } from "../services/secrets.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
@@ -52,6 +53,25 @@ function proposalListPage(query: Record<string, unknown>) {
   return {
     limit: Math.min(requestedLimit, MAX_PROPOSAL_LIST_LIMIT),
     offset: rawOffset === undefined ? 0 : Number.parseInt(rawOffset, 10),
+  };
+}
+
+function accessEventsPage(query: Record<string, unknown>) {
+  const rawLimit = query.limit;
+  const rawCursor = query.cursor ?? query.before;
+  if (rawLimit !== undefined && (typeof rawLimit !== "string" || !/^\d+$/.test(rawLimit))) {
+    throw unprocessable("limit must be a positive integer");
+  }
+  if (rawCursor !== undefined && typeof rawCursor !== "string") {
+    throw unprocessable("cursor must be a string");
+  }
+  const requestedLimit = rawLimit === undefined
+    ? SECRET_ACCESS_EVENTS_DEFAULT_LIMIT
+    : Number.parseInt(rawLimit, 10);
+  if (requestedLimit < 1) throw unprocessable("limit must be a positive integer");
+  return {
+    limit: Math.min(requestedLimit, SECRET_ACCESS_EVENTS_MAX_LIMIT),
+    cursor: rawCursor ?? null,
   };
 }
 
@@ -1099,8 +1119,9 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       "Secret not found",
     );
     if (!existing) return;
-    const events = await svc.listAccessEvents(existing.companyId, existing.id);
-    res.json(events);
+    const page = accessEventsPage(req.query as Record<string, unknown>);
+    const { items, nextCursor } = await svc.listAccessEvents(existing.companyId, existing.id, page);
+    res.json({ events: items, nextCursor });
   });
 
   router.delete("/secrets/:id", async (req, res) => {
