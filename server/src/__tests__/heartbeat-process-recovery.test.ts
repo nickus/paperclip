@@ -5409,6 +5409,83 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(true);
   });
 
+  it("resumes the finish-handoff run with the whole saved session of the run it follows", async () => {
+    const { agentId, runId, issueId, companyId } =
+      await seedQueuedIssueRunFixture();
+    // What an adapter saves after a run on a sandbox target: the session id
+    // plus the working directory and the execution identity that the next
+    // run's adapter compares with its own target before it resumes.
+    const savedSessionParams = {
+      sessionId: "ses_first_run",
+      cwd: "/workspace",
+      remoteExecution: {
+        transport: "sandbox",
+        providerKey: "kubernetes",
+        environmentId: "environment-1",
+        leaseId: "lease-row-1",
+        providerLeaseId: "provider-lease-1",
+        remoteCwd: "/workspace",
+      },
+    };
+    mockAdapterExecute.mockImplementationOnce(
+      async (ctx: { runId: string }) => {
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          createdByRunId: ctx.runId,
+          body: "Implemented the backend detector, but did not choose a final issue state.",
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary:
+            "Implemented the backend detector, but did not choose a final issue state.",
+          provider: "test",
+          model: "test-model",
+          sessionId: savedSessionParams.sessionId,
+          sessionParams: savedSessionParams,
+        };
+      },
+    );
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+
+    const handoffRun = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return (
+        rows.find(
+          (row) =>
+            (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason ===
+            "finish_successful_run_handoff",
+        ) ?? null
+      );
+    }, 5_000);
+    await waitForRunToSettle(heartbeat, handoffRun!.id, 5_000);
+    await waitForHeartbeatIdle(db, 5_000);
+
+    // The wake is queued while the first run finalizes. It must copy the
+    // session that run saved, not only its id: a bare id carries no execution
+    // identity, so a remote adapter refuses to resume it.
+    expect(handoffRun!.contextSnapshot).toMatchObject({
+      resumeFromRunId: runId,
+      resumeSessionParams: savedSessionParams,
+    });
+    const handoffInvocation = mockAdapterExecute.mock.calls
+      .map(([input]) => input as { runId?: string; runtime?: { sessionParams?: unknown } })
+      .find((input) => input.runId === handoffRun!.id);
+    expect(handoffInvocation?.runtime?.sessionParams).toMatchObject(
+      savedSessionParams,
+    );
+  });
+
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {
     const { companyId, agentId, runId, issueId } =
       await seedQueuedIssueRunFixture();

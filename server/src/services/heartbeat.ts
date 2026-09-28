@@ -24737,6 +24737,58 @@ export function heartbeatService(
         );
 
         const finalizedRun = persistedRun ?? (await getRun(run.id));
+        const persistTaskSessionForFinalizedRun = async (
+          finalized: NonNullable<typeof finalizedRun>,
+          sessionTaskKey: string,
+        ) => {
+          if (
+            adapterResult.clearSession ||
+            (!nextSessionState.params && !nextSessionState.displayId)
+          ) {
+            await clearTaskSessions(agent.companyId, agent.id, {
+              taskKey: sessionTaskKey,
+              adapterType: agent.adapterType,
+              expectedRunId: finalized.id,
+            });
+            return;
+          }
+          await upsertTaskSession({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            adapterType: agent.adapterType,
+            taskKey: sessionTaskKey,
+            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+              nextSessionState.params,
+              configuredModel,
+              sessionConfigMetadata,
+            ),
+            sessionDisplayId: nextSessionState.displayId,
+            lastRunId: finalized.id,
+            lastError: runErrorMessage,
+          });
+        };
+        // Save this run's task session before anything below can queue the
+        // next run on the task: the successful-run handoff, deferred wakes
+        // promoted when the issue execution is released, bounded retries and
+        // goal rollovers. A wake that resumes from this run copies the task
+        // session when it is queued. Saved only afterwards, the wake finds no
+        // session of this run and keeps just the bare session id, which an
+        // adapter on a remote target cannot match to its execution identity,
+        // so the follow-up run would start a new session.
+        let taskSessionPersisted = false;
+        if (finalizedRun && taskKey) {
+          try {
+            await persistTaskSessionForFinalizedRun(finalizedRun, taskKey);
+            taskSessionPersisted = true;
+          } catch (err) {
+            // Keep finalizing (issue release, follow-up wakes). The save is
+            // retried at the end, where a failure surfaces as it did before.
+            logger.warn(
+              { err, runId: run.id, taskKey },
+              "failed to save the task session before follow-up wakes; retrying after finalization",
+            );
+          }
+        }
         if (finalizedRun) {
           await appendRunEvent(finalizedRun, {
             eventType: "lifecycle",
@@ -25041,33 +25093,8 @@ export function heartbeatService(
             },
             normalizedUsage,
           );
-          if (taskKey) {
-            if (
-              adapterResult.clearSession ||
-              (!nextSessionState.params && !nextSessionState.displayId)
-            ) {
-              await clearTaskSessions(agent.companyId, agent.id, {
-                taskKey,
-                adapterType: agent.adapterType,
-                expectedRunId: finalizedRun.id,
-              });
-            } else {
-              await upsertTaskSession({
-                companyId: agent.companyId,
-                agentId: agent.id,
-                adapterType: agent.adapterType,
-                taskKey,
-                sessionParamsJson:
-                  attachPaperclipSessionMetadataToSessionParams(
-                    nextSessionState.params,
-                    configuredModel,
-                    sessionConfigMetadata,
-                  ),
-                sessionDisplayId: nextSessionState.displayId,
-                lastRunId: finalizedRun.id,
-                lastError: runErrorMessage,
-              });
-            }
+          if (taskKey && !taskSessionPersisted) {
+            await persistTaskSessionForFinalizedRun(finalizedRun, taskKey);
           }
         }
         await finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
