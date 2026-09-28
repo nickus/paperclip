@@ -246,6 +246,49 @@ describe("adapter session codecs", () => {
     expect(acpxSessionCodec.serialize(parsed)).toEqual(parsed);
     expect(acpxSessionCodec.getDisplayId?.(parsed)).toBe("runtime-session-1");
   });
+
+  it.each([
+    ["claude", claudeSessionCodec, "11111111-1111-4111-8111-111111111111"],
+    ["codex", codexSessionCodec, "codex-session-1"],
+    ["opencode", opencodeSessionCodec, "ses_opencode_1"],
+  ] as const)(
+    "keeps the sandbox execution identity of %s sessions so they can resume in the same sandbox",
+    (_name, codec, sessionId) => {
+      const remoteExecution = {
+        transport: "sandbox",
+        providerKey: "kubernetes",
+        environmentId: "environment-1",
+        leaseId: "lease-1",
+        providerLeaseId: "pc-1",
+        remoteCwd: "/workspace",
+      };
+      const serialized = codec.serialize({
+        sessionId,
+        cwd: "/workspace",
+        remoteExecution: { ...remoteExecution, runner: { execute: () => undefined }, token: "secret" },
+      });
+      expect(serialized).toEqual({ sessionId, cwd: "/workspace", remoteExecution });
+      expect(codec.deserialize(JSON.parse(JSON.stringify(serialized)))).toEqual({
+        sessionId,
+        cwd: "/workspace",
+        remoteExecution,
+      });
+    },
+  );
+
+  it.each([
+    ["claude", claudeSessionCodec, "11111111-1111-4111-8111-111111111111"],
+    ["codex", codexSessionCodec, "codex-session-1"],
+    ["opencode", opencodeSessionCodec, "ses_opencode_1"],
+  ] as const)("does not keep SSH or malformed execution identities for %s sessions", (_name, codec, sessionId) => {
+    expect(
+      codec.serialize({
+        sessionId,
+        remoteExecution: { transport: "ssh", host: "ssh.example.test", port: 22, username: "paperclip" },
+      }),
+    ).toEqual({ sessionId });
+    expect(codec.deserialize({ sessionId, remoteExecution: "sandbox" })).toEqual({ sessionId });
+  });
 });
 
 describe("codex resume recovery detection", () => {

@@ -41,6 +41,24 @@ import {
 
 type EnvironmentRow = typeof environments.$inferSelect;
 type EnvironmentLeaseRow = typeof environmentLeases.$inferSelect;
+
+/**
+ * The `details.code` of the 409 a lease acquisition raises when the released
+ * reusable lease it resumed was taken over by another run in the meantime.
+ */
+export const REUSABLE_LEASE_HANDOFF_CONFLICT_CODE = "reusable_lease_handoff_conflict";
+
+export function isReusableLeaseHandoffConflict(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { status?: unknown; details?: unknown };
+  return (
+    candidate.status === 409 &&
+    !!candidate.details &&
+    typeof candidate.details === "object" &&
+    (candidate.details as { code?: unknown }).code === REUSABLE_LEASE_HANDOFF_CONFLICT_CODE
+  );
+}
+
 const DEFAULT_LOCAL_ENVIRONMENT_NAME = "Local";
 const DEFAULT_LOCAL_ENVIRONMENT_DESCRIPTION =
   "Default execution environment for Paperclip runs on this machine.";
@@ -1545,6 +1563,7 @@ export function environmentService(db: Db) {
                 if (retired.length !== 1) {
                   throw conflict(
                     "Reusable sandbox lease ownership changed during acquisition.",
+                    { code: REUSABLE_LEASE_HANDOFF_CONFLICT_CODE },
                   );
                 }
               }

@@ -37,7 +37,7 @@ import {
   runWithRuntimeParent,
   type StartupSpanContext,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
-import { environmentService } from "./environments.js";
+import { environmentService, isReusableLeaseHandoffConflict } from "./environments.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { verifyNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import {
@@ -1116,6 +1116,10 @@ function reusableSandboxLeaseScopeMatches(input: {
   });
 }
 
+// Attempts at acquiring a run lease when each one loses a reusable lease
+// handoff to a concurrent run (see acquireRunLease).
+const REUSABLE_LEASE_HANDOFF_MAX_ATTEMPTS = 3;
+
 function reusableLeaseCanBeResumed(input: {
   lease: Pick<EnvironmentLease, "status" | "heartbeatRunId">;
   heartbeatRunId: string | null;
@@ -2103,6 +2107,12 @@ function createSandboxEnvironmentDriver(
             });
           }
         }
+        // Ad-hoc test leases are never publishable for reuse: storing them
+        // as `reuse_by_environment` would let a concurrent heartbeat resume
+        // the test's provider lease and lose its sandbox when the test ends.
+        const resolvedLeasePolicy = supportsReusableLeases && parsed.config.reuseLease && input.heartbeatRunId !== null
+          ? "reuse_by_environment"
+          : "ephemeral";
         const acquisitionRunId = input.heartbeatRunId ?? randomUUID();
         const acquiredLease = providerLease ?? await (async () => {
           try {
@@ -2136,6 +2146,9 @@ function createSandboxEnvironmentDriver(
                 ...(requestedExpiresAtParam(input.requestedExpiresAt) !== undefined
                   ? { requestedExpiresAt: requestedExpiresAtParam(input.requestedExpiresAt) }
                   : {}),
+                // The policy this lease is recorded with, so a provider that keeps
+                // sandboxes between runs never keeps one the host will not resume.
+                leasePolicy: resolvedLeasePolicy,
               },
               resolvePluginSandboxRpcTimeoutMs(
                 workerConfig,
@@ -2187,13 +2200,6 @@ function createSandboxEnvironmentDriver(
             throw error;
           }
         })();
-
-        // Ad-hoc test leases are never publishable for reuse: storing them
-        // as `reuse_by_environment` would let a concurrent heartbeat resume
-        // the test's provider lease and lose its sandbox when the test ends.
-        const resolvedLeasePolicy = supportsReusableLeases && parsed.config.reuseLease && input.heartbeatRunId !== null
-          ? "reuse_by_environment"
-          : "ephemeral";
         const sanitizedProviderMetadata = stripSecretRefValuesFromPluginLeaseMetadata({
           metadata: acquiredLease.metadata,
           schema: pluginProvider.resolved.driver.configSchema as Record<string, unknown> | null | undefined,
@@ -3301,6 +3307,9 @@ function createSandboxEnvironmentDriver(
             providerLeaseId: input.lease.providerLeaseId,
             leaseMetadata: metadata,
             ...(input.cancelActiveWork ? { cancelActiveWork: true } : {}),
+            // How the run ended, so a provider that keeps sandboxes between
+            // runs can stop keeping one in which run after run fails.
+            runStatus: input.status,
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)))),
         );
         termination = remoteTerminationReceipt(input.lease, receipt);
@@ -3319,11 +3328,23 @@ function createSandboxEnvironmentDriver(
     // reaper, which would destroy the resource the retain policy wants to keep.
     const retained =
       input.lease.leasePolicy === "retain_on_failure" && input.status === "failed";
+    // A reusable provider resource that the provider confirmed stopped (not
+    // destroyed) stays eligible for resume whatever the run's outcome, so a
+    // follow-up run after a failed or timed-out run continues in the same
+    // sandbox. Only `released`/`retained` leases are resume candidates; the
+    // failure reason is still recorded below.
+    const stoppedReusable =
+      input.lease.leasePolicy === "reuse_by_environment" &&
+      input.status === "failed" &&
+      cleanupStatus === "success" &&
+      termination?.state === "stopped";
     const releaseStatus = retained
       ? ("retained" as const)
       : cleanupStatus === "failed"
         ? ("pending_cleanup" as const)
-        : input.status;
+        : stoppedReusable
+          ? ("released" as const)
+          : input.status;
     const failureReason =
       input.status === "failed"
         ? "adapter_or_run_failure"
@@ -3954,7 +3975,7 @@ export function environmentRuntimeService(
         persistedExecutionWorkspace: input.persistedExecutionWorkspace,
       });
       const driver = requireDriver(input.environment);
-      const lease = await driver.acquireRunLease({
+      const acquire = () => driver.acquireRunLease({
         companyId: input.companyId,
         environment: input.environment,
         issueId: input.issueId,
@@ -3968,6 +3989,35 @@ export function environmentRuntimeService(
         requestedExpiresAt: input.requestedExpiresAt ?? null,
         assertCompanyBinding: input.assertCompanyBinding,
       });
+      // Runs that start together in one reuse scope (for example two tasks of
+      // an agent that share an execution workspace) can all pick the same
+      // released reusable lease. The lease handoff lets one run take it and
+      // rejects the others. The lease a run lost is no longer resumable, so
+      // acquiring again resumes another released sandbox of the scope or
+      // acquires a fresh one. The rejected attempt provisioned nothing: it
+      // only resumed the sandbox the winning run now owns.
+      let lease: EnvironmentLease;
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          lease = await acquire();
+          break;
+        } catch (error) {
+          if (
+            attempt >= REUSABLE_LEASE_HANDOFF_MAX_ATTEMPTS ||
+            !isReusableLeaseHandoffConflict(error)
+          ) {
+            throw error;
+          }
+          logger.info(
+            {
+              environmentId: input.environment.id,
+              heartbeatRunId: input.heartbeatRunId,
+              attempt,
+            },
+            "Reusable sandbox lease was taken by another run; acquiring again",
+          );
+        }
+      }
 
       return {
         environment: input.environment,

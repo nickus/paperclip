@@ -69,6 +69,43 @@ const SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES = SANDBOX_WORKSPACE_HEAVY_DIR_NAMES.f
   `*/${entry}`,
   `*/${entry}/*`,
 ]);
+/**
+ * Directory names kept through the per-run restage of a sandbox that is reused
+ * between runs (`preserveBuildDirs`): dependency installs, build outputs and
+ * tool caches. The host copy never carries them (they are excluded from
+ * staging, or usually git-ignored) and they are the expensive part of warming
+ * up a working tree, so a resumed sandbox keeps its own.
+ */
+export const SANDBOX_REUSED_BUILD_DIR_NAMES = [
+  ...SANDBOX_WORKSPACE_HEAVY_DIR_NAMES,
+  "target",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".gradle",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".tox",
+] as const;
+// The reused build directories at any depth, left out of the restore: they
+// belong to the kept sandbox, not to the host workspace.
+//
+// Matching is by directory name only, like the pod-side stash and restore of
+// these directories and like the heavy directory excludes. With
+// `preserveBuildDirs` on, these names are therefore reserved anywhere in the
+// workspace: a source directory that uses one (a tracked `target/` or `venv/`,
+// for example) is still staged into the sandbox, but a run's changes inside it
+// are never restored to the host. This is intentional: build output is not
+// told apart from source by content, and restoring such directories would
+// bring back ones the host deleted. Keep source out of directories with these
+// names, or do not reuse the sandbox for such a workspace (`preserveBuildDirs`
+// is on exactly when the execution target reuses its sandbox).
+const SANDBOX_REUSED_BUILD_DIR_EXCLUDES = SANDBOX_REUSED_BUILD_DIR_NAMES.flatMap((entry) => [
+  entry,
+  `${entry}/*`,
+  `*/${entry}`,
+  `*/${entry}/*`,
+]);
 
 export interface SandboxRemoteExecutionSpec {
   transport: "sandbox";
@@ -656,6 +693,63 @@ function buildWorkspaceTarExtractCommand(input: {
   );
 }
 
+// `find` operand group matching any reused build directory name. The names are
+// static literals, shell-quoted (C1/C3).
+function reusedBuildDirNameTest(): string {
+  return `\\( ${SANDBOX_REUSED_BUILD_DIR_NAMES.map((name) => `-name ${shellQuote(name)}`).join(" -o ")} \\)`;
+}
+
+// Moves one directory ($1, relative to the current directory) to the same
+// relative path under the directory in $0. Runs as `sh -c <script> <dir> <path>`.
+const MOVE_BUILD_DIR_TO_SCRIPT = 'p=$1; mkdir -p -- "$0/${p%/*}" && mv -- "$p" "$0/$p"';
+// Moves one stashed directory ($1) back into the workspace in $0, but only
+// when its parent still exists there (the host did not delete that project)
+// and nothing took its place (a path the host staged wins).
+const RESTORE_BUILD_DIR_SCRIPT =
+  'p=$1; if [ -d "$0/${p%/*}" ] && [ ! -e "$0/$p" ] && [ ! -L "$0/$p" ]; then mv -- "$p" "$0/$p"; fi';
+
+// Named builder (C3): before a destroy-then-replace restage of a reused
+// sandbox, move every reused build directory out of the workspace into
+// `stashDir` (under `.paperclip-runtime`, which the wipe preserves; the move
+// is a rename on the same volume). `.git` and `.paperclip-runtime` are not
+// searched. Best effort: it always exits 0, since a directory it cannot keep
+// is simply rebuilt by the next install.
+function buildStashBuildDirsCommand(input: {
+  workspaceRemoteDir: string;
+  stashDir: string;
+}): string {
+  const stash = shellQuote(input.stashDir);
+  return (
+    `rm -rf -- ${stash} && mkdir -p -- ${stash} && cd -- ${shellQuote(input.workspaceRemoteDir)} && ` +
+    `find . -mindepth 1 \\( -name .git -o -path ./.paperclip-runtime \\) -prune -o ` +
+    `-type d ${reusedBuildDirNameTest()} -prune ` +
+    `-exec sh -c ${shellQuote(MOVE_BUILD_DIR_TO_SCRIPT)} ${stash} {} \\; ; true`
+  );
+}
+
+// Named builder (C3): after the restage, move the stashed build directories
+// back (see RESTORE_BUILD_DIR_SCRIPT for which ones) and drop the stash.
+function buildRestoreBuildDirsCommand(input: {
+  workspaceRemoteDir: string;
+  stashDir: string;
+}): string {
+  const stash = shellQuote(input.stashDir);
+  return (
+    `if cd -- ${stash} 2>/dev/null; then ` +
+    `find . -mindepth 1 -type d ${reusedBuildDirNameTest()} -prune ` +
+    `-exec sh -c ${shellQuote(RESTORE_BUILD_DIR_SCRIPT)} ${shellQuote(input.workspaceRemoteDir)} {} \\; ; ` +
+    `cd / && rm -rf -- ${stash}; fi; true`
+  );
+}
+
+/** Test hook: the stash/restore commands exactly as the restage runs them. */
+export function buildReusedBuildDirCommandsForTest(input: {
+  workspaceRemoteDir: string;
+  stashDir: string;
+}): { stash: string; restore: string } {
+  return { stash: buildStashBuildDirsCommand(input), restore: buildRestoreBuildDirsCommand(input) };
+}
+
 // Named builder (C3): remove paths deleted in the host git worktree from the
 // sandbox workspace. Every path is shell-quoted; the caller supplies only
 // already-confined relative paths from the git snapshot.
@@ -1103,6 +1197,13 @@ export async function prepareSandboxManagedRuntime(input: {
   workspaceGitSnapshot?: GitWorkspaceSnapshot | null;
   workspaceExclude?: string[];
   preserveAbsentOnRestore?: string[];
+  /**
+   * Keep the sandbox's own build directories (SANDBOX_REUSED_BUILD_DIR_NAMES,
+   * at any depth) through the destroy-then-replace restage of the workspace.
+   * Set for a sandbox that is kept between runs of the same task; the host
+   * copy stays authoritative for everything it stages.
+   */
+  preserveBuildDirs?: boolean;
   assets?: SandboxManagedRuntimeAsset[];
   /**
    * Referenced (additional) projects to stage into the sandbox as plain,
@@ -1215,6 +1316,11 @@ export async function prepareSandboxManagedRuntime(input: {
     input.preserveAbsentOnRestore,
     input.workspaceExclude,
     gitIgnoredExcludes,
+    // A reused sandbox keeps its build directories between runs (see
+    // `preserveBuildDirs`), including ones the host no longer has. Restoring
+    // them would bring back a directory the host deleted, for example in a
+    // workspace another task's run shares.
+    input.preserveBuildDirs ? SANDBOX_REUSED_BUILD_DIR_EXCLUDES : undefined,
   );
   const repositories = gitSnapshot?.repositories ?? [];
   const workspaceRestoreExclude = mergeExcludes(restoreExclude, repositories.map((repo) => repo.path));
@@ -1505,6 +1611,18 @@ export async function prepareSandboxManagedRuntime(input: {
 
           if (!stageWorkspace) return;
 
+          if (input.preserveBuildDirs) {
+            // Wrap the extract commands: stash before the first wipe, put back
+            // after the last step (including the deleted-path removal).
+            const stashDir = path.posix.join(runtimeRootDir, "reused-build-dirs");
+            workspacePostUploadCommands.unshift({
+              command: buildStashBuildDirsCommand({ workspaceRemoteDir, stashDir }),
+            });
+            workspacePostUploadCommands.push({
+              command: buildRestoreBuildDirsCommand({ workspaceRemoteDir, stashDir }),
+            });
+          }
+
           // One confined `syncIn` for the whole merged workspace file set. The confine
           // guard covers every mapping BEFORE any bytes upload (fail-closed): a source
           // or target escape in EITHER tar mapping stops the upload of both.
@@ -1750,6 +1868,7 @@ export async function prepareSandboxManagedRuntime(input: {
                 workspaceInboundMode: "adopt_remote",
                 workspaceGitSnapshot: repository.snapshot,
                 workspaceExclude: nestedExclude,
+                preserveBuildDirs: input.preserveBuildDirs,
                 workspaceBaseline: await selectDirectorySnapshot(baselineSnapshot!, {
                   prefix,
                   exclude: mergeExcludes(SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES, [...GIT_ARCHIVE_EXCLUDES], [".paperclip-runtime"], nestedExclude),

@@ -232,7 +232,8 @@ async function streamFileToPodStdin(input: {
  * cannot fill the host disk. Resolves only after the file is fully flushed, so a
  * caller that reads it back always sees the complete archive; throws fail-loud on
  * a non-zero exit, a tripped disk guard, or a stream error, writing no file the
- * caller then trusts.
+ * caller then trusts. On success resolves with the pod's trimmed stderr (the
+ * script's non-fatal diagnostics, e.g. entries it chose to leave out).
  */
 async function streamPodStdoutToFile(input: {
   exec: PodStreamExec;
@@ -241,7 +242,7 @@ async function streamPodStdoutToFile(input: {
   maxOutputBytes: number;
   timeoutMs: number;
   label: string;
-}): Promise<void> {
+}): Promise<string> {
   const fileStream = createWriteStream(input.filePath);
   let written = 0;
   const guard = new Transform({
@@ -267,12 +268,13 @@ async function streamPodStdoutToFile(input: {
       maxStderrBytes: SYNC_STDERR_CAP_BYTES,
     });
     await flushed;
+    const detail = (result.stderr || "").trim();
     if (result.exitCode !== 0) {
-      const detail = (result.stderr || "").trim();
       throw new Error(
         `Kubernetes ${input.label} failed (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`,
       );
     }
+    return detail;
   } catch (err) {
     // Tear the sink down so a tripped guard / rejected exec never leaves the
     // file stream open (and its `finished` promise dangling as unhandled).
@@ -818,12 +820,81 @@ async function syncOutFileMappings(input: {
   });
 }
 
+// How many skipped symlinks the pod names individually on stderr before it
+// switches to a single count; keeps the diagnostics far below the stderr cap.
+const ESCAPING_LINK_LOG_LIMIT = 20;
+
+/**
+ * In-pod POSIX-sh helpers for leaving out symlinks the host would refuse.
+ *
+ * `_pc_link_escapes <member> <target>` succeeds when the link target, read
+ * relative to the member's parent directory, leaves the synced directory. It is
+ * the same lexical rule `assertTarballEntriesConfined` applies on the host (an
+ * absolute target, or `..` climbing above the archive root), so the pod skips
+ * exactly the links the host would reject and the host check stays the
+ * fail-closed backstop. It is pure shell (no extra process per call).
+ *
+ * `_pc_note_skip` logs a skipped link to stderr (the first
+ * `ESCAPING_LINK_LOG_LIMIT` by name) and `_pc_skip_summary` reports the total
+ * once the limit is exceeded.
+ */
+function escapingLinkHelpers(): string[] {
+  return [
+    "_pc_skipped=0;",
+    "_pc_link_escapes() {",
+    '  case "$2" in /*) return 0 ;; esac;',
+    '  _pc_depth=0; _pc_rest=$1;',
+    '  while :; do case "$_pc_rest" in */*) _pc_depth=$((_pc_depth + 1)); _pc_rest=${_pc_rest#*/} ;; *) break ;; esac; done;',
+    '  _pc_rest=$2;',
+    '  while [ -n "$_pc_rest" ]; do',
+    '    case "$_pc_rest" in */*) _pc_part=${_pc_rest%%/*}; _pc_rest=${_pc_rest#*/} ;; *) _pc_part=$_pc_rest; _pc_rest= ;; esac;',
+    '    case "$_pc_part" in',
+    '      ""|.) : ;;',
+    '      ..) _pc_depth=$((_pc_depth - 1)); [ "$_pc_depth" -ge 0 ] || return 0 ;;',
+    '      *) _pc_depth=$((_pc_depth + 1)) ;;',
+    '    esac;',
+    '  done;',
+    '  return 1;',
+    '};',
+    "_pc_note_skip() {",
+    "  _pc_skipped=$((_pc_skipped + 1));",
+    `  if [ "$_pc_skipped" -le ${ESCAPING_LINK_LOG_LIMIT} ]; then printf 'syncOut: skipped symlink whose target leaves the synced directory: %s -> %s\\n' "$1" "$2" >&2; fi;`,
+    "};",
+    "_pc_skip_summary() {",
+    `  if [ "$_pc_skipped" -gt ${ESCAPING_LINK_LOG_LIMIT} ]; then printf 'syncOut: skipped %s symlinks in total whose target leaves the synced directory\\n' "$_pc_skipped" >&2; fi;`,
+    "};",
+  ];
+}
+
+/**
+ * `find` predicate that prunes directories the tar excludes will drop anyway
+ * (every exclude pattern without a `/`, matched as a basename like tar's
+ * unanchored exclude does), so the nested-link scan does not walk dependency or
+ * build trees. Pruning is only an optimization: a link the scan misses is still
+ * caught, fail-closed, by the host-side member check.
+ */
+function nestedLinkScanFindArgs(excludes: string[]): string {
+  const names = excludes.filter((entry) => entry.length > 0 && !entry.includes("/"));
+  if (names.length === 0) return ". -type l -print";
+  const prune = names.map((entry) => `-name ${shQuote(entry)}`).join(" -o ");
+  return `. \\( ${prune} \\) -prune -o -type l -print`;
+}
+
 /**
  * Stream one `kind:"directory"` mapping back in ONE exec: the in-pod script
  * confines the source (realpath through `/proc/self/fd`), tars it (reproducing
  * `followSymlinks` → `-h` and `exclude`, naming top-level entries so no "." self
  * entry is embedded) straight to stdout, and the host streams that into a file,
  * member-confines the sandbox-authored tar, and extracts into the target dir.
+ *
+ * Without `followSymlinks`, symlinks whose target leaves the synced directory
+ * (absolute targets, or `..` above its root) are left out and logged instead of
+ * packed: the host refuses such a member and would otherwise fail the whole
+ * transfer because of one stray link. Top-level entries are filtered in the
+ * shell; nested ones are handed to GNU tar as an exact (anchored, literal)
+ * exclude list. The host-side member check is unchanged and still rejects any
+ * escaping link the pod could not leave out (another tar, or a name that cannot
+ * be expressed in an exclude list).
  */
 async function syncOutDirectoryMapping(input: {
   exec: PodStreamExec;
@@ -835,10 +906,9 @@ async function syncOutDirectoryMapping(input: {
   const { exec, mapping, remoteDir, timeoutMs, maxOutputBytes } = input;
   assertConfinedSandboxPath(remoteDir, mapping.sourcePath, "source");
   return withHostTempDir(async (tmp) => {
-    const excludeFlags = ["._*", ...(mapping.exclude ?? [])]
-      .map((entry) => `--exclude ${shQuote(entry)}`)
-      .join(" ");
-    const script = [
+    const excludes = ["._*", ...(mapping.exclude ?? [])];
+    const excludeFlags = excludes.map((entry) => `--exclude ${shQuote(entry)}`).join(" ");
+    const confineAndEnter = [
       ...canonicalizerPreamble(shQuote(remoteDir)),
       // Confine the source dir through an open-then-verify pinned fd before taring.
       `_pc_real=$(_pc_resolve ${shQuote(mapping.sourcePath)}) || { echo "ESCAPE" >&2; exit 42; };`,
@@ -847,18 +917,63 @@ async function syncOutDirectoryMapping(input: {
       `_pc_fd_real=$(_pc_resolve /proc/self/fd/9) || { echo "ESCAPE" >&2; exit 42; };`,
       `case "$_pc_fd_real/" in "$_pc_root"/*) : ;; *) echo "ESCAPE" >&2; exit 42 ;; esac;`,
       `cd /proc/self/fd/9 || { echo "cd failed" >&2; exit 46; };`,
-      // Collect top-level entries (incl. dotfiles) without a "." self-entry, then
-      // tar with the `followSymlinks` → `-h` mapping, streaming to stdout.
-      "set -- *",
-      'if [ "$#" -eq 1 ] && [ "$1" = "*" ] && [ ! -e "$1" ] && [ ! -L "$1" ]; then set --; fi',
-      'for entry in .[!.]* ..?*; do [ -e "$entry" ] || [ -L "$entry" ] || continue; set -- "$@" "$entry"; done',
-      `if [ "$#" -eq 0 ]; then dd if=/dev/zero bs=1024 count=1 2>/dev/null; ` +
-        `else tar -c --no-xattrs ${mapping.followSymlinks ? "-h " : ""}${excludeFlags} -f - -- "$@" || { echo "tar failed" >&2; exit 43; }; fi`,
-      `exec 9>&-;`,
-    ].join("\n");
+    ];
+    const packEntries = mapping.followSymlinks
+      ? [
+          // Collect top-level entries (incl. dotfiles) without a "." self-entry, then
+          // tar with `-h` (links are dereferenced, so none is packed as a link),
+          // streaming to stdout.
+          "set -- *",
+          'if [ "$#" -eq 1 ] && [ "$1" = "*" ] && [ ! -e "$1" ] && [ ! -L "$1" ]; then set --; fi',
+          'for entry in .[!.]* ..?*; do [ -e "$entry" ] || [ -L "$entry" ] || continue; set -- "$@" "$entry"; done',
+          `if [ "$#" -eq 0 ]; then dd if=/dev/zero bs=1024 count=1 2>/dev/null; ` +
+            `else tar -c --no-xattrs -h ${excludeFlags} -f - -- "$@" || { echo "tar failed" >&2; exit 43; }; fi`,
+        ]
+      : [
+          ...escapingLinkHelpers(),
+          // Nested links: read each symlink `find` reports (re-checking it really
+          // is a symlink, so a name split across lines cannot inject a pattern)
+          // and print the escaping ones as exact exclude patterns. Names ending in
+          // whitespace are left in: tar trims them from an exclude list, so they
+          // would name a different member; the host check rejects them instead.
+          "_pc_nested_escaping_links() {",
+          "  while IFS= read -r _pc_path; do",
+          '    _pc_name=${_pc_path#./};',
+          '    case "$_pc_name" in */*) : ;; *) continue ;; esac;',
+          '    [ -L "$_pc_path" ] || continue;',
+          '    _pc_target=$(readlink -- "$_pc_path") || continue;',
+          '    _pc_link_escapes "$_pc_name" "$_pc_target" || continue;',
+          '    case "$_pc_name" in *[[:space:]]) continue ;; esac;',
+          '    _pc_note_skip "$_pc_name" "$_pc_target";',
+          "    printf '%s\\n' \"$_pc_name\";",
+          "  done;",
+          "  _pc_skip_summary;",
+          "};",
+          // Top-level entries (incl. dotfiles, no "." self-entry), leaving out
+          // escaping symlinks.
+          "set --",
+          'for entry in * .[!.]* ..?*; do',
+          '  [ -e "$entry" ] || [ -L "$entry" ] || continue;',
+          '  if [ -L "$entry" ] && _pc_target=$(readlink -- "$entry") && _pc_link_escapes "$entry" "$_pc_target"; then',
+          '    _pc_note_skip "$entry" "$_pc_target"; continue;',
+          "  fi;",
+          '  set -- "$@" "$entry";',
+          "done",
+          'if [ "$#" -eq 0 ]; then _pc_skip_summary; dd if=/dev/zero bs=1024 count=1 2>/dev/null;',
+          'else case "$(tar --version 2>/dev/null)" in',
+          // GNU tar reads the nested exclusions from stdin; `--anchored
+          // --no-wildcards` applies only to that list (the `--exclude` patterns
+          // before it keep their usual glob semantics), so each one names exactly
+          // one member.
+          `  *"GNU tar"*) { find ${nestedLinkScanFindArgs(excludes)} 2>/dev/null || :; } | _pc_nested_escaping_links | ` +
+            `tar -c --no-xattrs ${excludeFlags} --anchored --no-wildcards -X - -f - -- "$@" || { echo "tar failed" >&2; exit 43; } ;;`,
+          `  *) _pc_skip_summary; tar -c --no-xattrs ${excludeFlags} -f - -- "$@" || { echo "tar failed" >&2; exit 43; } ;;`,
+          "esac; fi",
+        ];
+    const script = [...confineAndEnter, ...packEntries, `exec 9>&-;`].join("\n");
 
     const localTar = path.join(tmp, "sync-out.tar");
-    await streamPodStdoutToFile({
+    const diagnostics = await streamPodStdoutToFile({
       exec,
       script,
       filePath: localTar,
@@ -866,6 +981,9 @@ async function syncOutDirectoryMapping(input: {
       timeoutMs,
       label: "syncOut directory transfer",
     });
+    if (diagnostics.length > 0) {
+      console.warn(`[kubernetes] syncOut of ${mapping.sourcePath}:\n${diagnostics}`);
+    }
     const bytesTransferred = (await fs.stat(localTar)).size;
     await extractHostTarball({ archivePath: localTar, localDir: mapping.targetPath });
     const filesTransferred = await countHostFiles(mapping.targetPath, mapping.exclude);

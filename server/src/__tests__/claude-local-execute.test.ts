@@ -917,6 +917,86 @@ describe("claude execute", () => {
     }
   }, 10_000);
 
+  it("resumes the saved session on a follow-up run in the same reusable sandbox", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-sandbox-reuse-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
+    const remoteWorkspace = path.join(root, "sandbox-workspace");
+    await fs.mkdir(remoteWorkspace, { recursive: true });
+    const baseInput = {
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: { engine: "cli" },
+      },
+      config: {
+        engine: "cli",
+        command: commandPath,
+        cwd: workspace,
+        env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+        promptTemplate: "Continue the task.",
+      },
+      context: {},
+      authToken: "run-jwt-token",
+      onLog: async () => {},
+    };
+    const target = (leaseId: string, acquisition: { outcome: "created" | "resumed" | "replacement"; providerLeaseId: string }) => ({
+      kind: "remote" as const,
+      transport: "sandbox" as const,
+      providerKey: "kubernetes",
+      environmentId: "env-1",
+      leaseId,
+      remoteCwd: remoteWorkspace,
+      timeoutMs: 30_000,
+      sandboxLeaseAcquisition: acquisition,
+      runner: createLocalSandboxRunner(),
+    });
+    const noSession = { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null };
+
+    try {
+      const first = await execute({
+        runId: "run-reuse-1",
+        ...baseInput,
+        runtime: noSession,
+        executionTarget: target("lease-1", { outcome: "created", providerLeaseId: "pc-1" }),
+      });
+      expect(first.exitCode).toBe(0);
+      // The heartbeat persists the session through the adapter codec.
+      const saved = sessionCodec.deserialize(JSON.parse(JSON.stringify(sessionCodec.serialize(first.sessionParams ?? null))))!;
+      const savedRuntime = {
+        sessionId: saved.sessionId as string,
+        sessionParams: saved,
+        sessionDisplayId: saved.sessionId as string,
+        taskKey: "task-1",
+      };
+
+      // Next run: a new lease row that resumed the same provider sandbox.
+      const second = await execute({
+        runId: "run-reuse-2",
+        ...baseInput,
+        runtime: savedRuntime,
+        executionTarget: target("lease-2", { outcome: "resumed", providerLeaseId: "pc-1" }),
+      });
+      expect(second.exitCode).toBe(0);
+      let capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
+      expect(capture.argv).toEqual(expect.arrayContaining(["--resume", "11111111-1111-4111-8111-111111111111"]));
+
+      // A replacement sandbox starts a fresh session.
+      await execute({
+        runId: "run-reuse-3",
+        ...baseInput,
+        runtime: savedRuntime,
+        executionTarget: target("lease-3", { outcome: "replacement", providerLeaseId: "pc-2" }),
+      });
+      capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
+      expect(capture.argv).not.toContain("--resume");
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("omits --effort for sandbox-managed runs when the installed Claude CLI does not advertise it", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-sandbox-effort-"));
     const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root, {

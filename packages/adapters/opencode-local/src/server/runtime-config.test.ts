@@ -1,8 +1,14 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
+import {
+  buildPruneManagedOpenCodeHomesCommand,
+  prepareManagedOpenCodeRemoteHomes,
+  prepareOpenCodeRuntimeConfig,
+} from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
 
@@ -319,5 +325,88 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(prepared.env).toEqual({ XDG_CONFIG_HOME: configHome });
     expect(prepared.notes).toEqual([]);
     await prepared.cleanup();
+  });
+});
+
+describe("prepareManagedOpenCodeRemoteHomes", () => {
+  const managed = (identity: string) => ({ managedAiConnection: { method: "api_key", identity } });
+  const root = "/workspace/.paperclip-runtime/opencode";
+
+  it("gives every run its own home outside a reused sandbox", () => {
+    const env: Record<string, string> = {};
+    const home = prepareManagedOpenCodeRemoteHomes({
+      env,
+      config: managed("grant-1:user-1:gen-a"),
+      runtimeRootDir: root,
+      runId: "run-1",
+    });
+    expect(home).toEqual({ managedAuthRoot: `${root}/managed-auth`, homeName: "run-1", perAccount: false });
+    expect(env.XDG_DATA_HOME).toBe(`${root}/managed-auth/run-1/data`);
+  });
+
+  it("keeps one home per account in a reused sandbox, so the session store carries over", () => {
+    const first: Record<string, string> = {};
+    const second: Record<string, string> = {};
+    const otherAccount: Record<string, string> = {};
+    const a = prepareManagedOpenCodeRemoteHomes({
+      env: first,
+      config: managed("grant-1:user-1:gen-a"),
+      runtimeRootDir: root,
+      runId: "run-1",
+      reusedSandbox: true,
+    });
+    // Same account, rotated credential, next run.
+    prepareManagedOpenCodeRemoteHomes({
+      env: second,
+      config: managed("grant-1:user-1:gen-b"),
+      runtimeRootDir: root,
+      runId: "run-2",
+      reusedSandbox: true,
+    });
+    prepareManagedOpenCodeRemoteHomes({
+      env: otherAccount,
+      config: managed("grant-2:user-1:gen-a"),
+      runtimeRootDir: root,
+      runId: "run-3",
+      reusedSandbox: true,
+    });
+    expect(a?.perAccount).toBe(true);
+    expect(a?.homeName).toMatch(/^account-[0-9a-f]{32}$/);
+    expect(second.XDG_DATA_HOME).toBe(first.XDG_DATA_HOME);
+    expect(second.HOME).toBe(first.HOME);
+    expect(otherAccount.XDG_DATA_HOME).not.toBe(first.XDG_DATA_HOME);
+  });
+
+  it("stays per run when the connection carries no identity, and does nothing without a managed connection", () => {
+    const env: Record<string, string> = {};
+    expect(
+      prepareManagedOpenCodeRemoteHomes({
+        env,
+        config: { managedAiConnection: { method: "api_key" } },
+        runtimeRootDir: root,
+        runId: "run-9",
+        reusedSandbox: true,
+      }),
+    ).toMatchObject({ homeName: "run-9", perAccount: false });
+    expect(
+      prepareManagedOpenCodeRemoteHomes({ env: {}, config: {}, runtimeRootDir: root, runId: "run-9", reusedSandbox: true }),
+    ).toBeNull();
+  });
+
+  it("prunes every other managed home in the sandbox", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-managed-homes-"));
+    try {
+      const managedAuthRoot = path.join(dir, "managed-auth");
+      for (const name of ["run-old", "account-other", "account-keep"]) {
+        await fs.mkdir(path.join(managedAuthRoot, name, "data"), { recursive: true });
+      }
+      await promisify(execFileCallback)("sh", [
+        "-c",
+        buildPruneManagedOpenCodeHomesCommand({ managedAuthRoot, homeName: "account-keep", perAccount: true }),
+      ]);
+      expect(await fs.readdir(managedAuthRoot)).toEqual(["account-keep"]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });

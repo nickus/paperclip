@@ -683,6 +683,14 @@ const PENDING_CLEANUP_ATTEMPTS_METADATA_KEY = "pendingCleanupRetryAttempts";
 const PENDING_CLEANUP_CAP_WARNED_METADATA_KEY = "pendingCleanupRetryCapWarned";
 // The reaper sweeps at most this many orphaned active leases per tick.
 const ORPHANED_ACTIVE_LEASE_SWEEP_PAGE_SIZE = 20;
+// The reaper releases at most this many terminal runs' stale "active" leases
+// per tick.
+const STALE_TERMINAL_RUN_LEASE_PAGE_SIZE = 20;
+// A terminal run's lease is stale only after both the run finished and the
+// lease last changed this long ago. A live executor (possibly still inside a
+// slow provider acquire when the run was cancelled) releases its own lease
+// well within this window; the grace keeps the reaper from racing it.
+export const STALE_TERMINAL_RUN_LEASE_GRACE_MS = 10 * 60 * 1000;
 
 // A provider or plugin destroy rejection can carry a bearer credential, a
 // signed URL, or provider response detail in its name, code, message, cause, or
@@ -6477,6 +6485,23 @@ function buildSessionConfigCategoryValues(input: {
   // boundary; the reusable row and its evolving generation are state.
   delete workspaceConfig.existingExecutionWorkspace;
   delete workspaceConfig.reusableExecutionWorkspaceConfig;
+  // The issue's own workspace mode reaches a run only through the
+  // requested/effective mode above (and through the adapter config it shapes,
+  // which has its own category). The mode field itself is also written by the
+  // heartbeat: when a task is pinned to the execution workspace its first run
+  // realized (reuse_existing, e.g. for reusable sandboxes), the resolved mode is
+  // copied onto the issue settings. Hashing the raw field would count that
+  // write-back as a configuration change and start a new agent session on the
+  // first follow-up run, although nothing about how the task runs changed. Keep
+  // every other issue setting (strategy, runtime, egress, concurrency) in the
+  // fingerprint, and treat "no settings left" the same as "no settings".
+  if (workspaceConfig.issueSettings != null) {
+    const { mode: _issueMode, ...issueSettings } = parseObject(
+      workspaceConfig.issueSettings,
+    );
+    workspaceConfig.issueSettings =
+      Object.keys(issueSettings).length > 0 ? issueSettings : null;
+  }
   return {
     adapter: {
       adapterType: input.adapterType,
@@ -9415,6 +9440,8 @@ export function heartbeatService(
   options: HeartbeatServiceOptions = {},
 ) {
   let shutdownInProgress = false;
+  // Single-flight guard for reconcileStaleTerminalRunLeases in this service.
+  let staleTerminalRunLeaseReconciliationInFlight = false;
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -10215,6 +10242,145 @@ export function heartbeatService(
       );
     }
     await acknowledgeRemoteStop(input.runId, input.companyId);
+  }
+
+  // Release the environment leases of a legacy run that a Stop/pause path just
+  // terminated. An in-process executor still owns its leases and releases them
+  // in its own teardown (possibly after a slow provider acquire returns), so
+  // only release here when no executor is left to do it, e.g. a run orphaned by
+  // a server restart and then cancelled. Native runs keep their dedicated
+  // finalization coordinator. Release is idempotent: it only touches leases
+  // that are still "active".
+  async function releaseEnvironmentLeasesForStoppedRun(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "runtimeMode">,
+  ) {
+    if (run.runtimeMode === "native") return;
+    if (activeRunExecutions.has(run.id) || adapterExecutionControls.has(run.id)) return;
+    const stopped = await getRun(run.id);
+    if (!stopped || !isHeartbeatRunTerminalStatus(stopped.status)) return;
+    // An executor in another server process still holds an unexpired
+    // controller lease: its own teardown releases the environment lease (the
+    // stale-lease reconciliation is the backstop if that process dies).
+    if (
+      stopped.controllerBootId &&
+      stopped.controllerBootId !== legacyControllerBootId &&
+      (stopped.controllerLeaseExpiresAt?.getTime() ?? 0) > Date.now()
+    ) return;
+    await releaseEnvironmentLeasesForRun({
+      runId: stopped.id,
+      companyId: stopped.companyId,
+      agentId: stopped.agentId,
+      status: stopped.status,
+      failureReason: stopped.error ?? undefined,
+    });
+  }
+
+  // Reconcile "active" environment leases whose legacy run is already terminal
+  // but whose executor never reached its teardown, e.g. the server restarted
+  // while a cancelled run's sandbox was still starting. Nothing else ever
+  // releases such a lease, so it stays "active" forever and the task's saved
+  // comments wait for a sandbox-stop receipt that is never produced. The
+  // release goes through the normal driver path: a confirmed provider stop is
+  // recorded as a termination receipt, and a failed release lands in
+  // pending_cleanup for the existing retry sweep.
+  //
+  // Unlike the Stop path, this needs no controller-lease check: a legacy
+  // controller lease renews only while its run is "running"
+  // (legacy-controller-lease.ts), so a terminal run's controller lease lapses
+  // at most 60s after the run stopped, long before the grace below ends, and
+  // its executor aborts once renewal fails. An executor elsewhere that is still
+  // tearing down after the grace would only repeat this idempotent release.
+  async function reconcileStaleTerminalRunLeases(opts?: {
+    graceMs?: number;
+    now?: Date;
+  }): Promise<{ reconciled: number; runIds: string[] }> {
+    // Each release can wait on a provider teardown RPC, so an overlapping reaper
+    // tick skips the step instead of stacking a second serial teardown loop
+    // (and delaying its own dispatch work behind it).
+    if (staleTerminalRunLeaseReconciliationInFlight) return { reconciled: 0, runIds: [] };
+    staleTerminalRunLeaseReconciliationInFlight = true;
+    try {
+      return await reconcileStaleTerminalRunLeasePage(opts);
+    } finally {
+      staleTerminalRunLeaseReconciliationInFlight = false;
+    }
+  }
+
+  async function reconcileStaleTerminalRunLeasePage(opts?: {
+    graceMs?: number;
+    now?: Date;
+  }): Promise<{ reconciled: number; runIds: string[] }> {
+    const graceMs = Math.max(0, opts?.graceMs ?? STALE_TERMINAL_RUN_LEASE_GRACE_MS);
+    const cutoff = new Date((opts?.now ?? new Date()).getTime() - graceMs);
+    const candidates = await db
+      .selectDistinct({ runId: heartbeatRuns.id })
+      .from(environmentLeases)
+      .innerJoin(
+        heartbeatRuns,
+        and(
+          eq(heartbeatRuns.id, environmentLeases.heartbeatRunId),
+          eq(heartbeatRuns.companyId, environmentLeases.companyId),
+        ),
+      )
+      .where(
+        and(
+          eq(environmentLeases.status, "active"),
+          lte(environmentLeases.updatedAt, cutoff),
+          inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+          // Native runs can be resumed or finalized after a terminal-looking
+          // status; their coordinator owns the lease lifecycle.
+          ne(heartbeatRuns.runtimeMode, "native"),
+          or(
+            lte(heartbeatRuns.finishedAt, cutoff),
+            and(isNull(heartbeatRuns.finishedAt), lte(heartbeatRuns.updatedAt, cutoff)),
+          ),
+        ),
+      )
+      .limit(STALE_TERMINAL_RUN_LEASE_PAGE_SIZE);
+    const runIds: string[] = [];
+    for (const { runId } of candidates) {
+      // A hot restart is draining this process; the next server picks up the rest.
+      if (shutdownInProgress) break;
+      // Never touch a lease whose executor is still alive in this process.
+      if (activeRunExecutions.has(runId) || adapterExecutionControls.has(runId)) continue;
+      try {
+        const run = await getRun(runId);
+        if (!run || run.runtimeMode === "native" || !isHeartbeatRunTerminalStatus(run.status)) continue;
+        // Atomically claim the run's stale leases before the release, like the
+        // pending_cleanup sweep's attempt claim. Bumping updatedAt drops them
+        // from every other reconciler's candidates (an overlapping tick or
+        // another server process), so only one of them releases the sandbox. A
+        // lease the release leaves "active" is retried only after another grace.
+        const claimed = await db
+          .update(environmentLeases)
+          .set({ updatedAt: new Date() })
+          .where(
+            and(
+              eq(environmentLeases.companyId, run.companyId),
+              eq(environmentLeases.heartbeatRunId, run.id),
+              eq(environmentLeases.status, "active"),
+              lte(environmentLeases.updatedAt, cutoff),
+            ),
+          )
+          .returning({ id: environmentLeases.id });
+        if (claimed.length === 0) continue;
+        await releaseEnvironmentLeasesForRun({
+          runId: run.id,
+          companyId: run.companyId,
+          agentId: run.agentId,
+          status: run.status,
+          failureReason: run.error ?? "stale_terminal_run_lease",
+        });
+        runIds.push(run.id);
+        // A confirmed stop may unblock the user's saved messages right away.
+        await resumeRemoteStopComments((await getRun(run.id)) ?? run).catch((err) => {
+          logger.warn({ err, runId: run.id }, "could not reconsider messages after stale lease release");
+        });
+      } catch (err) {
+        logger.warn({ err, runId }, "failed to reconcile stale environment lease for terminal run");
+      }
+    }
+    return { reconciled: runIds.length, runIds };
   }
 
   async function acknowledgeRemoteStop(runId: string, companyId: string) {
@@ -19350,6 +19516,25 @@ export function heartbeatService(
       );
     }
 
+    // Release "active" leases left behind by terminal runs whose executor died
+    // before its teardown. Isolated like the sweep below.
+    try {
+      const staleLeases = await reconcileStaleTerminalRunLeases();
+      if (staleLeases.reconciled > 0) {
+        logger.warn(
+          { reconciled: staleLeases.reconciled, runIds: staleLeases.runIds },
+          "released stale environment leases of terminal heartbeat runs",
+        );
+      }
+    } catch {
+      // Log a constant errorKind only, like the sweeps below: the exception can
+      // carry a provider credential in its message, cause, or stack.
+      logger.error(
+        { errorKind: "stale_terminal_run_lease_reconcile_failed" },
+        "stale terminal-run environment lease reconciliation failed",
+      );
+    }
+
     // Recover an active lease whose run already ended before the same-tick
     // pending_cleanup sweep, so this tick can stop the recovered sandbox.
     // Isolate the sweep so its failure never hides the reaper result.
@@ -21823,10 +22008,14 @@ export function heartbeatService(
         issueRef?.executionWorkspacePreference ?? null;
       let issueExecutionWorkspaceModeForRun =
         issueExecutionWorkspaceSettings?.mode ?? null;
-      const warmReusableExecutionWorkspace =
+      // A sandbox environment that keeps its sandbox between runs (`reuseLease`,
+      // with or without a warm runner) hands a retained sandbox back only to a
+      // run on the same execution workspace. Keep the issue on the workspace
+      // its first run persisted; otherwise every run of a shared-workspace issue
+      // creates a new workspace row and never finds its sandbox again.
+      const reusableSandboxExecutionWorkspace =
         selectedEnvironmentForConfig?.driver === "sandbox" &&
-        selectedEnvironmentConfigForFingerprint.reuseLease === true &&
-        selectedEnvironmentConfigForFingerprint.runnerLifecycleMode === "warm";
+        selectedEnvironmentConfigForFingerprint.reuseLease === true;
       // Native provider checkpoints bind to the workspace row, including ordinary
       // local shared workspaces. Persist that binding independently of the opt-in
       // isolated-workspace UI, just as warm sandbox continuity already does.
@@ -21845,7 +22034,7 @@ export function heartbeatService(
           issueRef?.executionWorkspacePreference === "reuse_existing" ||
           requestedExecutionWorkspaceMode === "isolated_workspace" ||
           requestedExecutionWorkspaceMode === "operator_branch" ||
-          warmReusableExecutionWorkspace || nativeSharedWorkspace;
+          reusableSandboxExecutionWorkspace || nativeSharedWorkspace;
         const nextIssuePatch: Record<string, unknown> = {};
         if (issueExecutionWorkspaceIdForRun !== workspace.id) {
           nextIssuePatch.executionWorkspaceId = workspace.id;
@@ -21874,7 +22063,7 @@ export function heartbeatService(
             db,
             undefined,
             undefined,
-            { bindRuntimeSharedWorkspace: (warmReusableExecutionWorkspace || nativeSharedWorkspace) && workspace.mode === "shared_workspace" },
+            { bindRuntimeSharedWorkspace: (reusableSandboxExecutionWorkspace || nativeSharedWorkspace) && workspace.mode === "shared_workspace" },
           );
           issueExecutionWorkspaceIdForRun = workspace.id;
           issueProjectWorkspaceIdForRun =
@@ -25038,6 +25227,58 @@ export function heartbeatService(
         );
 
         const finalizedRun = persistedRun ?? (await getRun(run.id));
+        const persistTaskSessionForFinalizedRun = async (
+          finalized: NonNullable<typeof finalizedRun>,
+          sessionTaskKey: string,
+        ) => {
+          if (
+            adapterResult.clearSession ||
+            (!nextSessionState.params && !nextSessionState.displayId)
+          ) {
+            await clearTaskSessions(agent.companyId, agent.id, {
+              taskKey: sessionTaskKey,
+              adapterType: agent.adapterType,
+              expectedRunId: finalized.id,
+            });
+            return;
+          }
+          await upsertTaskSession({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            adapterType: agent.adapterType,
+            taskKey: sessionTaskKey,
+            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+              nextSessionState.params,
+              configuredModel,
+              sessionConfigMetadata,
+            ),
+            sessionDisplayId: nextSessionState.displayId,
+            lastRunId: finalized.id,
+            lastError: runErrorMessage,
+          });
+        };
+        // Save this run's task session before anything below can queue the
+        // next run on the task: the successful-run handoff, deferred wakes
+        // promoted when the issue execution is released, bounded retries and
+        // goal rollovers. A wake that resumes from this run copies the task
+        // session when it is queued. Saved only afterwards, the wake finds no
+        // session of this run and keeps just the bare session id, which an
+        // adapter on a remote target cannot match to its execution identity,
+        // so the follow-up run would start a new session.
+        let taskSessionPersisted = false;
+        if (finalizedRun && taskKey) {
+          try {
+            await persistTaskSessionForFinalizedRun(finalizedRun, taskKey);
+            taskSessionPersisted = true;
+          } catch (err) {
+            // Keep finalizing (issue release, follow-up wakes). The save is
+            // retried at the end, where a failure surfaces as it did before.
+            logger.warn(
+              { err, runId: run.id, taskKey },
+              "failed to save the task session before follow-up wakes; retrying after finalization",
+            );
+          }
+        }
         if (finalizedRun) {
           await appendRunEvent(finalizedRun, {
             eventType: "lifecycle",
@@ -25350,33 +25591,8 @@ export function heartbeatService(
             },
             normalizedUsage,
           );
-          if (taskKey) {
-            if (
-              adapterResult.clearSession ||
-              (!nextSessionState.params && !nextSessionState.displayId)
-            ) {
-              await clearTaskSessions(agent.companyId, agent.id, {
-                taskKey,
-                adapterType: agent.adapterType,
-                expectedRunId: finalizedRun.id,
-              });
-            } else {
-              await upsertTaskSession({
-                companyId: agent.companyId,
-                agentId: agent.id,
-                adapterType: agent.adapterType,
-                taskKey,
-                sessionParamsJson:
-                  attachPaperclipSessionMetadataToSessionParams(
-                    nextSessionState.params,
-                    configuredModel,
-                    sessionConfigMetadata,
-                  ),
-                sessionDisplayId: nextSessionState.displayId,
-                lastRunId: finalizedRun.id,
-                lastError: runErrorMessage,
-              });
-            }
+          if (taskKey && !taskSessionPersisted) {
+            await persistTaskSessionForFinalizedRun(finalizedRun, taskKey);
           }
         }
         await finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
@@ -29117,6 +29333,11 @@ export function heartbeatService(
           finishedAt: cancelled.finishedAt ?? new Date(),
           error: reason,
         });
+        // Release the sandbox lease of a run with no live executor left to
+        // tear it down (idempotent; skipped while an executor still owns it).
+        await releaseEnvironmentLeasesForStoppedRun(cancelled).catch((err) => {
+          logger.warn({ err, runId: cancelled.id }, "failed to release environment leases for cancelled run");
+        });
         await appendRunEvent(cancelled, {
           eventType: "lifecycle",
           stream: "system",
@@ -29207,6 +29428,12 @@ export function heartbeatService(
           });
         }
         runningProcesses.delete(run.id);
+        // No adapter owner stopped here, so no executor teardown is guaranteed
+        // to release this run's sandbox lease (e.g. a run orphaned by a
+        // restart). Release it now unless a live executor still owns it.
+        await releaseEnvironmentLeasesForStoppedRun(run).catch((err) => {
+          logger.warn({ err, runId: run.id }, "failed to release environment leases for cancelled run");
+        });
         await releaseIssueExecutionAndPromote(run);
       } finally {
         stopOwnership?.release();
@@ -29621,6 +29848,7 @@ export function heartbeatService(
     reapOrphanedRuns,
     sweepOrphanedActiveLeases,
     sweepPendingCleanupLeases,
+    reconcileStaleTerminalRunLeases,
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
