@@ -325,6 +325,56 @@ describe("secrets API parity commands", () => {
   });
 });
 
+describe("secrets access-events output", () => {
+  const logged = () => vi.mocked(console.log).mock.calls.map((call) => String(call[0]));
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    delete process.env.PAPERCLIP_API_KEY;
+    delete process.env.PAPERCLIP_API_URL;
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("prints an empty list when the server answers with no body", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
+
+    await runSecretCommand(["secrets", "access-events", "secret-1"]);
+
+    expect(process.exit).not.toHaveBeenCalled();
+    expect(logged()).toEqual([expect.stringContaining("(empty)")]);
+  });
+
+  it("prints an empty page as JSON when the server answers with no body", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
+
+    await runSecretCommand(["secrets", "access-events", "secret-1", "--json"]);
+
+    expect(process.exit).not.toHaveBeenCalled();
+    expect(JSON.parse(logged()[0]!)).toEqual({ events: [], nextCursor: null });
+  });
+
+  it("passes limit and cursor through and points at the next page", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ events: [], nextCursor: "cursor-2" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await runSecretCommand(["secrets", "access-events", "secret-1", "--limit", "5", "--cursor", "cursor-1"]);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "http://localhost:3100/api/secrets/secret-1/access-events?limit=5&cursor=cursor-1",
+    );
+    expect(logged().join("\n")).toContain("--cursor cursor-2");
+  });
+});
+
 async function runSecretCommand(args: string[]): Promise<void> {
   const program = new Command();
   program.exitOverride();

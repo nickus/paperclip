@@ -532,7 +532,12 @@ export function registerSecretCommands(program: Command): void {
           if (opts.cursor) params.set("cursor", opts.cursor);
           const query = params.toString();
           const path = `${apiPath`/api/secrets/${secretId}/access-events`}${query ? `?${query}` : ""}`;
-          const page = await ctx.api.get<SecretAccessEventPage>(path);
+          // The client resolves an empty response body (e.g. 204) to null;
+          // treat it as an empty last page instead of dereferencing it.
+          const page: SecretAccessEventPage = (await ctx.api.get<SecretAccessEventPage>(path)) ?? {
+            events: [],
+            nextCursor: null,
+          };
 
           if (ctx.json) {
             printOutput(page, { json: true });
