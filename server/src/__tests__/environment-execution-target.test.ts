@@ -323,6 +323,70 @@ describe("resolveEnvironmentExecutionTarget", () => {
     expect(mockResolveEnvironmentDriverConfigForRuntime).not.toHaveBeenCalled();
   });
 
+  it("stamps the environment's bridge policy and the run company on SSH targets", async () => {
+    const sshConfig = {
+      host: "ssh.example.test",
+      port: 22,
+      username: "paperclip",
+      remoteWorkspacePath: "/srv/paperclip",
+      privateKey: "PRIVATE KEY",
+      knownHosts: "[ssh.example.test]:22 ssh-ed25519 AAAA",
+      strictHostKeyChecking: true,
+    };
+    const resolveFor = async (config: Record<string, unknown>) => {
+      mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver: "ssh", config });
+      return resolveEnvironmentExecutionTarget({
+        db: {} as never,
+        companyId: "company-1",
+        adapterType: "claude_local",
+        environment: { id: "env-ssh-1", driver: "ssh", config: {} },
+        leaseId: "lease-ssh-1",
+        leaseMetadata: {},
+        lease: null,
+        environmentRuntime: null,
+      });
+    };
+
+    expect(await resolveFor(sshConfig)).toMatchObject({
+      transport: "ssh",
+      paperclipApiBridgePolicy: "restricted",
+      paperclipApiBridgeCompanyId: "company-1",
+    });
+    expect(await resolveFor({ ...sshConfig, paperclipApiBridgePolicy: "agent" })).toMatchObject({
+      transport: "ssh",
+      paperclipApiBridgePolicy: "agent",
+      paperclipApiBridgeCompanyId: "company-1",
+    });
+  });
+
+  it("stamps the environment's bridge policy and the run company on sandbox targets", async () => {
+    const resolveFor = async (config: Record<string, unknown>) => {
+      mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver: "sandbox", config });
+      return resolveEnvironmentExecutionTarget({
+        db: {} as never,
+        companyId: "company-1",
+        adapterType: "opencode_local",
+        environment: { id: "env-1", driver: "sandbox", config: { provider: "fake-plugin" } },
+        leaseId: "lease-1",
+        leaseMetadata: {},
+        lease: null,
+        environmentRuntime: null,
+      });
+    };
+
+    expect(await resolveFor({ provider: "fake-plugin", reuseLease: false })).toMatchObject({
+      transport: "sandbox",
+      paperclipApiBridgePolicy: "restricted",
+      paperclipApiBridgeCompanyId: "company-1",
+    });
+    expect(await resolveFor({ provider: "fake-plugin", reuseLease: false, paperclipApiBridgePolicy: "agent" }))
+      .toMatchObject({
+        transport: "sandbox",
+        paperclipApiBridgePolicy: "agent",
+        paperclipApiBridgeCompanyId: "company-1",
+      });
+  });
+
   it("resolves SSH execution targets for grok_local", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "ssh",

@@ -147,6 +147,31 @@ describe("findReusableSandboxLeaseId", () => {
     expect(selected).toBe("sandbox-template-b");
   });
 
+  it("ignores the host-only bridge policy when matching a reusable plugin lease", () => {
+    const selected = findReusableSandboxLeaseId({
+      config: {
+        provider: "fake-plugin",
+        image: "template-b",
+        timeoutMs: 300000,
+        reuseLease: true,
+        paperclipApiBridgePolicy: "agent",
+      },
+      leases: [
+        {
+          providerLeaseId: "sandbox-template-b",
+          metadata: {
+            provider: "fake-plugin",
+            image: "template-b",
+            timeoutMs: 300000,
+            reuseLease: true,
+          },
+        },
+      ],
+    });
+
+    expect(selected).toBe("sandbox-template-b");
+  });
+
   it("requires image identity for reusable fake sandbox leases", () => {
     const selected = findReusableSandboxLeaseId({
       config: {

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
+import { SANDBOX_CALLBACK_BRIDGE_POLICIES } from "@paperclipai/shared";
 import type {
   Environment,
   EnvironmentDriver,
@@ -37,6 +38,12 @@ const secretRefSchema = z.object({
   version: z.union([z.literal("latest"), z.number().int().positive()]).optional().default("latest"),
 }).strict();
 
+// Route policy for the environment's Paperclip API bridge (see
+// `SANDBOX_CALLBACK_BRIDGE_POLICIES`). Absent means the restricted allowlist.
+const paperclipApiBridgePolicySchema = z.enum(SANDBOX_CALLBACK_BRIDGE_POLICIES, {
+  error: `Paperclip API bridge policy must be one of: ${SANDBOX_CALLBACK_BRIDGE_POLICIES.join(", ")}.`,
+}).optional();
+
 const sshEnvironmentConfigSchema = z.object({
   host: z.string({ error: "SSH environments require a host." }).trim().min(1, "SSH environments require a host."),
   port: z.coerce.number().int().min(1).max(65535).default(22),
@@ -55,6 +62,7 @@ const sshEnvironmentConfigSchema = z.object({
     .nullable()
     .transform((value) => (value && value.length > 0 ? value : null)),
   strictHostKeyChecking: z.boolean().optional().default(true),
+  paperclipApiBridgePolicy: paperclipApiBridgePolicySchema,
 }).strict();
 
 const sshEnvironmentConfigProbeSchema = sshEnvironmentConfigSchema.extend({
@@ -77,6 +85,7 @@ const fakeSandboxEnvironmentConfigSchema = z.object({
     .default("ubuntu:24.04"),
   reuseLease: z.boolean().optional().default(false),
   streamRunLogs: z.boolean().optional(),
+  paperclipApiBridgePolicy: paperclipApiBridgePolicySchema,
   runnerLifecycleMode: z.enum(["inherit", "per_turn", "warm"]).optional(),
   runnerIdleTimeoutMs: z.coerce
     .number()
@@ -100,6 +109,7 @@ const pluginSandboxEnvironmentConfigSchema = z.object({
   timeoutMs: z.coerce.number().int().min(1).max(86_400_000).optional(),
   reuseLease: z.boolean().optional().default(false),
   streamRunLogs: z.boolean().optional(),
+  paperclipApiBridgePolicy: paperclipApiBridgePolicySchema,
   runnerLifecycleMode: z.enum(["inherit", "per_turn", "warm"]).optional(),
   runnerIdleTimeoutMs: z.coerce
     .number()
@@ -403,6 +413,9 @@ export function stripSandboxProviderEnvelope(config: SandboxEnvironmentConfig): 
   const {
     provider: _provider,
     streamRunLogs: _streamRunLogs,
+    // Host-only: the provider never sees the bridge policy, so it neither
+    // rejects the key nor folds it into its reusable-lease fingerprint.
+    paperclipApiBridgePolicy: _paperclipApiBridgePolicy,
     ...driverConfig
   } = config as Record<string, unknown>;
   return driverConfig;
@@ -418,6 +431,7 @@ const HOST_OWNED_SANDBOX_FLAGS = [
   "streamRunLogs",
   "runnerLifecycleMode",
   "runnerIdleTimeoutMs",
+  "paperclipApiBridgePolicy",
 ] as const;
 
 function applyHostOwnedSandboxFlags(

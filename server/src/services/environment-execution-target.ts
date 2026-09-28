@@ -7,6 +7,7 @@ import {
   type SandboxLeaseAcquisition,
 } from "@paperclipai/adapter-utils/execution-target";
 import type { DuplexObservabilityRecorder } from "@paperclipai/adapter-utils/duplex-observability";
+import { normalizeSandboxCallbackBridgePolicy } from "@paperclipai/adapter-utils/sandbox-callback-bridge";
 import {
   clampSpanLabel,
   getActiveStepContext,
@@ -366,6 +367,10 @@ export async function resolveEnvironmentExecutionTarget(input: {
       shellCommand,
       remoteCwd,
       enableSandboxDuplexBridge,
+      // Host-only bridge settings: the route policy from the environment
+      // config (absent means restricted) and the run's company.
+      paperclipApiBridgePolicy: normalizeSandboxCallbackBridgePolicy(parsed.config.paperclipApiBridgePolicy),
+      paperclipApiBridgeCompanyId: input.companyId,
       runnerLifecyclePolicy:
         parsed.config.runnerLifecycleMode === "warm"
           ? {
@@ -654,6 +659,9 @@ export async function resolveEnvironmentExecutionTarget(input: {
     environmentId: input.environment.id ?? null,
     leaseId: input.leaseId ?? null,
     remoteCwd,
+    // Host-only bridge settings, as for sandbox targets above.
+    paperclipApiBridgePolicy: normalizeSandboxCallbackBridgePolicy(parsed.config.paperclipApiBridgePolicy),
+    paperclipApiBridgeCompanyId: input.companyId,
     spec: {
       host: parsed.config.host,
       port: parsed.config.port,

@@ -4,6 +4,7 @@ import type {
   EnvironmentLeasePolicy,
   EnvironmentLeaseStatus,
   EnvironmentStatus,
+  SandboxCallbackBridgePolicy,
 } from "../constants.js";
 import type { AgentEnvConfig, EnvSecretRefBinding } from "./secrets.js";
 
@@ -20,6 +21,11 @@ export interface SshEnvironmentConfig {
   privateKeySecretRef: EnvSecretRefBinding | null;
   knownHosts: string | null;
   strictHostKeyChecking: boolean;
+  /**
+   * Route policy for this environment's Paperclip API bridge. Absent means
+   * `restricted`. The host reads it; it never reaches the remote side.
+   */
+  paperclipApiBridgePolicy?: SandboxCallbackBridgePolicy;
 }
 
 export type SandboxEnvironmentProvider = "fake" | (string & {});
@@ -28,6 +34,11 @@ export interface FakeSandboxEnvironmentConfig {
   provider: "fake";
   image: string;
   reuseLease: boolean;
+  /**
+   * Route policy for this environment's Paperclip API bridge. Absent means
+   * `restricted`. The host reads it; it never reaches the remote side.
+   */
+  paperclipApiBridgePolicy?: SandboxCallbackBridgePolicy;
   /** Stream agent CLI stdout/stderr during sandbox runs (bridge log-tail loop). */
   streamRunLogs?: boolean;
   /** Override the paperclip_runner lifecycle for this environment. */
@@ -45,6 +56,11 @@ export interface FakeSandboxEnvironmentConfig {
 export interface PluginSandboxEnvironmentConfig {
   provider: SandboxEnvironmentProvider;
   reuseLease: boolean;
+  /**
+   * Route policy for this environment's Paperclip API bridge. Absent means
+   * `restricted`. The host reads it; it never reaches the remote side.
+   */
+  paperclipApiBridgePolicy?: SandboxCallbackBridgePolicy;
   timeoutMs?: number;
   /** Stream agent CLI stdout/stderr during sandbox runs (bridge log-tail loop). */
   streamRunLogs?: boolean;

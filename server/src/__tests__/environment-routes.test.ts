@@ -2757,6 +2757,103 @@ describe("environment routes", () => {
     expect(JSON.stringify(mockEnvironmentService.update.mock.calls[0][1])).not.toContain("known-host");
   });
 
+  it("sets the bridge policy on an SSH environment with a config-only patch", async () => {
+    const secretRef = {
+      type: "secret_ref" as const,
+      secretId: "11111111-1111-1111-1111-111111111111",
+      version: "latest" as const,
+    };
+    const environment = {
+      ...createEnvironment(),
+      name: "SSH Lane",
+      driver: "ssh" as const,
+      config: {
+        host: "ssh.example.test",
+        port: 22,
+        username: "ssh-user",
+        remoteWorkspacePath: "/srv/paperclip/workspace",
+        privateKey: null,
+        privateKeySecretRef: secretRef,
+        knownHosts: "known-host",
+        strictHostKeyChecking: true,
+      },
+    };
+    mockEnvironmentService.getById.mockResolvedValue(environment);
+    mockEnvironmentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...environment,
+      ...patch,
+    }));
+    const app = createApp({ type: "board", userId: "user-1", source: "local_implicit" });
+
+    const res = await request(app)
+      .patch(`/api/environments/${environment.id}?companyId=company-1`)
+      .send({ config: { paperclipApiBridgePolicy: "agent" } });
+
+    expect(res.status).toBe(200);
+    const persisted = mockEnvironmentService.update.mock.calls[0][1].config as Record<string, unknown>;
+    // The patch merges into the saved config: connection settings and the
+    // private key reference stay as they were.
+    expect(persisted).toMatchObject({
+      host: "ssh.example.test",
+      username: "ssh-user",
+      privateKeySecretRef: secretRef,
+      knownHosts: "known-host",
+      paperclipApiBridgePolicy: "agent",
+    });
+
+    mockEnvironmentService.update.mockClear();
+    const rejected = await request(app)
+      .patch(`/api/environments/${environment.id}?companyId=company-1`)
+      .send({ config: { paperclipApiBridgePolicy: "everything" } });
+    expect(rejected.status).toBe(422);
+    expect(mockEnvironmentService.update).not.toHaveBeenCalled();
+  });
+
+  it("persists a sandbox bridge policy without passing it to the provider plugin", async () => {
+    const existing = {
+      ...createEnvironment(),
+      id: "env-sandbox-policy",
+      name: "Pods",
+      driver: "sandbox" as const,
+      config: { provider: "fake-plugin", image: "fake:test", reuseLease: true },
+    };
+    mockEnvironmentService.getById.mockResolvedValue(existing);
+    mockEnvironmentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...existing,
+      ...patch,
+    }));
+    const providerConfigs: Array<Record<string, unknown>> = [];
+    mockValidatePluginSandboxProviderConfig.mockImplementation(
+      async ({ provider, config }: { provider: string; config: Record<string, unknown> }) => {
+        providerConfigs.push(config);
+        // A provider schema that drops unknown keys.
+        const { image, reuseLease } = config;
+        return {
+          normalizedConfig: { image, reuseLease },
+          pluginId: `plugin-${provider}`,
+          pluginKey: `plugin.${provider}`,
+          driver: { driverKey: provider, kind: "sandbox_provider", displayName: provider, configSchema: { type: "object" } },
+        };
+      },
+    );
+    const app = createApp({ type: "board", userId: "user-1", source: "local_implicit" }, { pluginWorkerManager: {} });
+
+    const res = await request(app)
+      .patch(`/api/environments/${existing.id}?companyId=company-1`)
+      .send({ config: { paperclipApiBridgePolicy: "agent" } });
+
+    expect(res.status).toBe(200);
+    expect(providerConfigs).toHaveLength(1);
+    expect(providerConfigs[0]).not.toHaveProperty("paperclipApiBridgePolicy");
+    const persisted = mockEnvironmentService.update.mock.calls[0][1].config as Record<string, unknown>;
+    expect(persisted).toMatchObject({
+      provider: "fake-plugin",
+      image: "fake:test",
+      reuseLease: true,
+      paperclipApiBridgePolicy: "agent",
+    });
+  });
+
   it("re-points a sandbox secret ref to another company's secret even when existing bindings disagree", async () => {
     const oldSecretId = "11111111-1111-1111-1111-111111111111";
     const newSecretId = "22222222-2222-2222-2222-222222222222";

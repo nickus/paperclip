@@ -104,6 +104,10 @@ export async function createNativeGitHubAccess(input: {
         hostApiToken: token,
         hostApiUrl: url,
         onLog: input.onLog,
+        // This bridge only carries GitHub credential requests, so it keeps the
+        // restricted routes whatever policy the environment grants the agent's
+        // own API bridge.
+        routePolicy: "restricted",
       });
       if (input.target?.kind === "remote" && !bridge) {
         throw new Error("GitHub session requires a remote callback bridge");

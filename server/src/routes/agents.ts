@@ -1745,6 +1745,30 @@ export function agentRoutes(
     return actorAgent;
   }
 
+  /**
+   * The execution environment of an agent that another agent creates. A new
+   * agent runs where its creator runs: an omitted environment inherits the
+   * creator's, and naming any other one is refused. Without this, a create
+   * that names no environment falls back to the instance default, which can be
+   * the host itself, so an agent confined to an isolated environment could
+   * place a new agent outside it. The board can still move the new agent.
+   * Board and user actors (`creator` null) keep the requested value.
+   */
+  function resolveAgentCreatedEnvironmentId(
+    creator: { defaultEnvironmentId?: string | null } | null,
+    requested: string | null | undefined,
+  ): string | null | undefined {
+    if (!creator) return requested;
+    const creatorEnvironmentId = creator.defaultEnvironmentId ?? null;
+    if (requested === undefined || requested === null) return creatorEnvironmentId;
+    if (requested !== creatorEnvironmentId) {
+      throw forbidden(
+        "An agent can only create agents in its own execution environment. Omit defaultEnvironmentId; the board can move the new agent afterwards.",
+      );
+    }
+    return requested;
+  }
+
   async function assertBoardCanManageAgentsForCompany(req: Request, companyId: string) {
     assertBoard(req);
     assertCompanyAccess(req, companyId);
@@ -4434,7 +4458,7 @@ export function agentRoutes(
 
   router.post("/companies/:companyId/agent-hires", validate(createAgentHireSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertCanCreateAgentsForCompany(req, companyId);
+    const hiringAgent = await assertCanCreateAgentsForCompany(req, companyId);
     const sourceIssueIds = parseSourceIssueIds(req.body);
     const {
       desiredSkills: requestedDesiredSkills,
@@ -4478,6 +4502,7 @@ export function agentRoutes(
       hireInput.adapterConfig = inheritNativeRunnerAdapterConfig(caller.adapterConfig);
       hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
     }
+    hireInput.defaultEnvironmentId = resolveAgentCreatedEnvironmentId(hiringAgent, hireInput.defaultEnvironmentId);
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
@@ -4754,7 +4779,7 @@ export function agentRoutes(
 
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertCanCreateAgentsForCompany(req, companyId);
+    const creatingAgent = await assertCanCreateAgentsForCompany(req, companyId);
 
     const company = await db
       .select()
@@ -4786,6 +4811,7 @@ export function agentRoutes(
       onboardingFirstAgent: createOnboardingFirstAgent,
       ...createInput
     } = req.body;
+    createInput.defaultEnvironmentId = resolveAgentCreatedEnvironmentId(creatingAgent, createInput.defaultEnvironmentId);
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
@@ -5756,6 +5782,58 @@ export function agentRoutes(
     source: HeartbeatSource | undefined;
     skippedResponse: (agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>, payload: Record<string, unknown> | null) => unknown | Promise<unknown>;
   };
+  // Resolve the issue a wake binds its run to. The top-level `issueId` and,
+  // for an agent waking itself, the payload's `issueId`/`taskId` (which the
+  // heartbeat reads as the run's task) must name an issue in the woken agent's
+  // company; an agent may only bind an issue assigned to it. The binding is
+  // written back as `payload.issueId` in its canonical id form.
+  const bindWakePayloadToIssue = async (
+    req: Request,
+    agent: { id: string; companyId: string },
+    requestedIssueId: unknown,
+    payload: Record<string, unknown> | null,
+  ): Promise<Record<string, unknown> | null> => {
+    const resolveBoundIssue = async (reference: string, field: string) => {
+      const issue = await issueService(db).getById(reference);
+      if (!issue || issue.companyId !== agent.companyId) throw notFound("Issue not found");
+      if (req.actor.type === "agent" && issue.assigneeAgentId !== agent.id) {
+        throw forbidden(`An agent can only start a run for an issue assigned to it (${field}).`);
+      }
+      return issue;
+    };
+    const payloadReferences = (["issueId", "taskId"] as const).flatMap((field) => {
+      const value = payload?.[field];
+      return typeof value === "string" && value.trim().length > 0 ? [{ field, value: value.trim() }] : [];
+    });
+
+    if (requestedIssueId !== undefined && requestedIssueId !== null) {
+      if (typeof requestedIssueId !== "string" || requestedIssueId.trim().length === 0) {
+        throw badRequest("issueId must be a non-empty issue id or identifier.");
+      }
+      const issue = await resolveBoundIssue(requestedIssueId, "issueId");
+      for (const reference of payloadReferences) {
+        if (reference.value !== issue.id && reference.value !== issue.identifier) {
+          throw badRequest(`issueId and payload.${reference.field} name different issues.`);
+        }
+      }
+      return { ...(payload ?? {}), issueId: issue.id };
+    }
+
+    // A board or system wake keeps its payload as given. An agent's own wake
+    // payload binds the run the same way the top-level field does, so it is
+    // held to the same rule.
+    if (req.actor.type !== "agent" || payloadReferences.length === 0) return payload;
+    let boundIssueId: string | null = null;
+    for (const reference of payloadReferences) {
+      const issue = await resolveBoundIssue(reference.value, `payload.${reference.field}`);
+      if (boundIssueId && boundIssueId !== issue.id) {
+        throw badRequest("payload.issueId and payload.taskId name different issues.");
+      }
+      boundIssueId = issue.id;
+    }
+    return { ...(payload ?? {}), issueId: boundIssueId };
+  };
+
   const handleWakeupRoute = async (
     req: Request,
     res: Response,
@@ -5785,6 +5863,10 @@ export function agentRoutes(
 
     let wakePayload = req.body.payload ?? null;
     let retryConversationContext: Record<string, unknown> = {};
+    if (req.body.issueId !== undefined && req.body.failedRunId) {
+      throw badRequest("An exact failed-run retry cannot override its execution context.");
+    }
+    wakePayload = await bindWakePayloadToIssue(req, agent, req.body.issueId, wakePayload);
     if (req.body.failedRunId) {
       assertBoard(req);
       if (
@@ -6037,6 +6119,7 @@ export function agentRoutes(
 
     const body = (req.body ?? {}) as Partial<{
       reason: unknown;
+      issueId: unknown;
       payload: unknown;
       idempotencyKey: unknown;
       forceFreshSession: unknown;
@@ -6071,10 +6154,18 @@ export function agentRoutes(
     if (typeof body.reason === "string" && body.reason.length > 0) {
       wakeOpts.reason = body.reason;
     }
-    if (body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)) {
+    const invokePayload = await bindWakePayloadToIssue(
+      req,
+      agent,
+      body.issueId,
+      body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)
+        ? body.payload as Record<string, unknown>
+        : null,
+    );
+    if (invokePayload) {
       wakeOpts.payload = req.actor.type === "agent"
-        ? { ...body.payload, commentId: undefined, wakeCommentId: undefined, wakeCommentIds: undefined }
-        : body.payload as Record<string, unknown>;
+        ? { ...invokePayload, commentId: undefined, wakeCommentId: undefined, wakeCommentIds: undefined }
+        : invokePayload;
     }
     if (typeof body.idempotencyKey === "string" && body.idempotencyKey.length > 0) {
       wakeOpts.idempotencyKey = body.idempotencyKey;

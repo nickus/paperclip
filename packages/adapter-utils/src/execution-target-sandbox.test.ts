@@ -3,7 +3,7 @@ import http2 from "node:http2";
 import net from "node:net";
 import { duplexPair, type Duplex } from "node:stream";
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -2340,6 +2340,160 @@ describe("sandbox adapter execution targets", () => {
       }]);
     } finally {
       await bridge?.stop();
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
+  it("applies the target's bridge route policy to forwarded requests", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-policy-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
+    await mkdir(runtimeRootDir, { recursive: true });
+
+    const forwarded: string[] = [];
+    const forwardedHeaders: Array<Record<string, string | string[] | undefined>> = [];
+    const apiServer = createServer((req, res) => {
+      forwarded.push(`${req.method ?? "GET"} ${req.url ?? "/"}`);
+      forwardedHeaders.push({ ...req.headers });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      apiServer.once("error", reject);
+      apiServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = apiServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected the bridge test API server to listen on a TCP port.");
+    }
+    const apiPort = address.port;
+
+    const baseTarget: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+      timeoutMs: 30_000,
+      streamRunLogs: false,
+    };
+
+    async function statusesThroughBridge(
+      target: AdapterSandboxExecutionTarget,
+      runId: string,
+      routePolicy?: "restricted" | "agent",
+    ) {
+      const bridge = await startAdapterExecutionTargetPaperclipBridge({
+        runId,
+        target,
+        runtimeRootDir,
+        adapterKey: "codex",
+        hostApiToken: "real-run-jwt",
+        hostApiUrl: `http://127.0.0.1:${apiPort}`,
+        ...(routePolicy ? { routePolicy } : {}),
+      });
+      try {
+        const results: Array<{ status: number; error: string | null }> = [];
+        for (const route of [
+          "/api/companies/co-1/heartbeat-runs",
+          "/api/agents/me/secrets",
+          "/api/companies/co-2/issues",
+        ]) {
+          const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}${route}`, {
+            headers: { authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`, accept: "application/json" },
+          });
+          const body = await response.json() as { error?: string };
+          results.push({ status: response.status, error: body.error ?? null });
+        }
+        return results;
+      } finally {
+        await bridge?.stop();
+      }
+    }
+
+    try {
+      const restricted = await statusesThroughBridge(baseTarget, "run-bridge-restricted");
+      // The restricted list forwards company issue lists for any company id and
+      // leaves the company check to the server.
+      expect(restricted.map((result) => result.status)).toEqual([403, 403, 200]);
+      expect(restricted[0]!.error).toBe("Route not allowed: GET /api/companies/co-1/heartbeat-runs");
+      expect(forwarded).toEqual(["GET /api/companies/co-2/issues"]);
+      forwarded.length = 0;
+
+      const widened = await statusesThroughBridge(
+        { ...baseTarget, paperclipApiBridgePolicy: "agent", paperclipApiBridgeCompanyId: "co-1" },
+        "run-bridge-agent",
+      );
+      expect(widened.map((result) => result.status)).toEqual([200, 403, 403]);
+      expect(widened[1]!.error).toContain('bridge policy "agent"');
+      expect(widened[2]!.error).toContain("Runs can only reach their own company");
+      expect(forwarded).toEqual(["GET /api/companies/co-1/heartbeat-runs"]);
+      forwarded.length = 0;
+
+      // A caller can pin a bridge to the restricted routes whatever the
+      // target carries (a narrow-purpose bridge such as a credential broker).
+      const pinned = await statusesThroughBridge(
+        { ...baseTarget, paperclipApiBridgePolicy: "agent", paperclipApiBridgeCompanyId: "co-1" },
+        "run-bridge-pinned",
+        "restricted",
+      );
+      expect(pinned).toEqual(restricted);
+      expect(forwarded).toEqual(["GET /api/companies/co-2/issues"]);
+      forwarded.length = 0;
+      forwardedHeaders.length = 0;
+
+      // A request file written straight into the queue (skipping the
+      // in-sandbox gateway) reaches the API with allowlisted headers only.
+      const bridge = await startAdapterExecutionTargetPaperclipBridge({
+        runId: "run-bridge-forged-headers",
+        target: baseTarget,
+        runtimeRootDir,
+        adapterKey: "codex",
+        hostApiToken: "real-run-jwt",
+        hostApiUrl: `http://127.0.0.1:${apiPort}`,
+      });
+      try {
+        const queueDir = path.join(runtimeRootDir, "paperclip-bridge", "queue");
+        const staged = path.join(queueDir, "requests", "forged-1.tmp");
+        await writeFile(staged, JSON.stringify({
+          id: "forged-1",
+          method: "GET",
+          path: "/api/agents/me",
+          query: "",
+          headers: {
+            accept: "application/json",
+            cookie: "session=forged",
+            "x-forwarded-for": "203.0.113.9",
+            "x-paperclip-run-id": "someone-elses-run",
+            authorization: "Bearer forged",
+          },
+          body: "",
+          createdAt: new Date().toISOString(),
+        }));
+        await rename(staged, path.join(queueDir, "requests", "forged-1.json"));
+        const responsePath = path.join(queueDir, "responses", "forged-1.json");
+        const deadline = Date.now() + 10_000;
+        let raw: string | null = null;
+        while (raw === null && Date.now() < deadline) {
+          raw = await readFile(responsePath, "utf8").catch(() => null);
+          if (raw === null) await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(raw, "bridge wrote a response for the queued request").not.toBeNull();
+        expect((JSON.parse(raw!) as { status: number }).status).toBe(200);
+        expect(forwarded).toEqual(["GET /api/agents/me"]);
+        const received = forwardedHeaders[0]!;
+        expect(received.accept).toBe("application/json");
+        expect(received.cookie).toBeUndefined();
+        expect(received["x-forwarded-for"]).toBeUndefined();
+        expect(received.authorization).toBe("Bearer real-run-jwt");
+        expect(received["x-paperclip-run-id"]).toBe("run-bridge-forged-headers");
+      } finally {
+        await bridge?.stop();
+      }
+    } finally {
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));
     }
   });
