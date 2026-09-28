@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import express from "express";
+import request from "supertest";
+import { and, eq, like, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -36,10 +38,15 @@ import { getExecutionBlocker } from "../services/execution-blocker.js";
 import {
   deliverReleasedExecutionWaits,
   HELD_EXECUTION_WAIT_RELEASE_ENV,
+  HELD_EXECUTION_WAIT_RELEASE_RETRY_MS,
   heldExecutionWaitReleaseIdempotencyKey,
+  releaseHeldExecutionWaits,
 } from "../services/execution-wait-release.js";
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
 import {
   INERT_RUN_AUTO_RECONCILE_ENV,
+  INERT_RUN_RELEASE_RECHECK_MS,
   INERT_RUN_SETTLE_GRACE_MS,
 } from "../services/inert-legacy-execution.js";
 import {
@@ -632,15 +639,17 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       expect(wake).toHaveBeenCalledTimes(1);
       expect(wake).toHaveBeenCalledWith(agentId, expect.objectContaining({
         reason: "issue_recovery_action_restored",
-        idempotencyKey: heldExecutionWaitReleaseIdempotencyKey(action.id),
+        idempotencyKey: heldExecutionWaitReleaseIdempotencyKey({
+          issueId, agentId, heldWakes: [{ id: receipt.id, signalCount: 2 }],
+        }),
         payload: expect.objectContaining({
           issueId,
-          releasedRecoveryActionId: action.id,
+          releasedRecoveryActionIds: [action.id],
           releasedExecutionWaitIds: [receipt.id],
           heldSignalCount: 2,
         }),
         contextSnapshot: expect.objectContaining({
-          issueId, source: "execution.hold_released", releasedRecoveryActionId: action.id,
+          issueId, source: "execution.hold_released", releasedRecoveryActionIds: [action.id],
         }),
       }));
       // Not recovery-scoped: the released wake asks for the work itself.
@@ -649,7 +658,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       expect(opts.contextSnapshot).not.toHaveProperty("recoveryActionId");
       const [released] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id));
       expect(released!.payload).toMatchObject({
-        executionWait: { releasedByRecoveryActionId: action.id, releaseOutcome: "delivered", releaseRunId: runId },
+        executionWait: { recoveryActionId: action.id, releaseOutcome: "delivered", releaseRunId: runId, releasedSignalCount: 2 },
       });
       const [marked] = await legacyActions(issueId);
       expect(marked!.evidence).toMatchObject({ heldWakeRelease: { state: "delivered", runId } });
@@ -750,10 +759,671 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       const [delivered] = await legacyActions(issueId);
       expect(delivered!.evidence).toMatchObject({ continuationDelivery: "delivered", continuationRunId });
 
-      // The continuation already covers the held dependency wake.
+      // The continuation covers the held dependency wake; its delivery says so.
+      const [receipt] = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "execution_reconciliation_required"),
+      ));
+      expect(receipt!.payload).toMatchObject({
+        executionWait: { recoveryActionId: action!.id, releaseOutcome: "covered", releaseRunId: continuationRunId },
+      });
+      // The sweep finds nothing left and settles the action.
       const releaseWake = vi.fn();
-      expect(await deliverReleasedExecutionWaits(db, releaseWake as never)).toMatchObject({ covered: 1 });
+      expect(await deliverReleasedExecutionWaits(db, releaseWake as never)).toMatchObject({ checked: 1, covered: 0 });
       expect(releaseWake).not.toHaveBeenCalled();
+      expect((await legacyActions(issueId))[0]!.evidence).toMatchObject({ heldWakeRelease: { state: "no_held_wakes" } });
+    });
+  });
+
+  describe("releasing held wakes on every path that ends the last hold", () => {
+    const HELD = "execution_reconciliation_required";
+    // Recorded output makes a run ineligible for automatic reconciliation
+    // without a process id that the operator path would probe.
+    const workedRun = { lastOutputSeq: 3, lastOutputAt: new Date(), lastOutputBytes: 64 };
+
+    function createApp(wake: ReturnType<typeof vi.fn>) {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        (req as any).actor = { type: "board", source: "local_implicit" };
+        next();
+      });
+      app.use("/api", issueRoutes(db, {} as any, { recoveryActionEnqueueWakeup: wake as never }));
+      app.use(errorHandler);
+      return app;
+    }
+
+    async function addAgent(companyId: string, name: string) {
+      const id = randomUUID();
+      await db.insert(agents).values({
+        id, companyId, name, role: "engineer", status: "idle",
+        adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      return id;
+    }
+
+    /** Real admission queues runs without starting a provider process. */
+    async function prepareRealAdmission(companyId: string, agentId: string) {
+      const userId = randomUUID();
+      await db.insert(authUsers).values({
+        id: userId, name: "Operator", email: `${userId}@example.test`,
+        emailVerified: true, createdAt: new Date(), updatedAt: new Date(),
+      });
+      await db.update(companies).set({ defaultResponsibleUserId: userId }).where(eq(companies.id, companyId));
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, agentId));
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(), companyId, agentId, invocationSource: "manual", status: "running", startedAt: new Date(),
+      });
+      return userId;
+    }
+
+    /** An automatic signal that admission keeps back as a skipped receipt. */
+    async function holdSignal(agentId: string, issueId: string) {
+      expect(await heartbeatService(db).wakeup(agentId, {
+        source: "automation", triggerDetail: "system", reason: "issue_commented",
+        payload: { issueId }, requestedByActorType: "system", requestedByActorId: "agent-comment",
+        contextSnapshot: { issueId, taskId: issueId },
+      })).toBeNull();
+    }
+
+    /** A user comment admission saved behind the hold (the shape it records). */
+    async function saveCommentQueue(input: { companyId: string; agentId: string; issueId: string; actionId: string }) {
+      const userId = `user-${randomUUID()}`;
+      const [comment] = await db.insert(issueComments).values({
+        companyId: input.companyId, issueId: input.issueId, authorType: "user", authorUserId: userId,
+        body: "Please also update the changelog.",
+      }).returning();
+      const [queue] = await db.insert(agentWakeupRequests).values({
+        companyId: input.companyId, agentId: input.agentId, source: "on_demand", triggerDetail: "manual",
+        reason: "issue_commented", status: "deferred_issue_execution",
+        requestedByActorType: "user", requestedByActorId: userId,
+        payload: {
+          issueId: input.issueId,
+          commentId: comment!.id,
+          executionWait: {
+            recoveryActionId: input.actionId, reason: "execution_recovery",
+            message: "Waiting for execution recovery. Your message is saved.",
+          },
+          _paperclipWakeContext: {
+            issueId: input.issueId, taskId: input.issueId, wakeReason: "issue_commented",
+            commentId: comment!.id, wakeCommentId: comment!.id, wakeCommentIds: [comment!.id],
+          },
+        },
+      }).returning();
+      return { comment: comment!, queue: queue! };
+    }
+
+    async function heldTask() {
+      const fixture = await seedCompany();
+      const run = await seedStoppedRun({ ...fixture, overrides: workedRun });
+      const [action] = await legacyActions(fixture.issueId);
+      await holdSignal(fixture.agentId, fixture.issueId);
+      await holdSignal(fixture.agentId, fixture.issueId);
+      const [receipt] = await wakeRows(fixture.issueId, HELD);
+      expect(receipt).toMatchObject({ agentId: fixture.agentId, coalescedCount: 1 });
+      const saved = await saveCommentQueue({ ...fixture, actionId: action!.id });
+      return { ...fixture, run, action: action!, receipt: receipt!, ...saved };
+    }
+
+    async function wakeRows(issueId: string, reason?: string) {
+      const rows = await db.select().from(agentWakeupRequests)
+        .where(reason ? eq(agentWakeupRequests.reason, reason) : undefined);
+      return rows.filter((row) => row.payload?.issueId === issueId);
+    }
+
+    async function row(id: string) {
+      return (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, id)))[0]!;
+    }
+
+    async function closeHold(actionId: string, set: Partial<typeof issueRecoveryActions.$inferInsert> = {}) {
+      await db.update(issueRecoveryActions).set({
+        status: "cancelled", outcome: "cancelled", resolvedAt: new Date(), updatedAt: new Date(), ...set,
+      }).where(eq(issueRecoveryActions.id, actionId));
+    }
+
+    const releaseKeyPrefix = (issueId: string, agentId: string) => `execution-hold-released:${issueId}:${agentId}:`;
+
+    it("releases once when an operator cancels the hold through the resolve route", async () => {
+      const { companyId, agentId, issueId, action, receipt, queue } = await heldTask();
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      const app = createApp(wake);
+      await request(app).post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({ actionId: action.id, outcome: "cancelled", sourceIssueStatus: "in_review" })
+        .expect(200);
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+
+      // Delivered by the route itself, to the current assignee, as one wake.
+      expect(wake).toHaveBeenCalledTimes(1);
+      const [target, opts] = wake.mock.calls[0] as unknown as [string, Record<string, any>];
+      expect(target).toBe(agentId);
+      expect(opts.idempotencyKey.startsWith(releaseKeyPrefix(issueId, agentId))).toBe(true);
+      expect(opts.payload).toMatchObject({
+        issueId, releasedRecoveryActionIds: [action.id], heldSignalCount: 3,
+      });
+      expect([...opts.payload.releasedExecutionWaitIds].sort()).toEqual([receipt.id, queue.id].sort());
+      expect(opts.payload).not.toHaveProperty("recoveryActionId");
+
+      // Neither the sweep nor a replayed request delivers it again.
+      expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ checked: 1, delivered: 0 });
+      await request(app).post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({ actionId: action.id, outcome: "cancelled", sourceIssueStatus: "in_review" })
+        .expect(200);
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "no_held_wakes" });
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect((await row(receipt.id)).payload).toMatchObject({
+        executionWait: { releaseOutcome: "delivered", releasedSignalCount: 2 },
+      });
+    });
+
+    it("releases once when an operator restores the task for review through the route", async () => {
+      const { agentId, issueId, action } = await heldTask();
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      await request(createApp(wake)).post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "in_review" })
+        .expect(200);
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect(wake).toHaveBeenCalledWith(agentId, expect.objectContaining({ reason: "issue_recovery_action_restored" }));
+      await deliverReleasedExecutionWaits(db, wake);
+      expect(wake).toHaveBeenCalledTimes(1);
+    });
+
+    it("finalizes held wakes without a wake when the route closes the task", async () => {
+      const { issueId, action, receipt, queue } = await heldTask();
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      await request(createApp(wake)).post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "done" })
+        .expect(200);
+      expect(wake).not.toHaveBeenCalled();
+      expect((await row(receipt.id)).payload).toMatchObject({
+        executionWait: { releaseOutcome: "not_applicable", releaseReason: "task_closed" },
+      });
+      // The saved queue is closed; the comment stays on the task.
+      expect(await row(queue.id)).toMatchObject({
+        status: "cancelled",
+        payload: { executionWait: { releaseOutcome: "not_applicable", releaseReason: "task_closed" } },
+      });
+      const snapshot = [await row(receipt.id), await row(queue.id)];
+      await deliverReleasedExecutionWaits(db, wake);
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId: (await row(receipt.id)).companyId, issueId }))
+        .toMatchObject({ state: "no_held_wakes" });
+      expect(wake).not.toHaveBeenCalled();
+      expect([await row(receipt.id), await row(queue.id)]).toEqual(snapshot);
+    });
+
+    it("lets a route reconciliation's continuation carry the held wakes, then records them once", async () => {
+      const { companyId, agentId, issueId, run, action, receipt, queue, comment } = await heldTask();
+      await prepareRealAdmission(companyId, agentId);
+      const routeWake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      await request(createApp(routeWake)).post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id, outcome: "restored", sourceIssueStatus: "todo",
+          executionReconciliation: {
+            runId: run.id, providerStopped: true, actionOutcome: "not_performed",
+            outcomeEvidence: "The provider log shows the request was never submitted before the stop.",
+          },
+        })
+        .expect(200);
+      // The pending continuation owns the next turn.
+      expect(routeWake).not.toHaveBeenCalled();
+      expect(await releaseHeldExecutionWaits(db, routeWake, { companyId, issueId })).toMatchObject({
+        state: "continuation_pending",
+      });
+
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      const wake = vi.fn(heartbeat.wakeup);
+      await deliverReconciledExecutions(db, wake);
+      expect(wake).toHaveBeenCalledTimes(1);
+      const [continuationWake] = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${action.id}`));
+      expect(continuationWake).toMatchObject({ status: "queued" });
+      // The continuation adopted the saved comment and covers the held signals.
+      expect(await row(queue.id)).toMatchObject({ status: "coalesced", runId: continuationWake!.runId });
+      const [continuation] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, continuationWake!.runId!));
+      expect(continuation!.contextSnapshot).toMatchObject({ wakeCommentIds: [comment.id] });
+      expect((await row(receipt.id)).payload).toMatchObject({
+        executionWait: { releaseOutcome: "covered", releaseRunId: continuation!.id },
+      });
+
+      await deliverReleasedExecutionWaits(db, wake);
+      await deliverReconciledExecutions(db, wake);
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect(await db.select().from(agentWakeupRequests)
+        .where(like(agentWakeupRequests.idempotencyKey, "execution-hold-released:%"))).toHaveLength(0);
+    });
+
+    it("releases once when a settled no-replay hold is later reconciled through the route", async () => {
+      const { companyId, agentId, issueId, run, action, receipt } = await heldTask();
+      await settleUnrecoverableExecutions(db, new Date());
+      const [settled] = await legacyActions(issueId);
+      expect(settled).toMatchObject({ status: "resolved", evidence: { automaticRecovery: { replay: "blocked" } } });
+      // A settled hold is still a hold: nothing is released by the sweep.
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ checked: 0 });
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "held" });
+
+      await request(createApp(wake)).post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id, outcome: "restored", sourceIssueStatus: "todo",
+          executionReconciliation: {
+            runId: run.id, providerStopped: true, actionOutcome: "completed",
+            outcomeEvidence: "The pushed branch and the recorded comment match the provider receipts.",
+          },
+        })
+        .expect(200);
+      expect(wake).not.toHaveBeenCalled();
+      const continuationRunId = randomUUID();
+      const continuationWake = vi.fn(async (_agentId: string, opts: { idempotencyKey?: string | null }) => {
+        if (!opts.idempotencyKey?.startsWith("execution-reconciliation:")) return { id: randomUUID() } as never;
+        await db.insert(heartbeatRuns).values({
+          id: continuationRunId, companyId, agentId, invocationSource: "automation", status: "queued",
+          contextSnapshot: { issueId, recoveryActionId: action.id, previousRunId: run.id },
+        });
+        return { id: continuationRunId } as never;
+      });
+      await deliverReconciledExecutions(db, continuationWake as never);
+      // One continuation wake. This stand-in continuation does not adopt the
+      // saved comment the way admission does, so the comment still needs a
+      // delivery of its own: exactly one release wake.
+      expect(continuationWake).toHaveBeenCalledTimes(2);
+      expect((continuationWake.mock.calls[1] as unknown as [string, Record<string, any>])[1].idempotencyKey
+        .startsWith(releaseKeyPrefix(issueId, agentId))).toBe(true);
+      expect((await row(receipt.id)).payload).toMatchObject({ executionWait: { releaseOutcome: "delivered" } });
+      await deliverReleasedExecutionWaits(db, continuationWake as never);
+      await deliverReconciledExecutions(db, continuationWake as never);
+      expect(continuationWake).toHaveBeenCalledTimes(2);
+    });
+
+    it("delivers the saved comment through real admission when the hold is cancelled", async () => {
+      const { companyId, agentId, issueId, action, receipt, queue, comment } = await heldTask();
+      await prepareRealAdmission(companyId, agentId);
+      await closeHold(action.id);
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      const wake = vi.fn(heartbeat.wakeup);
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "delivered" });
+      expect(wake).toHaveBeenCalledTimes(1);
+      const [released] = await db.select().from(agentWakeupRequests)
+        .where(like(agentWakeupRequests.idempotencyKey, `${releaseKeyPrefix(issueId, agentId)}%`));
+      expect(released).toMatchObject({ status: "queued", agentId });
+      expect(await row(queue.id)).toMatchObject({ status: "coalesced", runId: released!.runId });
+      const [queuedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, released!.runId!));
+      expect(queuedRun!.contextSnapshot).toMatchObject({
+        issueId, source: "execution.hold_released", wakeCommentIds: [comment.id],
+      });
+      expect((await row(receipt.id)).payload).toMatchObject({
+        executionWait: { releaseOutcome: "delivered", releaseRunId: queuedRun!.id },
+      });
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "no_held_wakes" });
+      expect(wake).toHaveBeenCalledTimes(1);
+    });
+
+    it("delivers to the current assignee and finalizes the previous assignee's held wakes", async () => {
+      const { companyId, agentId: previousId, issueId, action, receipt, queue } = await heldTask();
+      const currentId = await addAgent(companyId, "Maintainer");
+      await db.update(issues).set({ assigneeAgentId: currentId }).where(eq(issues.id, issueId));
+      // The new assignee's own signal is held too.
+      await holdSignal(currentId, issueId);
+      const currentReceipt = (await wakeRows(issueId, HELD)).find((wake) => wake.agentId === currentId)!;
+      await closeHold(action.id);
+
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ delivered: 1, finalized: 2 });
+      expect(wake).toHaveBeenCalledTimes(1);
+      const [target, opts] = wake.mock.calls[0] as unknown as [string, Record<string, any>];
+      expect(target).toBe(currentId);
+      expect(opts.payload.releasedExecutionWaitIds).toEqual([currentReceipt.id]);
+
+      // The previous assignee's receipt is closed, and its saved queue is
+      // cancelled; the comment itself stays on the task.
+      const previousReceipt = await row(receipt.id);
+      expect(previousReceipt.payload).toMatchObject({
+        executionWait: { releaseOutcome: "not_applicable", releaseReason: "not_assignee", releasedSignalCount: 2 },
+      });
+      const previousQueue = await row(queue.id);
+      expect(previousQueue).toMatchObject({ status: "cancelled", agentId: previousId });
+      expect(previousQueue.finishedAt).not.toBeNull();
+
+      // Nothing is revisited: later passes neither wake nor touch those rows.
+      const snapshot = [await row(receipt.id), await row(queue.id), await row(currentReceipt.id)];
+      await db.update(issueRecoveryActions).set({
+        evidence: sql`${issueRecoveryActions.evidence} - 'heldWakeRelease'`,
+      }).where(eq(issueRecoveryActions.id, action.id));
+      await deliverReleasedExecutionWaits(db, wake);
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "no_held_wakes" });
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect([await row(receipt.id), await row(queue.id), await row(currentReceipt.id)]).toEqual(snapshot);
+    });
+
+    it("wakes no one when only a previous assignee had held wakes", async () => {
+      const { companyId, issueId, action, receipt, queue } = await heldTask();
+      const currentId = await addAgent(companyId, "Maintainer");
+      await db.update(issues).set({ assigneeAgentId: currentId }).where(eq(issues.id, issueId));
+      await closeHold(action.id);
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({
+        state: "not_applicable", agentId: currentId,
+      });
+      expect(wake).not.toHaveBeenCalled();
+      expect(await row(queue.id)).toMatchObject({ status: "cancelled" });
+      expect((await row(receipt.id)).payload).toMatchObject({ executionWait: { releaseOutcome: "not_applicable" } });
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "no_held_wakes" });
+    });
+
+    it("leaves a saved queue of an agent that was only mentioned alone", async () => {
+      const { companyId, issueId, action } = await heldTask();
+      const mentionedId = await addAgent(companyId, "Reviewer");
+      const mention = await saveCommentQueue({ companyId, agentId: mentionedId, issueId, actionId: action.id });
+      await closeHold(action.id);
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      await releaseHeldExecutionWaits(db, wake, { companyId, issueId });
+      expect(await row(mention.queue.id)).toMatchObject({ status: "deferred_issue_execution" });
+    });
+
+    it("delivers exactly once under concurrent releasers", async () => {
+      const { companyId, agentId, issueId, action } = await heldTask();
+      await closeHold(action.id);
+      let calls = 0;
+      const wake = vi.fn(async () => {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return { id: randomUUID() } as never;
+      });
+      const results = await Promise.all([
+        releaseHeldExecutionWaits(db, wake, { companyId, issueId }),
+        releaseHeldExecutionWaits(db, wake, { companyId, issueId }),
+        deliverReleasedExecutionWaits(db, wake),
+        releaseHeldExecutionWaits(db, wake, { companyId, issueId }),
+      ]);
+      expect(calls).toBe(1);
+      expect(wake).toHaveBeenCalledWith(agentId, expect.anything());
+      expect(results.filter((result) => "state" in result && result.state === "delivered")).toHaveLength(1);
+      await deliverReleasedExecutionWaits(db, wake);
+      expect(calls).toBe(1);
+    });
+
+    it("recognizes a delivery an interrupted releaser already made", async () => {
+      const { companyId, agentId, issueId, action, receipt, queue } = await heldTask();
+      await closeHold(action.id);
+      const key = heldExecutionWaitReleaseIdempotencyKey({
+        issueId, agentId, heldWakes: [{ id: receipt.id, signalCount: 2 }, { id: queue.id, signalCount: 1 }],
+      });
+      // The earlier attempt claimed, was admitted, and stopped before marking.
+      const stale = new Date(Date.now() - HELD_EXECUTION_WAIT_RELEASE_RETRY_MS - 1_000).toISOString();
+      for (const id of [receipt.id, queue.id]) {
+        await db.update(agentWakeupRequests).set({
+          payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{executionWait,releaseClaim}', ${JSON.stringify({ key, at: stale, attempts: 0 })}::jsonb)`,
+        }).where(eq(agentWakeupRequests.id, id));
+      }
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "automation", status: "queued" });
+      await db.insert(agentWakeupRequests).values({
+        companyId, agentId, source: "automation", reason: "issue_recovery_action_restored", status: "queued",
+        idempotencyKey: key, runId, payload: { issueId },
+      });
+      // Admission adopted the saved queue into that run.
+      await db.update(agentWakeupRequests).set({ status: "coalesced", runId }).where(eq(agentWakeupRequests.id, queue.id));
+
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "delivered", runId });
+      expect(wake).not.toHaveBeenCalled();
+      expect((await row(receipt.id)).payload).toMatchObject({ executionWait: { releaseOutcome: "delivered", releaseRunId: runId } });
+    });
+
+    it("retries a declined delivery at the retry pace with the same key, then delivers once", async () => {
+      const { companyId, issueId, action } = await heldTask();
+      await closeHold(action.id);
+      const wake = vi.fn()
+        .mockRejectedValueOnce(new Error("Agent is paused"))
+        .mockResolvedValue({ id: randomUUID() });
+      expect(await releaseHeldExecutionWaits(db, wake as never, { companyId, issueId })).toMatchObject({ state: "retry" });
+      expect(await releaseHeldExecutionWaits(db, wake as never, { companyId, issueId })).toMatchObject({ state: "claimed" });
+      expect(wake).toHaveBeenCalledTimes(1);
+      const later = new Date(Date.now() + HELD_EXECUTION_WAIT_RELEASE_RETRY_MS + 1_000);
+      expect(await releaseHeldExecutionWaits(db, wake as never, { companyId, issueId, now: later })).toMatchObject({
+        state: "delivered",
+      });
+      expect(wake).toHaveBeenCalledTimes(2);
+      const keys = wake.mock.calls.map((call) => (call[1] as { idempotencyKey: string }).idempotencyKey);
+      expect(keys[1]).toBe(keys[0]);
+    });
+
+    it("keeps wakes held until the last hold on the task is gone", async () => {
+      const { companyId, agentId, issueId, action } = await heldTask();
+      // A second incident on the same task while the first is still open.
+      await seedStoppedRun({ companyId, agentId, issueId, overrides: workedRun });
+      const newer = (await legacyActions(issueId)).find((candidate) => candidate.status === "active")!;
+      expect(newer.id).not.toBe(action.id);
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "held" });
+      expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ delivered: 0 });
+      expect(wake).not.toHaveBeenCalled();
+
+      await closeHold(newer.id);
+      expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ delivered: 1 });
+      expect(wake).toHaveBeenCalledTimes(1);
+      await deliverReleasedExecutionWaits(db, wake, new Date(Date.now() + HELD_EXECUTION_WAIT_RELEASE_RETRY_MS + 1_000));
+      expect(wake).toHaveBeenCalledTimes(1);
+    });
+
+    it("delivers signals held for longer than a day", async () => {
+      const { companyId, issueId, action, receipt } = await heldTask();
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 3 * 24 * 60 * 60_000) })
+        .where(eq(agentWakeupRequests.id, receipt.id));
+      await closeHold(action.id);
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ delivered: 1 });
+      expect((wake.mock.calls[0] as unknown as [string, Record<string, any>])[1].payload.releasedExecutionWaitIds)
+        .toContain(receipt.id);
+      void companyId;
+    });
+
+    it("releases again, once, for a new hold on the same task", async () => {
+      const { companyId, agentId, issueId, action } = await heldTask();
+      await closeHold(action.id);
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "delivered" });
+      // A later incident holds a new signal.
+      await seedStoppedRun({ companyId, agentId, issueId, overrides: workedRun });
+      const next = (await legacyActions(issueId)).find((candidate) => candidate.status === "active")!;
+      await holdSignal(agentId, issueId);
+      await closeHold(next.id);
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "delivered" });
+      expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({ state: "no_held_wakes" });
+      expect(wake).toHaveBeenCalledTimes(2);
+      const [first, second] = wake.mock.calls.map((call) => (call[1] as { idempotencyKey: string }).idempotencyKey);
+      expect(second).not.toBe(first);
+    });
+
+    it("releases after a hold ends through an explicit continuation that changes the disposition", async () => {
+      const { companyId, agentId, issueId, action } = await heldTask();
+      await settleUnrecoverableExecutions(db, new Date());
+      // The shape an explicit user continuation leaves: no longer a hold.
+      const [settled] = await legacyActions(issueId);
+      await db.update(issueRecoveryActions).set({
+        outcome: "cancelled", resolvedAt: new Date(),
+        evidence: { ...settled!.evidence, automaticRecovery: {
+          ...(settled!.evidence.automaticRecovery as object), replay: "explicit_user_continuation",
+        } },
+      }).where(eq(issueRecoveryActions.id, action.id));
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ delivered: 1 });
+      expect(wake).toHaveBeenCalledWith(agentId, expect.anything());
+      await deliverReleasedExecutionWaits(db, wake);
+      expect(wake).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("automatic reconciliation of a settled hold whose run did nothing", () => {
+    async function settledInertHold(input: { stop?: Partial<typeof heartbeatRuns.$inferInsert> } = {}) {
+      const fixture = await seedCompany();
+      // The reconciliation window passed before the run was assessed.
+      const run = await seedStoppedRun({
+        ...fixture, finishedAt: new Date(Date.now() - INERT_RUN_SETTLE_GRACE_MS - 60_000), stop: input.stop,
+      });
+      await settleUnrecoverableExecutions(db, new Date());
+      const [settled] = await legacyActions(fixture.issueId);
+      return { ...fixture, run, settled: settled! };
+    }
+
+    it("reconciles it as not performed, hands the task back and releases its held wakes", async () => {
+      const { companyId, agentId, issueId, run, settled } = await settledInertHold();
+      expect(settled).toMatchObject({
+        status: "resolved", outcome: "blocked",
+        evidence: { automaticRecovery: { replay: "blocked", issueStatusBefore: "in_progress" } },
+      });
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("blocked");
+      await heartbeatService(db).wakeup(agentId, {
+        source: "automation", triggerDetail: "system", reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+        payload: { issueId }, requestedByActorType: "system", requestedByActorId: "issue_update",
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON },
+      });
+
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
+      const [reconciled] = await legacyActions(issueId);
+      expect(reconciled).toMatchObject({
+        id: settled.id, status: "resolved", outcome: "restored",
+        evidence: {
+          continuationDelivery: "pending",
+          executionReconciliation: { runId: run.id, providerStopped: true, actionOutcome: "not_performed" },
+          inertRunAssessment: {
+            verdict: "inert", settledDisposition: { replay: "blocked", policy: "preserve_without_replay_v1" },
+          },
+        },
+      });
+      expect(reconciled!.evidence).not.toHaveProperty("automaticRecovery");
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("todo");
+
+      const continuationRunId = randomUUID();
+      const wake = vi.fn(async () => {
+        await db.insert(heartbeatRuns).values({
+          id: continuationRunId, companyId, agentId, invocationSource: "automation", status: "queued",
+          contextSnapshot: { issueId, recoveryActionId: settled.id, previousRunId: run.id },
+        });
+        return { id: continuationRunId } as never;
+      });
+      await deliverReconciledExecutions(db, wake);
+      await deliverReleasedExecutionWaits(db, wake);
+      expect(wake).toHaveBeenCalledTimes(1);
+      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.reason, "execution_reconciliation_required"));
+      expect(receipt!.payload).toMatchObject({ executionWait: { releaseOutcome: "covered", releaseRunId: continuationRunId } });
+      // Settled once; a later pass does not revisit it.
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 0 });
+    });
+
+    it("rechecks a settled hold at a bounded pace while its sandbox is releasing", async () => {
+      const fixture = await seedCompany();
+      const run = await seedStoppedRun({ ...fixture, finishedAt: new Date(Date.now() - INERT_RUN_SETTLE_GRACE_MS - 60_000) });
+      const [lease] = await db.insert(environmentLeases).values({
+        companyId: fixture.companyId, issueId: fixture.issueId, heartbeatRunId: run.id,
+        status: "active", provider: "kubernetes", providerLeaseId: "sandbox-9",
+      }).returning();
+      await settleUnrecoverableExecutions(db, new Date());
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 1, awaitingRelease: 1 });
+      expect((await legacyActions(fixture.issueId))[0]!.evidence).toMatchObject({
+        automaticRecovery: { replay: "blocked" }, inertRunAssessment: { verdict: "awaiting_release" },
+      });
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 0 });
+
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() })
+        .where(eq(environmentLeases.id, lease!.id));
+      const later = new Date(Date.now() + INERT_RUN_RELEASE_RECHECK_MS + 1_000);
+      expect(await reconcileInertLegacyExecutions(db, later)).toMatchObject({ reconciled: 1 });
+    });
+
+    it("keeps the task blocked when a first-class blocker still applies", async () => {
+      const fixture = await seedCompany();
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId, companyId: fixture.companyId, title: "Blocker", status: "todo", priority: "medium",
+        issueNumber: 2, identifier: `BLK-${blockerId.slice(0, 4)}`,
+      });
+      await db.insert(issueRelations).values({
+        companyId: fixture.companyId, issueId: blockerId, relatedIssueId: fixture.issueId, type: "blocks",
+      });
+      await seedStoppedRun({ ...fixture, finishedAt: new Date(Date.now() - INERT_RUN_SETTLE_GRACE_MS - 60_000) });
+      await settleUnrecoverableExecutions(db, new Date());
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
+      expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!.status).toBe("blocked");
+    });
+
+    it("keeps a task that was blocked before the hold blocked", async () => {
+      const fixture = await seedCompany();
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
+      await seedStoppedRun({ ...fixture, finishedAt: new Date(Date.now() - INERT_RUN_SETTLE_GRACE_MS - 60_000) });
+      await settleUnrecoverableExecutions(db, new Date());
+      expect((await legacyActions(fixture.issueId))[0]!.evidence).toMatchObject({
+        automaticRecovery: { issueStatusBefore: "blocked" },
+      });
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
+      expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!.status).toBe("blocked");
+    });
+
+    it.each([
+      ["a board operator's stop", { resultJson: { cancelledByActorType: "user", cancelledByUserId: null } }],
+      ["an interrupt by comment", { errorCode: "operator_interrupted" }],
+    ])("never revisits a settled hold after %s", async (_label, stop) => {
+      const { issueId } = await settledInertHold({ stop });
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 0, reconciled: 0 });
+      expect((await legacyActions(issueId))[0]).toMatchObject({
+        status: "resolved", evidence: { automaticRecovery: { replay: "blocked" } },
+      });
+    });
+
+    it("never revisits a settled hold whose run shows work", async () => {
+      const fixture = await seedCompany();
+      const run = await seedStoppedRun({ ...fixture, finishedAt: new Date(Date.now() - INERT_RUN_SETTLE_GRACE_MS - 60_000) });
+      await settleUnrecoverableExecutions(db, new Date());
+      await db.insert(activityLog).values({
+        companyId: fixture.companyId, actorType: "agent", actorId: fixture.agentId, agentId: fixture.agentId,
+        runId: run.id, action: "issue.comment_added", entityType: "issue", entityId: fixture.issueId,
+      });
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 0, notInert: 1 });
+      const [held] = await legacyActions(fixture.issueId);
+      expect(held).toMatchObject({
+        status: "resolved",
+        evidence: {
+          automaticRecovery: { replay: "blocked" },
+          inertRunAssessment: { verdict: "not_inert", reason: "agent_activity_recorded" },
+        },
+      });
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 0 });
+      expect(await getExecutionBlocker(db, fixture.companyId, fixture.issueId)).toMatchObject({ recoveryActionId: held!.id });
+    });
+
+    it("does not let settled holds of closed or reassigned tasks fill the batch", async () => {
+      const closed = await seedCompany();
+      const otherId = randomUUID();
+      await db.insert(agents).values({
+        id: otherId, companyId: closed.companyId, name: "Maintainer", role: "engineer", status: "idle",
+        adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      const finishedAt = new Date(Date.now() - INERT_RUN_SETTLE_GRACE_MS - 60_000);
+      for (let i = 0; i < 26; i += 1) {
+        const issueId = randomUUID();
+        await db.insert(issues).values({
+          id: issueId, companyId: closed.companyId, title: `Task ${i}`, status: "in_progress",
+          priority: "medium", assigneeAgentId: closed.agentId, issueNumber: 10 + i,
+          identifier: `CL-${i}-${issueId.slice(0, 4)}`,
+        });
+        await seedStoppedRun({ companyId: closed.companyId, agentId: closed.agentId, issueId, finishedAt });
+        await settleUnrecoverableExecutions(db, new Date());
+        // Closed, or handed to someone else, after the disposition.
+        await db.update(issues).set(i % 2 === 0 ? { status: "done" } : { assigneeAgentId: otherId })
+          .where(eq(issues.id, issueId));
+      }
+      const open = await seedCompany();
+      await seedStoppedRun({ ...open, finishedAt });
+      await settleUnrecoverableExecutions(db, new Date());
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 1, reconciled: 1 });
+      expect((await legacyActions(open.issueId))[0]).toMatchObject({ outcome: "restored" });
+    });
+
+    it("never revisits a hold an operator reconciled", async () => {
+      const { issueId, settled } = await settledInertHold();
+      await db.update(issueRecoveryActions).set({
+        evidence: { ...settled.evidence, executionReconciliation: { runId: settled.evidence.runId, actorId: "operator" } },
+      }).where(eq(issueRecoveryActions.id, settled.id));
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 0 });
+      void issueId;
     });
   });
 });

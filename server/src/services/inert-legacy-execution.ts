@@ -33,6 +33,12 @@ export const INERT_RUN_RECONCILIATION_POLICY = "inert_legacy_run_v1";
  */
 export const INERT_RUN_SETTLE_GRACE_MS = 10 * 60_000;
 
+/**
+ * A hold the disposition already settled while the run's sandbox was still
+ * releasing is rechecked at this pace until the release is recorded.
+ */
+export const INERT_RUN_RELEASE_RECHECK_MS = 5 * 60_000;
+
 const INERT_TERMINAL_STATUSES = ["cancelled", "failed"] as const;
 // Only system bookkeeping may exist for a run that never reached its adapter.
 const INERT_RUN_EVENT_TYPES = ["lifecycle", "error"] as const;

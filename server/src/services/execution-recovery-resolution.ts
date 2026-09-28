@@ -3,13 +3,14 @@ import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } 
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, asc, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, not, notInArray, or, sql } from "drizzle-orm";
 import {
   agents,
   chatActions,
   environmentLeases,
   heartbeatRuns,
   issueRecoveryActions,
+  issueRelations,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -31,7 +32,9 @@ import {
   inertLegacyRunRowCondition,
   isInertRunAutoReconcileEnabled,
   INERT_RUN_RECONCILIATION_POLICY,
+  INERT_RUN_RELEASE_RECHECK_MS,
 } from "./inert-legacy-execution.js";
+import { releaseHeldExecutionWaits } from "./execution-wait-release.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -205,6 +208,26 @@ export async function markExecutionReconciliation(
     );
 }
 
+/**
+ * A settled continuation is the last step of a hold that ended through
+ * reconciliation. Release what the hold kept back (the continuation covers the
+ * assignee's signals); a failure here leaves it to the periodic sweep.
+ */
+async function releaseAfterContinuation(
+  db: Db,
+  wake: ReturnType<typeof import("./heartbeat.js").heartbeatService>["wakeup"],
+  action: Pick<typeof issueRecoveryActions.$inferSelect, "id" | "companyId" | "sourceIssueId">,
+) {
+  try {
+    await releaseHeldExecutionWaits(db, wake, { companyId: action.companyId, issueId: action.sourceIssueId });
+  } catch (err) {
+    logger.warn(
+      { err, recoveryActionId: action.id, issueId: action.sourceIssueId },
+      "Held execution wait release after a reconciled continuation deferred to the sweep",
+    );
+  }
+}
+
 export async function deliverReconciledExecutions(
   db: Db,
   wake: ReturnType<typeof import("./heartbeat.js").heartbeatService>["wakeup"],
@@ -257,12 +280,19 @@ export async function deliverReconciledExecutions(
         task.assigneeAgentId !== action.returnOwnerAgentId ||
         ["done", "cancelled"].includes(task.status)
       ) {
-        await db
+        const [invalidated] = await db
           .update(issueRecoveryActions)
           .set({
-            evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
+            evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+              continuationDelivery: "invalidated",
+              continuationDeliveryAt: new Date().toISOString(),
+            })}::jsonb`,
           })
-          .where(pendingDecision);
+          .where(pendingDecision)
+          .returning({ id: issueRecoveryActions.id });
+        // The task changed hands or finished: whatever the hold kept back goes
+        // to the current assignee, or is finalized.
+        if (invalidated && task) await releaseAfterContinuation(db, wake, action);
         continue;
       }
       const run = await wake(action.returnOwnerAgentId, {
@@ -284,32 +314,36 @@ export async function deliverReconciledExecutions(
           source: "execution.reconciled",
         },
       });
-      if (run)
-        await db.transaction(async (tx) => {
-          await tx
-            .update(heartbeatRuns)
-            .set({ retryOfRunId: decision.runId })
-            .where(
-              and(
-                eq(heartbeatRuns.companyId, action.companyId),
-                eq(heartbeatRuns.id, run.id),
-                eq(heartbeatRuns.agentId, action.returnOwnerAgentId!),
-                sql`${heartbeatRuns.contextSnapshot}->>'recoveryActionId' = ${action.id}`,
-                sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' = ${decision.runId}`,
-              ),
-            );
-          await tx
-            .update(issueRecoveryActions)
-            .set({
-              evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify(
-                {
-                  continuationDelivery: "delivered",
-                  continuationRunId: run.id,
-                },
-              )}::jsonb`,
-            })
-            .where(pendingDecision);
-        });
+      if (!run) continue;
+      await db.transaction(async (tx) => {
+        await tx
+          .update(heartbeatRuns)
+          .set({ retryOfRunId: decision.runId })
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, action.companyId),
+              eq(heartbeatRuns.id, run.id),
+              eq(heartbeatRuns.agentId, action.returnOwnerAgentId!),
+              sql`${heartbeatRuns.contextSnapshot}->>'recoveryActionId' = ${action.id}`,
+              sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' = ${decision.runId}`,
+            ),
+          );
+        await tx
+          .update(issueRecoveryActions)
+          .set({
+            evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify(
+              {
+                continuationDelivery: "delivered",
+                continuationRunId: run.id,
+                continuationDeliveryAt: new Date().toISOString(),
+              },
+            )}::jsonb`,
+          })
+          .where(pendingDecision);
+      });
+      // The continuation covers the signals the hold kept back; record that,
+      // and finalize anything held for someone else.
+      await releaseAfterContinuation(db, wake, action);
     } catch {
       logger.warn(
         { recoveryActionId: action.id },
@@ -543,6 +577,8 @@ export async function settleUnrecoverableExecutions(
                 replay: "blocked",
                 actionOutcome: "unknown",
                 recordedAt: now.toISOString(),
+                // What a later reconciliation hands the task back from.
+                ...(current ? { issueStatusBefore: task.status } : {}),
               },
             },
           })
@@ -593,6 +629,49 @@ export async function settleUnrecoverableExecutions(
 }
 
 /**
+ * Legacy execution holds of this issue that the automatic reconciliation of
+ * inert runs may take: an open hold that has not been assessed yet, or a hold
+ * the automatic no-replay disposition settled before it could be assessed
+ * (the reconciliation window passed while the sandbox was still releasing, the
+ * policy was off, or the hold predates it). An operator's decision is never
+ * revisited: a settled hold that carries a reconciliation is not a candidate.
+ */
+function inertReconciliationCandidateCondition(recheckBefore: Date) {
+  return or(
+    and(
+      inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      sql`not (${issueRecoveryActions.evidence} ? 'inertRunAssessment')`,
+    ),
+    and(
+      eq(issueRecoveryActions.status, "resolved"),
+      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'policy' = 'preserve_without_replay_v1'`,
+      sql`not (${issueRecoveryActions.evidence} ? 'executionReconciliation')`,
+      or(
+        sql`not (${issueRecoveryActions.evidence} ? 'inertRunAssessment')`,
+        // A settled hold whose sandbox was still releasing is rechecked at a
+        // bounded pace instead of on every sweep.
+        sql`(
+          ${issueRecoveryActions.evidence}->'inertRunAssessment'->>'verdict' = 'awaiting_release'
+          and coalesce((${issueRecoveryActions.evidence}->'inertRunAssessment'->>'assessedAt')::timestamptz, 'epoch'::timestamptz)
+            <= ${recheckBefore.toISOString()}::timestamptz
+        )`,
+      ),
+    ),
+  );
+}
+
+function isSettledNoReplayHold(action: typeof issueRecoveryActions.$inferSelect) {
+  const automatic = action.evidence.automaticRecovery as { replay?: unknown; policy?: unknown } | undefined;
+  return (
+    action.status === "resolved" &&
+    automatic?.replay === "blocked" &&
+    automatic.policy === "preserve_without_replay_v1" &&
+    !action.evidence.executionReconciliation
+  );
+}
+
+/**
  * Reconcile legacy execution holds whose source run provably never reached its
  * adapter. The run stopped in the `preparing` stage, recorded no process,
  * output, usage, cost or agent API activity, and holds no execution
@@ -601,11 +680,18 @@ export async function settleUnrecoverableExecutions(
  * the same validation and delivery path, so the task's owner receives one
  * continuation and any waits the hold recorded are released.
  *
+ * A hold the automatic no-replay disposition already settled qualifies as
+ * well: the disposition records that outcomes are unknown, and for such a run
+ * they are known. Like the operator path for a settled hold, the task the
+ * disposition moved to `blocked` goes back to `todo` for the continuation,
+ * unless a first-class blocker or a pending review stage still applies.
+ *
  * Disabled with PAPERCLIP_AUTO_RECONCILE_INERT_RUNS=0. Any doubt keeps the hold.
  */
 export async function reconcileInertLegacyExecutions(db: Db, now = new Date()) {
   const result = { checked: 0, reconciled: 0, notInert: 0, awaitingRelease: 0 };
   if (!isInertRunAutoReconcileEnabled()) return result;
+  const recheckBefore = new Date(now.getTime() - INERT_RUN_RELEASE_RECHECK_MS);
   const candidates = await db
     .select({ action: issueRecoveryActions })
     .from(issueRecoveryActions)
@@ -617,12 +703,23 @@ export async function reconcileInertLegacyExecutions(db: Db, now = new Date()) {
         sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueRecoveryActions.sourceIssueId}::text`,
       ),
     )
+    // Only open work still assigned to the owner the hold returns it to: a
+    // settled hold never leaves the table, so a candidate the transaction
+    // below would skip for good must not fill the batch on every sweep.
+    .innerJoin(
+      issues,
+      and(
+        eq(issues.companyId, issueRecoveryActions.companyId),
+        eq(issues.id, issueRecoveryActions.sourceIssueId),
+        eq(issues.assigneeAgentId, issueRecoveryActions.returnOwnerAgentId),
+        notInArray(issues.status, ["done", "cancelled"]),
+      ),
+    )
     .where(
       and(
-        inArray(issueRecoveryActions.status, ["active", "escalated"]),
         eq(issueRecoveryActions.kind, "active_run_watchdog"),
         eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
-        sql`not (${issueRecoveryActions.evidence} ? 'inertRunAssessment')`,
+        inertReconciliationCandidateCondition(recheckBefore),
         inertLegacyRunRowCondition(),
       ),
     )
@@ -659,6 +756,7 @@ export async function reconcileInertLegacyExecutions(db: Db, now = new Date()) {
           .from(issueRecoveryActions)
           .where(eq(issueRecoveryActions.id, candidate.id))
           .for("update");
+        const settled = action ? isSettledNoReplayHold(action) : false;
         if (
           !task ||
           !run ||
@@ -666,7 +764,7 @@ export async function reconcileInertLegacyExecutions(db: Db, now = new Date()) {
           action.evidence.runId !== run.id ||
           action.cause !== LEGACY_RECOVERY_CAUSE ||
           action.kind !== "active_run_watchdog" ||
-          !["active", "escalated"].includes(action.status) ||
+          !(["active", "escalated"].includes(action.status) || settled) ||
           (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== task.id ||
           !action.returnOwnerAgentId ||
           task.assigneeAgentId !== action.returnOwnerAgentId ||
@@ -674,30 +772,71 @@ export async function reconcileInertLegacyExecutions(db: Db, now = new Date()) {
           isSupersededConversationRun(task, run) ||
           coordinator?.leaseOwner ||
           coordinator?.resultId ||
-          coordinator?.failureDetail?.successorRunId
+          coordinator?.failureDetail?.successorRunId ||
+          // Another execution took the settled task over since.
+          (settled && task.executionRunId && task.executionRunId !== run.id) ||
+          (settled && task.checkoutRunId && task.checkoutRunId !== run.id)
         )
           return "skipped" as const;
 
-        // Final for this run: hand it back to the regular disposition now.
-        const decline = async (reason: string) => {
-          await tx
+        const recordAssessment = (assessment: Record<string, unknown>) =>
+          tx
             .update(issueRecoveryActions)
             .set({
               evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
                 inertRunAssessment: {
                   policy: INERT_RUN_RECONCILIATION_POLICY,
-                  verdict: "not_inert",
-                  reason,
+                  ...assessment,
                   assessedAt: now.toISOString(),
                 },
               })}::jsonb`,
             })
             .where(eq(issueRecoveryActions.id, action.id));
+        // Final for this run: an open hold goes back to the regular
+        // disposition now; a settled hold stays with an operator.
+        const decline = async (reason: string) => {
+          await recordAssessment({ verdict: "not_inert", reason });
           return "not_inert" as const;
         };
         const verdict = await assessInertLegacyRun(tx as unknown as Db, run);
-        if (verdict.kind === "awaiting_release") return "awaiting_release" as const;
+        if (verdict.kind === "awaiting_release") {
+          // An open hold is simply revisited (the disposition leaves it alone
+          // during the window). A settled one records when it was checked.
+          if (settled) await recordAssessment({ verdict: "awaiting_release", reason: verdict.reason });
+          return "awaiting_release" as const;
+        }
         if (verdict.kind === "not_inert") return decline(verdict.reason);
+
+        // The disposition moved the task to `blocked` to hold it. Hand it back
+        // the way an operator restoring a settled hold does, unless something
+        // else still holds it.
+        let restoredStatus: string | null = null;
+        const statusBeforeHold = (action.evidence.automaticRecovery as { issueStatusBefore?: unknown } | undefined)
+          ?.issueStatusBefore;
+        if (
+          settled &&
+          action.outcome === "blocked" &&
+          task.status === "blocked" &&
+          // Blocked before the disposition: that hold is someone else's.
+          statusBeforeHold !== "blocked"
+        ) {
+          if (parseIssueExecutionState(task.executionState)?.status === "pending")
+            return decline("governed_stage_pending");
+          const [unresolvedBlocker] = await tx
+            .select({ id: issues.id })
+            .from(issueRelations)
+            .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+            .where(
+              and(
+                eq(issueRelations.companyId, task.companyId),
+                eq(issueRelations.relatedIssueId, task.id),
+                eq(issueRelations.type, "blocks"),
+                notInArray(issues.status, ["done", "cancelled"]),
+              ),
+            )
+            .limit(1);
+          if (!unresolvedBlocker) restoredStatus = "todo";
+        }
 
         const decision: ExecutionReconciliation = {
           runId: run.id,
@@ -723,8 +862,15 @@ export async function reconcileInertLegacyExecutions(db: Db, now = new Date()) {
           return decline(`reconciliation_refused: ${message.slice(0, 160)}`);
         }
         await markExecutionReconciliation(tx as unknown as Db, action, decision, "execution-recovery");
-        const note =
-          "The stopped run never reached its adapter, so no actions were performed. Reconciled automatically; the task continues in a new run.";
+        if (restoredStatus) {
+          await tx
+            .update(issues)
+            .set({ status: restoredStatus, updatedAt: now })
+            .where(and(eq(issues.id, task.id), eq(issues.status, "blocked")));
+        }
+        const note = settled
+          ? "The stopped run never reached its adapter, so no actions were performed. The held task was reconciled automatically and continues in a new run."
+          : "The stopped run never reached its adapter, so no actions were performed. Reconciled automatically; the task continues in a new run.";
         await tx
           .update(issueRecoveryActions)
           .set({
@@ -741,6 +887,8 @@ export async function reconcileInertLegacyExecutions(db: Db, now = new Date()) {
                 ...verdict.facts,
                 verdict: "inert",
                 assessedAt: now.toISOString(),
+                // The disposition this decision supersedes, kept for audit.
+                ...(settled ? { settledDisposition: action.evidence.automaticRecovery } : {}),
               },
             })}::jsonb`,
           })
@@ -759,6 +907,8 @@ export async function reconcileInertLegacyExecutions(db: Db, now = new Date()) {
             actionOutcome: "not_performed",
             automatic: true,
             policy: INERT_RUN_RECONCILIATION_POLICY,
+            ...(settled ? { supersededDisposition: "preserve_without_replay_v1" } : {}),
+            ...(restoredStatus ? { issueStatus: { from: task.status, to: restoredStatus } } : {}),
           },
         });
         await tx
