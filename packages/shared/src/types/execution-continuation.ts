@@ -45,6 +45,16 @@ export interface ExecutionContinuationEnvelope {
     result: unknown;
   }>;
   unresolvedInteractionIds: string[];
+  /**
+   * Newest-first digest of this agent's most recent earlier runs on the task.
+   * The summary is agent-authored low-trust text (one line, bounded length).
+   */
+  priorRuns?: Array<{
+    id: string;
+    status: string;
+    liveness: string | null;
+    summary: string | null;
+  }>;
   coverage: {
     kind: "full_task_history" | "task_history_delta";
     baseRunId?: string;
