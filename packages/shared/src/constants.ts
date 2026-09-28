@@ -583,10 +583,11 @@ export type EnvironmentDriver = (typeof ENVIRONMENT_DRIVERS)[number];
  *
  * - `restricted` (the default) forwards only the fixed route list the
  *   Paperclip skill documents.
- * - `agent` forwards every route the agent API serves to agents, minus a
+ * - `agent` forwards the route families agents use for their work, minus a
  *   fixed denylist (secret values, credentials, environment configuration,
- *   and instance/company administration). The server still authorizes every
- *   forwarded call for the agent.
+ *   unscrubbed host output, irreversible deletes, costs, and instance/company
+ *   administration). The server still authorizes every forwarded call for
+ *   the agent.
  */
 export const SANDBOX_CALLBACK_BRIDGE_POLICIES = ["restricted", "agent"] as const;
 export type SandboxCallbackBridgePolicy = (typeof SANDBOX_CALLBACK_BRIDGE_POLICIES)[number];

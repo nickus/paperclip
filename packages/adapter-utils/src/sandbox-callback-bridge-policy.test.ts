@@ -109,8 +109,7 @@ const RESTRICTED_ALLOWED: RouteCase[] = [
 // Routes agents call that only the `agent` policy forwards. The server still
 // authorizes each one for the calling agent.
 const AGENT_ONLY_ALLOWED: RouteCase[] = [
-  // Issues: create, edit, close, delete, subtasks, documents, interactions.
-  { method: "DELETE", path: "/api/issues/issue-1" },
+  // Issues: create, edit, close, subtasks, documents, interactions.
   { method: "GET", path: "/api/issues" },
   { method: "GET", path: "/api/issues/identifier/ABC-1" },
   { method: "POST", path: "/api/issues/issue-1/children" },
@@ -128,19 +127,17 @@ const AGENT_ONLY_ALLOWED: RouteCase[] = [
   { method: "DELETE", path: "/api/attachments/att-1" },
   { method: "GET", path: "/api/issues/issue-1/recovery-actions" },
   { method: "POST", path: "/api/issues/issue-1/recovery-actions/resolve" },
-  { method: "PUT", path: "/api/issues/issue-1/watchdog" },
+  { method: "GET", path: "/api/issues/issue-1/watchdog" },
   { method: "POST", path: "/api/issues/issue-1/tree-holds" },
   { method: "GET", path: "/api/issues/issue-1/runs" },
   { method: "GET", path: "/api/issues/issue-1/active-run" },
   { method: "POST", path: "/api/companies/co-1/labels" },
-  { method: "DELETE", path: "/api/labels/label-1" },
   // Agents: reads (colleagues, instructions, configuration) and self-wake.
   { method: "GET", path: "/api/agents/agent-2/instructions-bundle" },
   { method: "GET", path: "/api/agents/agent-2/instructions-bundle/file" },
   { method: "GET", path: "/api/agents/agent-2/configuration" },
   { method: "GET", path: "/api/agents/agent-2/config-revisions" },
-  { method: "GET", path: "/api/agents/agent-2/runtime-state" },
-  { method: "GET", path: "/api/agents/agent-2/task-sessions" },
+  { method: "GET", path: "/api/agents/agent-2/config-revisions/rev-1" },
   { method: "POST", path: "/api/agents/agent-1/wakeup" },
   // Runs and trajectories.
   { method: "GET", path: "/api/companies/co-1/heartbeat-runs" },
@@ -149,8 +146,6 @@ const AGENT_ONLY_ALLOWED: RouteCase[] = [
   { method: "GET", path: "/api/heartbeat-runs/run-1/events" },
   { method: "GET", path: "/api/heartbeat-runs/run-1/log" },
   { method: "GET", path: "/api/heartbeat-runs/run-1/issues" },
-  { method: "GET", path: "/api/heartbeat-runs/run-1/workspace-operations" },
-  { method: "GET", path: "/api/workspace-operations/op-1/log" },
   // Summary slots.
   { method: "GET", path: "/api/companies/co-1/summary-slots/project/header" },
   { method: "GET", path: "/api/companies/co-1/summary-slots/project/header/revisions" },
@@ -161,13 +156,10 @@ const AGENT_ONLY_ALLOWED: RouteCase[] = [
   { method: "GET", path: "/api/companies/co-1/search" },
   { method: "GET", path: "/api/companies/co-1/labels" },
   { method: "GET", path: "/api/companies/co-1/activity" },
-  { method: "GET", path: "/api/companies/co-1/audit/agent-actions" },
   { method: "GET", path: "/api/companies/co-1/artifacts" },
   { method: "GET", path: "/api/companies/co-1/timeline" },
   { method: "GET", path: "/api/companies/co-1/execution-workspaces" },
   { method: "GET", path: "/api/companies/co-1/workspace-overview" },
-  { method: "GET", path: "/api/companies/co-1/costs/summary" },
-  { method: "GET", path: "/api/companies/co-1/budgets/overview" },
   { method: "GET", path: "/api/companies/co-1/user-directory" },
   { method: "GET", path: "/api/companies/co-1/members" },
   { method: "GET", path: "/api/companies/co-1/project-repositories" },
@@ -176,18 +168,14 @@ const AGENT_ONLY_ALLOWED: RouteCase[] = [
   { method: "GET", path: "/api/routines/r-1/revisions" },
   { method: "POST", path: "/api/routines/r-1/revisions/rev-1/restore" },
   { method: "POST", path: "/api/approvals/ap-1/resubmit" },
-  { method: "POST", path: "/api/approvals/ap-1/approve" },
   // Other reads.
   { method: "GET", path: "/api/projects/proj-1/workspaces" },
   { method: "GET", path: "/api/execution-workspaces/ws-1/close-readiness" },
   { method: "GET", path: "/api/status-cards/card-1" },
-  { method: "GET", path: "/api/feedback-traces/trace-1/bundle" },
   { method: "GET", path: "/api/assets/asset-1/content" },
   { method: "GET", path: "/api/skills/index" },
   { method: "GET", path: "/api/health" },
   { method: "GET", path: "/api/llms/agent-icons.txt" },
-  { method: "GET", path: "/api/plugins/tools" },
-  { method: "POST", path: "/api/plugins/tools/execute" },
 ];
 
 // Routes the `agent` policy refuses: credential material, environment
@@ -304,6 +292,41 @@ const AGENT_DENIED: RouteCase[] = [
   { method: "POST", path: "/api/heartbeat-runs/run-1/watchdog-decisions" },
   { method: "POST", path: "/api/issues/issue-1/admin/force-release" },
   { method: "GET", path: "/api/issues/issue-1/file-resources/content" },
+  // Workspace-operation output, wherever it is nested.
+  { method: "GET", path: "/api/heartbeat-runs/run-1/workspace-operations" },
+  { method: "GET", path: "/api/workspace-operations/op-1/log" },
+  { method: "GET", path: "/api/execution-workspaces/ws-1/workspace-operations" },
+  // Irreversible deletes; closing is a status update.
+  { method: "DELETE", path: "/api/issues/issue-1" },
+  { method: "DELETE", path: "/api/Issues/issue-1/" },
+  { method: "DELETE", path: "/api/labels/label-1" },
+  // Directing other agents and promoting low-trust content.
+  { method: "PUT", path: "/api/issues/issue-1/watchdog" },
+  { method: "DELETE", path: "/api/issues/issue-1/watchdog" },
+  { method: "POST", path: "/api/issues/issue-1/low-trust/promotions" },
+  // Board-only decisions and state.
+  { method: "POST", path: "/api/approvals/ap-1/approve" },
+  { method: "POST", path: "/api/approvals/ap-1/reject" },
+  { method: "POST", path: "/api/approvals/ap-1/request-revision" },
+  { method: "GET", path: "/api/agents/agent-2/runtime-state" },
+  { method: "GET", path: "/api/agents/agent-2/task-sessions" },
+  { method: "GET", path: "/api/feedback-traces/trace-1" },
+  { method: "GET", path: "/api/feedback-traces/trace-1/bundle" },
+  { method: "GET", path: "/api/issues/issue-1/feedback-traces" },
+  { method: "GET", path: "/api/companies/co-1/feedback-traces" },
+  // Costs, budgets and the audit log.
+  { method: "GET", path: "/api/companies/co-1/costs/summary" },
+  { method: "GET", path: "/api/companies/co-1/costs/finance-events" },
+  { method: "GET", path: "/api/companies/co-1/budgets/overview" },
+  { method: "GET", path: "/api/companies/co-1/audit/agent-actions" },
+  { method: "GET", path: "/api/companies/co-1/audit/agent-actions.csv" },
+  // Agent reads outside the listed ones.
+  { method: "GET", path: "/api/agents/agent-2/new-thing" },
+  { method: "GET", path: "/api/agents/me/new-thing" },
+  // Plugin tools run in plugin workers on the host.
+  { method: "GET", path: "/api/plugins/tools" },
+  { method: "POST", path: "/api/plugins/tools/execute" },
+  { method: "GET", path: "/api/plugins/plugin-1/api/anything" },
   // Unknown families fail closed.
   { method: "GET", path: "/api/new-thing" },
   { method: "GET", path: "/api/runs/run-1" },
@@ -434,11 +457,20 @@ describe("sandbox callback bridge route policies", () => {
         { method: "GET", path: "/api/companies/ABCDEF/issues" },
         { policy: "agent", companyId: "abcdef" },
       )).toBeNull();
-      // Without a company id the server's own company check is the only one.
-      expect(authorizeSandboxCallbackBridgeRequestForPolicy(
-        { method: "GET", path: `/api/companies/${OTHER_COMPANY}/issues` },
-        { policy: "agent" },
-      )).toBeNull();
+      // Without a bound company every company-scoped path is refused, so a
+      // target that stamps the policy but not the company fails closed.
+      for (const companyId of [undefined, null, "", "  "]) {
+        for (const path of [`/api/companies/${COMPANY}`, `/api/companies/${COMPANY}/issues`]) {
+          expect(authorizeSandboxCallbackBridgeRequestForPolicy(
+            { method: "GET", path },
+            { policy: "agent", companyId },
+          ), `${String(companyId)} ${path}`).toContain("Runs can only reach their own company");
+        }
+        expect(authorizeSandboxCallbackBridgeRequestForPolicy(
+          { method: "GET", path: "/api/issues/issue-1" },
+          { policy: "agent", companyId },
+        )).toBeNull();
+      }
     });
   });
 

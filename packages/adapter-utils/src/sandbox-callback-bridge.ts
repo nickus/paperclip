@@ -524,14 +524,32 @@ export const AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRoute
   // Board-only issue recovery and host workspace file reads.
   { methods: ALL_METHODS, path: /^\/api\/issues\/[^/]+\/admin(?:\/|$)/ },
   { methods: ALL_METHODS, path: /^\/api\/issues\/[^/]+\/file-resources(?:\/|$)/ },
+  // Workspace provisioning, setup and runtime-service output from the host.
+  // It is stored without secret scrubbing, so no run reads it through the
+  // bridge, wherever it is nested.
+  { methods: ALL_METHODS, path: /(?:^|\/)workspace-operations(?:\/|$)/ },
+  // Irreversible deletes. Agents close an issue by setting its status; a
+  // label delete removes it company-wide.
+  { methods: ["DELETE"], path: /^\/api\/issues\/[^/]+$/ },
+  { methods: ["DELETE"], path: /^\/api\/labels\/[^/]+$/ },
+  // Writes that direct other agents or change the trust of existing content:
+  // naming a watchdog agent with instructions, and promoting low-trust output.
+  { methods: WRITE_METHODS, path: /^\/api\/issues\/[^/]+\/watchdog$/ },
+  { methods: WRITE_METHODS, path: /^\/api\/issues\/[^/]+\/low-trust(?:\/|$)/ },
+  // Board-only routes, refused here so agents get a final answer instead of
+  // probing the server: approval decisions, session and runtime state,
+  // feedback traces.
+  { methods: ALL_METHODS, path: /^\/api\/approvals\/[^/]+\/(?:approve|reject|request-revision)$/ },
+  { methods: ALL_METHODS, path: /^\/api\/agents\/[^/]+\/(?:runtime-state|task-sessions)(?:\/|$)/ },
+  { methods: ALL_METHODS, path: /(?:^|\/)feedback-traces(?:\/|$)/ },
 ];
 
 const COMPANY = "^\\/api\\/companies\\/[^/]+";
 const SEGMENTS = "(?:\\/[^/]+)*";
 
 // Company-scoped read families. Anything else under a company (environments,
-// secrets, tools, adapters, AI connections, invites, members' writes, budgets,
-// exports) stays unreachable.
+// secrets, tools, adapters, AI connections, invites, members' writes, costs,
+// budgets, the audit log, exports) stays unreachable.
 const AGENT_COMPANY_READ_FAMILIES = [
   "dashboard",
   "agents",
@@ -548,13 +566,11 @@ const AGENT_COMPANY_READ_FAMILIES = [
   "skills",
   "labels",
   "activity",
-  "audit",
   "artifacts",
   "timeline",
   "execution-workspaces",
   "workspace-overview",
   "status-cards",
-  "costs",
   "user-directory",
   "members",
   "agent-configurations",
@@ -562,7 +578,6 @@ const AGENT_COMPANY_READ_FAMILIES = [
   "live-runs",
   "summary-slots",
   "built-in-agents",
-  "feedback-traces",
 ].join("|");
 
 /**
@@ -573,26 +588,30 @@ const AGENT_COMPANY_READ_FAMILIES = [
  * at all. It is a superset of the restricted allowlist.
  */
 export const AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRouteRule[] = [
-  // Agents: every read, self-wake, and the skill/instructions-path calls the
-  // restricted list already carries.
-  { methods: ["GET"], path: new RegExp(`^\\/api\\/agents${SEGMENTS}$`) },
+  // Agents: the caller's own inbox, colleagues' records, configuration and
+  // instructions (the server redacts and gates them), self-wake, and the
+  // skill/instructions-path calls the restricted list already carries.
+  { methods: ["GET"], path: /^\/api\/agents\/me(?:\/inbox-lite|\/inbox\/mine)?$/ },
+  {
+    methods: ["GET"],
+    path: /^\/api\/agents\/[^/]+(?:\/(?:skills|configuration|config-revisions(?:\/[^/]+)?|instructions-bundle(?:\/file)?))?$/,
+  },
   { methods: ["POST"], path: /^\/api\/agents\/[^/]+\/wakeup$/ },
   { methods: ["POST"], path: /^\/api\/agents\/[^/]+\/skills\/sync$/ },
   { methods: ["PATCH"], path: /^\/api\/agents\/[^/]+\/instructions-path$/ },
 
   // Issues and everything under them: comments, documents, checkout and
   // release, children, interactions, work products, attachments, approvals,
-  // recovery actions, watchdogs, tree holds.
+  // recovery actions, tree holds. The deny rules above take out deletes of
+  // the issue itself, watchdog writes, and low-trust promotions.
   { methods: ALL_METHODS, path: new RegExp(`^\\/api\\/issues${SEGMENTS}$`) },
   { methods: ["PATCH", "DELETE"], path: /^\/api\/work-products\/[^/]+$/ },
   { methods: ["GET"], path: /^\/api\/attachments\/[^/]+\/content$/ },
   { methods: ["DELETE"], path: /^\/api\/attachments\/[^/]+$/ },
-  { methods: ["DELETE"], path: /^\/api\/labels\/[^/]+$/ },
 
   // Company-scoped reads and the company-scoped creates agents use.
   { methods: ["GET"], path: new RegExp(`${COMPANY}$`) },
   { methods: ["GET"], path: new RegExp(`${COMPANY}\\/(?:${AGENT_COMPANY_READ_FAMILIES})${SEGMENTS}$`) },
-  { methods: ["GET"], path: new RegExp(`${COMPANY}\\/budgets\\/overview$`) },
   { methods: ["GET"], path: new RegExp(`${COMPANY}\\/email\\/(?:inboxes|tasks\\/[^/]+|deliveries\\/[^/]+)$`) },
   { methods: ["POST"], path: new RegExp(`${COMPANY}\\/(?:issues|labels|routines|approvals|agent-hires)$`) },
   { methods: ["POST"], path: new RegExp(`${COMPANY}\\/issues\\/[^/]+\\/attachments$`) },
@@ -600,15 +619,12 @@ export const AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRout
   { methods: ["PUT"], path: new RegExp(`${COMPANY}\\/summary-slots\\/[^/]+\\/[^/]+$`) },
   { methods: ["POST"], path: new RegExp(`${COMPANY}\\/summary-slots\\/[^/]+\\/[^/]+\\/generate$`) },
 
-  // Runs and their trajectories.
-  {
-    methods: ["GET"],
-    path: /^\/api\/heartbeat-runs\/[^/]+(?:\/(?:events|log|issues|workspace-operations))?$/,
-  },
-  { methods: ["GET"], path: /^\/api\/workspace-operations\/[^/]+\/log$/ },
+  // Runs and their trajectories. Run logs and excerpts are scrubbed for
+  // secrets when the server stores them.
+  { methods: ["GET"], path: /^\/api\/heartbeat-runs\/[^/]+(?:\/(?:events|log|issues))?$/ },
 
   // Routines the agent owns (the server enforces ownership) and approvals
-  // (the server keeps approve/reject board-only).
+  // (the deny rules above take out the board's decisions).
   { methods: ALL_METHODS, path: new RegExp(`^\\/api\\/routines\\/[^/]+${SEGMENTS}$`) },
   { methods: ["PATCH", "DELETE"], path: /^\/api\/routine-triggers\/[^/]+$/ },
   { methods: ALL_METHODS, path: new RegExp(`^\\/api\\/approvals\\/[^/]+${SEGMENTS}$`) },
@@ -616,22 +632,14 @@ export const AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRout
   // Read-only context.
   { methods: ["GET"], path: new RegExp(`^\\/api\\/projects\\/[^/]+${SEGMENTS}$`) },
   { methods: ["GET"], path: /^\/api\/goals\/[^/]+$/ },
-  {
-    methods: ["GET"],
-    path: /^\/api\/execution-workspaces\/[^/]+(?:\/(?:close-readiness|workspace-operations))?$/,
-  },
+  { methods: ["GET"], path: /^\/api\/execution-workspaces\/[^/]+(?:\/close-readiness)?$/ },
   { methods: ["POST"], path: /^\/api\/execution-workspaces\/[^/]+\/runtime-services\/(?:start|stop|restart)$/ },
   { methods: ["GET"], path: new RegExp(`^\\/api\\/status-cards\\/[^/]+${SEGMENTS}$`) },
-  { methods: ["GET"], path: /^\/api\/feedback-traces\/[^/]+(?:\/bundle)?$/ },
   { methods: ["GET"], path: /^\/api\/assets\/[^/]+\/content$/ },
   { methods: ["GET"], path: new RegExp(`^\\/api\\/skills${SEGMENTS}$`) },
   { methods: ["GET"], path: /^\/api\/health$/ },
   { methods: ["GET"], path: /^\/api\/openapi\.json$/ },
   { methods: ["GET"], path: /^(?:\/api)?\/llms(?:\/[^/]+)+$/ },
-
-  // Plugin tools; the tool gateway applies the agent's tool policy.
-  { methods: ["GET"], path: /^\/api\/plugins\/tools$/ },
-  { methods: ["POST"], path: /^\/api\/plugins\/tools\/execute$/ },
 
   // Runtime capability authentication is independently checked by the controller.
   { methods: ["POST"], path: /^\/runtime-tools\/github\/credentials$/ },
@@ -696,9 +704,11 @@ export function authorizeSandboxCallbackBridgeRequestForPolicy(
   if (agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES, method, matchPath)) {
     return agentPolicyDenial(method, request.path);
   }
-  const companyId = options.companyId?.trim().toLowerCase();
+  // A run with no bound company reaches no company-scoped path at all, so a
+  // target that stamps the policy but not the company fails closed.
+  const companyId = options.companyId?.trim().toLowerCase() || null;
   const companyMatch = /^\/api\/companies\/([^/]+)/.exec(matchPath);
-  if (companyId && companyMatch && companyMatch[1] !== companyId) {
+  if (companyMatch && companyMatch[1] !== companyId) {
     return `Route not allowed (bridge policy "agent"): ${method} ${request.path}. ` +
       "Runs can only reach their own company.";
   }
