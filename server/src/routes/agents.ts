@@ -5680,30 +5680,56 @@ export function agentRoutes(
     source: HeartbeatSource | undefined;
     skippedResponse: (agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>, payload: Record<string, unknown> | null) => unknown | Promise<unknown>;
   };
-  // Resolve a wake's top-level `issueId` into the payload binding the
-  // heartbeat reads (`payload.issueId`). The issue must belong to the woken
-  // agent's company, and an agent waking itself may only bind an issue
-  // assigned to it.
+  // Resolve the issue a wake binds its run to. The top-level `issueId` and,
+  // for an agent waking itself, the payload's `issueId`/`taskId` (which the
+  // heartbeat reads as the run's task) must name an issue in the woken agent's
+  // company; an agent may only bind an issue assigned to it. The binding is
+  // written back as `payload.issueId` in its canonical id form.
   const bindWakePayloadToIssue = async (
     req: Request,
     agent: { id: string; companyId: string },
     requestedIssueId: unknown,
     payload: Record<string, unknown> | null,
   ): Promise<Record<string, unknown> | null> => {
-    if (requestedIssueId === undefined || requestedIssueId === null) return payload;
-    if (typeof requestedIssueId !== "string" || requestedIssueId.trim().length === 0) {
-      throw badRequest("issueId must be a non-empty issue id or identifier.");
+    const resolveBoundIssue = async (reference: string, field: string) => {
+      const issue = await issueService(db).getById(reference);
+      if (!issue || issue.companyId !== agent.companyId) throw notFound("Issue not found");
+      if (req.actor.type === "agent" && issue.assigneeAgentId !== agent.id) {
+        throw forbidden(`An agent can only start a run for an issue assigned to it (${field}).`);
+      }
+      return issue;
+    };
+    const payloadReferences = (["issueId", "taskId"] as const).flatMap((field) => {
+      const value = payload?.[field];
+      return typeof value === "string" && value.trim().length > 0 ? [{ field, value: value.trim() }] : [];
+    });
+
+    if (requestedIssueId !== undefined && requestedIssueId !== null) {
+      if (typeof requestedIssueId !== "string" || requestedIssueId.trim().length === 0) {
+        throw badRequest("issueId must be a non-empty issue id or identifier.");
+      }
+      const issue = await resolveBoundIssue(requestedIssueId, "issueId");
+      for (const reference of payloadReferences) {
+        if (reference.value !== issue.id && reference.value !== issue.identifier) {
+          throw badRequest(`issueId and payload.${reference.field} name different issues.`);
+        }
+      }
+      return { ...(payload ?? {}), issueId: issue.id };
     }
-    const issue = await issueService(db).getById(requestedIssueId);
-    if (!issue || issue.companyId !== agent.companyId) throw notFound("Issue not found");
-    if (req.actor.type === "agent" && issue.assigneeAgentId !== agent.id) {
-      throw forbidden("An agent can only start a run for an issue assigned to it.");
+
+    // A board or system wake keeps its payload as given. An agent's own wake
+    // payload binds the run the same way the top-level field does, so it is
+    // held to the same rule.
+    if (req.actor.type !== "agent" || payloadReferences.length === 0) return payload;
+    let boundIssueId: string | null = null;
+    for (const reference of payloadReferences) {
+      const issue = await resolveBoundIssue(reference.value, `payload.${reference.field}`);
+      if (boundIssueId && boundIssueId !== issue.id) {
+        throw badRequest("payload.issueId and payload.taskId name different issues.");
+      }
+      boundIssueId = issue.id;
     }
-    const payloadIssueId = typeof payload?.issueId === "string" ? payload.issueId.trim() : "";
-    if (payloadIssueId && payloadIssueId !== issue.id && payloadIssueId !== issue.identifier) {
-      throw badRequest("issueId and payload.issueId name different issues.");
-    }
-    return { ...(payload ?? {}), issueId: issue.id };
+    return { ...(payload ?? {}), issueId: boundIssueId };
   };
 
   const handleWakeupRoute = async (
