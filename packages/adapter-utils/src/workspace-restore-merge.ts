@@ -191,7 +191,21 @@ function fileModesMatch(left: number, right: number): boolean {
   return (left & EXECUTABLE_MODE_BIT) === (right & EXECUTABLE_MODE_BIT);
 }
 
-function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEntry | null | undefined): boolean {
+/**
+ * How much of a file's mode two entries must share to match:
+ * - `"full"`: every mode bit. For two snapshots of the same tree on this host
+ *   (the baseline and the target's current state), where no extraction sits in
+ *   between, so any mode difference is a real change made on the host.
+ * - `"executable"`: only the owner-executable bit (see {@link fileModesMatch}).
+ *   For comparing an extracted copy of the remote workspace with the baseline.
+ */
+type FileModeMatch = "full" | "executable";
+
+function entriesMatch(
+  left: SnapshotEntry | null | undefined,
+  right: SnapshotEntry | null | undefined,
+  fileModeMatch: FileModeMatch,
+): boolean {
   if (!left || !right) return false;
   if (left.kind !== right.kind) return false;
   if (left.kind === "dir") return true;
@@ -199,7 +213,8 @@ function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEnt
     return left.target === right.target;
   }
   if (left.kind === "file" && right.kind === "file") {
-    return fileModesMatch(left.mode, right.mode) && left.hash === right.hash;
+    const modesMatch = fileModeMatch === "full" ? left.mode === right.mode : fileModesMatch(left.mode, right.mode);
+    return modesMatch && left.hash === right.hash;
   }
   return false;
 }
@@ -444,7 +459,9 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
   });
   // A file the run changed keeps the host copy's permission bits unless the run
   // changed whether it is executable (see fileModesMatch): the other bits of an
-  // extracted file's mode come from the extracting umask, not from the run.
+  // extracted file's mode come from the extracting umask, not from the run. A
+  // file new to the host takes its extracted mode: the run's mode narrowed by
+  // the extracting umask, as for any file this process creates.
   const keepHostMode = existing?.isFile() === true && fileModesMatch(existing.mode, entry.mode);
   await fs.chmod(targetPath, keepHostMode ? existing!.mode : entry.mode);
 }
@@ -476,7 +493,10 @@ export async function mergeDirectoryWithBaseline(input: {
       .sort(([left], [right]) => right.length - left.length);
 
     for (const [relative, baselineEntry] of deletedLeafEntries) {
-      if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;
+      // Both sides were read from this host, so compare the full mode: a host
+      // change to any permission bit (e.g. `chmod 600`) made while the run was
+      // going keeps the file, like a content change does.
+      if (!entriesMatch(current.entries.get(relative), baselineEntry, "full")) continue;
       await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true }).catch(() => undefined);
     }
 
@@ -489,7 +509,9 @@ export async function mergeDirectoryWithBaseline(input: {
     }
 
     const changedSourceEntries = [...source.entries.entries()]
-      .filter(([relative, entry]) => !entriesMatch(input.baseline.entries.get(relative), entry))
+      // The source is an extracted copy of the remote workspace: its non-executable
+      // mode bits come from the extracting umask, so they are not compared.
+      .filter(([relative, entry]) => !entriesMatch(input.baseline.entries.get(relative), entry, "executable"))
       .sort(([left], [right]) => left.localeCompare(right));
 
     for (const [relative, entry] of changedSourceEntries) {
@@ -505,5 +527,6 @@ export async function directoryEntryMatchesBaseline(
   relative: string,
   baselineEntry: SnapshotEntry,
 ): Promise<boolean> {
-  return entriesMatch(await readSnapshotEntry(rootDir, relative), baselineEntry);
+  // A host tree checked against its own baseline: compare the full mode.
+  return entriesMatch(await readSnapshotEntry(rootDir, relative), baselineEntry, "full");
 }
