@@ -1382,12 +1382,12 @@ export function parseAdapterExecutionTarget(value: unknown): AdapterExecutionTar
       transport: "ssh",
       environmentId: readStringMeta(parsed, "environmentId"),
       leaseId: readStringMeta(parsed, "leaseId"),
-      remoteCwd: spec.remoteCwd,
-      spec,
       // Only a well-formed key survives a round trip; anything else means the per-run layout.
       ...(isSshWorkspaceReuseKey(parsed.workspaceReuseKey)
         ? { workspaceReuseKey: parsed.workspaceReuseKey }
         : {}),
+      remoteCwd: spec.remoteCwd,
+      spec,
     };
   }
 
