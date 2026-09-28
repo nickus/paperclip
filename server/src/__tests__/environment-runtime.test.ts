@@ -681,6 +681,90 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     ).toHaveLength(1);
   });
 
+  it("acquires a fresh sandbox for a run that loses a reusable lease to a concurrent run", async () => {
+    const seeded = await seedReusablePluginSandboxLease();
+    const leaseMetadata = {
+      provider: "fake-plugin",
+      image: "fake:test",
+      timeoutMs: 1234,
+      reuseLease: true,
+      remoteCwd: "/workspace",
+    };
+    let acquiredSandboxes = 0;
+    let resumeArrivals = 0;
+    let releaseResumes!: () => void;
+    const bothResumesArrived = new Promise<void>((resolve) => {
+      releaseResumes = resolve;
+    });
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === seeded.pluginId),
+      call: vi.fn(async (_pluginId: string, method: string, params: Record<string, unknown>) => {
+        if (method === "environmentAcquireLease") {
+          acquiredSandboxes += 1;
+          return { providerLeaseId: `sandbox-${acquiredSandboxes}`, metadata: leaseMetadata };
+        }
+        if (method === "environmentReleaseLease") return undefined;
+        if (method === "environmentResumeLease") {
+          // Hold both resumes until the other has also picked the released
+          // lease, so both runs reach the lease handoff with the same lease.
+          resumeArrivals += 1;
+          if (resumeArrivals === 2) releaseResumes();
+          await Promise.race([bothResumesArrived, new Promise((resolve) => setTimeout(resolve, 5_000))]);
+          return { providerLeaseId: params.providerLeaseId, metadata: leaseMetadata };
+        }
+        throw new Error(`Unexpected plugin method during concurrent resume: ${method}`);
+      }),
+      getWorker: vi.fn(() => ({
+        supportedMethods: [
+          "environmentResumeLease",
+          "environmentReleaseLease",
+          "environmentDestroyLease",
+        ],
+      })),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const acquireFor = (heartbeatRunId: string) =>
+      runtimeWithPlugin.acquireRunLease({
+        companyId: seeded.companyId,
+        environment: seeded.environment,
+        issueId: null,
+        agentId: seeded.agentId,
+        heartbeatRunId,
+        persistedExecutionWorkspace: {
+          id: seeded.executionWorkspaceId,
+          mode: "shared_workspace",
+        },
+      });
+    await environmentService(db).releaseLease(seeded.reusableLease.id, "expired");
+    await acquireFor(seeded.runId);
+    await runtimeWithPlugin.releaseRunLeases(seeded.runId, "released", undefined, "stop_and_retain");
+
+    const runIds = [randomUUID(), randomUUID()];
+    for (const id of runIds) {
+      await db.insert(heartbeatRuns).values({
+        id,
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        invocationSource: "manual",
+        status: "running",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+    }
+    const results = await Promise.allSettled(runIds.map((id) => acquireFor(id)));
+
+    expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+    const leases = results.map(
+      (result) => (result as PromiseFulfilledResult<Awaited<ReturnType<typeof acquireFor>>>).value.lease,
+    );
+    expect(resumeArrivals).toBe(2);
+    expect(leases.map((lease) => lease.providerLeaseId).sort()).toEqual(["sandbox-1", "sandbox-2"]);
+    expect(leases.map((lease) => lease.metadata?.sandboxLeaseAcquisition).sort(
+      (left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)),
+    )).toEqual([{ outcome: "created" }, { outcome: "resumed" }]);
+    expect(leases.every((lease) => lease.status === "active")).toBe(true);
+  });
+
   it("reacquires one provider lease row idempotently during same-run recovery", async () => {
     const seeded = await seedReusablePluginSandboxLease();
     const workerManager = {

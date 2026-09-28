@@ -34,7 +34,7 @@ import {
   runWithRuntimeParent,
   type StartupSpanContext,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
-import { environmentService } from "./environments.js";
+import { environmentService, isReusableLeaseHandoffConflict } from "./environments.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { verifyNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import {
@@ -1096,6 +1096,10 @@ function reusableSandboxLeaseScopeMatches(input: {
     config: input.config,
   });
 }
+
+// Attempts at acquiring a run lease when each one loses a reusable lease
+// handoff to a concurrent run (see acquireRunLease).
+const REUSABLE_LEASE_HANDOFF_MAX_ATTEMPTS = 3;
 
 function reusableLeaseCanBeResumed(input: {
   lease: Pick<EnvironmentLease, "status" | "heartbeatRunId">;
@@ -3734,7 +3738,7 @@ export function environmentRuntimeService(
         persistedExecutionWorkspace: input.persistedExecutionWorkspace,
       });
       const driver = requireDriver(input.environment);
-      const lease = await driver.acquireRunLease({
+      const acquire = () => driver.acquireRunLease({
         companyId: input.companyId,
         environment: input.environment,
         issueId: input.issueId,
@@ -3748,6 +3752,35 @@ export function environmentRuntimeService(
         requestedExpiresAt: input.requestedExpiresAt ?? null,
         assertCompanyBinding: input.assertCompanyBinding,
       });
+      // Runs that start together in one reuse scope (for example two tasks of
+      // an agent that share an execution workspace) can all pick the same
+      // released reusable lease. The lease handoff lets one run take it and
+      // rejects the others. The lease a run lost is no longer resumable, so
+      // acquiring again resumes another released sandbox of the scope or
+      // acquires a fresh one. The rejected attempt provisioned nothing: it
+      // only resumed the sandbox the winning run now owns.
+      let lease: EnvironmentLease;
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          lease = await acquire();
+          break;
+        } catch (error) {
+          if (
+            attempt >= REUSABLE_LEASE_HANDOFF_MAX_ATTEMPTS ||
+            !isReusableLeaseHandoffConflict(error)
+          ) {
+            throw error;
+          }
+          logger.info(
+            {
+              environmentId: input.environment.id,
+              heartbeatRunId: input.heartbeatRunId,
+              attempt,
+            },
+            "Reusable sandbox lease was taken by another run; acquiring again",
+          );
+        }
+      }
 
       return {
         environment: input.environment,
