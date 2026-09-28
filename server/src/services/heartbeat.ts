@@ -981,13 +981,17 @@ export interface SharedWorkspaceHolder {
 export class WorkspaceBusyDeferral extends Error {
   code = WORKSPACE_BUSY_ERROR_CODE;
   holder: SharedWorkspaceHolder;
-  projectWorkspaceId: string;
+  // The shared tree's project workspace; null when it is the managed
+  // directory of a project without workspaces.
+  projectWorkspaceId: string | null;
+  projectId: string | null;
   deferralAttempt: number;
   wasIssueAssignee: boolean;
 
   constructor(input: {
     holder: SharedWorkspaceHolder;
-    projectWorkspaceId: string;
+    projectWorkspaceId: string | null;
+    projectId: string | null;
     deferralAttempt: number;
     wasIssueAssignee: boolean;
   }) {
@@ -999,6 +1003,7 @@ export class WorkspaceBusyDeferral extends Error {
     this.name = "WorkspaceBusyDeferral";
     this.holder = input.holder;
     this.projectWorkspaceId = input.projectWorkspaceId;
+    this.projectId = input.projectId;
     this.deferralAttempt = input.deferralAttempt;
     this.wasIssueAssignee = input.wasIssueAssignee;
   }
@@ -15976,9 +15981,48 @@ export function heartbeatService(
     };
   }
 
+  // Resolves which shared tree an issue's shared-workspace run works in. An
+  // issue with a project workspace uses that workspace. An issue without one
+  // uses its project's default tree: the project's first workspace (the one
+  // run workspace resolution tries first), or the managed project directory
+  // when the project has no workspace. `defaultTreeProjectId` is set when the
+  // tree is that default tree, so issues of the project without a project
+  // workspace share it. Returns null for an issue without a project.
+  async function resolveSharedWorkspaceScope(input: {
+    companyId: string;
+    projectId: string | null;
+    projectWorkspaceId: string | null;
+  }): Promise<{ projectWorkspaceId: string | null; defaultTreeProjectId: string | null } | null> {
+    if (!input.projectId) {
+      return input.projectWorkspaceId
+        ? { projectWorkspaceId: input.projectWorkspaceId, defaultTreeProjectId: null }
+        : null;
+    }
+    const defaultProjectWorkspaceId = await db
+      .select({ id: projectWorkspaces.id })
+      .from(projectWorkspaces)
+      .where(
+        and(
+          eq(projectWorkspaces.companyId, input.companyId),
+          eq(projectWorkspaces.projectId, input.projectId),
+        ),
+      )
+      .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+      .limit(1)
+      .then((rows) => rows[0]?.id ?? null);
+    const usesDefaultTree =
+      !input.projectWorkspaceId ||
+      input.projectWorkspaceId === defaultProjectWorkspaceId;
+    return {
+      projectWorkspaceId: input.projectWorkspaceId ?? defaultProjectWorkspaceId,
+      defaultTreeProjectId: usesDefaultTree ? input.projectId : null,
+    };
+  }
+
   // Finds a running heartbeat run (other than the caller's) whose context
-  // issue shares the same project workspace, i.e. the run that currently
-  // "holds" the shared working tree. Runs that have been silent past
+  // issue shares the same project workspace (or, for issues without one, the
+  // same project default tree; see resolveSharedWorkspaceScope), i.e. the run
+  // that currently "holds" the shared working tree. Runs that have been silent past
   // WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS do not count — a zombie holder must
   // not park other work forever, and recovery's silent-run escalation is
   // already reaping it. When isolated workspaces are enabled, holders whose
@@ -15989,7 +16033,8 @@ export function heartbeatService(
   // resolves to the shared tree, so no holder is excluded.
   async function findSharedWorkspaceHolder(input: {
     companyId: string;
-    projectWorkspaceId: string;
+    projectWorkspaceId: string | null;
+    defaultTreeProjectId: string | null;
     excludeIssueId: string;
     excludeRunId: string;
     honorIsolatedWorkspaceModes: boolean;
@@ -15999,6 +16044,21 @@ export function heartbeatService(
       (input.now ?? new Date()).getTime() -
         WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS,
     );
+    const sharesWorkspace = or(
+      ...(input.projectWorkspaceId
+        ? [eq(issues.projectWorkspaceId, input.projectWorkspaceId)]
+        : []),
+      // Issues without a project workspace run in their project's default tree.
+      ...(input.defaultTreeProjectId
+        ? [
+            and(
+              eq(issues.projectId, input.defaultTreeProjectId),
+              isNull(issues.projectWorkspaceId),
+            ),
+          ]
+        : []),
+    );
+    if (!sharesWorkspace) return null;
     return await db
       .select({
         runId: heartbeatRuns.id,
@@ -16022,7 +16082,7 @@ export function heartbeatService(
           // Last observed activity: output beats start beats creation. A run
           // that started recently but has not written output yet is live.
           sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${staleCutoff.toISOString()}::timestamptz`,
-          eq(issues.projectWorkspaceId, input.projectWorkspaceId),
+          sharesWorkspace,
           ne(sql`${issues.id}::text`, input.excludeIssueId),
           ...(input.honorIsolatedWorkspaceModes
             ? [
@@ -16115,6 +16175,7 @@ export function heartbeatService(
         },
         workspaceBusy: {
           projectWorkspaceId: deferral.projectWorkspaceId,
+          projectId: deferral.projectId,
           holderRunId: deferral.holder.runId,
           holderIssueId: deferral.holder.issueId,
           deferralAttempt: deferral.deferralAttempt,
@@ -20759,13 +20820,19 @@ export function heartbeatService(
       // execution target it either remains the existing deferral gate or becomes dispatch context.
       // Holder staleness and the workspace_busy retry ladder are intentionally unchanged for every
       // path that serializes.
-      if (
-        issueRef?.projectWorkspaceId &&
-        effectiveExecutionWorkspaceMode === "shared_workspace"
-      ) {
+      const sharedWorkspaceScope =
+        issueRef && effectiveExecutionWorkspaceMode === "shared_workspace"
+          ? await resolveSharedWorkspaceScope({
+              companyId: agent.companyId,
+              projectId: issueRef.projectId ?? null,
+              projectWorkspaceId: issueRef.projectWorkspaceId ?? null,
+            })
+          : null;
+      if (issueRef && sharedWorkspaceScope) {
         const workspaceHolder = await findSharedWorkspaceHolder({
           companyId: agent.companyId,
-          projectWorkspaceId: issueRef.projectWorkspaceId,
+          projectWorkspaceId: sharedWorkspaceScope.projectWorkspaceId,
+          defaultTreeProjectId: sharedWorkspaceScope.defaultTreeProjectId,
           excludeIssueId: issueRef.id,
           excludeRunId: run.id,
           honorIsolatedWorkspaceModes: isolatedWorkspacesEnabled,
@@ -20782,7 +20849,8 @@ export function heartbeatService(
           if (shouldSerialize) {
             throw new WorkspaceBusyDeferral({
               holder: workspaceHolder,
-              projectWorkspaceId: issueRef.projectWorkspaceId,
+              projectWorkspaceId: sharedWorkspaceScope.projectWorkspaceId,
+              projectId: issueRef.projectId ?? null,
               deferralAttempt:
                 run.scheduledRetryReason === WORKSPACE_BUSY_RETRY_REASON
                   ? (run.scheduledRetryAttempt ?? 0)
@@ -20816,7 +20884,8 @@ export function heartbeatService(
               event: "shared_workspace_concurrent_dispatch",
               runId: run.id,
               issueId: issueRef.id,
-              projectWorkspaceId: issueRef.projectWorkspaceId,
+              projectWorkspaceId: sharedWorkspaceScope.projectWorkspaceId,
+              projectId: issueRef.projectId ?? null,
               holderRunId: workspaceHolder.runId,
               holderIssueId: workspaceHolder.issueId,
               sharedWorkspaceConcurrency,
