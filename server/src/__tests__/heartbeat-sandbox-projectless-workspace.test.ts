@@ -29,13 +29,22 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 // agent it stages the workspace into the sandbox through the execution target's
 // native sync, which every such adapter does (`prepareAdapterExecutionTargetRuntime`
 // routes all staging through `syncIn`).
+// Each run also records its task's disposition (here: moves it to review), as
+// an agent does through the API. A run that leaves its task in progress without
+// one gets disposition-repair runs, the later of them scheduled after a delay,
+// which would keep a wake from ever settling.
+const recordDisposition = vi.hoisted(() => ({
+  current: null as null | ((issueId: unknown) => Promise<void>),
+}));
+
 const adapterExecute = vi.hoisted(() =>
-  vi.fn(async (input: { executionTarget?: any }) => {
+  vi.fn(async (input: { executionTarget?: any; context?: Record<string, unknown> }) => {
     const target = input.executionTarget;
     if (target?.kind === "remote" && typeof target.runner?.syncIn === "function") {
       await target.runner.syncIn([{ operationId: "sync-op-1", files: [] }]);
       await target.runner.syncOut([{ operationId: "sync-op-2", files: [] }]);
     }
+    await recordDisposition.current?.(input.context?.issueId);
     return {
       exitCode: 0,
       signal: null,
@@ -206,6 +215,10 @@ describeEmbeddedPostgres("heartbeat sandbox runs without a project workspace", (
     stopDb = () => started.cleanup();
     db = createDb(started.connectionString);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    recordDisposition.current = async (issueId) => {
+      if (typeof issueId !== "string") return;
+      await db.update(issues).set({ status: "in_review", updatedAt: new Date() }).where(eq(issues.id, issueId));
+    };
   }, 20_000);
 
   afterEach(async () => {
@@ -217,6 +230,7 @@ describeEmbeddedPostgres("heartbeat sandbox runs without a project workspace", (
   });
 
   afterAll(async () => {
+    recordDisposition.current = null;
     await db.$client.end();
     await stopDb?.();
   }, 30_000);

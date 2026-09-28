@@ -26,13 +26,24 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 
-const adapterExecute = vi.hoisted(() => vi.fn(async () => ({
-  exitCode: 0,
-  signal: null,
-  timedOut: false,
-  provider: "test",
-  model: "test-model",
-})));
+// Each run records its task's disposition (here: moves it to review), as an
+// agent does through the API. A run that leaves its task in progress without
+// one gets disposition-repair runs, the later of them scheduled after a delay,
+// which would keep a wake from ever settling.
+const recordDisposition = vi.hoisted(() => ({
+  current: null as null | ((issueId: unknown) => Promise<void>),
+}));
+
+const adapterExecute = vi.hoisted(() => vi.fn(async (input?: { context?: Record<string, unknown> }) => {
+  await recordDisposition.current?.(input?.context?.issueId);
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    provider: "test",
+    model: "test-model",
+  };
+}));
 
 vi.mock("../adapters/index.js", () => ({
   getServerAdapter: () => ({
@@ -138,6 +149,10 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
     db = createDb(started.connectionString);
     // The default posture: the opt-in isolated worktree UI is off.
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    recordDisposition.current = async (issueId) => {
+      if (typeof issueId !== "string") return;
+      await db.update(issues).set({ status: "in_review", updatedAt: new Date() }).where(eq(issues.id, issueId));
+    };
   }, 20_000);
 
   afterEach(async () => {
@@ -149,6 +164,7 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
   });
 
   afterAll(async () => {
+    recordDisposition.current = null;
     await db.$client.end();
     await stopDb?.();
   }, 30_000);
@@ -315,6 +331,8 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
           createdAt: new Date(),
         });
       }
+      // The task is back in progress for this wake (its last run moved it to review).
+      await db.update(issues).set({ status: "in_progress", updatedAt: new Date() }).where(eq(issues.id, targetIssueId));
       const run = await heartbeat.wakeup(agentId, {
         source: "on_demand",
         triggerDetail: "manual",
@@ -431,7 +449,8 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
     // The adapter keeps whatever session it is handed and starts a new one
     // only when it gets none, like a CLI agent resuming by session id.
     let sessionsStarted = 0;
-    adapterExecute.mockImplementation((async (input: { runtime?: { sessionParams?: Record<string, unknown> | null } }) => {
+    adapterExecute.mockImplementation((async (input: { context?: Record<string, unknown>; runtime?: { sessionParams?: Record<string, unknown> | null } }) => {
+      await recordDisposition.current?.(input?.context?.issueId);
       const resumed = input?.runtime?.sessionParams?.sessionId;
       const sessionId = typeof resumed === "string" ? resumed : `session-${++sessionsStarted}`;
       return {
@@ -474,13 +493,16 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
     } finally {
       await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
       adapterExecute.mockReset();
-      adapterExecute.mockImplementation(async () => ({
-        exitCode: 0,
-        signal: null,
-        timedOut: false,
-        provider: "test",
-        model: "test-model",
-      }));
+      adapterExecute.mockImplementation(async (input?: { context?: Record<string, unknown> }) => {
+        await recordDisposition.current?.(input?.context?.issueId);
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          provider: "test",
+          model: "test-model",
+        };
+      });
     }
   }, 90_000);
 
