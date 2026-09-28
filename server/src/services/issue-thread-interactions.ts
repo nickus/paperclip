@@ -104,6 +104,7 @@ import {
   runWorkspaceIsFinalized,
 } from "./issues.js";
 import { questionResponseDeliveryValues } from "./question-response-delivery.js";
+import { isChangeConsentTargetKey } from "./change-consent-gate.js";
 import {
   cancelPendingIssueInteractionChatPublications,
   enqueueIssueInteractionChatPublications,
@@ -382,6 +383,13 @@ export function resolveInteractionPolicy(args: {
   governance: InteractionResolverGovernance;
   hasToolAction: boolean;
   hasSecretProposal?: boolean;
+  /**
+   * The card is bound to a change-consent target (see
+   * `isChangeConsentTargetKey`). Accepting it authorizes a protected change,
+   * so only a board user may resolve it, whatever the request or company
+   * governance says.
+   */
+  hasChangeConsentTarget?: boolean;
 }) {
   const kindGovernance = args.governance[args.kind];
   const requestedPolicyInput =
@@ -396,7 +404,7 @@ export function resolveInteractionPolicy(args: {
   let effectiveResolverPolicy = requestedResolverPolicy;
   let effectiveResolverPolicySource: IssueThreadInteractionEffectiveResolverPolicySource =
     "requested";
-  if (args.hasToolAction || args.hasSecretProposal) {
+  if (args.hasToolAction || args.hasSecretProposal || args.hasChangeConsentTarget) {
     effectiveResolverPolicy = "human_only";
     effectiveResolverPolicySource = "governed_action";
   } else if (kindGovernance?.cap) {
@@ -3309,6 +3317,10 @@ export function issueThreadInteractionService(
         hasSecretProposal:
           data.kind === "request_confirmation" &&
           data.payload.secretProposal !== undefined,
+        hasChangeConsentTarget:
+          data.kind === "request_confirmation" &&
+          data.payload.target?.type === "custom" &&
+          isChangeConsentTargetKey(data.payload.target.key),
       });
       const normalizedData = {
         ...data,

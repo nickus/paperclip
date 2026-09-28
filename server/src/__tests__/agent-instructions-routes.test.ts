@@ -608,11 +608,19 @@ describe("agent instructions bundle routes", () => {
       };
     }
 
-    // A request_confirmation row as the change-consent gate reads it.
-    function consentRow(overrides: { sourceRunId?: string; consumed?: boolean } = {}) {
+    // A request_confirmation row as the change-consent gate reads it. By
+    // default a board user accepted it.
+    function consentRow(overrides: {
+      sourceRunId?: string;
+      consumed?: boolean;
+      resolvedByUserId?: string | null;
+      resolvedByAgentId?: string | null;
+    } = {}) {
       return {
         id: "interaction-1",
         sourceRunId: overrides.sourceRunId ?? "run-proposal",
+        resolvedByUserId: overrides.resolvedByUserId === undefined ? "board-user" : overrides.resolvedByUserId,
+        resolvedByAgentId: overrides.resolvedByAgentId ?? null,
         payload: {
           version: 1,
           prompt: "Apply the proposed instructions change?",
@@ -721,7 +729,7 @@ describe("agent instructions bundle routes", () => {
       expect(mockAgentService.update).not.toHaveBeenCalled();
     });
 
-    it("refuses a card accepted in the applying run itself, or one already consumed", async () => {
+    it("refuses a card created in the applying run itself, or one already consumed", async () => {
       mockSuggestOnlyCoach();
       for (const row of [consentRow({ sourceRunId: APPLY_RUN_ID }), consentRow({ consumed: true })]) {
         const { db, consumedUpdates } = consentDb([row]);
@@ -735,7 +743,25 @@ describe("agent instructions bundle routes", () => {
       expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
     });
 
-    it("applies the write with a card accepted in an earlier run, and consumes the card", async () => {
+    it("refuses a card that an agent accepted, including the agent that created it", async () => {
+      mockSuggestOnlyCoach();
+      for (const row of [
+        consentRow({ resolvedByUserId: null, resolvedByAgentId: COACH_AGENT_ID }),
+        consentRow({ resolvedByUserId: null, resolvedByAgentId: "other-agent" }),
+        consentRow({ resolvedByUserId: null }),
+      ]) {
+        const { db, consumedUpdates } = consentDb([row]);
+        const res = await requestApp(
+          await createApp(coachActor(), db),
+          (baseUrl) => request(baseUrl).put(FILE_PATH).send({ path: "AGENTS.md", content: "# Changed\n" }),
+        );
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(consumedUpdates).toEqual([]);
+      }
+      expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+    });
+
+    it("applies the write with a card a board user accepted in an earlier run, and consumes the card", async () => {
       mockSuggestOnlyCoach();
       const { db, consumedUpdates } = consentDb([consentRow()]);
 

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -14,9 +15,12 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  agentInstructionsChangeTargetKey,
   changeConsentGateService,
+  isChangeConsentTargetKey,
   skillChangeTargetKey,
 } from "../services/change-consent-gate.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -32,6 +36,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
 
   afterEach(async () => {
     await db.delete(issueThreadInteractions);
+    await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -239,6 +244,154 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       resolvedAt: new Date(),
     });
 
+    await expect(changeConsentGateService(db).assertConsented({
+      companyId,
+      actorAgentId: coachId,
+      actorRunId: randomUUID(),
+      targetKeys: [targetKey],
+    })).resolves.toBe(true);
+  });
+  it("recognizes change-consent target keys, including the legacy spellings", () => {
+    for (const key of [
+      "agent:agent-1:instructions",
+      "agent:agent-1:profile",
+      "skill:skill-1",
+      "skill-slug:review",
+      "skill-import:https://example.test/skills",
+      "skills:scan-projects",
+      "reflection-coach:agent-instructions:agent-1",
+    ]) {
+      expect(isChangeConsentTargetKey(key), key).toBe(true);
+    }
+    for (const key of ["", "agent:agent-1", "agent:agent-1:budget", "native_completion_review", "plan", null, 1]) {
+      expect(isChangeConsentTargetKey(key), String(key)).toBe(false);
+    }
+  });
+
+  it("rejects a card resolved by an agent, including the creator itself, or by the system", async () => {
+    const { companyId, coachId, sourceRunId, proposalIssueId, targetKey } = await seedGateFixture();
+    const resolutions = [
+      // The creating agent accepted its own card.
+      { resolvedByAgentId: coachId, resolvedByUserId: null },
+      // A system resolution names nobody.
+      { resolvedByAgentId: null, resolvedByUserId: null },
+      // An agent id always disqualifies the row, even next to a user id.
+      { resolvedByAgentId: coachId, resolvedByUserId: "board-user" },
+    ];
+    for (const resolution of resolutions) {
+      await db.insert(issueThreadInteractions).values({
+        id: randomUUID(),
+        companyId,
+        issueId: proposalIssueId,
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee_on_accept",
+        sourceRunId,
+        createdByAgentId: coachId,
+        payload: {
+          version: 1,
+          prompt: "Apply this skill diff?",
+          detailsMarkdown: "```diff\n+Tighten the workflow.\n```",
+          target: { type: "custom", key: targetKey, revisionId: "proposal-v1" },
+        },
+        result: { version: 1, outcome: "accepted" },
+        ...resolution,
+        resolvedAt: new Date(),
+      });
+    }
+
+    await expect(changeConsentGateService(db).assertConsented({
+      companyId,
+      actorAgentId: coachId,
+      actorRunId: randomUUID(),
+      targetKeys: [targetKey],
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "reflection_coach_mutation_gate_required" },
+    });
+
+    const stored = await db
+      .select({ result: issueThreadInteractions.result })
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.companyId, companyId));
+    expect(stored).toHaveLength(resolutions.length);
+    for (const row of stored) {
+      expect(row.result).not.toHaveProperty("consumedByRunId");
+    }
+  });
+
+  it("counts only a board user's acceptance of a card created through the interaction service", async () => {
+    const { companyId, coachId, sourceRunId, proposalIssueId } = await seedGateFixture();
+    const targetAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: targetAgentId,
+      companyId,
+      name: "Target agent",
+      role: "general",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const targetKey = agentInstructionsChangeTargetKey(targetAgentId);
+    const interactions = issueThreadInteractionService(db);
+    const issue = { id: proposalIssueId, companyId, goalId: null, projectId: null };
+    const cardInput = {
+      kind: "request_confirmation" as const,
+      continuationPolicy: "wake_assignee_on_accept" as const,
+      // Asking for the widest policy does not let an agent resolve the card.
+      resolverPolicy: "anyone" as const,
+      sourceRunId,
+      payload: {
+        version: 1 as const,
+        prompt: "Apply this instructions change?",
+        detailsMarkdown: "```diff\n-old rule\n+new rule\n```",
+        target: { type: "custom" as const, key: targetKey },
+      },
+    };
+    const coachInProposalRun = { agentId: coachId, runId: sourceRunId };
+
+    const card = await interactions.create(issue, cardInput, coachInProposalRun);
+    expect(card).toMatchObject({
+      status: "pending",
+      effectiveResolverPolicy: "human_only",
+      effectiveResolverPolicySource: "governed_action",
+    });
+    await expect(interactions.acceptInteraction(issue, card.id, {}, coachInProposalRun)).rejects.toMatchObject({
+      status: 403,
+      details: { code: "interaction_human_only" },
+    });
+
+    // A card stored before the clamp keeps the `anyone` policy, so its creator
+    // can still accept it. That acceptance is not consent.
+    await db
+      .update(issueThreadInteractions)
+      .set({ effectiveResolverPolicy: "anyone", effectiveResolverPolicySource: "requested" })
+      .where(eq(issueThreadInteractions.id, card.id));
+    const selfAccepted = await interactions.acceptInteraction(issue, card.id, {}, coachInProposalRun);
+    expect(selfAccepted.interaction).toMatchObject({
+      status: "accepted",
+      resolvedByAgentId: coachId,
+      resolvedByUserId: null,
+    });
+    await expect(changeConsentGateService(db).assertConsented({
+      companyId,
+      actorAgentId: coachId,
+      actorRunId: randomUUID(),
+      targetKeys: [targetKey],
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "reflection_coach_mutation_gate_required" },
+    });
+
+    // The same change accepted by a board user is consent for a later run.
+    const secondCard = await interactions.create(
+      issue,
+      { ...cardInput, payload: { ...cardInput.payload, prompt: "Apply this instructions change (again)?" } },
+      coachInProposalRun,
+    );
+    const boardAccepted = await interactions.acceptInteraction(issue, secondCard.id, {}, { userId: "board-user" });
+    expect(boardAccepted.interaction).toMatchObject({ status: "accepted", resolvedByUserId: "board-user" });
     await expect(changeConsentGateService(db).assertConsented({
       companyId,
       actorAgentId: coachId,

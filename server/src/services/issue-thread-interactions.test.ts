@@ -135,6 +135,22 @@ describe("issueThreadInteractionService", () => {
     });
   });
 
+  it("always clamps change-consent confirmations to human-only", async () => {
+    const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
+    expect(resolveInteractionPolicy({
+      kind: "request_confirmation",
+      requested: "anyone",
+      governance: { request_confirmation: { defaultPolicy: "anyone", cap: "anyone" } },
+      hasToolAction: false,
+      hasChangeConsentTarget: true,
+    })).toEqual({
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "governed_action",
+    });
+  });
+
   it("create reuses an existing interaction for the same idempotency key", async () => {
     const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
 

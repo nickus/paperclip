@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { issueThreadInteractions } from "@paperclipai/db";
-import { and, desc, eq, or, sql } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, or, sql } from "drizzle-orm";
 import type { RequestConfirmationPayload, RequestConfirmationResult } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 
@@ -33,6 +33,26 @@ export function skillImportChangeTargetKey(source: string) {
 
 export function skillsScanProjectsChangeTargetKey() {
   return "skills:scan-projects";
+}
+
+/**
+ * Target keys the change-consent gate reads, including the legacy spellings it
+ * still honours. A `request_confirmation` bound to one of them is change
+ * consent, so only a board user may resolve it.
+ */
+const CHANGE_CONSENT_TARGET_KEY_PATTERNS: readonly RegExp[] = [
+  /^agent:.+:(?:instructions|profile)$/,
+  /^skill:.+$/,
+  /^skill-slug:.+$/,
+  /^skill-import:.+$/,
+  /^skills:scan-projects$/,
+  /^reflection-coach:.+$/,
+];
+
+export function isChangeConsentTargetKey(key: unknown): boolean {
+  if (typeof key !== "string") return false;
+  const trimmed = key.trim();
+  return trimmed.length > 0 && CHANGE_CONSENT_TARGET_KEY_PATTERNS.some((pattern) => pattern.test(trimmed));
 }
 
 export function touchesAgentProfileChangeConsentFields(patchData: Record<string, unknown>) {
@@ -144,12 +164,17 @@ export function changeConsentGateService(db: Db) {
         ),
       );
 
+      // Consent means a board user accepted the card. A card resolved by an
+      // agent (including the one that created it, which the default
+      // `anyone` resolver policy allows) or by the system never counts.
       const rows = await db
         .select({
           id: issueThreadInteractions.id,
           sourceRunId: issueThreadInteractions.sourceRunId,
           payload: issueThreadInteractions.payload,
           result: issueThreadInteractions.result,
+          resolvedByUserId: issueThreadInteractions.resolvedByUserId,
+          resolvedByAgentId: issueThreadInteractions.resolvedByAgentId,
         })
         .from(issueThreadInteractions)
         .where(and(
@@ -157,6 +182,8 @@ export function changeConsentGateService(db: Db) {
           eq(issueThreadInteractions.createdByAgentId, actorAgentId),
           eq(issueThreadInteractions.kind, "request_confirmation"),
           eq(issueThreadInteractions.status, "accepted"),
+          isNotNull(issueThreadInteractions.resolvedByUserId),
+          isNull(issueThreadInteractions.resolvedByAgentId),
           targetKeyPredicate,
         ))
         .orderBy(desc(issueThreadInteractions.resolvedAt), desc(issueThreadInteractions.createdAt))
@@ -168,6 +195,8 @@ export function changeConsentGateService(db: Db) {
         return payload.target?.type === "custom"
           && queryTargetKeys.includes(payload.target.key)
           && result?.outcome === "accepted"
+          && Boolean(readNonEmptyString(row.resolvedByUserId))
+          && !row.resolvedByAgentId
           && !requestConfirmationResultConsumed(result)
           && payloadHasDisplayedDiff(payload)
           && Boolean(row.sourceRunId)
@@ -176,8 +205,8 @@ export function changeConsentGateService(db: Db) {
 
       if (!accepted) {
         throw forbidden(
-          "Reflection Coach mutations require an accepted request_confirmation with a displayed diff for this target, "
-            + "created in a previous run and not already consumed.",
+          "This change requires a request_confirmation with a displayed diff for this target, "
+            + "accepted by a board user, created in a previous run and not already consumed.",
           {
             code: "reflection_coach_mutation_gate_required",
             targetKeys,
@@ -188,8 +217,8 @@ export function changeConsentGateService(db: Db) {
       const acceptedResult = accepted.result as RequestConfirmationResult | null;
       if (!acceptedResult) {
         throw forbidden(
-          "Reflection Coach mutations require an accepted request_confirmation with a displayed diff for this target, "
-            + "created in a previous run and not already consumed.",
+          "This change requires a request_confirmation with a displayed diff for this target, "
+            + "accepted by a board user, created in a previous run and not already consumed.",
           {
             code: "reflection_coach_mutation_gate_required",
             targetKeys,
@@ -210,6 +239,8 @@ export function changeConsentGateService(db: Db) {
           eq(issueThreadInteractions.createdByAgentId, actorAgentId),
           eq(issueThreadInteractions.kind, "request_confirmation"),
           eq(issueThreadInteractions.status, "accepted"),
+          isNotNull(issueThreadInteractions.resolvedByUserId),
+          isNull(issueThreadInteractions.resolvedByAgentId),
           sql`${issueThreadInteractions.result}->>'outcome' = 'accepted'`,
           sql`coalesce(${issueThreadInteractions.result}->>'consumedByRunId', ${issueThreadInteractions.result}->>'consumedAt') is null`,
         ))
@@ -217,8 +248,8 @@ export function changeConsentGateService(db: Db) {
 
       if (!consumed) {
         throw forbidden(
-          "Reflection Coach mutations require an accepted request_confirmation with a displayed diff for this target, "
-            + "created in a previous run and not already consumed.",
+          "This change requires a request_confirmation with a displayed diff for this target, "
+            + "accepted by a board user, created in a previous run and not already consumed.",
           {
             code: "reflection_coach_mutation_gate_required",
             targetKeys,
