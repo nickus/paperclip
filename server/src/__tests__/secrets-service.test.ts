@@ -1250,7 +1250,7 @@ describeEmbeddedPostgres("secretService", () => {
     }
 
     expect(redactedValues).toEqual(["runtime-secret", "runtime-secret"]);
-    const events = await svc.listAccessEvents(companyId, secret.id);
+    const events = (await svc.listAccessEvents(companyId, secret.id)).items;
     expect(events).toHaveLength(2);
     expect(events).toEqual(expect.arrayContaining([
       expect.objectContaining({
@@ -1345,7 +1345,7 @@ describeEmbeddedPostgres("secretService", () => {
     })).rejects.toThrow(/verified heartbeat run/i);
 
     expect(registerForRedaction).not.toHaveBeenCalled();
-    const events = await svc.listAccessEvents(companyId, secret.id);
+    const events = (await svc.listAccessEvents(companyId, secret.id)).items;
     expect(events).toEqual([
       expect.objectContaining({
         consumerType: "agent_api",
@@ -1390,7 +1390,7 @@ describeEmbeddedPostgres("secretService", () => {
       registerForRedaction: vi.fn(),
     })).rejects.toThrow(/low[_-]trust.*secrets:read/i);
 
-    expect(await svc.listAccessEvents(companyId, secret.id)).toEqual([]);
+    expect((await svc.listAccessEvents(companyId, secret.id)).items).toEqual([]);
   });
 
   it("syncs top-level secret refs idempotently", async () => {
@@ -1504,7 +1504,7 @@ describeEmbeddedPostgres("secretService", () => {
     });
 
     expect(resolved.env.API_KEY).toBe("runtime-secret");
-    const events = await svc.listAccessEvents(companyId, secret.id);
+    const events = (await svc.listAccessEvents(companyId, secret.id)).items;
     expect(events).toHaveLength(2);
     expect(events.map((event) => event.outcome).sort()).toEqual(["failure", "success"]);
     expect(JSON.stringify(events)).not.toContain("runtime-secret");
@@ -1539,7 +1539,7 @@ describeEmbeddedPostgres("secretService", () => {
       secretName,
     });
     // Value-free validation: no access events recorded.
-    expect(await svc.listAccessEvents(companyId, secret.id)).toHaveLength(0);
+    expect((await svc.listAccessEvents(companyId, secret.id)).items).toHaveLength(0);
 
     await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
 
@@ -1711,7 +1711,7 @@ describeEmbeddedPostgres("secretService", () => {
       }),
     ]);
 
-    const events = await svc.listAccessEvents(companyId, secret.id);
+    const events = (await svc.listAccessEvents(companyId, secret.id)).items;
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       companyId,
@@ -2534,7 +2534,7 @@ describeEmbeddedPostgres("secretService", () => {
     await db.update(companySecrets).set({ status: "deleted" }).where(eq(companySecrets.id, secret.id));
     await expect(svc.resolveEnvBindings(companyId, env, context)).rejects.toThrow(/not found/i);
 
-    const events = await svc.listAccessEvents(companyId, secret.id);
+    const events = (await svc.listAccessEvents(companyId, secret.id)).items;
     expect(events.map((event) => event.errorCode).sort()).toEqual([
       "binding_missing",
       "provider_error",
@@ -4516,7 +4516,7 @@ describeEmbeddedPostgres("secretService", () => {
     });
 
     expect(resolved).toBe("runtime-secret");
-    const events = await svc.listAccessEvents(companyId, secret.id);
+    const events = (await svc.listAccessEvents(companyId, secret.id)).items;
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       companyId,
@@ -4604,4 +4604,111 @@ describeEmbeddedPostgres("secretService", () => {
       }),
     ).rejects.toThrow(/active member|secrets:read|forbidden/i);
   });
+
+  it("paginates access events newest-first and enforces the default and max page sizes even when far more rows exist", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `pagination-volume-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "runtime-secret",
+    });
+
+    // A secret read by a hot loop can rack up far more access events than any
+    // caller ever wants back in one response; this is the shape that used to
+    // crash the route with `RangeError: Invalid string length`.
+    const total = 1005;
+    const startAt = Date.parse("2026-01-01T00:00:00.000Z");
+    const seeded = Array.from({ length: total }, (_, i) => ({
+      id: randomUUID(),
+      companyId,
+      secretId: secret.id,
+      provider: "local_encrypted" as const,
+      actorType: "system" as const,
+      consumerType: "system" as const,
+      consumerId: `pagination-volume-${i}`,
+      outcome: "success" as const,
+      createdAt: new Date(startAt + i * 1000),
+    }));
+    await db.insert(secretAccessEvents).values(seeded);
+
+    // Sanity check: the table genuinely holds far more rows than any page
+    // below returns, so a shrunken result actually proves pagination limited
+    // the query instead of just reflecting a small dataset.
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(secretAccessEvents)
+      .where(eq(secretAccessEvents.secretId, secret.id));
+    expect(count).toBe(total);
+
+    const defaultPage = await svc.listAccessEvents(companyId, secret.id);
+    expect(defaultPage.items).toHaveLength(100);
+    expect(defaultPage.nextCursor).not.toBeNull();
+    // Newest-first: the most recently seeded row leads the page.
+    expect(defaultPage.items[0]!.id).toBe(seeded[total - 1]!.id);
+    expect(defaultPage.items[99]!.id).toBe(seeded[total - 100]!.id);
+
+    const overLimitPage = await svc.listAccessEvents(companyId, secret.id, { limit: 50_000 });
+    expect(overLimitPage.items).toHaveLength(1000);
+    expect(overLimitPage.nextCursor).not.toBeNull();
+  }, 30_000);
+
+  it("walks cursor-paginated access events in disjoint, newest-first pages, including a tied timestamp", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `pagination-cursor-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "runtime-secret",
+    });
+
+    const total = 37;
+    const startAt = Date.parse("2026-02-01T00:00:00.000Z");
+    const seeded = Array.from({ length: total }, (_, i) => ({
+      id: randomUUID(),
+      companyId,
+      secretId: secret.id,
+      provider: "local_encrypted" as const,
+      actorType: "system" as const,
+      consumerType: "system" as const,
+      consumerId: `pagination-cursor-${i}`,
+      outcome: "success" as const,
+      createdAt: new Date(startAt + i * 1000),
+    }));
+    // Force a tie so a page boundary landing on it must fall back to
+    // ordering by id to stay disjoint (a plain `ORDER BY created_at` alone
+    // could otherwise split or duplicate this pair across two pages).
+    seeded[20]!.createdAt = seeded[21]!.createdAt;
+    await db.insert(secretAccessEvents).values(seeded);
+
+    const expectedOrder = [...seeded]
+      .sort((a, b) => {
+        const byTime = b.createdAt.getTime() - a.createdAt.getTime();
+        if (byTime !== 0) return byTime;
+        return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+      })
+      .map((row) => row.id);
+
+    const pageSize = 5;
+    const collected: string[] = [];
+    const seenIds = new Set<string>();
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const page = await svc.listAccessEvents(companyId, secret.id, { limit: pageSize, cursor });
+      expect(page.items.length).toBeGreaterThan(0);
+      expect(page.items.length).toBeLessThanOrEqual(pageSize);
+      for (const item of page.items) {
+        // Disjoint: no id already seen on an earlier page.
+        expect(seenIds.has(item.id)).toBe(false);
+        seenIds.add(item.id);
+        collected.push(item.id);
+      }
+      cursor = page.nextCursor;
+      pages += 1;
+      expect(pages).toBeLessThan(20); // guards against an infinite loop on a regression
+    } while (cursor);
+
+    expect(collected).toEqual(expectedOrder);
+  }, 30_000);
 });

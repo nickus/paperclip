@@ -1007,6 +1007,98 @@ describe("secret routes", () => {
     );
   });
 
+  it("applies the default limit and returns { events, nextCursor } for GET /secrets/:id/access-events", async () => {
+    mockSecretService.getById.mockResolvedValue({
+      id: "99999999-9999-4999-8999-999999999999",
+      companyId: "company-1",
+      name: "OpenAI",
+      key: "openai",
+      provider: "aws_secrets_manager",
+      managedMode: "paperclip_managed",
+    });
+    mockSecretService.listAccessEvents.mockResolvedValue({
+      items: [{ id: "event-1" }],
+      nextCursor: "opaque-cursor",
+    });
+
+    const res = await request(createApp()).get(
+      "/api/secrets/99999999-9999-4999-8999-999999999999/access-events",
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ events: [{ id: "event-1" }], nextCursor: "opaque-cursor" });
+    expect(mockSecretService.listAccessEvents).toHaveBeenCalledWith(
+      "company-1",
+      "99999999-9999-4999-8999-999999999999",
+      { limit: 100, cursor: null },
+    );
+  });
+
+  it("forwards limit and cursor query params for GET /secrets/:id/access-events", async () => {
+    mockSecretService.getById.mockResolvedValue({
+      id: "99999999-9999-4999-8999-999999999999",
+      companyId: "company-1",
+      name: "OpenAI",
+      key: "openai",
+      provider: "aws_secrets_manager",
+      managedMode: "paperclip_managed",
+    });
+    mockSecretService.listAccessEvents.mockResolvedValue({ items: [], nextCursor: null });
+
+    const res = await request(createApp()).get(
+      "/api/secrets/99999999-9999-4999-8999-999999999999/access-events?limit=25&cursor=abc123",
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ events: [], nextCursor: null });
+    expect(mockSecretService.listAccessEvents).toHaveBeenCalledWith(
+      "company-1",
+      "99999999-9999-4999-8999-999999999999",
+      { limit: 25, cursor: "abc123" },
+    );
+  });
+
+  it("clamps an over-limit GET /secrets/:id/access-events request to the max page size", async () => {
+    mockSecretService.getById.mockResolvedValue({
+      id: "99999999-9999-4999-8999-999999999999",
+      companyId: "company-1",
+      name: "OpenAI",
+      key: "openai",
+      provider: "aws_secrets_manager",
+      managedMode: "paperclip_managed",
+    });
+    mockSecretService.listAccessEvents.mockResolvedValue({ items: [], nextCursor: null });
+
+    const res = await request(createApp()).get(
+      "/api/secrets/99999999-9999-4999-8999-999999999999/access-events?limit=1000000",
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockSecretService.listAccessEvents).toHaveBeenCalledWith(
+      "company-1",
+      "99999999-9999-4999-8999-999999999999",
+      { limit: 1000, cursor: null },
+    );
+  });
+
+  it("rejects a non-numeric limit for GET /secrets/:id/access-events", async () => {
+    mockSecretService.getById.mockResolvedValue({
+      id: "99999999-9999-4999-8999-999999999999",
+      companyId: "company-1",
+      name: "OpenAI",
+      key: "openai",
+      provider: "aws_secrets_manager",
+      managedMode: "paperclip_managed",
+    });
+
+    const res = await request(createApp()).get(
+      "/api/secrets/99999999-9999-4999-8999-999999999999/access-events?limit=not-a-number",
+    );
+
+    expect(res.status).toBe(422);
+    expect(mockSecretService.listAccessEvents).not.toHaveBeenCalled();
+  });
+
   it("allows DELETE to retry cleanup for already soft-deleted secrets", async () => {
     const secret = {
       id: "33333333-3333-4333-8333-333333333333",

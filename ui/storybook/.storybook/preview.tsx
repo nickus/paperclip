@@ -608,11 +608,12 @@ function installStorybookApiFixtures() {
     );
     if (secretEventsMatch) {
       const [, secretId] = secretEventsMatch;
-      return Response.json(
-        storybookSecretAccessEvents.filter(
+      return Response.json({
+        events: storybookSecretAccessEvents.filter(
           (event) => event.secretId === secretId,
         ),
-      );
+        nextCursor: null,
+      });
     }
 
     const companyResourceMatch = url.pathname.match(
