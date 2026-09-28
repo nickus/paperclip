@@ -206,6 +206,63 @@ describe("boundExecutionContinuation", () => {
   });
 });
 
+describe("boundExecutionContinuation human responses", () => {
+  function withHumanResponses(): ExecutionContinuationEnvelope {
+    const full = longLivedTaskEnvelope();
+    const response = (id: string, text: string) => ({
+      id,
+      kind: "ask_user_questions",
+      status: "answered",
+      resolvedByUserId: "board-user",
+      resolvedAt: "2026-09-01T00:00:00.000Z",
+      result: { answers: [{ questionId: "q1", optionIds: ["a"], otherText: text }] },
+    });
+    return {
+      ...full,
+      humanResponses: [
+        // The answer to the triggering card is the oldest one.
+        response("question-card", "TRIGGER_ANSWER " + "because ".repeat(200)),
+        ...Array.from({ length: 30 }, (_, index) =>
+          response(`question-${index}`, `answer ${index} ` + "context ".repeat(600)),
+        ),
+      ],
+    };
+  }
+
+  it("keeps a small task's human responses unchanged", () => {
+    const full = { ...withHumanResponses(), messages: [message(0)], interactionOutcomes: [], completedActions: [], completedWork: null };
+    full.humanResponses = full.humanResponses!.slice(0, 3);
+    const bounded = boundExecutionContinuation(full, options(full));
+    expect(bounded.humanResponses).toEqual(full.humanResponses);
+    expect(bounded.coverage.omittedHumanResponseCount).toBeUndefined();
+  });
+
+  it("bounds them on a long-lived task and always keeps the triggering answer", () => {
+    const full = withHumanResponses();
+    const bounded = boundExecutionContinuation(full, options(full));
+    expect(executionContinuationBytes(bounded)).toBeLessThanOrEqual(EXECUTION_CONTINUATION_TARGET_BYTES);
+    const ids = bounded.humanResponses!.map((row) => row.id);
+    expect(ids).toContain("question-card");
+    // The newest answers are kept; the rest are counted.
+    expect(ids).toContain("question-29");
+    expect(ids.length).toBeLessThan(full.humanResponses!.length);
+    expect(bounded.coverage.omittedHumanResponseCount).toBe(full.humanResponses!.length - ids.length);
+    // The triggering answer keeps its content within the trigger budget.
+    const trigger = bounded.humanResponses!.find((row) => row.id === "question-card")!;
+    expect(JSON.stringify(trigger.result)).toContain("TRIGGER_ANSWER");
+    expect(trigger.resolvedByUserId).toBe("board-user");
+    for (const row of bounded.humanResponses!) {
+      expect(JSON.stringify(row.result).length).toBeLessThanOrEqual(6_000);
+    }
+  });
+
+  it("leaves envelopes without human responses without the field", () => {
+    const full = longLivedTaskEnvelope();
+    const bounded = boundExecutionContinuation(full, options(full));
+    expect("humanResponses" in bounded).toBe(false);
+  });
+});
+
 describe("boundContinuationJsonValue", () => {
   it("keeps small values and shrinks large ones with markers", () => {
     const small = { outcome: "accepted" };

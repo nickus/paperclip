@@ -40,6 +40,11 @@ describe("native continuation event projection", () => {
     expect(JSON.parse(text).taskChanges).toEqual({ description: issue.description });
     expect(text).toContain("CHILD_RESULT");
   });
+  it("retains bootstrap framing when a delta message body was shortened", () => {
+    // The compact delta cannot explain a cut body; the full wake framing does.
+    const cut = { ...message, body: "Yes, please", bodyTruncated: true, bodyChars: 20_000 };
+    expect(build({ ...wake, executionContinuation: { ...wake.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [cut] } } })).toBeNull();
+  });
   it.each([{ fallbackFetchNeeded: true }, { recovery: { cause: "interrupted" } }, { externalChatExecutionBound: true }, { reason: "issue_assigned" }])("retains bootstrap framing for special wakes: %j", (extra) => {
     expect(build({ ...wake, ...extra })).toBeNull();
   });
