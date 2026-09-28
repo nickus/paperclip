@@ -456,7 +456,7 @@ async function resumeReusableLease(
     expectedReuseKey: stamp.key,
     expectedSpecHash: specHash,
     expectedSpecVersion: String(REUSE_SPEC_VERSION),
-    readyTimeoutMs: RESUME_READY_TIMEOUT_MS,
+    readyTimeoutMs: resumeReadyTimeoutMs(config),
     pollMs: RESUME_READY_POLL_MS,
   });
   if (!check.resumable) {
@@ -735,6 +735,13 @@ async function releaseReusableLease(
 // faster and more reliable than waiting.
 const RESUME_READY_TIMEOUT_MS = 30_000;
 const RESUME_READY_POLL_MS = 1_000;
+
+// The resume liveness wait is a pod-readiness wait like any other, so it also
+// honours podReadyTimeoutSec: min(RESUME_READY_TIMEOUT_MS, podReadyTimeoutSec
+// ?? 600s). With the default cap this stays at RESUME_READY_TIMEOUT_MS.
+function resumeReadyTimeoutMs(config: KubernetesProviderConfig): number {
+  return resolvePodReadyTimeoutMs(config, RESUME_READY_TIMEOUT_MS);
+}
 
 // The workspace remote dir is the confinement root for native file sync. It is
 // recorded on the lease metadata at realizeWorkspace time (`remoteCwd`); require
@@ -1304,7 +1311,7 @@ const plugin = definePlugin(withAuthEviction({
       namespace,
       name: params.providerLeaseId,
       backend: leaseBackend,
-      readyTimeoutMs: RESUME_READY_TIMEOUT_MS,
+      readyTimeoutMs: resumeReadyTimeoutMs(config),
       pollMs: RESUME_READY_POLL_MS,
     });
 

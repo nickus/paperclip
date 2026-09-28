@@ -173,6 +173,34 @@ describe("onEnvironmentExecute pod-readiness deadline (sandbox-cr backend)", () 
   });
 });
 
+describe("onEnvironmentResumeLease pod-readiness deadline (sandbox-cr backend)", () => {
+  it("bounds the resume liveness wait to podReadyTimeoutSec when it is below the resume wait", async () => {
+    vi.useFakeTimers();
+    const getNamespacedCustomObject = vi.fn().mockResolvedValue(pendingSandboxCr());
+    h.clients = { custom: { getNamespacedCustomObject }, core: { listNamespacedEvent: vi.fn() } };
+
+    let settled: { providerLeaseId: string | null; metadata?: Record<string, unknown> } | undefined;
+    void plugin.definition.onEnvironmentResumeLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: { ...CONFIG, podReadyTimeoutSec: 5 },
+      providerLeaseId: "pc-resume",
+      leaseMetadata: { namespace: "paperclip-acme", backend: "sandbox-cr" },
+    }).then((lease) => {
+      settled = lease;
+    });
+
+    await vi.advanceTimersByTimeAsync(7_000);
+    // Not resumable after the 5s cap, well before the 30s resume wait: the
+    // host falls back to a fresh lease.
+    expect(settled).toEqual({
+      providerLeaseId: null,
+      metadata: expect.objectContaining({ expired: true, reason: expect.stringContaining("5000ms") }),
+    });
+  });
+});
+
 describe("file sync pod-readiness deadline (sandbox-cr backend, sync path)", () => {
   it("bounds the readiness wait to podReadyTimeoutSec and enriches the thrown error with recent pod events", async () => {
     vi.useFakeTimers();
