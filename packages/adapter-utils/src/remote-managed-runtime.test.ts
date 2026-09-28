@@ -362,4 +362,109 @@ describe("remote managed runtime", () => {
       warnSpy.mockRestore();
     }
   });
+
+  describe("workspace reuse key", () => {
+    const KEY = "0123456789abcdef0123456789abcdef";
+    const spec = {
+      host: "127.0.0.1",
+      port: 2222,
+      username: "fixture",
+      remoteWorkspacePath: "/home/agent/work",
+      remoteCwd: "/home/agent/work",
+      privateKey: "PRIVATE KEY",
+      knownHosts: "KNOWN HOSTS",
+      strictHostKeyChecking: true,
+    };
+
+    async function makeWorkspace(): Promise<{ workspaceDir: string; skillsDir: string }> {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-reuse-"));
+      cleanupDirs.push(rootDir);
+      const workspaceDir = path.join(rootDir, "workspace");
+      const skillsDir = path.join(rootDir, "skills");
+      await mkdir(workspaceDir, { recursive: true });
+      await mkdir(skillsDir, { recursive: true });
+      return { workspaceDir, skillsDir };
+    }
+
+    it("stages consecutive runs of one key at the same workspace path with per-run runtime roots", async () => {
+      const { workspaceDir, skillsDir } = await makeWorkspace();
+      const stable = `/home/agent/work/.paperclip-runtime/workspaces/${KEY}/workspace`;
+
+      const first = await prepareRemoteManagedRuntime({
+        spec,
+        runId: "run-1",
+        adapterKey: "opencode",
+        workspaceLocalDir: workspaceDir,
+        workspaceReuseKey: KEY,
+        assets: [{ key: "skills", localDir: skillsDir }],
+      });
+      const second = await prepareRemoteManagedRuntime({
+        spec,
+        runId: "run-2",
+        adapterKey: "opencode",
+        workspaceLocalDir: workspaceDir,
+        workspaceReuseKey: KEY,
+        assets: [{ key: "skills", localDir: skillsDir }],
+      });
+
+      expect(first.workspaceRemoteDir).toBe(stable);
+      expect(second.workspaceRemoteDir).toBe(stable);
+      expect(first.workspaceReuseKey).toBe(KEY);
+      expect(first.runtimeRootDir).toBe("/home/agent/work/.paperclip-runtime/runs/run-1/opencode");
+      expect(second.runtimeRootDir).toBe("/home/agent/work/.paperclip-runtime/runs/run-2/opencode");
+      expect(second.assetDirs.skills).toBe("/home/agent/work/.paperclip-runtime/runs/run-2/opencode/skills");
+
+      // The stable directory is prepared on the host before the workspace sync.
+      const stageCalls = runSshCommand.mock.calls as unknown as Array<[unknown, string]>;
+      expect(stageCalls).toHaveLength(2);
+      expect(stageCalls[0]![1]).toContain(`/home/agent/work/.paperclip-runtime/workspaces/${KEY}`);
+      expect(stageCalls[0]![1]).toContain("mv \"$ws\" \"$dest\"");
+      expect(stageCalls[1]![1]).toContain("'run-2'");
+      expect(runSshCommand.mock.invocationCallOrder[0]!).toBeLessThan(
+        prepareWorkspaceForSshExecution.mock.invocationCallOrder[0]!,
+      );
+      expect(prepareWorkspaceForSshExecution).toHaveBeenCalledWith(expect.objectContaining({ remoteDir: stable }));
+
+      await second.restoreWorkspace();
+      expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({ remoteDir: stable }));
+    });
+
+    it("keeps the per-run layout byte for byte without a key", async () => {
+      const { workspaceDir, skillsDir } = await makeWorkspace();
+      const prepared = await prepareRemoteManagedRuntime({
+        spec,
+        runId: "run-1",
+        adapterKey: "opencode",
+        workspaceLocalDir: workspaceDir,
+        assets: [{ key: "skills", localDir: skillsDir }],
+      });
+      expect(prepared.workspaceRemoteDir).toBe("/home/agent/work/.paperclip-runtime/runs/run-1/workspace");
+      expect(prepared.runtimeRootDir).toBe(
+        "/home/agent/work/.paperclip-runtime/runs/run-1/workspace/.paperclip-runtime/opencode",
+      );
+      expect(prepared.assetDirs.skills).toBe(
+        "/home/agent/work/.paperclip-runtime/runs/run-1/workspace/.paperclip-runtime/opencode/skills",
+      );
+      expect(prepared.workspaceReuseKey).toBeNull();
+      expect(runSshCommand).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["a malformed key", { workspaceReuseKey: "../../etc" }],
+      ["an unsafe run id", { workspaceReuseKey: KEY, runId: "../run" }],
+      ["an unsynced workspace", { workspaceReuseKey: KEY, syncWorkspace: false, workspaceRemoteDir: "/app" }],
+    ] as const)("ignores the key for %s", async (_label, overrides) => {
+      const { workspaceDir } = await makeWorkspace();
+      const prepared = await prepareRemoteManagedRuntime({
+        spec,
+        runId: "run-1",
+        adapterKey: "opencode",
+        workspaceLocalDir: workspaceDir,
+        ...overrides,
+      });
+      expect(prepared.workspaceReuseKey).toBeNull();
+      expect(prepared.workspaceRemoteDir).not.toContain("/workspaces/");
+      expect(runSshCommand).not.toHaveBeenCalled();
+    });
+  });
 });

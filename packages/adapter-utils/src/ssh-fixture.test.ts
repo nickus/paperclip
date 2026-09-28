@@ -22,6 +22,7 @@ import {
   type SshEnvLabFixtureState,
 } from "./ssh.js";
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { prepareAdapterExecutionTargetRuntime, type AdapterSshExecutionTarget } from "./execution-target.js";
 import { runChildProcess } from "./server-utils.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
@@ -1289,4 +1290,84 @@ describe("ssh env-lab fixture", () => {
     expect(recentSubjects).toContain("remote update a");
     expect(recentSubjects).toContain("remote update b");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it.each(["git", "plain"] as const)(
+    "stages a stable workspace per reuse key across prepare and restore cycles (%s)",
+    async (kind) => {
+      const KEY = "0123456789abcdef0123456789abcdef";
+      const rootDir = await createFixtureRootDir();
+      const statePath = path.join(rootDir, "state.json");
+      const localRepo = path.join(rootDir, "local-workspace");
+      const skillsDir = path.join(rootDir, "skills");
+      await mkdir(localRepo, { recursive: true });
+      await mkdir(skillsDir, { recursive: true });
+      await writeFile(path.join(skillsDir, "SKILL.md"), "skill\n", "utf8");
+      await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
+      if (kind === "git") {
+        await git(localRepo, ["init"]);
+        await git(localRepo, ["checkout", "-b", "main"]);
+        await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+        await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+        await git(localRepo, ["add", "tracked.txt"]);
+        await git(localRepo, ["commit", "-m", "initial"]);
+      }
+
+      const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH stable workspace test");
+      if (!started) return;
+      const config = await buildSshEnvLabFixtureConfig(started);
+      const target: AdapterSshExecutionTarget = {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: started.workspaceDir,
+        spec: { ...config, remoteCwd: started.workspaceDir },
+        workspaceReuseKey: KEY,
+      };
+      const runtimeDir = path.join(started.workspaceDir, ".paperclip-runtime");
+      const stable = path.posix.join(runtimeDir, "workspaces", KEY, "workspace");
+      const prepare = (runId: string) =>
+        prepareAdapterExecutionTargetRuntime({
+          runId,
+          target,
+          adapterKey: "test-adapter",
+          workspaceLocalDir: localRepo,
+          assets: [{ key: "skills", localDir: skillsDir }],
+        });
+
+      const first = await prepare("run-1");
+      expect(first.workspaceRemoteDir).toBe(stable);
+      expect(first.runtimeRootDir).toBe(path.posix.join(runtimeDir, "runs", "run-1", "test-adapter"));
+      expect(await readFile(path.join(stable, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(await readFile(path.join(runtimeDir, "runs", "run-1", "test-adapter", "skills", "SKILL.md"), "utf8"))
+        .toBe("skill\n");
+      await runSshCommand(
+        config,
+        `printf "from run 1\\n" > ${JSON.stringify(path.posix.join(stable, "agent-notes.md"))}`,
+        { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+      );
+      await first.restoreWorkspace();
+      expect(await readFile(path.join(localRepo, "agent-notes.md"), "utf8")).toBe("from run 1\n");
+
+      const second = await prepare("run-2");
+      // Same working directory as run 1, so a CLI session saved there resolves.
+      expect(second.workspaceRemoteDir).toBe(stable);
+      expect(second.runtimeRootDir).toBe(path.posix.join(runtimeDir, "runs", "run-2", "test-adapter"));
+      // The file written in run 1 came back through the host copy.
+      expect(await readFile(path.join(stable, "agent-notes.md"), "utf8")).toBe("from run 1\n");
+      // Run 1's remote copy was moved aside, and the sync of run 2 left run 1's runtime files alone.
+      expect(await readFile(path.join(runtimeDir, "runs", "run-1", "workspace", "agent-notes.md"), "utf8"))
+        .toBe("from run 1\n");
+      expect(await readFile(path.join(runtimeDir, "runs", "run-1", "test-adapter", "skills", "SKILL.md"), "utf8"))
+        .toBe("skill\n");
+      expect(await readFile(path.join(runtimeDir, "workspaces", KEY, ".last-run"), "utf8")).toBe("run-2\n");
+
+      await runSshCommand(
+        config,
+        `printf "from run 2\\n" >> ${JSON.stringify(path.posix.join(stable, "agent-notes.md"))}`,
+        { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+      );
+      await second.restoreWorkspace();
+      expect(await readFile(path.join(localRepo, "agent-notes.md"), "utf8")).toBe("from run 1\nfrom run 2\n");
+    },
+    SSH_FIXTURE_TEST_TIMEOUT_MS,
+  );
 });

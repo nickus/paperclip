@@ -16,6 +16,13 @@ import {
 } from "./sandbox-managed-runtime.js";
 import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 import type { RuntimeProgressSink } from "./runtime-progress.js";
+import {
+  buildSshReusableWorkspaceStageScript,
+  isSshRunIdPathSegment,
+  isSshWorkspaceReuseKey,
+  sshReusableWorkspaceDir,
+  sshRunDir,
+} from "./ssh-workspace-layout.js";
 
 // The fixed heavy-directory excludes every referenced project drops,
 // regardless of its ignore resolution. A `git`-resolved project additionally
@@ -47,6 +54,11 @@ export interface PreparedRemoteManagedRuntime {
   workspaceLocalDir: string;
   workspaceRemoteDir: string;
   runtimeRootDir: string;
+  /**
+   * The workspace reuse key the workspace was staged under, or null when the
+   * run used its own per-run workspace directory.
+   */
+  workspaceReuseKey: string | null;
   assetDirs: Record<string, string>;
   /**
    * Remote directory of each additional (referenced) project that staged
@@ -114,6 +126,14 @@ export async function prepareRemoteManagedRuntime(input: {
   workspaceLocalDir: string;
   workspaceRemoteDir?: string;
   syncWorkspace?: boolean;
+  /**
+   * Stages the workspace at a stable path keyed by this value (see
+   * ssh-workspace-layout.ts) instead of a new per-run directory, so an agent
+   * CLI can resume a session it saved in that directory. The caller must make
+   * sure no other run uses the same key at the same time. Ignored when the
+   * workspace is not synced or the key or run id is malformed.
+   */
+  workspaceReuseKey?: string | null;
   assets?: RemoteManagedRuntimeAsset[];
   /** Referenced (additional) projects to stage as plain, read-only trees. */
   additionalSources?: SandboxAdditionalSource[];
@@ -123,16 +143,37 @@ export async function prepareRemoteManagedRuntime(input: {
 }): Promise<PreparedRemoteManagedRuntime> {
   const baseWorkspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
   const syncWorkspace = input.syncWorkspace !== false;
-  const workspaceRemoteDir = syncWorkspace
-    ? path.posix.join(
-        baseWorkspaceRemoteDir,
-        ".paperclip-runtime",
-        "runs",
-        input.runId,
-        "workspace",
-      )
-    : baseWorkspaceRemoteDir;
-  const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
+  const workspaceReuseKey =
+    syncWorkspace && isSshWorkspaceReuseKey(input.workspaceReuseKey) && isSshRunIdPathSegment(input.runId)
+      ? input.workspaceReuseKey
+      : null;
+  let workspaceRemoteDir: string;
+  let runtimeRootDir: string;
+  if (workspaceReuseKey) {
+    // Stable workspace path, per-run runtime files next to it (not inside it).
+    await runSshCommand(
+      input.spec,
+      buildSshReusableWorkspaceStageScript({
+        baseRemoteDir: baseWorkspaceRemoteDir,
+        key: workspaceReuseKey,
+        runId: input.runId,
+      }),
+      { timeoutMs: 60_000, maxBuffer: 64 * 1024 },
+    );
+    workspaceRemoteDir = sshReusableWorkspaceDir(baseWorkspaceRemoteDir, workspaceReuseKey);
+    runtimeRootDir = path.posix.join(sshRunDir(baseWorkspaceRemoteDir, input.runId), input.adapterKey);
+  } else {
+    workspaceRemoteDir = syncWorkspace
+      ? path.posix.join(
+          baseWorkspaceRemoteDir,
+          ".paperclip-runtime",
+          "runs",
+          input.runId,
+          "workspace",
+        )
+      : baseWorkspaceRemoteDir;
+    runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
+  }
 
   const preparedWorkspace = syncWorkspace
     ? await prepareWorkspaceForSshExecution({
@@ -232,6 +273,7 @@ export async function prepareRemoteManagedRuntime(input: {
     workspaceLocalDir: input.workspaceLocalDir,
     workspaceRemoteDir,
     runtimeRootDir,
+    workspaceReuseKey,
     assetDirs,
     additionalSourceDirs,
     restoreWorkspace: async (onProgress?: RuntimeProgressSink) => {
