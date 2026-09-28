@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -684,10 +684,13 @@ describe("sandbox callback bridge worker route policy", () => {
       },
     });
     // Write the request files directly, the way a process inside the sandbox
-    // could, bypassing the gateway's own URL parsing.
+    // could, bypassing the gateway's own URL parsing. Like the gateway, write
+    // each one under a name the worker ignores and rename it into place, so
+    // the polling worker never reads a partly written file.
     for (const [index, request] of requests.entries()) {
+      const requestPath = path.posix.join(directories.requestsDir, `req-${index}.json`);
       await writeFile(
-        path.posix.join(directories.requestsDir, `req-${index}.json`),
+        `${requestPath}.tmp`,
         `${JSON.stringify({
           id: `req-${index}`,
           method: request.method,
@@ -699,6 +702,7 @@ describe("sandbox callback bridge worker route policy", () => {
         })}\n`,
         "utf8",
       );
+      await rename(`${requestPath}.tmp`, requestPath);
     }
     await worker.stop({ drainTimeoutMs: 2_000 });
     const responses = await Promise.all(requests.map(async (_request, index) => {
