@@ -6421,6 +6421,23 @@ function buildSessionConfigCategoryValues(input: {
   // boundary; the reusable row and its evolving generation are state.
   delete workspaceConfig.existingExecutionWorkspace;
   delete workspaceConfig.reusableExecutionWorkspaceConfig;
+  // The issue's own workspace mode reaches a run only through the
+  // requested/effective mode above (and through the adapter config it shapes,
+  // which has its own category). The mode field itself is also written by the
+  // heartbeat: when a task is pinned to the execution workspace its first run
+  // realized (reuse_existing, e.g. for reusable sandboxes), the resolved mode is
+  // copied onto the issue settings. Hashing the raw field would count that
+  // write-back as a configuration change and start a new agent session on the
+  // first follow-up run, although nothing about how the task runs changed. Keep
+  // every other issue setting (strategy, runtime, egress, concurrency) in the
+  // fingerprint, and treat "no settings left" the same as "no settings".
+  if (workspaceConfig.issueSettings != null) {
+    const { mode: _issueMode, ...issueSettings } = parseObject(
+      workspaceConfig.issueSettings,
+    );
+    workspaceConfig.issueSettings =
+      Object.keys(issueSettings).length > 0 ? issueSettings : null;
+  }
   return {
     adapter: {
       adapterType: input.adapterType,

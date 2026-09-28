@@ -2324,6 +2324,113 @@ describe("effective run session config freshness", () => {
     });
   });
 
+  it("does not reset when the task is pinned to the workspace mode it already ran in", async () => {
+    // Before the first run the task has no workspace settings; afterwards the
+    // heartbeat pins it to the realized workspace by copying the resolved mode
+    // onto the issue. The mode that governs the run is unchanged.
+    const unpinned = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "shared_workspace",
+        effectiveMode: "shared_workspace",
+        projectPolicy: null,
+        issueSettings: null,
+      },
+    });
+    const pinned = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "shared_workspace",
+        effectiveMode: "shared_workspace",
+        projectPolicy: null,
+        issueSettings: { mode: "shared_workspace" },
+      },
+    });
+    expect(pinned.categoryFingerprints.workspaceConfig).toBe(unpinned.categoryFingerprints.workspaceConfig);
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(unpinned),
+        configMetadata: pinned,
+      }),
+    ).toMatchObject({ reset: false, changedCategories: [], reasons: [] });
+
+    // The same holds when the task already had other workspace settings that
+    // the pinning keeps.
+    const egress = { allowFqdns: ["registry.example.test"], allowCidrs: [] };
+    const withEgress = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "shared_workspace",
+        effectiveMode: "shared_workspace",
+        issueSettings: { networkEgress: egress },
+      },
+    });
+    const withEgressPinned = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "shared_workspace",
+        effectiveMode: "shared_workspace",
+        issueSettings: { networkEgress: egress, mode: "shared_workspace" },
+      },
+    });
+    expect(withEgressPinned.categoryFingerprints.workspaceConfig).toBe(
+      withEgress.categoryFingerprints.workspaceConfig,
+    );
+  });
+
+  it("still resets when a task's other workspace settings or its resolved mode change", async () => {
+    const base = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "shared_workspace",
+        effectiveMode: "shared_workspace",
+        issueSettings: {
+          mode: "shared_workspace",
+          networkEgress: { allowFqdns: ["registry.example.test"], allowCidrs: [] },
+        },
+      },
+    });
+    const egressChanged = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "shared_workspace",
+        effectiveMode: "shared_workspace",
+        issueSettings: {
+          mode: "shared_workspace",
+          networkEgress: { allowFqdns: ["registry.example.test", "api.example.test"], allowCidrs: [] },
+        },
+      },
+    });
+    const strategyAdded = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "shared_workspace",
+        effectiveMode: "shared_workspace",
+        issueSettings: {
+          mode: "shared_workspace",
+          networkEgress: { allowFqdns: ["registry.example.test"], allowCidrs: [] },
+          workspaceStrategy: { type: "git_worktree" },
+        },
+      },
+    });
+    const modeChanged = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "isolated_workspace",
+        effectiveMode: "isolated_workspace",
+        issueSettings: {
+          mode: "isolated_workspace",
+          networkEgress: { allowFqdns: ["registry.example.test"], allowCidrs: [] },
+        },
+      },
+    });
+
+    for (const next of [egressChanged, strategyAdded, modeChanged]) {
+      expect(
+        resolveTaskSessionConfigFreshness({
+          hasTaskSession: true,
+          configuredModel: "gpt-5.4-mini",
+          taskSessionParams: sessionParamsWithConfigMetadata(base),
+          configMetadata: next,
+        }),
+      ).toMatchObject({ reset: true, changedCategories: ["workspaceConfig"] });
+    }
+  });
+
   it("keeps model-only compatibility as an additional reset reason", async () => {
     const base = await buildSessionConfigMetadata();
 
