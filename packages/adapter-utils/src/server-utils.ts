@@ -96,6 +96,11 @@ interface SpawnTarget {
   args: string[];
   cwd?: string;
   env?: Record<string, string | undefined>;
+  /**
+   * Written to the child's stdin before the caller's stdin; stdin is then ended.
+   * Remote targets use it to hand over env values without putting them in `args`.
+   */
+  stdinPrefix?: string;
   cleanup?: () => Promise<void>;
 }
 
@@ -3526,6 +3531,7 @@ async function resolveSpawnTarget(
       command: sshResolved,
       args: spawnTarget.args,
       cwd: process.cwd(),
+      ...(spawnTarget.stdinPrefix != null ? { stdinPrefix: spawnTarget.stdinPrefix } : {}),
       cleanup: spawnTarget.cleanup,
     };
   }
@@ -4617,12 +4623,18 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
+        // The target's stdin prefix (e.g. a remote target's env handoff) goes
+        // ahead of the caller's stdin; with neither, stdin stays closed.
+        const stdinPayload =
+          target.stdinPrefix != null || opts.stdin != null
+            ? `${target.stdinPrefix ?? ""}${opts.stdin ?? ""}`
+            : null;
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
           detached: process.platform !== "win32",
           shell: false,
-          stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+          stdio: [stdinPayload != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
@@ -4776,10 +4788,14 @@ export async function runChildProcess(
         });
 
         const stdin = child.stdin;
-        if (opts.stdin != null && stdin) {
+        if (stdinPayload != null && stdin) {
+          // A child that exits without reading all of its stdin (e.g. ssh
+          // failing to connect) makes the write fail with EPIPE; the exit
+          // status reports that failure, so the stream error is not fatal.
+          stdin.on("error", () => {});
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
+            stdin.write(stdinPayload);
             stdin.end();
           });
         }
