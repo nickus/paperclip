@@ -20,6 +20,12 @@ export interface AdapterCapabilities {
   supportsLocalAgentJwt: boolean;
   requiresMaterializedRuntimeSkills: boolean;
   supportsAcp: boolean;
+  /**
+   * The adapter runs in SSH and sandbox environments. The server always sends
+   * it; absent (the built-in defaults used before the listing loads) means the
+   * built-in list decides.
+   */
+  supportsRemoteManagedEnvironments?: boolean;
   /** Present only when the adapter declares an interactive login capability. */
   login?: AdapterLoginProjection;
 }

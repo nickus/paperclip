@@ -529,6 +529,20 @@ export interface ServerAdapterModule {
    * rather than reading config.paperclipRuntimeSkills.
    */
   requiresMaterializedRuntimeSkills?: boolean;
+
+  /**
+   * Adapter runs inside remote managed environments (SSH and sandbox drivers).
+   * An adapter that sets this starts its runtime through `ctx.executionTarget`
+   * whenever the target is remote (the `@paperclipai/adapter-utils/execution-target`
+   * helpers: workspace and asset sync, process execution with env kept out of
+   * argv, the run-scoped Paperclip API bridge, and a session identity tied to
+   * the target), never as a host process. Agents using it can then select SSH
+   * and sandbox environments, and runs get a remote execution target.
+   * When undefined, the server falls back to its built-in list of
+   * remote-capable adapter types, so external plugins must opt in; `false`
+   * restricts the adapter to the local environment.
+   */
+  supportsRemoteManagedEnvironments?: boolean;
   /**
    * Optional: describe how this adapter's runtime command should be launched
    * and provisioned in fresh remote environments such as sandboxes.

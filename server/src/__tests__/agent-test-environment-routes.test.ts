@@ -483,6 +483,8 @@ describe("agent test-environment route", () => {
         // The Test lease re-checks the company binding, so a binding change
         // between the route guard and the lease cannot open a foreign sandbox.
         assertCompanyBinding: true,
+        // The provider boots the tested adapter's runtime image, as for a run.
+        adapterType: "external_test",
         environment: expect.objectContaining({
           config: expect.objectContaining({
             reuseLease: false,

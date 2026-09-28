@@ -17,6 +17,8 @@ import {
   DEFAULT_SANDBOX_REMOTE_CWD,
   resolveEnvironmentExecutionTarget,
 } from "../services/environment-execution-target.js";
+import { registerServerAdapter, unregisterServerAdapter } from "../adapters/registry.js";
+import type { ServerAdapterModule } from "../adapters/types.js";
 
 const A = SANDBOX_STARTUP_SPAN_ATTRS;
 
@@ -321,6 +323,93 @@ describe("resolveEnvironmentExecutionTarget", () => {
       expect(target, `driver ${driver}`).toBeNull();
     }
     expect(mockResolveEnvironmentDriverConfigForRuntime).not.toHaveBeenCalled();
+  });
+
+  it("resolves remote targets for an external adapter that declares remote-managed support", async () => {
+    const sshConfig = {
+      host: "ssh.example.test",
+      port: 22,
+      username: "paperclip",
+      remoteWorkspacePath: "/srv/paperclip",
+      privateKey: "PRIVATE KEY",
+      knownHosts: "[ssh.example.test]:22 ssh-ed25519 AAAA",
+      strictHostKeyChecking: true,
+    };
+    const externalAdapter = (supportsRemoteManagedEnvironments?: boolean): ServerAdapterModule => ({
+      type: "external_remote_test",
+      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+      testEnvironment: async () => ({
+        adapterType: "external_remote_test",
+        status: "pass",
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+      ...(supportsRemoteManagedEnvironments === undefined ? {} : { supportsRemoteManagedEnvironments }),
+    });
+    const resolve = (driver: "sandbox" | "ssh") =>
+      resolveEnvironmentExecutionTarget({
+        db: {} as never,
+        companyId: "company-1",
+        adapterType: "external_remote_test",
+        environment: { id: `env-${driver}`, driver, config: {} },
+        leaseId: "lease-1",
+        leaseMetadata: {},
+        lease: null,
+        environmentRuntime: null,
+      });
+
+    try {
+      // Not registered, and registered without a declaration: not in the
+      // built-in list, so the adapter stays on the local environment.
+      expect(await resolve("sandbox")).toBeNull();
+      registerServerAdapter(externalAdapter());
+      expect(await resolve("sandbox")).toBeNull();
+      expect(await resolve("ssh")).toBeNull();
+      expect(mockResolveEnvironmentDriverConfigForRuntime).not.toHaveBeenCalled();
+
+      registerServerAdapter(externalAdapter(true));
+      mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValueOnce({
+        driver: "sandbox",
+        config: { provider: "fake-plugin", reuseLease: false, timeoutMs: 30_000 },
+      });
+      expect(await resolve("sandbox")).toMatchObject({
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "fake-plugin",
+      });
+      mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValueOnce({ driver: "ssh", config: sshConfig });
+      expect(await resolve("ssh")).toMatchObject({
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/srv/paperclip",
+      });
+    } finally {
+      unregisterServerAdapter("external_remote_test");
+    }
+  });
+
+  it("returns null when a registered adapter declares no remote-managed support for a built-in type", async () => {
+    const builtIn = "opencode_local";
+    const { findServerAdapter } = await import("../adapters/registry.js");
+    const original = findServerAdapter(builtIn);
+    expect(original).not.toBeNull();
+    try {
+      registerServerAdapter({ ...original!, supportsRemoteManagedEnvironments: false });
+      const target = await resolveEnvironmentExecutionTarget({
+        db: {} as never,
+        companyId: "company-1",
+        adapterType: builtIn,
+        environment: { id: "env-1", driver: "sandbox", config: { provider: "fake-plugin" } },
+        leaseId: "lease-1",
+        leaseMetadata: {},
+        lease: null,
+        environmentRuntime: null,
+      });
+      expect(target).toBeNull();
+      expect(mockResolveEnvironmentDriverConfigForRuntime).not.toHaveBeenCalled();
+    } finally {
+      registerServerAdapter(original!);
+    }
   });
 
   it("stamps the environment's bridge policy and the run company on SSH targets", async () => {

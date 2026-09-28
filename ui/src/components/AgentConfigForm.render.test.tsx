@@ -143,9 +143,16 @@ const mockLoginProjections = vi.hoisted(
     ]),
 );
 
+// Adapters outside the built-in list that declare remote-managed environment
+// support, as the server projects it for an external adapter plugin.
+const mockRemoteManagedAdapters = vi.hoisted(() => new Set<string>(["remote_vendor_local"]));
+
 vi.mock("../adapters/use-adapter-capabilities", () => ({
   useAdapterCapabilities: () => (adapterType: string) => {
     const login = mockLoginProjections.get(adapterType);
+    const remote = mockRemoteManagedAdapters.has(adapterType)
+      ? { supportsRemoteManagedEnvironments: true }
+      : {};
     return adapterType === "hermes_gateway"
       ? {
           supportsInstructionsBundle: false,
@@ -161,6 +168,7 @@ vi.mock("../adapters/use-adapter-capabilities", () => ({
           requiresMaterializedRuntimeSkills: false,
           supportsAcp: true,
           ...(login ? { login } : {}),
+          ...remote,
         };
   },
 }));
@@ -971,6 +979,44 @@ describe("AgentConfigForm environment selector", () => {
 
     expect(text).toContain("Environment override");
     expect(selector?.textContent).toContain("E2B · sandbox");
+  });
+
+  it("offers sandbox environments to an external adapter that declares remote-managed support", async () => {
+    const result = await renderForm(
+      [
+        makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
+        makeEnvironment({
+          id: "sandbox-1",
+          name: "E2B",
+          driver: "sandbox",
+          config: { provider: "e2b" },
+        }),
+      ],
+      { adapterType: "remote_vendor_local" },
+    );
+    roots.push(result.root);
+
+    expect(result.container.textContent).toContain("Environment override");
+    expect(result.container.querySelector("select")?.textContent).toContain("E2B · sandbox");
+  });
+
+  it("keeps an external adapter without a remote-managed declaration on the local environment", async () => {
+    const result = await renderForm(
+      [
+        makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
+        makeEnvironment({
+          id: "sandbox-1",
+          name: "E2B",
+          driver: "sandbox",
+          config: { provider: "e2b" },
+        }),
+      ],
+      { adapterType: "external_vendor_local" },
+    );
+    roots.push(result.root);
+
+    expect(result.container.textContent).not.toContain("Environment override");
+    expect(result.container.querySelector("select")).toBeNull();
   });
 
   it("keeps an existing non-runnable override visible so it can be cleared", async () => {

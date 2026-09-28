@@ -1772,6 +1772,74 @@ describe.sequential("agent permission routes", () => {
     });
   }
 
+  for (const declared of [true, false] as const) {
+    it(`${declared ? "allows" : "rejects"} a sandbox default environment for an external adapter that ${declared ? "declares" : "does not declare"} remote-managed support`, async () => {
+      const { registerServerAdapter, unregisterServerAdapter } = await vi.importActual<
+        typeof import("../adapters/registry.js")
+      >("../adapters/registry.js");
+      const adapterType = "external_remote_test";
+      registerServerAdapter({
+        type: adapterType,
+        execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+        testEnvironment: async () => ({
+          adapterType,
+          status: "pass",
+          checks: [],
+          testedAt: new Date(0).toISOString(),
+        }),
+        ...(declared ? { supportsRemoteManagedEnvironments: true } : {}),
+      });
+      try {
+        const environmentId = "33333333-3333-4333-8333-333333333333";
+        mockEnvironmentService.getById.mockResolvedValue({
+          id: environmentId,
+          companyId,
+          driver: "sandbox",
+          config: { provider: "fake-plugin" },
+        });
+        mockAgentService.create.mockResolvedValue({
+          ...baseAgent,
+          name: "External Builder",
+          adapterType,
+          defaultEnvironmentId: environmentId,
+        });
+
+        const app = await createApp({
+          type: "board",
+          userId: "board-user",
+          source: "local_implicit",
+          isInstanceAdmin: true,
+          companyIds: [companyId],
+        });
+
+        const res = await requestApp(app, (baseUrl) => request(baseUrl)
+          .post(`/api/companies/${companyId}/agents`)
+          .send({
+            name: "External Builder",
+            role: "engineer",
+            adapterType,
+            adapterConfig: {},
+            defaultEnvironmentId: environmentId,
+          }));
+
+        if (declared) {
+          expect(res.status, JSON.stringify(res.body)).toBe(201);
+          expect(mockAgentService.create).toHaveBeenCalledWith(
+            companyId,
+            expect.objectContaining({ adapterType, defaultEnvironmentId: environmentId }),
+            expect.anything(),
+          );
+        } else {
+          expect(res.status).toBe(422);
+          expect(res.body.error).toContain('Environment driver "sandbox" is not allowed here');
+          expect(mockAgentService.create).not.toHaveBeenCalled();
+        }
+      } finally {
+        unregisterServerAdapter(adapterType);
+      }
+    });
+  }
+
   it("rejects updating an agent with an unsupported default environment driver", async () => {
     const environmentId = "33333333-3333-4333-8333-333333333333";
     mockEnvironmentService.getById.mockResolvedValue({
