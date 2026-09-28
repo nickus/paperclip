@@ -3232,7 +3232,11 @@ function dropInternalPluginSandboxConfigKeys(
 }
 
 function sandboxConfigForLeaseMetadata(config: SandboxEnvironmentConfig): Record<string, unknown> {
-  return { ...config };
+  // The Paperclip API bridge policy is host-only run behavior, not part of a
+  // sandbox's identity: leave it out of lease metadata so changing it keeps
+  // the reusable-lease fingerprint, and so the provider never receives it.
+  const { paperclipApiBridgePolicy: _paperclipApiBridgePolicy, ...leaseConfig } = config as Record<string, unknown>;
+  return leaseConfig;
 }
 
 function tryParseCurrentPluginConfig(environment: Environment): PluginEnvironmentConfig | null {

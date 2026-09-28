@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { HttpError } from "../errors.js";
-import { normalizeEnvironmentConfig, parseEnvironmentDriverConfig } from "../services/environment-config.ts";
+import {
+  normalizeEnvironmentConfig,
+  parseEnvironmentDriverConfig,
+  stripSandboxProviderEnvelope,
+} from "../services/environment-config.ts";
 
 describe("environment config helpers", () => {
   it("normalizes SSH config into its canonical stored shape", () => {
@@ -34,6 +38,50 @@ describe("environment config helpers", () => {
       knownHosts: null,
       strictHostKeyChecking: true,
     });
+  });
+
+  it("accepts a Paperclip API bridge policy on SSH and sandbox configs and rejects unknown values", () => {
+    const ssh = {
+      host: "ssh.example.test",
+      username: "ssh-user",
+      remoteWorkspacePath: "/srv/paperclip/workspace",
+    };
+    for (const policy of ["restricted", "agent"] as const) {
+      expect(normalizeEnvironmentConfig({
+        driver: "ssh",
+        config: { ...ssh, paperclipApiBridgePolicy: policy },
+      })).toMatchObject({ paperclipApiBridgePolicy: policy });
+      expect(normalizeEnvironmentConfig({
+        driver: "sandbox",
+        config: { provider: "fake", image: "ubuntu:24.04", paperclipApiBridgePolicy: policy },
+      })).toMatchObject({ paperclipApiBridgePolicy: policy });
+      expect(normalizeEnvironmentConfig({
+        driver: "sandbox",
+        config: { provider: "fake-plugin", paperclipApiBridgePolicy: policy },
+      })).toMatchObject({ paperclipApiBridgePolicy: policy });
+    }
+    expect(normalizeEnvironmentConfig({ driver: "ssh", config: ssh })).not.toHaveProperty("paperclipApiBridgePolicy");
+    for (const policy of ["open", "AGENT", "", true]) {
+      expect(() => normalizeEnvironmentConfig({
+        driver: "ssh",
+        config: { ...ssh, paperclipApiBridgePolicy: policy },
+      })).toThrow(HttpError);
+      expect(() => normalizeEnvironmentConfig({
+        driver: "sandbox",
+        config: { provider: "fake-plugin", paperclipApiBridgePolicy: policy },
+      })).toThrow("bridge policy");
+    }
+  });
+
+  it("keeps the bridge policy out of the config a sandbox provider receives", () => {
+    const parsed = parseEnvironmentDriverConfig({
+      driver: "sandbox",
+      config: { provider: "fake-plugin", image: "template-a", paperclipApiBridgePolicy: "agent" },
+    });
+    expect(parsed.driver).toBe("sandbox");
+    if (parsed.driver !== "sandbox") return;
+    expect(parsed.config.paperclipApiBridgePolicy).toBe("agent");
+    expect(stripSandboxProviderEnvelope(parsed.config)).toEqual({ image: "template-a", reuseLease: false });
   });
 
   it("rejects raw SSH private keys in the stored config shape", () => {
