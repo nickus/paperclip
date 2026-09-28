@@ -43,12 +43,14 @@ import {
   heldExecutionWaitReleaseIdempotencyKey,
   releaseHeldExecutionWaits,
 } from "../services/execution-wait-release.js";
+import { createExecutionHoldWakeBudget } from "../services/execution-hold-wake-budget.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import {
   INERT_RUN_AUTO_RECONCILE_ENV,
   INERT_RUN_RELEASE_RECHECK_MS,
   INERT_RUN_SETTLE_GRACE_MS,
+  INERT_RUN_SETTLED_HOLD_MAX_AGE_ENV,
 } from "../services/inert-legacy-execution.js";
 import {
   legacyExecutionRecoveryFingerprint,
@@ -84,6 +86,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     delete process.env[INERT_RUN_AUTO_RECONCILE_ENV];
+    delete process.env[INERT_RUN_SETTLED_HOLD_MAX_AGE_ENV];
     delete process.env[HELD_EXECUTION_WAIT_RELEASE_ENV];
     await heartbeatService(db).drainActiveRunExecutions();
     await db.delete(issueRecoveryActions);
@@ -522,14 +525,15 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       expect(wake).toHaveBeenCalledTimes(26);
     });
 
-    it("leaves a continuation out of the delivery batch while a first-class blocker is unresolved", async () => {
+    it.each(["todo", "cancelled"] as const)("leaves a continuation out of the delivery batch while a first-class blocker is %s", async (blockerStatus) => {
       const { companyId, agentId, issueId } = await seedCompany();
       await seedStoppedRun({ companyId, agentId, issueId });
       expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
-      // A blocker added after the reconciliation.
+      // A blocker added after the reconciliation. Like admission, only a done
+      // blocker counts as resolved.
       const blockerId = randomUUID();
       await db.insert(issues).values({
-        id: blockerId, companyId, title: "Blocker", status: "todo", priority: "medium",
+        id: blockerId, companyId, title: "Blocker", status: blockerStatus, priority: "medium",
         issueNumber: 2, identifier: `BLK-${blockerId.slice(0, 4)}`,
       });
       await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
@@ -541,6 +545,83 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       await deliverReconciledExecutions(db, wake);
       expect(wake).toHaveBeenCalledTimes(1);
       expect(wake).toHaveBeenCalledWith(agentId, expect.objectContaining({ reason: "issue_recovery_action_restored" }));
+    });
+
+    it("does not continue a task whose first-class blocker was cancelled", async () => {
+      const { companyId, agentId, issueId } = await seedCompany();
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId, companyId, title: "Blocker", status: "cancelled", priority: "medium",
+        issueNumber: 2, identifier: `BLK-${blockerId.slice(0, 4)}`,
+      });
+      await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
+      await seedStoppedRun({ companyId, agentId, issueId });
+      // Admission would not start the continuation: a cancelled blocker stays
+      // unresolved until the relation is removed or replaced.
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 0, deferred: 1 });
+      const [held] = await legacyActions(issueId);
+      expect(held!.evidence).toMatchObject({
+        inertRunAssessment: { verdict: "deferred", reason: "first_class_blocker_unresolved" },
+      });
+      expect(held!.evidence).not.toHaveProperty("continuationDelivery");
+      expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: held!.id });
+    });
+
+    it("rotates continuations admission keeps declining behind the others", async () => {
+      const declining = await seedCompany();
+      const declined = new Set<string>();
+      for (let i = 0; i < 25; i += 1) {
+        const issueId = randomUUID();
+        await db.insert(issues).values({
+          id: issueId, companyId: declining.companyId, title: `Task ${i}`, status: "in_progress",
+          priority: "medium", assigneeAgentId: declining.agentId, issueNumber: 10 + i,
+          identifier: `DC-${i}-${issueId.slice(0, 4)}`,
+        });
+        await seedStoppedRun({ companyId: declining.companyId, agentId: declining.agentId, issueId });
+        declined.add(issueId);
+      }
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 25 });
+      const other = await seedCompany();
+      await seedStoppedRun(other);
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
+      // Stands in for a gate admission keeps applying (it records a receipt).
+      const wake = vi.fn(async (_agentId: string, opts: { payload?: Record<string, unknown> }) =>
+        declined.has(String(opts.payload?.issueId)) ? null : ({ id: randomUUID() } as never));
+      await deliverReconciledExecutions(db, wake as never);
+      await deliverReconciledExecutions(db, wake as never);
+      expect(wake.mock.calls.filter(([agentId]) => agentId === other.agentId)).toHaveLength(1);
+      expect((await legacyActions(other.issueId))[0]!.evidence).toMatchObject({ continuationDelivery: "delivered" });
+    });
+
+    it("paces continuation deliveries with the shared wake budget", async () => {
+      const first = await seedCompany();
+      const second = await seedCompany();
+      await seedStoppedRun(first);
+      await seedStoppedRun(second);
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 2 });
+      let clock = 0;
+      const budget = createExecutionHoldWakeBudget({ limit: 1, windowMs: 1_000, now: () => clock });
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      await deliverReconciledExecutions(db, wake, { budget });
+      await deliverReconciledExecutions(db, wake, { budget });
+      expect(wake).toHaveBeenCalledTimes(1);
+      clock += 1_000;
+      await deliverReconciledExecutions(db, wake, { budget });
+      expect(wake).toHaveBeenCalledTimes(2);
+      expect(new Set(wake.mock.calls.map((call) => (call as unknown as [string])[0])))
+        .toEqual(new Set([first.agentId, second.agentId]));
+    });
+
+    it("leaves an open hold whose task was parked to the regular disposition", async () => {
+      const fixture = await seedCompany();
+      await seedStoppedRun(fixture);
+      await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, fixture.issueId));
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 0, deferred: 1 });
+      expect((await legacyActions(fixture.issueId))[0]).toMatchObject({
+        status: "active",
+        evidence: { inertRunAssessment: { verdict: "deferred", reason: "task_parked:backlog" } },
+      });
+      expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!.status).toBe("backlog");
     });
 
     it("does not chain automatic continuations", async () => {
@@ -1280,6 +1361,8 @@ describeEmbeddedPostgres("execution recovery holds", () => {
           ...(settled!.evidence.automaticRecovery as object), replay: "explicit_user_continuation",
         } },
       }).where(eq(issueRecoveryActions.id, action.id));
+      // The user's turn takes the task out of the disposition's block.
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
       const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
       expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ delivered: 1 });
       expect(wake).toHaveBeenCalledWith(agentId, expect.anything());
@@ -1463,6 +1546,242 @@ describeEmbeddedPostgres("execution recovery holds", () => {
         state: "no_held_wakes", promotedDeferredWakes: false,
       });
     });
+
+    /** An answer to the agent's question, saved by real admission behind the hold. */
+    async function holdAnswer(input: { agentId: string; issueId: string; userId: string }) {
+      const interactionId = randomUUID();
+      const idempotencyKey = `interaction:${interactionId}:answered`;
+      const interaction = { interactionId, interactionKind: "ask_user_questions", interactionStatus: "answered" };
+      expect(await heartbeatService(db, { runtimeEnv: {} }).wakeup(input.agentId, {
+        source: "automation", triggerDetail: "system", reason: "issue_commented", idempotencyKey,
+        payload: { issueId: input.issueId, ...interaction, mutation: "interaction" },
+        requestedByActorType: "user", requestedByActorId: input.userId,
+        contextSnapshot: { issueId: input.issueId, taskId: input.issueId, ...interaction, wakeReason: "issue_commented" },
+      })).toBeNull();
+      const [answer] = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
+      expect(answer).toMatchObject({
+        status: "deferred_issue_execution", payload: { executionWait: { recoveryActionId: expect.any(String) } },
+      });
+      return { answer: answer!, interactionId };
+    }
+
+    async function queuedRunsOn(agentId: string, issueId: string) {
+      return (await db.select().from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued"))))
+        .filter((run) => run.contextSnapshot?.issueId === issueId);
+    }
+
+    it("does not promote a saved answer ahead of the reconciled continuation that owns the next turn", async () => {
+      const { companyId, agentId, issueId } = await seedCompany();
+      const userId = await prepareRealAdmission(companyId, agentId);
+      const run = await seedStoppedRun({ companyId, agentId, issueId, overrides: workedRun });
+      const [action] = await legacyActions(issueId);
+      const { answer } = await holdAnswer({ agentId, issueId, userId });
+
+      await request(createApp(vi.fn(async () => ({ id: randomUUID() }) as never)))
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo",
+          executionReconciliation: {
+            runId: run.id, providerStopped: true, actionOutcome: "not_performed",
+            outcomeEvidence: "The provider log shows the request was never submitted before the stop.",
+          },
+        })
+        .expect(200);
+      // The continuation owns the next turn: nothing runs ahead of it.
+      expect(await queuedRunsOn(agentId, issueId)).toHaveLength(0);
+      expect(await row(answer.id)).toMatchObject({ status: "deferred_issue_execution" });
+
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      const promote = heartbeat.promoteDeferredWakesAfterExecutionHold;
+      await deliverReconciledExecutions(db, heartbeat.wakeup, { promote });
+      expect((await legacyActions(issueId))[0]!.evidence).toMatchObject({ continuationDelivery: "delivered" });
+      await deliverReleasedExecutionWaits(db, heartbeat.wakeup, new Date(), { promote });
+      // One queued run: the continuation, in a fresh session. The answer
+      // waits for that run's own release.
+      const queued = await queuedRunsOn(agentId, issueId);
+      expect(queued).toHaveLength(1);
+      expect(queued[0]!.contextSnapshot).toMatchObject({ recoveryActionId: action!.id, forceFreshSession: true });
+      expect(await row(answer.id)).toMatchObject({ status: "deferred_issue_execution" });
+    });
+
+    it("keeps a paused owner's saved answer until the owner is resumed", async () => {
+      const { companyId, agentId, issueId } = await seedCompany();
+      const userId = await prepareRealAdmission(companyId, agentId);
+      await seedStoppedRun({ companyId, agentId, issueId, overrides: workedRun });
+      const [action] = await legacyActions(issueId);
+      const { answer, interactionId } = await holdAnswer({ agentId, issueId, userId });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+      await closeHold(action!.id);
+
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      const promote = heartbeat.promoteDeferredWakesAfterExecutionHold;
+      expect(await releaseHeldExecutionWaits(db, heartbeat.wakeup, { companyId, issueId, promote })).toMatchObject({
+        state: "owner_unavailable", agentId, promotedDeferredWakes: false,
+      });
+      expect(await row(answer.id)).toMatchObject({ status: "deferred_issue_execution" });
+      expect(await deliverReleasedExecutionWaits(db, heartbeat.wakeup, new Date(), { promote })).toMatchObject({ checked: 1 });
+      expect((await legacyActions(issueId))[0]!.evidence).toMatchObject({
+        heldWakeRelease: { state: "retry", reason: "owner_unavailable", backoff: 0 },
+      });
+      expect(await row(answer.id)).toMatchObject({ status: "deferred_issue_execution" });
+
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
+      const resumed = new Date(Date.now() + HELD_EXECUTION_WAIT_RELEASE_RETRY_MS + 1_000);
+      await deliverReleasedExecutionWaits(db, heartbeat.wakeup, resumed, { promote });
+      expect((await row(answer.id)).status).toBe("queued");
+      const queued = await queuedRunsOn(agentId, issueId);
+      expect(queued).toHaveLength(1);
+      expect(queued[0]!.contextSnapshot).toMatchObject({ interactionId });
+      expect((await legacyActions(issueId))[0]!.evidence).toMatchObject({ heldWakeRelease: { state: "no_held_wakes" } });
+    });
+
+    it("does not promote a saved mention next to a run already queued on the task", async () => {
+      const { companyId, agentId, issueId } = await seedCompany();
+      const userId = await prepareRealAdmission(companyId, agentId);
+      const reviewerId = await addAgent(companyId, "Reviewer");
+      await prepareRealAdmission(companyId, reviewerId);
+      await db.update(issues).set({
+        status: "in_review",
+        executionState: {
+          status: "pending", currentStageId: randomUUID(), currentStageIndex: 0, currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerId, userId: null },
+          returnAssignee: { type: "agent", agentId, userId: null },
+          completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        },
+      }).where(eq(issues.id, issueId));
+      // The held run is the reviewer's; the assignee's mention is saved.
+      await seedStoppedRun({ companyId, agentId: reviewerId, issueId, overrides: workedRun });
+      const [action] = await legacyActions(issueId);
+      const [comment] = await db.insert(issueComments).values({
+        companyId, issueId, authorType: "user", authorUserId: userId, body: "@Builder a question for you.",
+      }).returning();
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      expect(await heartbeat.wakeup(agentId, {
+        source: "automation", triggerDetail: "system", reason: "issue_comment_mentioned",
+        payload: { issueId, commentId: comment!.id }, requestedByActorType: "user", requestedByActorId: userId,
+        contextSnapshot: {
+          issueId, taskId: issueId, commentId: comment!.id, wakeCommentId: comment!.id, wakeReason: "issue_comment_mentioned",
+        },
+      })).toBeNull();
+      const [mention] = (await wakeRows(issueId)).filter((wake) => wake.agentId === agentId);
+      expect(mention).toMatchObject({ status: "deferred_issue_execution" });
+      await closeHold(action!.id);
+      // The assignee's next turn is already queued, without the execution lock yet.
+      const next = await heartbeat.wakeup(agentId, {
+        source: "automation", triggerDetail: "system", reason: "issue_recovery_action_restored",
+        payload: { issueId }, requestedByActorType: "system", requestedByActorId: "execution-recovery",
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_recovery_action_restored" },
+      });
+      expect(next).toMatchObject({ status: "queued" });
+
+      const promote = heartbeat.promoteDeferredWakesAfterExecutionHold;
+      await releaseHeldExecutionWaits(db, heartbeat.wakeup, { companyId, issueId, promote });
+      // The queued run's own release promotes the mention later.
+      expect((await queuedRunsOn(agentId, issueId)).map((run) => run.id)).toEqual([next!.id]);
+      expect(await row(mention!.id)).toMatchObject({ status: "deferred_issue_execution" });
+    });
+
+    it.each(["backlog", "blocked"] as const)(
+      "keeps the held wakes of a task moved to %s until it is back in work",
+      async (status) => {
+        const { companyId, agentId, issueId, action, receipt, queue } = await heldTask();
+        await db.update(issues).set({ status }).where(eq(issues.id, issueId));
+        await closeHold(action.id);
+        const wake = admittingWake();
+        expect(await releaseHeldExecutionWaits(db, wake, { companyId, issueId })).toMatchObject({
+          state: "task_parked", agentId,
+        });
+        expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ checked: 1, delivered: 0 });
+        expect(wake).not.toHaveBeenCalled();
+        expect((await legacyActions(issueId))[0]!.evidence).toMatchObject({
+          heldWakeRelease: { state: "retry", reason: "task_parked" },
+        });
+        expect((await row(receipt.id)).payload).toMatchObject({
+          executionWait: expect.not.objectContaining({ releasedAt: expect.anything() }),
+        });
+        expect(await row(queue.id)).toMatchObject({ status: "deferred_issue_execution" });
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe(status);
+
+        // Back in work: delivered once, at the retry pace.
+        await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+        const later = new Date(Date.now() + HELD_EXECUTION_WAIT_RELEASE_RETRY_MS + 1_000);
+        expect(await deliverReleasedExecutionWaits(db, wake, later)).toMatchObject({ delivered: 1 });
+        expect(wake).toHaveBeenCalledTimes(1);
+        expect(await row(queue.id)).toMatchObject({ status: "coalesced" });
+      },
+    );
+
+    it("does not promote wakes saved on a parked task", async () => {
+      const { companyId, agentId, issueId } = await seedCompany();
+      const userId = await prepareRealAdmission(companyId, agentId);
+      await seedStoppedRun({ companyId, agentId, issueId, overrides: workedRun });
+      const [action] = await legacyActions(issueId);
+      const { answer } = await holdAnswer({ agentId, issueId, userId });
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+      await closeHold(action!.id);
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      expect(await releaseHeldExecutionWaits(db, heartbeat.wakeup, {
+        companyId, issueId, promote: heartbeat.promoteDeferredWakesAfterExecutionHold,
+      })).toMatchObject({ state: "task_parked", promotedDeferredWakes: false });
+      expect(await row(answer.id)).toMatchObject({ status: "deferred_issue_execution" });
+      expect(await queuedRunsOn(agentId, issueId)).toHaveLength(0);
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("blocked");
+    });
+
+    it("promotes another agent's saved mention on a parked task without checking the task out", async () => {
+      const { companyId, agentId, issueId } = await seedCompany();
+      const userId = await prepareRealAdmission(companyId, agentId);
+      const reviewerId = await addAgent(companyId, "Reviewer");
+      await prepareRealAdmission(companyId, reviewerId);
+      await seedStoppedRun({ companyId, agentId, issueId, overrides: workedRun });
+      const [action] = await legacyActions(issueId);
+      const [comment] = await db.insert(issueComments).values({
+        companyId, issueId, authorType: "user", authorUserId: userId, body: "@Reviewer please take a look.",
+      }).returning();
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      expect(await heartbeat.wakeup(reviewerId, {
+        source: "automation", triggerDetail: "system", reason: "issue_comment_mentioned",
+        payload: { issueId, commentId: comment!.id }, requestedByActorType: "user", requestedByActorId: userId,
+        contextSnapshot: {
+          issueId, taskId: issueId, commentId: comment!.id, wakeCommentId: comment!.id, wakeReason: "issue_comment_mentioned",
+        },
+      })).toBeNull();
+      const [mention] = (await wakeRows(issueId)).filter((wake) => wake.agentId === reviewerId);
+      await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, issueId));
+      await closeHold(action!.id);
+      expect(await releaseHeldExecutionWaits(db, heartbeat.wakeup, {
+        companyId, issueId, promote: heartbeat.promoteDeferredWakesAfterExecutionHold,
+      })).toMatchObject({ state: "no_held_wakes", promotedDeferredWakes: true });
+      expect((await row(mention!.id)).status).toBe("queued");
+      expect(await queuedRunsOn(reviewerId, issueId)).toHaveLength(1);
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("backlog");
+    });
+
+    it("paces sweep deliveries with the shared wake budget", async () => {
+      const first = await heldTask();
+      const second = await heldTask();
+      await closeHold(first.action.id);
+      await closeHold(second.action.id);
+      let clock = 0;
+      const budget = createExecutionHoldWakeBudget({ limit: 1, windowMs: 1_000, now: () => clock });
+      const wake = admittingWake();
+      expect(await deliverReleasedExecutionWaits(db, wake, new Date(), { budget })).toMatchObject({
+        checked: 1, delivered: 1, overBudget: 1,
+      });
+      expect(wake).toHaveBeenCalledTimes(1);
+      // The one over budget was left untouched for the next window.
+      expect(await deliverReleasedExecutionWaits(db, wake, new Date(), { budget })).toMatchObject({
+        checked: 0, overBudget: 1,
+      });
+      clock += 1_000;
+      expect(await deliverReleasedExecutionWaits(db, wake, new Date(), { budget })).toMatchObject({
+        checked: 1, delivered: 1, overBudget: 0,
+      });
+      expect(new Set(wake.mock.calls.map((call) => (call[1] as { payload: { issueId: string } }).payload.issueId)))
+        .toEqual(new Set([first.issueId, second.issueId]));
+    });
   });
 
   describe("automatic reconciliation of a settled hold whose run did nothing", () => {
@@ -1576,31 +1895,82 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!.status).toBe("todo");
     });
 
-    it("keeps a task that was blocked before the hold blocked", async () => {
-      const fixture = await seedCompany();
-      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
-      await seedStoppedRun({ ...fixture, finishedAt: new Date(Date.now() - INERT_RUN_SETTLE_GRACE_MS - 60_000) });
-      await settleUnrecoverableExecutions(db, new Date());
-      expect((await legacyActions(fixture.issueId))[0]!.evidence).toMatchObject({
-        automaticRecovery: { issueStatusBefore: "blocked" },
+    it.each([
+      ["was blocked before the hold", "status_before_hold:blocked"],
+      ["has no recorded status from before the hold", "status_before_hold:unknown"],
+      ["was blocked by someone else", "status_changed:blocked"],
+    ] as const)("leaves a blocked task that %s to an operator, and continues it back in work", async (_label, reason) => {
+      const { companyId, issueId, settled } = await settledInertHold();
+      expect(settled).toMatchObject({ outcome: "blocked", evidence: { automaticRecovery: { issueStatusBefore: "in_progress" } } });
+      const automatic = settled.evidence.automaticRecovery as Record<string, unknown>;
+      if (reason === "status_before_hold:blocked") {
+        await db.update(issueRecoveryActions).set({
+          evidence: { ...settled.evidence, automaticRecovery: { ...automatic, issueStatusBefore: "blocked" } },
+        }).where(eq(issueRecoveryActions.id, settled.id));
+      } else if (reason === "status_before_hold:unknown") {
+        // Holds settled by an earlier version carry no status from before the hold.
+        const { issueStatusBefore: _omitted, ...rest } = automatic;
+        await db.update(issueRecoveryActions).set({ evidence: { ...settled.evidence, automaticRecovery: rest } })
+          .where(eq(issueRecoveryActions.id, settled.id));
+      } else {
+        // The disposition did not block it (the task was not current then).
+        await db.update(issueRecoveryActions).set({ outcome: "cancelled" }).where(eq(issueRecoveryActions.id, settled.id));
+      }
+      // The continuation would check the blocked task out again.
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 0, deferred: 1 });
+      const [held] = await legacyActions(issueId);
+      expect(held).toMatchObject({
+        status: "resolved",
+        evidence: { automaticRecovery: { replay: "blocked" }, inertRunAssessment: { verdict: "deferred", reason } },
       });
-      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
-      expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!.status).toBe("blocked");
+      expect(held!.evidence).not.toHaveProperty("continuationDelivery");
+      expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: settled.id });
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("blocked");
+
+      // Someone puts it back in work: rechecked at a bounded pace, continued as is.
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+      const later = new Date(Date.now() + INERT_RUN_RELEASE_RECHECK_MS + 1_000);
+      expect(await reconcileInertLegacyExecutions(db, later)).toMatchObject({ reconciled: 1 });
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("todo");
     });
 
-    it("keeps a blocked task blocked when the status before the hold was not recorded", async () => {
-      const fixture = await seedCompany();
-      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
-      await seedStoppedRun({ ...fixture, finishedAt: new Date(Date.now() - INERT_RUN_SETTLE_GRACE_MS - 60_000) });
-      await settleUnrecoverableExecutions(db, new Date());
-      // Holds settled by an earlier version carry no status from before the hold.
-      const [settled] = await legacyActions(fixture.issueId);
-      const { issueStatusBefore, ...automaticRecovery } = settled!.evidence.automaticRecovery as Record<string, unknown>;
-      expect(issueStatusBefore).toBe("blocked");
-      await db.update(issueRecoveryActions).set({ evidence: { ...settled!.evidence, automaticRecovery } })
-        .where(eq(issueRecoveryActions.id, settled!.id));
+    it("rechecks a settled hold deferred while a review stage is pending", async () => {
+      const { companyId, agentId, issueId } = await settledInertHold();
+      const reviewerId = randomUUID();
+      await db.insert(agents).values({
+        id: reviewerId, companyId, name: "Reviewer", role: "engineer", status: "idle",
+        adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      await db.update(issues).set({
+        executionState: {
+          status: "pending", currentStageId: randomUUID(), currentStageIndex: 0, currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerId, userId: null },
+          returnAssignee: { type: "agent", agentId, userId: null },
+          completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        },
+      }).where(eq(issues.id, issueId));
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 0, deferred: 1 });
+      expect((await legacyActions(issueId))[0]!.evidence).toMatchObject({
+        inertRunAssessment: { verdict: "deferred", reason: "governed_stage_pending" },
+      });
+      // The stage completes and the task is back in work.
+      await db.update(issues).set({ executionState: null, status: "todo" }).where(eq(issues.id, issueId));
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 0 });
+      const later = new Date(Date.now() + INERT_RUN_RELEASE_RECHECK_MS + 1_000);
+      expect(await reconcileInertLegacyExecutions(db, later)).toMatchObject({ reconciled: 1 });
+    });
+
+    it("leaves a hold settled longer ago than the configured age to an operator", async () => {
+      const { issueId, settled } = await settledInertHold();
+      const dayAndHourAgo = new Date(Date.now() - 25 * 60 * 60_000);
+      await db.update(issueRecoveryActions).set({ resolvedAt: dayAndHourAgo, updatedAt: dayAndHourAgo })
+        .where(eq(issueRecoveryActions.id, settled.id));
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 0 });
+      expect((await legacyActions(issueId))[0]).toMatchObject({
+        status: "resolved", evidence: { automaticRecovery: { replay: "blocked" } },
+      });
+      process.env[INERT_RUN_SETTLED_HOLD_MAX_AGE_ENV] = "48";
       expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
-      expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!.status).toBe("blocked");
     });
 
     it("leaves a settled hold to an operator once the board parks its task, and continues it back in work", async () => {

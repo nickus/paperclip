@@ -15,6 +15,10 @@ import {
   settleUnrecoverableExecutions,
 } from "./services/execution-recovery-resolution.js";
 import { deliverReleasedExecutionWaits } from "./services/execution-wait-release.js";
+import {
+  createExecutionHoldWakeBudget,
+  executionHoldSweepWakeLimit,
+} from "./services/execution-hold-wake-budget.js";
 import { reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./services/execution-control-deadline.js";
@@ -1159,17 +1163,25 @@ async function startServerWithDatabaseTeardown(
     }
   };
   const executionControlSweepsInFlight = new Set<string>();
+  // Shared by the sweeps that wake agents after execution recovery holds, so a
+  // backlog found at startup is handed back at a bounded pace.
+  const executionHoldWakeBudget = createExecutionHoldWakeBudget({
+    limit: executionHoldSweepWakeLimit(),
+    windowMs: EXECUTION_RECONCILIATION_INTERVAL_MS,
+  });
   const executionControlSweeps = [
     ["finalization", () => reconcileAbandonedExecutionControl(db)],
     ["replacement", () => heartbeat ? reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run) }) : undefined],
     ["reconciliation_delivery", () => heartbeat ? deliverReconciledExecutions(db, heartbeat.wakeup, {
       promote: heartbeat.promoteDeferredWakesAfterExecutionHold,
+      budget: executionHoldWakeBudget,
     }) : undefined],
     ["status_delivery", () => deliverExecutionStatuses(db)],
     ["automatic_disposition", () => settleUnrecoverableExecutions(db)],
     ["inert_reconciliation", () => reconcileInertLegacyExecutions(db)],
     ["held_wait_release", () => heartbeat ? deliverReleasedExecutionWaits(db, heartbeat.wakeup, new Date(), {
       promote: heartbeat.promoteDeferredWakesAfterExecutionHold,
+      budget: executionHoldWakeBudget,
     }) : undefined],
     ["local_ai_login_cleanup", () => localAiLoginService(db).reapExpired()],
   ] as const;

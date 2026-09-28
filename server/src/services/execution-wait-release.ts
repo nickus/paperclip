@@ -16,6 +16,7 @@ import { isConversation } from "./agent-conversations.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
+import { withWakeBudget, type ExecutionHoldWakeBudget } from "./execution-hold-wake-budget.js";
 
 /**
  * Wakes that arrive while an execution recovery hold is in place are kept
@@ -45,10 +46,16 @@ import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js
  *   wakes are finalized the same way.
  * - A paused owner, or one awaiting approval, keeps its held wakes; the
  *   release is retried until the owner can be invoked again.
- * - Other wakes the hold kept back (mentions of other agents, answers to an
- *   agent's question) are not this release's to deliver. Once nothing else
- *   is left for the release to do, they go through the regular deferred-wake
- *   promotion that the held run's own release stood down from.
+ * - A task someone parked since (moved to `backlog` or `blocked`) keeps its
+ *   held wakes too: a release wake would check it back out. The release is
+ *   retried until the task is back in work, or finalized once it is closed.
+ * - Other wakes the hold kept back (mentions, answers to an agent's
+ *   question) are not this release's to deliver. Once nothing else is left
+ *   for the release to do, they go through the regular deferred-wake
+ *   promotion that the held run's own release stood down from. That
+ *   promotion waits, like a delivery, while a reconciled continuation or a
+ *   chat retry owns the next turn, and while the parked task's assignee, or a
+ *   paused or unapproved owner, has wakes saved on the task.
  *
  * Paths that end a hold call it directly; `deliverReleasedExecutionWaits` is
  * the periodic backstop for every other path and for retries.
@@ -90,6 +97,9 @@ export type PromoteDeferredWakesAfterHold = (input: {
 const UNAVAILABLE_OWNER_STATUSES = ["paused", "pending_approval"];
 // Owners that will never take a wake again.
 const FINISHED_OWNER_STATUSES = ["terminated"];
+// Someone parked the task. A release wake is issue-scoped, and admission
+// checks such a task back out, so held wakes wait until it is back in work.
+const PARKED_TASK_STATUSES = ["backlog", "blocked"];
 
 export function isHeldExecutionWaitReleaseEnabled(env: NodeJS.ProcessEnv = process.env) {
   const value = env[HELD_EXECUTION_WAIT_RELEASE_ENV]?.trim().toLowerCase();
@@ -127,6 +137,8 @@ export type HeldExecutionWaitReleaseState =
   | "claimed"
   /** The owner is paused or awaiting approval; its wakes stay held. */
   | "owner_unavailable"
+  /** The task was moved to backlog or blocked; its wakes stay held. */
+  | "task_parked"
   | "no_held_wakes"
   /** Everything held was finalized; nothing is delivered. */
   | "not_applicable"
@@ -446,6 +458,69 @@ function pendingReviewParticipant(task: typeof issues.$inferSelect) {
   return participant?.type === "agent" && participant.agentId ? participant.agentId : null;
 }
 
+function isOpenTask(task: typeof issues.$inferSelect) {
+  return !["done", "cancelled"].includes(task.status);
+}
+
+/**
+ * Agents the held wakes of an open task go to: its assignee and, while a
+ * review stage waits on another agent, that agent.
+ */
+function releaseRecipients(task: typeof issues.$inferSelect) {
+  if (!isOpenTask(task)) return [] as string[];
+  return [...new Set([task.assigneeAgentId, pendingReviewParticipant(task)].filter(
+    (agentId): agentId is string => typeof agentId === "string",
+  ))];
+}
+
+/**
+ * A reconciled continuation that can still be delivered to one of these
+ * owners owns the next turn; its delivery releases the held wakes afterwards.
+ * One that will be invalidated (the owner changed) does not hold them back.
+ */
+async function hasPendingContinuation(tx: Db, task: typeof issues.$inferSelect, agentIds: string[]) {
+  if (agentIds.length === 0) return false;
+  const [continuation] = await tx
+    .select({ id: issueRecoveryActions.id })
+    .from(issueRecoveryActions)
+    .where(
+      and(
+        eq(issueRecoveryActions.companyId, task.companyId),
+        eq(issueRecoveryActions.sourceIssueId, task.id),
+        inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
+        eq(issueRecoveryActions.status, "resolved"),
+        inArray(issueRecoveryActions.returnOwnerAgentId, agentIds),
+        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+      ),
+    )
+    .limit(1);
+  return Boolean(continuation);
+}
+
+/** A chat retry authorized for this task still owns its next turn. */
+async function hasInFlightChatRetry(tx: Db, task: typeof issues.$inferSelect) {
+  const [delegated] = await tx
+    .select({ id: issueRecoveryActions.id })
+    .from(issueRecoveryActions)
+    .innerJoin(
+      chatActions,
+      and(
+        eq(chatActions.companyId, issueRecoveryActions.companyId),
+        sql`${chatActions.id}::text = ${issueRecoveryActions.evidence}->'continuationDeliveryOwner'->>'actionId'`,
+      ),
+    )
+    .where(
+      and(
+        eq(issueRecoveryActions.companyId, task.companyId),
+        eq(issueRecoveryActions.sourceIssueId, task.id),
+        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'delegated'`,
+        inArray(chatActions.status, IN_FLIGHT_CHAT_ACTION_STATUSES),
+      ),
+    )
+    .limit(1);
+  return Boolean(delegated);
+}
+
 /**
  * What to do with one recipient's held wakes. Runs under the issue lock.
  */
@@ -474,24 +549,7 @@ async function planRecipient(
   // until the owner is resumed or approved.
   if (UNAVAILABLE_OWNER_STATUSES.includes(owner.status)) return { state: "owner_unavailable", agentId };
 
-  // A reconciled continuation that can still be delivered to this owner owns
-  // the next turn; its delivery releases these wakes afterwards. One that will
-  // be invalidated (the owner changed) does not hold them back.
-  const [continuation] = await tx
-    .select({ id: issueRecoveryActions.id })
-    .from(issueRecoveryActions)
-    .where(
-      and(
-        eq(issueRecoveryActions.companyId, task.companyId),
-        eq(issueRecoveryActions.sourceIssueId, task.id),
-        inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
-        eq(issueRecoveryActions.status, "resolved"),
-        eq(issueRecoveryActions.returnOwnerAgentId, agentId),
-        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
-      ),
-    )
-    .limit(1);
-  if (continuation) return { state: "continuation_pending", agentId };
+  if (await hasPendingContinuation(tx, task, [agentId])) return { state: "continuation_pending", agentId };
 
   // Held automatic signals are covered once the owner has run on the task
   // after the last of them. A saved comment queue is not: a run queued
@@ -526,27 +584,7 @@ async function planRecipient(
     }
   }
 
-  // A chat retry authorized for this task still owns its next turn.
-  const [delegated] = await tx
-    .select({ id: issueRecoveryActions.id })
-    .from(issueRecoveryActions)
-    .innerJoin(
-      chatActions,
-      and(
-        eq(chatActions.companyId, issueRecoveryActions.companyId),
-        sql`${chatActions.id}::text = ${issueRecoveryActions.evidence}->'continuationDeliveryOwner'->>'actionId'`,
-      ),
-    )
-    .where(
-      and(
-        eq(issueRecoveryActions.companyId, task.companyId),
-        eq(issueRecoveryActions.sourceIssueId, task.id),
-        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'delegated'`,
-        inArray(chatActions.status, IN_FLIGHT_CHAT_ACTION_STATUSES),
-      ),
-    )
-    .limit(1);
-  if (delegated) return { state: "delegated", agentId };
+  if (await hasInFlightChatRetry(tx, task)) return { state: "delegated", agentId };
 
   const key = heldExecutionWaitReleaseIdempotencyKey({ issueId: task.id, agentId, heldWakes: ownerWakes });
   // An interrupted earlier attempt may already have been admitted. Its key
@@ -703,17 +741,27 @@ function combineRecipients(results: HeldExecutionWaitRelease[], finalizedWaitIds
 }
 
 /**
- * Wakes the hold kept back that are not the release's to deliver (mentions of
- * other agents, answers to an agent's question, approvals) are still saved.
- * The held run's own release stood down for the hold, so nothing else would
- * promote them; run that promotion now. It applies every regular gate, and
- * stands down again if the task is held or another run owns it.
+ * Wakes the hold kept back that are not the release's to deliver (mentions,
+ * answers to an agent's question, approvals) are still saved. The held run's
+ * own release stood down for the hold, so nothing else would promote them;
+ * run that promotion now. It applies every regular gate, and stands down
+ * again if the task is held or another run owns it.
+ *
+ * The regular drain promotes a saved wake as an ordinary run, and fails the
+ * wakes of an agent it cannot invoke. So it waits, with a state the sweep
+ * retries, while:
+ * - a reconciled continuation for a recipient is pending, or a chat retry is
+ *   in flight: that turn comes first, in a fresh session, and its delivery
+ *   runs this release again;
+ * - the task is parked (backlog, blocked) and its assignee has wakes saved on
+ *   it, which would check it back out;
+ * - a recipient with wakes saved on the task is paused or awaiting approval.
  */
 async function promoteRemainingHeldWakes(
   db: Db,
   promote: PromoteDeferredWakesAfterHold,
   task: typeof issues.$inferSelect,
-) {
+): Promise<{ promoted: boolean; waiting?: HeldExecutionWaitRelease }> {
   const [saved] = await db
     .select({ id: agentWakeupRequests.id })
     .from(agentWakeupRequests)
@@ -726,7 +774,39 @@ async function promoteRemainingHeldWakes(
       ),
     )
     .limit(1);
-  if (!saved) return false;
+  if (!saved) return { promoted: false };
+  const recipients = releaseRecipients(task);
+  // Recipients with any wake saved on the task, held or queued before the
+  // hold: the drain takes the task's whole queue in order.
+  const owners = recipients.length === 0 ? [] : await db
+    .select({ agentId: agents.id, status: agents.status })
+    .from(agents)
+    .where(
+      and(
+        eq(agents.companyId, task.companyId),
+        inArray(agents.id, recipients),
+        sql`exists (
+          select 1 from ${agentWakeupRequests}
+          where ${agentWakeupRequests.companyId} = ${task.companyId}
+            and ${agentWakeupRequests.agentId} = ${agents.id}
+            and ${agentWakeupRequests.status} = ${DEFERRED_STATUS}
+            and ${agentWakeupRequests.payload}->>'issueId' = ${task.id}
+        )`,
+      ),
+    );
+  // Only a wake of the assignee checks the task out; one of another agent
+  // (a mention) leaves a parked task where it is.
+  if (PARKED_TASK_STATUSES.includes(task.status) && owners.some((owner) => owner.agentId === task.assigneeAgentId)) {
+    return { promoted: false, waiting: { state: "task_parked", agentId: task.assigneeAgentId } };
+  }
+  if (await hasPendingContinuation(db, task, recipients)) {
+    return { promoted: false, waiting: { state: "continuation_pending", agentId: task.assigneeAgentId } };
+  }
+  if (await hasInFlightChatRetry(db, task)) {
+    return { promoted: false, waiting: { state: "delegated", agentId: task.assigneeAgentId } };
+  }
+  const unavailable = owners.find((owner) => UNAVAILABLE_OWNER_STATUSES.includes(owner.status));
+  if (unavailable) return { promoted: false, waiting: { state: "owner_unavailable", agentId: unavailable.agentId } };
   // The legacy run of the most recently closed execution hold on this task:
   // only a legacy run's release stands down while its outcome is held.
   const [held] = await db
@@ -750,9 +830,9 @@ async function promoteRemainingHeldWakes(
     )
     .orderBy(desc(issueRecoveryActions.resolvedAt))
     .limit(1);
-  if (!held) return false;
+  if (!held) return { promoted: false };
   const promoted = await promote({ companyId: task.companyId, issueId: task.id, runId: held.runId });
-  return promoted !== false;
+  return { promoted: promoted !== false };
 }
 
 /**
@@ -793,14 +873,11 @@ export async function releaseHeldExecutionWaits(
 
     const held = await loadHeldWakes(tx, task);
     if (held.length === 0) return { task, outcomes: [{ state: "no_held_wakes" }], finalizedWaitIds: [] };
-    const open = !["done", "cancelled"].includes(task.status);
-    const assigneeAgentId = task.assigneeAgentId && open ? task.assigneeAgentId : null;
+    const assigneeAgentId = task.assigneeAgentId && isOpenTask(task) ? task.assigneeAgentId : null;
     // A pending review stage waits on its participant, who may not be the
     // assignee; that agent's held wakes are its own to receive.
-    const reviewerAgentId = open ? pendingReviewParticipant(task) : null;
-    const recipients = [...new Set([assigneeAgentId, reviewerAgentId].filter(
-      (agentId): agentId is string => typeof agentId === "string",
-    ))];
+    const recipients = releaseRecipients(task);
+    const parked = PARKED_TASK_STATUSES.includes(task.status);
     const others = held.filter((wake) => !recipients.includes(wake.agentId));
 
     // Finalize everything that is not a recipient's. Receipts are replaceable
@@ -824,7 +901,10 @@ export async function releaseHeldExecutionWaits(
     const outcomes: Planned["outcomes"] = [];
     for (const agentId of recipients) {
       const ownerWakes = held.filter((wake) => wake.agentId === agentId);
-      if (ownerWakes.length > 0) outcomes.push(await planRecipient(tx, task, agentId, ownerWakes, now));
+      if (ownerWakes.length === 0) continue;
+      // Parked since the signals were held: they wait for the task to be
+      // back in work (or closed) instead of checking it back out.
+      outcomes.push(parked ? { state: "task_parked", agentId } : await planRecipient(tx, task, agentId, ownerWakes, now));
     }
     if (outcomes.length === 0) outcomes.push({ state: "not_applicable", agentId: assigneeAgentId });
     return { task, outcomes, finalizedWaitIds };
@@ -840,10 +920,13 @@ export async function releaseHeldExecutionWaits(
   if (
     input.promote &&
     (combined.state === "no_held_wakes" || combined.state === "not_applicable") &&
-    !["done", "cancelled"].includes(task.status)
+    isOpenTask(task)
   ) {
     try {
-      combined.promotedDeferredWakes = await promoteRemainingHeldWakes(db, input.promote, task);
+      const promotion = await promoteRemainingHeldWakes(db, input.promote, task);
+      // Not final: the sweep retries until the promotion may run.
+      if (promotion.waiting) return { ...combined, ...promotion.waiting, promotedDeferredWakes: false };
+      combined.promotedDeferredWakes = promotion.promoted;
     } catch (err) {
       // Nothing else promotes them: the sweep retries.
       logger.warn({ err, issueId: task.id }, "Promotion of wakes saved behind a closed execution hold failed");
@@ -885,10 +968,13 @@ export async function deliverReleasedExecutionWaits(
   db: Db,
   wake: Wake,
   now = new Date(),
-  options: { promote?: PromoteDeferredWakesAfterHold } = {},
+  options: { promote?: PromoteDeferredWakesAfterHold; budget?: ExecutionHoldWakeBudget } = {},
 ) {
-  const result = { checked: 0, delivered: 0, covered: 0, finalized: 0, retried: 0 };
+  const result = { checked: 0, delivered: 0, covered: 0, finalized: 0, retried: 0, overBudget: 0 };
   if (!isHeldExecutionWaitReleaseEnabled()) return result;
+  const { budget } = options;
+  const budgetedWake = withWakeBudget(budget, wake);
+  const promote = options.promote ? withWakeBudget(budget, options.promote) : undefined;
   const lookback = new Date(now.getTime() - HELD_EXECUTION_WAIT_RELEASE_LOOKBACK_MS);
   const candidates = await db
     .select({
@@ -929,18 +1015,27 @@ export async function deliverReleasedExecutionWaits(
     .limit(25);
 
   const released = new Map<string, HeldExecutionWaitRelease>();
-  for (const action of candidates) {
+  for (const [index, action] of candidates.entries()) {
+    // Paced: the rest waits, untouched, for a later pass.
+    if (budget && !budget.available()) {
+      result.overBudget = candidates.length - index;
+      logger.info(
+        { overBudget: result.overBudget },
+        "Held execution wait releases paced by the sweep wake budget; the rest wait for the next pass",
+      );
+      break;
+    }
     result.checked += 1;
     const attemptedAt = now.toISOString();
     try {
       const issueKey = `${action.companyId}:${action.sourceIssueId}`;
       let outcome = released.get(issueKey);
       if (!outcome) {
-        outcome = await releaseHeldExecutionWaits(db, wake, {
+        outcome = await releaseHeldExecutionWaits(db, budgetedWake, {
           companyId: action.companyId,
           issueId: action.sourceIssueId,
           now,
-          promote: options.promote,
+          promote,
         });
         released.set(issueKey, outcome);
         if (outcome.state === "delivered") result.delivered += 1;

@@ -465,6 +465,40 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect(drainCalls).toBe(1);
   });
 
+  it("stands a drain after a hold down while any agent's run is live on the issue", async () => {
+    const companyId = await seedCompany();
+    const reviewerId = await seedAgent({ companyId, name: "Reviewer" });
+    const assigneeId = await seedAgent({ companyId, name: "Assignee" });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: assigneeId });
+    // The held run belongs to another agent than the one with a queued run.
+    const runId = await seedRun({ companyId, agentId: reviewerId, contextSnapshot: { issueId }, status: "failed" });
+    await seedDeferredWake({ companyId, agentId: assigneeId, issueId });
+    await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation", status: "cancelled",
+      fingerprint: `legacy-execution:${runId}`, evidence: { runId },
+      nextAction: "Check the stopped execution.",
+    });
+    // Queued, not yet dispatched: it holds no execution lock on the issue.
+    const queuedId = await seedRun({ companyId, agentId: assigneeId, contextSnapshot: { issueId }, status: "queued" });
+    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+    let drainCalls = 0;
+    const drain = async () => {
+      drainCalls++;
+      return { outcome: { kind: "released" as const }, postCommitEffects: [] };
+    };
+    const release = () =>
+      adapter.withIssueExecutionLock({ companyId, runId, now: new Date(), afterExecutionHold: true }, drain);
+
+    await release();
+    expect(drainCalls).toBe(0);
+    // Once that run is done, its own release has drained; a drain after the
+    // hold may run again.
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, queuedId));
+    await release();
+    expect(drainCalls).toBe(1);
+  });
+
   // Review test (a): a foreign-company agent id produces the current failed
   // wake status and the current error text, and creates no run.
   it("skips preserved handoff receipts for one drain without changing their durable state", async () => {

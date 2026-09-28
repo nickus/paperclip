@@ -39,6 +39,25 @@ export const INERT_RUN_SETTLE_GRACE_MS = 10 * 60_000;
  */
 export const INERT_RUN_RELEASE_RECHECK_MS = 5 * 60_000;
 
+/**
+ * A hold the disposition already settled is reconciled automatically only
+ * while the settlement is this recent. An older one (for example one that
+ * predates this policy) stays with an operator: continuing a task long after
+ * it stopped would surprise the people working on it.
+ *
+ * PAPERCLIP_AUTO_RECONCILE_SETTLED_HOLD_MAX_AGE_HOURS overrides it (a positive
+ * number of hours).
+ */
+export const INERT_RUN_SETTLED_HOLD_MAX_AGE_ENV = "PAPERCLIP_AUTO_RECONCILE_SETTLED_HOLD_MAX_AGE_HOURS";
+export const DEFAULT_INERT_RUN_SETTLED_HOLD_MAX_AGE_MS = 24 * 60 * 60_000;
+
+export function inertRunSettledHoldMaxAgeMs(env: NodeJS.ProcessEnv = process.env) {
+  const raw = env[INERT_RUN_SETTLED_HOLD_MAX_AGE_ENV]?.trim();
+  const hours = raw ? Number(raw) : Number.NaN;
+  // Anything but a positive number keeps the conservative default.
+  return Number.isFinite(hours) && hours > 0 ? hours * 60 * 60_000 : DEFAULT_INERT_RUN_SETTLED_HOLD_MAX_AGE_MS;
+}
+
 const INERT_TERMINAL_STATUSES = ["cancelled", "failed"] as const;
 // Only system bookkeeping may exist for a run that never reached its adapter.
 const INERT_RUN_EVENT_TYPES = ["lifecycle", "error"] as const;
