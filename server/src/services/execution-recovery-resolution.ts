@@ -3,8 +3,9 @@ import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } 
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
 import {
+  agents,
   chatActions,
   environmentLeases,
   heartbeatRuns,
@@ -21,6 +22,16 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import { DIRECT_NON_INVOKABLE_STATUSES } from "./agent-invokability.js";
+import { LEGACY_RECOVERY_CAUSE } from "./legacy-execution-recovery.js";
+import {
+  assessInertLegacyRun,
+  describeInertRunEvidence,
+  inertLegacyRunGraceCondition,
+  inertLegacyRunRowCondition,
+  isInertRunAutoReconcileEnabled,
+  INERT_RUN_RECONCILIATION_POLICY,
+} from "./inert-legacy-execution.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -242,6 +253,14 @@ export async function deliverReconciledExecutions(
           .where(pendingDecision);
         continue;
       }
+      // A paused, terminated or unapproved owner cannot accept the wake. Keep
+      // the delivery pending without a rejected attempt on every sweep; it is
+      // delivered once the owner becomes invokable again.
+      const [owner] = await db
+        .select({ status: agents.status })
+        .from(agents)
+        .where(and(eq(agents.companyId, action.companyId), eq(agents.id, action.returnOwnerAgentId)));
+      if (owner && DIRECT_NON_INVOKABLE_STATUSES.has(owner.status)) continue;
       const run = await wake(action.returnOwnerAgentId, {
         source: "automation",
         triggerDetail: "system",
@@ -389,6 +408,16 @@ export async function settleUnrecoverableExecutions(
         sql`coalesce(${nativeRunFinalizations.failureDetail}->>'successorRunId', '') = ''`,
         sql`(${heartbeatRuns.runtimeMode} <> 'native' or coalesce(${nativeRunFinalizations.failureCode}, '') <> 'native_provider_terminal_failed'
         or coalesce(${nativeRunFinalizations.failureDetail}->>'replacementDenied', '') <> '')`,
+        // A run that stopped before adapter dispatch belongs to the inert-run
+        // reconciliation for a short window, until it is assessed or the
+        // window closes. Blocking it here first would leave a no-replay hold.
+        isInertRunAutoReconcileEnabled()
+          ? not(and(
+            eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+            inertLegacyRunGraceCondition(now),
+            sql`not (${issueRecoveryActions.evidence} ? 'inertRunAssessment')`,
+          )!)
+          : undefined,
       ),
     )
     .limit(25);
@@ -557,4 +586,212 @@ export async function settleUnrecoverableExecutions(
       );
     }
   }
+}
+
+/**
+ * Reconcile legacy execution holds whose source run provably never reached its
+ * adapter. The run stopped in the `preparing` stage, recorded no process,
+ * output, usage, cost or agent API activity, and holds no execution
+ * environment. The decision is the one an operator would record
+ * (`actionOutcome: "not_performed"`, `providerStopped: true`); it goes through
+ * the same validation and delivery path, so the task's owner receives one
+ * continuation and any waits the hold recorded are released.
+ *
+ * Disabled with PAPERCLIP_AUTO_RECONCILE_INERT_RUNS=0. Any doubt keeps the hold.
+ */
+export async function reconcileInertLegacyExecutions(db: Db, now = new Date()) {
+  const result = { checked: 0, reconciled: 0, notInert: 0, awaitingRelease: 0 };
+  if (!isInertRunAutoReconcileEnabled()) return result;
+  const candidates = await db
+    .select({ action: issueRecoveryActions })
+    .from(issueRecoveryActions)
+    .innerJoin(
+      heartbeatRuns,
+      and(
+        eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
+        sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'`,
+        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueRecoveryActions.sourceIssueId}::text`,
+      ),
+    )
+    .where(
+      and(
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        eq(issueRecoveryActions.kind, "active_run_watchdog"),
+        eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+        sql`not (${issueRecoveryActions.evidence} ? 'inertRunAssessment')`,
+        inertLegacyRunRowCondition(),
+      ),
+    )
+    .orderBy(asc(issueRecoveryActions.updatedAt))
+    .limit(25);
+  for (const { action: candidate } of candidates) {
+    const runId = candidate.evidence.runId;
+    if (typeof runId !== "string") continue;
+    result.checked += 1;
+    try {
+      const outcome = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
+        );
+        // Same issue -> coordinator -> run -> action lock order as the
+        // automatic disposition and operator resolution.
+        const [task] = await tx
+          .select()
+          .from(issues)
+          .where(and(eq(issues.companyId, candidate.companyId), eq(issues.id, candidate.sourceIssueId)))
+          .for("update");
+        const [coordinator] = await tx
+          .select()
+          .from(nativeRunFinalizations)
+          .where(and(eq(nativeRunFinalizations.companyId, candidate.companyId), eq(nativeRunFinalizations.runId, runId)))
+          .for("update");
+        const [run] = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.companyId, candidate.companyId), eq(heartbeatRuns.id, runId)))
+          .for("update");
+        const [action] = await tx
+          .select()
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.id, candidate.id))
+          .for("update");
+        if (
+          !task ||
+          !run ||
+          !action ||
+          action.evidence.runId !== run.id ||
+          action.cause !== LEGACY_RECOVERY_CAUSE ||
+          action.kind !== "active_run_watchdog" ||
+          !["active", "escalated"].includes(action.status) ||
+          (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== task.id ||
+          !action.returnOwnerAgentId ||
+          task.assigneeAgentId !== action.returnOwnerAgentId ||
+          ["done", "cancelled"].includes(task.status) ||
+          isSupersededConversationRun(task, run) ||
+          coordinator?.leaseOwner ||
+          coordinator?.resultId ||
+          coordinator?.failureDetail?.successorRunId
+        )
+          return "skipped" as const;
+
+        // Final for this run: hand it back to the regular disposition now.
+        const decline = async (reason: string) => {
+          await tx
+            .update(issueRecoveryActions)
+            .set({
+              evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+                inertRunAssessment: {
+                  policy: INERT_RUN_RECONCILIATION_POLICY,
+                  verdict: "not_inert",
+                  reason,
+                  assessedAt: now.toISOString(),
+                },
+              })}::jsonb`,
+            })
+            .where(eq(issueRecoveryActions.id, action.id));
+          return "not_inert" as const;
+        };
+        const verdict = await assessInertLegacyRun(tx as unknown as Db, run);
+        if (verdict.kind === "awaiting_release") return "awaiting_release" as const;
+        if (verdict.kind === "not_inert") return decline(verdict.reason);
+
+        const decision: ExecutionReconciliation = {
+          runId: run.id,
+          providerStopped: true,
+          actionOutcome: "not_performed",
+          outcomeEvidence: describeInertRunEvidence(verdict.facts),
+        };
+        // The operator path's own checks: owner, run state, process ownership,
+        // coordinator, unreleased environments and a buildable continuation.
+        // A refusal is final; a database error aborts the transaction, so the
+        // marker write fails too and the candidate is retried.
+        try {
+          await validateExecutionReconciliation({
+            db: tx as unknown as Db,
+            companyId: task.companyId,
+            issueId: task.id,
+            agentId: task.assigneeAgentId,
+            sourceRunId: action.evidence.runId,
+            decision,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return decline(`reconciliation_refused: ${message.slice(0, 160)}`);
+        }
+        await markExecutionReconciliation(tx as unknown as Db, action, decision, "execution-recovery");
+        const note =
+          "The stopped run never reached its adapter, so no actions were performed. Reconciled automatically; the task continues in a new run.";
+        await tx
+          .update(issueRecoveryActions)
+          .set({
+            status: "resolved",
+            outcome: "restored",
+            resolvedAt: now,
+            updatedAt: now,
+            nextAction: note,
+            resolutionNote: note,
+            wakePolicy: null,
+            monitorPolicy: null,
+            evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+              inertRunAssessment: {
+                ...verdict.facts,
+                verdict: "inert",
+                assessedAt: now.toISOString(),
+              },
+            })}::jsonb`,
+          })
+          .where(eq(issueRecoveryActions.id, action.id));
+        await persistActivity(tx as unknown as Db, {
+          companyId: run.companyId,
+          actorType: "system",
+          actorId: "execution-recovery",
+          action: "issue.execution_recovery_settled",
+          entityType: "issue",
+          entityId: task.id,
+          runId: run.id,
+          details: {
+            recoveryActionId: action.id,
+            outcome: "restored",
+            actionOutcome: "not_performed",
+            automatic: true,
+            policy: INERT_RUN_RECONCILIATION_POLICY,
+          },
+        });
+        await tx
+          .update(heartbeatRuns)
+          .set({ executionStatusDeliveryId: randomUUID() })
+          .where(eq(heartbeatRuns.id, run.id));
+        await appendHeartbeatRunEvent(tx as unknown as Db, {
+          companyId: run.companyId,
+          agentId: run.agentId,
+          runId: run.id,
+          eventType: "lifecycle",
+          stream: "system",
+          level: "info",
+          message: note,
+          payload: {
+            recoveryActionId: action.id,
+            cause: action.cause,
+            automaticRecovery: INERT_RUN_RECONCILIATION_POLICY,
+            actionOutcome: "not_performed",
+          },
+        });
+        return "reconciled" as const;
+      });
+      if (outcome === "reconciled") {
+        result.reconciled += 1;
+        logger.info(
+          { recoveryActionId: candidate.id, issueId: candidate.sourceIssueId, runId, policy: INERT_RUN_RECONCILIATION_POLICY },
+          "Reconciled an inert legacy execution hold automatically",
+        );
+      } else if (outcome === "not_inert") result.notInert += 1;
+      else if (outcome === "awaiting_release") result.awaitingRelease += 1;
+    } catch (err) {
+      logger.warn(
+        { err, recoveryActionId: candidate.id, issueId: candidate.sourceIssueId, runId },
+        "Inert execution reconciliation declined; the hold stays with the regular disposition",
+      );
+    }
+  }
+  return result;
 }

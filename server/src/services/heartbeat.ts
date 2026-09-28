@@ -393,7 +393,10 @@ import {
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import {
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  reportSkippedDependencyWake,
+} from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -25700,7 +25703,40 @@ export function heartbeatService(
     }
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+  // A dependency wake that admission does not dispatch leaves only a receipt;
+  // report each one with the gate (and recovery action) that held it.
+  async function enqueueWakeup(
+    agentId: string,
+    opts: WakeupOptions = {},
+    executionWaitRequestId?: string,
+  ): ReturnType<typeof enqueueWakeupUnreported> {
+    if (opts.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON)
+      return enqueueWakeupUnreported(agentId, opts, executionWaitRequestId);
+    // Receipts are stamped by the database clock; allow for skew.
+    const observedFrom = new Date(Date.now() - 5_000);
+    const issueId =
+      readNonEmptyString(opts.payload?.issueId) ??
+      readNonEmptyString(opts.contextSnapshot?.issueId);
+    const report = (error?: unknown) =>
+      reportSkippedDependencyWake(db, {
+        agentId,
+        issueId,
+        idempotencyKey: opts.idempotencyKey ?? null,
+        observedFrom,
+        error,
+      });
+    let run: Awaited<ReturnType<typeof enqueueWakeupUnreported>>;
+    try {
+      run = await enqueueWakeupUnreported(agentId, opts, executionWaitRequestId);
+    } catch (error) {
+      await report(error);
+      throw error;
+    }
+    if (!run) await report();
+    return run;
+  }
+
+  async function enqueueWakeupUnreported(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
