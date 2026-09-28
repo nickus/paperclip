@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -260,5 +260,118 @@ describe("managed GitHub launcher environment", () => {
       runId: "run-failure", target: fixture.target, cwd: fixture.root, env: {},
     })).rejects.toThrow("Could not resolve remote PATH for managed GitHub launchers");
     expect(fixture.runner.execute).toHaveBeenCalledTimes(1);
+  });
+
+  describe("staged PATH rc (BASH_ENV / .profile / zsh dotfiles)", () => {
+    // Every one of these sources a real staged rc file with a real `sh`, so a
+    // regression in the generated POSIX text (a bashism, an unquoted glob-able
+    // expansion, an unbalanced quote) fails the test the same way it would
+    // fail an actual login or BASH_ENV-sourcing shell. The PATH under test is
+    // set with a `PATH=...; export PATH;` preamble ahead of the staged
+    // script, not via the executed sh's own spawn env, so command lookup for
+    // `sh` itself keeps using the fixture's real PATH.
+    it("keeps every custom PATH entry and puts the launcher dir first when sourced", async () => {
+      const fixture = await sandbox("custom/bin");
+      const env = await prepareGitHubOperationLaunchers({
+        runId: "run-rc-custom", target: fixture.target, cwd: fixture.root, env: {},
+      });
+      const dir = env.PAPERCLIP_GITHUB_LAUNCHER_DIR!;
+      const script = await readFile(path.join(dir, ".bashrc"), "utf8");
+      const result = await fixture.runner.execute({
+        command: "sh",
+        args: ["-c", `PATH='/custom/a:/custom/b:/custom/c'\nexport PATH\n${script}\nprintf '%s' "$PATH"`],
+      });
+      expect(result.stdout).toBe(`${dir}:/custom/a:/custom/b:/custom/c`);
+    });
+
+    it("does not grow PATH when sourced repeatedly", async () => {
+      const fixture = await sandbox("custom/bin");
+      const env = await prepareGitHubOperationLaunchers({
+        runId: "run-rc-idempotent", target: fixture.target, cwd: fixture.root, env: {},
+      });
+      const dir = env.PAPERCLIP_GITHUB_LAUNCHER_DIR!;
+      const script = await readFile(path.join(dir, ".profile"), "utf8");
+      const result = await fixture.runner.execute({
+        command: "sh",
+        args: ["-c", `PATH='/custom/a:/custom/b'\nexport PATH\n${script}\n${script}\n${script}\nprintf '%s' "$PATH"`],
+      });
+      expect(result.stdout).toBe(`${dir}:/custom/a:/custom/b`);
+    });
+
+    it("moves an already-present launcher dir to the front instead of duplicating it", async () => {
+      const fixture = await sandbox("custom/bin");
+      const env = await prepareGitHubOperationLaunchers({
+        runId: "run-rc-middle", target: fixture.target, cwd: fixture.root, env: {},
+      });
+      const dir = env.PAPERCLIP_GITHUB_LAUNCHER_DIR!;
+      const script = await readFile(path.join(dir, ".zshrc"), "utf8");
+      const result = await fixture.runner.execute({
+        command: "sh",
+        args: ["-c", `PATH='/custom/a:${dir}:/custom/b'\nexport PATH\n${script}\nprintf '%s' "$PATH"`],
+      });
+      expect(result.stdout).toBe(`${dir}:/custom/a:/custom/b`);
+    });
+
+    it("falls back to the staging-time PATH when the sourcing shell's PATH is empty", async () => {
+      const fixture = await sandbox("custom/bin");
+      const env = await prepareGitHubOperationLaunchers({
+        runId: "run-rc-empty", target: fixture.target, cwd: fixture.root, env: {},
+      });
+      const dir = env.PAPERCLIP_GITHUB_LAUNCHER_DIR!;
+      const script = await readFile(path.join(dir, ".zshenv"), "utf8");
+      const result = await fixture.runner.execute({
+        command: "sh", args: ["-c", `unset PATH\n${script}\nprintf '%s' "$PATH"`],
+      });
+      expect(result.stdout).toBe(`${dir}:${fixture.remotePath}`);
+    });
+
+    it("does not glob a PATH entry that contains '*'", async () => {
+      const fixture = await sandbox("custom/bin");
+      // A real matching file, so a stray `for x in $list`/unquoted expansion
+      // in the generated rc would actually expand this instead of silently
+      // no-op'ing on a pattern with nothing to match.
+      const globDir = path.join(fixture.root, "globdir");
+      await mkdir(globDir, { recursive: true });
+      await writeFile(path.join(globDir, "match"), "");
+      const env = await prepareGitHubOperationLaunchers({
+        runId: "run-rc-glob", target: fixture.target, cwd: fixture.root, env: {},
+      });
+      const dir = env.PAPERCLIP_GITHUB_LAUNCHER_DIR!;
+      const script = await readFile(path.join(dir, ".bash_profile"), "utf8");
+      const literalEntry = `${globDir}/*`;
+      const result = await fixture.runner.execute({
+        command: "sh",
+        args: ["-c", `PATH='${literalEntry}:/bin'\nexport PATH\n${script}\nprintf '%s' "$PATH"`],
+        cwd: globDir,
+      });
+      expect(result.stdout).toBe(`${dir}:${literalEntry}:/bin`);
+    });
+
+    it("keeps a tool's own child-shell PATH through BASH_ENV instead of overwriting it with the staging-time PATH", async () => {
+      // Reproduces the real-world failure directly against the filesystem: a
+      // tool (e.g. a test suite) spawns a bash subprocess with its own PATH;
+      // BASH_ENV still points at the staged .bashrc, which every
+      // non-interactive bash sources before running the tool's command.
+      // (Node's async child_process spawn suppresses bash's BASH_ENV
+      // auto-sourcing when the child's stdin is left as an untouched pipe —
+      // which is how the mocked sandbox runner above always spawns — so this
+      // one calls execFileSync directly with stdin ignored, the way a real
+      // non-interactive child bash is normally spawned, against the same
+      // real staged file the mocked runner above wrote to disk.)
+      const fixture = await sandbox("custom/bin");
+      const env = await prepareGitHubOperationLaunchers({
+        runId: "run-rc-bashenv", target: fixture.target, cwd: fixture.root, env: {},
+      });
+      // Resolved up front, on the real local PATH: the test's own fake PATH
+      // below is what the *spawned* bash sees as $PATH, not what this process
+      // uses to locate the bash binary to spawn.
+      const bashBin = (await exec("sh", ["-c", "command -v bash"])).stdout.trim();
+      const stdout = execFileSync(bashBin, ["-c", 'printf "%s" "$PATH"'], {
+        env: { HOME: fixture.root, PATH: "/tool/own/a:/tool/own/b", BASH_ENV: env.BASH_ENV! },
+        stdio: ["ignore", "pipe", "pipe"],
+        encoding: "utf8",
+      });
+      expect(stdout).toBe(`${env.PAPERCLIP_GITHUB_LAUNCHER_DIR}:/tool/own/a:/tool/own/b`);
+    });
   });
 });
