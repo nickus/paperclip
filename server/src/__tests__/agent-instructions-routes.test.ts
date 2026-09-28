@@ -804,6 +804,22 @@ describe("agent instructions bundle routes", () => {
       expect(consumedUpdates).toEqual([]);
     });
 
+    it("refuses an agent write to the legacy prompt template pseudo-file before consuming a card", async () => {
+      mockSuggestOnlyCoach();
+      const { db, consumedUpdates } = consentDb([consentRow()]);
+
+      const res = await requestApp(
+        await createApp(coachActor(), db),
+        (baseUrl) => request(baseUrl).put(FILE_PATH).send({ path: "promptTemplate.legacy.md", content: "{{agent}}" }),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toContain("promptTemplate.legacy.md");
+      expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(consumedUpdates).toEqual([]);
+    });
+
     it("applies the write with a card a board user accepted in an earlier run, and consumes the card", async () => {
       mockSuggestOnlyCoach();
       const { db, consumedUpdates } = consentDb([consentRow()]);
@@ -851,6 +867,20 @@ describe("agent instructions bundle routes", () => {
           instructionsFilePath: "/tmp/agent-1/AGENTS.md",
         }),
       }),
+      expect.any(Object),
+    );
+  });
+
+  it("still lets a board user write the legacy prompt template pseudo-file", async () => {
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .put("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle/file?companyId=company-1")
+      .send({ path: "promptTemplate.legacy.md", content: "Legacy prompt\n" }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "11111111-1111-4111-8111-111111111111" }),
+      "promptTemplate.legacy.md",
+      "Legacy prompt\n",
       expect.any(Object),
     );
   });

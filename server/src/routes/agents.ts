@@ -523,6 +523,9 @@ export function agentRoutes(
     "agentsMdPath",
   ] as const;
   const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET: ReadonlySet<string> = new Set(KNOWN_INSTRUCTIONS_BUNDLE_KEYS);
+  // The pseudo-file path the instructions service maps onto
+  // adapterConfig.promptTemplate (see services/agent-instructions.ts).
+  const LEGACY_PROMPT_TEMPLATE_FILE_PATH = "promptTemplate.legacy.md";
 
   const router = Router();
   const svc = agentService(db);
@@ -5093,6 +5096,15 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    // The legacy pseudo-file is not a bundle file: writing it replaces
+    // adapterConfig.promptTemplate. Agents write real bundle files only.
+    // Checked before authorization so a refused request never consumes an
+    // accepted change consent.
+    if (req.actor.type === "agent" && req.body.path === LEGACY_PROMPT_TEMPLATE_FILE_PATH) {
+      throw forbidden(
+        `Agent-authenticated callers cannot write ${LEGACY_PROMPT_TEMPLATE_FILE_PATH}; write the bundle's entry file instead.`,
+      );
+    }
     await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
