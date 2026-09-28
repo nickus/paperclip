@@ -21,7 +21,12 @@ import {
 import { documentAnnotationService } from "../services/document-annotations.js";
 import { documentService } from "../services/documents.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
-import { buildDocumentReviewContext, buildPlanReviewContext, PLAN_REVIEW_CONTEXT_LIMITS } from "../services/plan-review-context.js";
+import {
+  buildDocumentReviewContext,
+  buildPlanReviewContext,
+  DOCUMENT_REVIEW_CONTEXT_LIMITS,
+  PLAN_REVIEW_CONTEXT_LIMITS,
+} from "../services/plan-review-context.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -822,7 +827,7 @@ describeEmbeddedPostgres("documentAnnotationService", () => {
       .set({ updatedAt: new Date("2026-06-02T00:00:00.000Z") })
       .where(eq(issueDocuments.documentId, newer.id));
 
-    for (let index = 0; index < PLAN_REVIEW_CONTEXT_LIMITS.maxThreads + 1; index += 1) {
+    for (let index = 0; index < DOCUMENT_REVIEW_CONTEXT_LIMITS.maxThreads + 1; index += 1) {
       await annotations.createThread(
         issueId,
         index === 0 ? "run-summary" : "qa-evidence",
@@ -848,8 +853,8 @@ describeEmbeddedPostgres("documentAnnotationService", () => {
 
     expect(context?.documents.map((document) => document.documentKey)).toEqual(["run-summary", "qa-evidence"]);
     expect(context?.totals).toMatchObject({
-      openThreadCount: PLAN_REVIEW_CONTEXT_LIMITS.maxThreads + 1,
-      includedThreadCount: PLAN_REVIEW_CONTEXT_LIMITS.maxThreads,
+      openThreadCount: DOCUMENT_REVIEW_CONTEXT_LIMITS.maxThreads + 1,
+      includedThreadCount: DOCUMENT_REVIEW_CONTEXT_LIMITS.maxThreads,
       omittedThreadCount: 1,
     });
     expect(context?.documents[1]).toMatchObject({ truncated: true });

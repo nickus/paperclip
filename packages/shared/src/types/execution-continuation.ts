@@ -10,6 +10,8 @@ export interface ExecutionContinuationEnvelope {
   };
   originCommentIds: string[];
   objective: string;
+  /** Set when `objective` was cut to the envelope's size budget. */
+  objectiveTruncated?: boolean;
   messages: Array<{
     id: string;
     authorType: string;
@@ -17,6 +19,9 @@ export interface ExecutionContinuationEnvelope {
     /** Run-authored Local CLI comments retain user attribution but are not human direction. */
     createdByRunId?: string | null;
     body: string;
+    /** Set when `body` is a prefix of the comment; `bodyChars` is its full length. */
+    bodyTruncated?: boolean;
+    bodyChars?: number;
     createdAt: string;
     updatedAt: string;
     deleted: boolean;
@@ -65,9 +70,27 @@ export interface ExecutionContinuationEnvelope {
     summary: string | null;
   }>;
   coverage: {
-    kind: "full_task_history" | "task_history_delta";
+    /**
+     * `full_task_history`: every message of the task is in `messages`.
+     * `recent_task_history`: the most recent messages plus the originating
+     * requests; older ones are counted in `omittedMessageCount` and can be
+     * read from `historyPath`.
+     */
+    kind: "full_task_history" | "recent_task_history" | "task_history_delta";
     baseRunId?: string;
     throughCommentId: string | null;
     summaryThroughCommentId: null;
+    totalMessageCount?: number;
+    omittedMessageCount?: number;
+    /** The most recent omitted message ids (at most a few dozen). */
+    omittedMessageIds?: string[];
+    /** API path that lists the task's full message history. */
+    historyPath?: string;
+    omittedInteractionOutcomeCount?: number;
+    omittedHumanResponseCount?: number;
+    omittedCompletedActionCount?: number;
+    omittedRecoveryOutcomeCount?: number;
+    omittedUnresolvedInteractionIdCount?: number;
+    omittedOriginCommentIdCount?: number;
   };
 }

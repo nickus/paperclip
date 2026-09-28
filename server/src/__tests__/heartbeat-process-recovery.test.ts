@@ -8,6 +8,10 @@ import { issueService } from "../services/issues.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import { spawn, type ChildProcess } from "node:child_process";
+import {
+  ADAPTER_ENV_TOO_LARGE_ERROR_CODE,
+  AdapterEnvTooLargeError,
+} from "@paperclipai/adapter-utils/env-payload";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -4294,6 +4298,87 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         retryRunId: retryRun?.id ?? null,
       },
     });
+    mockAdapterExecute.mockClear();
+  });
+
+  it.each([
+    [
+      "the argv/env guard",
+      () =>
+        new AdapterEnvTooLargeError({
+          reason: "single_string",
+          location: "local",
+          largest: { kind: "environment", name: "LARGE_TOOL_CONFIG", bytes: 400_000 },
+          totalBytes: 410_000,
+          limitBytes: 122_880,
+        }),
+    ],
+    ["a kernel E2BIG", () => Object.assign(new Error("spawn E2BIG"), { code: "E2BIG" })],
+  ])("does not retry an interaction continuation whose process env is too large (%s)", async (_label, makeError) => {
+    const { companyId, agentId, runId, wakeupRequestId, issueId } =
+      await seedQueuedIssueRunFixture();
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      createdByAgentId: agentId,
+      resolvedByUserId: "responsible-user",
+      resolvedAt: new Date("2026-03-19T00:00:00.000Z"),
+      payload: {
+        version: 1,
+        prompt: "Approve the plan?",
+        target: { type: "issue_document", issueId, key: "plan", revisionId: randomUUID() },
+      },
+      result: { version: 1, outcome: "accepted" },
+    });
+    const continuationContext = {
+      issueId,
+      interactionId,
+      interactionKind: "request_confirmation",
+      interactionStatus: "accepted",
+      mutation: "interaction",
+    };
+    await db
+      .update(agentWakeupRequests)
+      .set({ source: "automation", reason: "issue_commented", payload: continuationContext })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        invocationSource: "automation",
+        contextSnapshot: { ...continuationContext, taskId: issueId, wakeReason: "issue_commented" },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+
+    mockAdapterExecute.mockRejectedValueOnce(makeError());
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+
+    const failedRun = await waitForValue(async () => {
+      const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      return row?.status === "failed" ? row : null;
+    });
+    expect(failedRun).toMatchObject({ status: "failed", errorCode: ADAPTER_ENV_TOO_LARGE_ERROR_CODE });
+    const released = await waitForValue(async () => {
+      const [issue] = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      return issue && issue.executionRunId !== runId ? issue : null;
+    });
+    expect(released).not.toBeNull();
+    await waitForHeartbeatIdle(db);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    // Neither the interaction continuation retry nor the immediate recovery
+    // replays a run that fails the same way before any provider work.
+    expect(runs).toHaveLength(1);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
     mockAdapterExecute.mockClear();
   });
 

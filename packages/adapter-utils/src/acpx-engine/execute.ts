@@ -76,6 +76,12 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import {
+  createLocalEnvPayloadFileStore,
+  describeExternalizedEnvPayloads,
+  externalizeEnvPayloads,
+  omitOversizedEnvPayloads,
+} from "@paperclipai/adapter-utils/env-payload";
+import {
   createAcpRuntime,
   createAgentRegistry,
   createRuntimeStore,
@@ -481,6 +487,9 @@ interface AcpxPreparedRuntime {
   // executor can cache/refresh the staged-runtime entry after a clean turn.
   // Null for local runs, the runner-less fallback, and non-remote lanes.
   remoteStagingEnvDelta: Record<string, string> | null;
+  // Removes the host files that carry oversized Paperclip JSON payload
+  // variables for the local lane (see env-payload.ts). Null when none exist.
+  envPayloadCleanup: (() => Promise<void>) | null;
   // Per-session staging lease held from the initial stage-or-reuse decision
   // through the active turn and released only after bridge cleanup completes.
   // This keeps later overlapping runs from re-staging into the same remote
@@ -2488,6 +2497,25 @@ async function buildRuntime(input: {
     await emitRunPhaseTiming(input.ctx, "start_transport", nowMs() - startTransportStart, "failed");
     throw err;
   }
+  // No provider child may carry a large JSON payload in its environment
+  // (E2BIG). The local lane gets oversized payload variables as <NAME>_FILE
+  // files in the run scratch directory. On the remote lane the host relay only
+  // proxies the sandbox process, which gets its environment through the
+  // process-session bridge's launch envelope, so the relay's copy just leaves
+  // them out.
+  let envPayloadCleanup: (() => Promise<void>) | null = null;
+  if (processSessionBridge) {
+    runtimeEnv = omitOversizedEnvPayloads(runtimeEnv);
+  } else {
+    const externalized = await externalizeEnvPayloads(runtimeEnv, () =>
+      createLocalEnvPayloadFileStore(runtimeEnv.PAPERCLIP_RUN_SCRATCH_DIR ?? null),
+    );
+    runtimeEnv = externalized.env;
+    envPayloadCleanup = externalized.directory ? externalized.cleanup : null;
+    if (externalized.files.length > 0) {
+      await input.ctx.onLog("stdout", describeExternalizedEnvPayloads(externalized.files)).catch(() => undefined);
+    }
+  }
   // The relay runs on the host with the sanitized remote launch environment.
   // Its /usr/bin/env node shebang cannot rely on that environment's PATH.
   const overrideCommand = processSessionBridge?.agentCommand
@@ -2538,6 +2566,7 @@ async function buildRuntime(input: {
     remoteManagedHomeTeardown,
     remoteStagingDispose,
     remoteStagingEnvDelta,
+    envPayloadCleanup,
     sessionStagingLeaseRelease,
     remoteExecutionIdentity,
     skillPromptInstructions,
@@ -2695,6 +2724,7 @@ async function stopRunTransport(prepared: AcpxPreparedRuntime): Promise<void> {
   await Promise.allSettled([
     prepared.processSessionBridge?.stop(),
     prepared.paperclipBridge?.stop(),
+    prepared.envPayloadCleanup?.(),
   ]);
 }
 

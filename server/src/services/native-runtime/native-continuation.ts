@@ -15,6 +15,10 @@ export function buildNativeContinuationPrompt(input: {
   const continuation = wake?.executionContinuation;
   const delta = continuation?.resumeDelta;
   if (!wake || !delta || delta.baseRunId !== input.previousRunId) return null;
+  // A bounded continuation can carry only the start of a long message. The
+  // full wake framing says so and where to read the rest; this compact delta
+  // cannot, so it is used only when every delta message is whole.
+  if (delta.messages.some((message) => message.bodyTruncated === true)) return null;
   const rawWake = input.wakePayload && typeof input.wakePayload === "object"
     ? input.wakePayload as Record<string, unknown> : {};
   // Attachment descriptors are intentionally omitted by the generic normalizer.

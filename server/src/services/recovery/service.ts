@@ -512,6 +512,9 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "low_trust_boundary_mismatch",
   "low_trust_requires_sandbox_environment",
   "low_trust_runtime_services_denied",
+  // The run's process argv/env exceeded the kernel limits. Retrying the same
+  // context fails the same way before any provider work starts.
+  "adapter_env_too_large",
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run

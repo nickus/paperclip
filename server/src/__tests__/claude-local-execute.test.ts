@@ -473,6 +473,77 @@ describe("claude execute", () => {
     }
   });
 
+  it("hands an oversized workspace-hints payload to Claude as a file instead of an env var", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-payload-file-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root, {
+      commandWriter: async (target) => {
+        await fs.writeFile(
+          target,
+          `#!/usr/bin/env node
+const fs = require("node:fs");
+const file = process.env.PAPERCLIP_WORKSPACES_FILE || null;
+fs.writeFileSync(process.env.PAPERCLIP_TEST_CAPTURE_PATH, JSON.stringify({
+  inline: "PAPERCLIP_WORKSPACES_JSON" in process.env,
+  wakeInline: "PAPERCLIP_WAKE_PAYLOAD_JSON" in process.env,
+  file,
+  hints: file ? JSON.parse(fs.readFileSync(file, "utf8")) : null,
+  prompt: fs.readFileSync(0, "utf8"),
+}));
+console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-8111-111111111111", result: "ok", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }));
+`,
+          "utf8",
+        );
+        await fs.chmod(target, 0o755);
+      },
+    });
+    // Workspace hints far above the 128 KiB a single env string may have.
+    const paperclipWorkspaces = Array.from({ length: 200 }, (_, index) => ({
+      workspaceId: `workspace-${index}`,
+      cwd: path.join(root, `repo-${index}`),
+      repoUrl: `https://example.com/org/repo-${index}.git`,
+      notes: "n".repeat(2_000),
+    }));
+    try {
+      const result = await execute({
+        runId: "run-payload-file",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          promptTemplate: "Do work.",
+        },
+        context: {
+          issueId: "issue-1",
+          paperclipWorkspaces,
+          paperclipWake: {
+            reason: "issue_commented",
+            issue: { id: "issue-1", identifier: "T-1", title: "Long task", status: "in_progress", priority: "high" },
+            comments: [{ id: "comment-1", body: "Please continue.", authorType: "user" }],
+            commentIds: ["comment-1"],
+          },
+        },
+        authToken: "tok",
+        onLog: async () => {},
+        onMeta: async () => {},
+      });
+      expect(result.exitCode).toBe(0);
+      const captured = JSON.parse(await fs.readFile(capturePath, "utf-8"));
+      expect(captured.inline).toBe(false);
+      expect(captured.wakeInline).toBe(false);
+      expect(captured.file).toEqual(expect.stringContaining("paperclip-env-"));
+      expect(captured.hints).toHaveLength(200);
+      expect(captured.prompt).toContain("Please continue.");
+      // Removed with the run.
+      await expect(fs.access(captured.file)).rejects.toThrow();
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("omits --append-system-prompt-file on a resumed session even when instructionsFile is set", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-resume-"));
     const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);

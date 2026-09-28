@@ -19,6 +19,10 @@ import {
   isRunBriefEnabled,
 } from "./run-brief.js";
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
+import {
+  boundExecutionContinuation,
+  continuationMessageUnchanged,
+} from "./execution-continuation-bounds.js";
 
 export class StaleExecutionContinuationError extends Error {
   constructor(readonly code: "continuation_task_ownership_changed") {
@@ -255,27 +259,23 @@ export async function buildExecutionContinuation(input: {
   const deliveredMessages = Array.isArray(priorEnvelope.messages)
     ? priorEnvelope.messages.map(object)
     : null;
+  // Ids of the messages the resumed provider session has not seen (or saw in
+  // an older version). The delta itself is cut from the bounded message list.
   const resumeDelta =
     deliveredMessages && input.previousContextRunId
       ? {
           baseRunId: input.previousContextRunId,
-          messages: messages.filter(
-            (message) =>
-              originCommentIds.includes(message.id) ||
-              !deliveredMessages.some(
-                (prior) =>
-                  prior.id === message.id &&
-                  prior.updatedAt === message.updatedAt &&
-                  prior.body === message.body &&
-                  prior.deleted === message.deleted &&
-                  prior.authorId === message.authorId &&
-                  (prior.createdByRunId ?? null) === message.createdByRunId &&
-                  JSON.stringify(prior.sourceTrust) ===
-                    JSON.stringify(message.sourceTrust),
-              ),
+          messageIds: new Set(
+            messages
+              .filter(
+                (message) =>
+                  originCommentIds.includes(message.id) ||
+                  !deliveredMessages.some((prior) => continuationMessageUnchanged(prior, message)),
+              )
+              .map((message) => message.id),
           ),
         }
-      : undefined;
+      : null;
   const latestRequest = messages.findLast(
     (row) =>
       row.authorType === "user" && !row.createdByRunId && !row.deleted && row.body.trim().length > 0,
@@ -378,9 +378,8 @@ export async function buildExecutionContinuation(input: {
     (hasConversationContinuationPolicy(lastTerminal.result) ||
       lastTerminal.status === "interrupted" || lastTerminal.errorCode === "process_lost")
     ? lastTerminal.id : undefined);
-  return {
+  const fullEnvelope: ExecutionContinuationEnvelope = {
     ...(interruptedRunId ? { interruptedRunId } : {}),
-    ...(resumeDelta ? { resumeDelta } : {}),
     recoveryOutcomes: reconciliations
       .filter((row) => row.evidence.executionReconciliation)
       .map((row) => ({
@@ -431,4 +430,16 @@ export async function buildExecutionContinuation(input: {
       summaryThroughCommentId: null,
     },
   };
+  // Keep the envelope bounded on long-lived tasks: the originating requests,
+  // the latest request and the most recent messages stay verbatim; older
+  // history is counted and left to the comments API.
+  return boundExecutionContinuation(fullEnvelope, {
+    requiredMessageIds: new Set([
+      ...originCommentIds,
+      ...(latestRequest ? [latestRequest.id] : []),
+    ]),
+    triggerInteractionId: triggerInteraction?.id ?? null,
+    resumeDelta,
+    historyPath: `/api/issues/${issueId}/comments?order=asc`,
+  });
 }
