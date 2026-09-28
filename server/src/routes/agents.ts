@@ -1724,6 +1724,30 @@ export function agentRoutes(
     return actorAgent;
   }
 
+  /**
+   * The execution environment of an agent that another agent creates. A new
+   * agent runs where its creator runs: an omitted environment inherits the
+   * creator's, and naming any other one is refused. Without this, a create
+   * that names no environment falls back to the instance default, which can be
+   * the host itself, so an agent confined to an isolated environment could
+   * place a new agent outside it. The board can still move the new agent.
+   * Board and user actors (`creator` null) keep the requested value.
+   */
+  function resolveAgentCreatedEnvironmentId(
+    creator: { defaultEnvironmentId?: string | null } | null,
+    requested: string | null | undefined,
+  ): string | null | undefined {
+    if (!creator) return requested;
+    const creatorEnvironmentId = creator.defaultEnvironmentId ?? null;
+    if (requested === undefined || requested === null) return creatorEnvironmentId;
+    if (requested !== creatorEnvironmentId) {
+      throw forbidden(
+        "An agent can only create agents in its own execution environment. Omit defaultEnvironmentId; the board can move the new agent afterwards.",
+      );
+    }
+    return requested;
+  }
+
   async function assertBoardCanManageAgentsForCompany(req: Request, companyId: string) {
     assertBoard(req);
     assertCompanyAccess(req, companyId);
@@ -4389,7 +4413,7 @@ export function agentRoutes(
 
   router.post("/companies/:companyId/agent-hires", validate(createAgentHireSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertCanCreateAgentsForCompany(req, companyId);
+    const hiringAgent = await assertCanCreateAgentsForCompany(req, companyId);
     const sourceIssueIds = parseSourceIssueIds(req.body);
     const {
       desiredSkills: requestedDesiredSkills,
@@ -4408,6 +4432,7 @@ export function agentRoutes(
       onboardingFirstAgent: hireOnboardingFirstAgent,
       ...hireInput
     } = req.body;
+    hireInput.defaultEnvironmentId = resolveAgentCreatedEnvironmentId(hiringAgent, hireInput.defaultEnvironmentId);
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
@@ -4678,7 +4703,7 @@ export function agentRoutes(
 
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertCanCreateAgentsForCompany(req, companyId);
+    const creatingAgent = await assertCanCreateAgentsForCompany(req, companyId);
 
     const company = await db
       .select()
@@ -4710,6 +4735,7 @@ export function agentRoutes(
       onboardingFirstAgent: createOnboardingFirstAgent,
       ...createInput
     } = req.body;
+    createInput.defaultEnvironmentId = resolveAgentCreatedEnvironmentId(creatingAgent, createInput.defaultEnvironmentId);
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
