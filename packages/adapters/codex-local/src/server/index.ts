@@ -84,6 +84,8 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(record.workspaceId) ?? readNonEmptyString(record.workspace_id);
     const repoUrl = readNonEmptyString(record.repoUrl) ?? readNonEmptyString(record.repo_url);
     const repoRef = readNonEmptyString(record.repoRef) ?? readNonEmptyString(record.repo_ref);
+    // Sandbox identities only: on an SSH host CODEX_HOME (and with it the
+    // session files) is staged per run, so an SSH session cannot be resumed.
     const remoteExecution = serializeSandboxSessionExecutionIdentity(record.remoteExecution);
     return {
       sessionId,

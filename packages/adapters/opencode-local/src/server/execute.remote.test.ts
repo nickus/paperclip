@@ -98,7 +98,9 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
+import type { AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { execute } from "./execute.js";
+import { sessionCodec } from "./index.js";
 
 describe("opencode remote execution", () => {
   const cleanupDirs: string[] = [];
@@ -397,5 +399,88 @@ describe("opencode remote execution", () => {
       | undefined;
     expect(call?.[2]).toContain("--session");
     expect(call?.[2]).toContain("session-123");
+  });
+
+  it("resumes the session of an earlier run of the same task from the stable SSH workspace", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-stable-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    const key = "0123456789abcdef0123456789abcdef";
+    const stableWorkspace = `/remote/workspace/.paperclip-runtime/workspaces/${key}/workspace`;
+    const target = (leaseId: string): AdapterSshExecutionTarget => ({
+      kind: "remote",
+      transport: "ssh",
+      environmentId: "env-1",
+      leaseId,
+      remoteCwd: "/remote/workspace",
+      spec: {
+        host: "127.0.0.1",
+        port: 2222,
+        username: "fixture",
+        remoteWorkspacePath: "/remote/workspace",
+        remoteCwd: "/remote/workspace",
+        privateKey: "PRIVATE KEY",
+        knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+        strictHostKeyChecking: true,
+      },
+      workspaceReuseKey: key,
+    });
+    const logs: string[] = [];
+    const base = {
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Builder",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      config: { command: "opencode", model: "opencode/gpt-5-nano" },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      onLog: async (_stream: "stdout" | "stderr", chunk: string) => {
+        logs.push(chunk);
+      },
+    };
+
+    const first = await execute({
+      ...base,
+      runId: "run-1",
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: "task-1" },
+      executionTarget: target("lease-1"),
+    });
+    expect(first.sessionParams).toEqual({
+      sessionId: "session_123",
+      cwd: stableWorkspace,
+      remoteExecution: {
+        transport: "ssh",
+        host: "127.0.0.1",
+        port: 2222,
+        username: "fixture",
+        remoteCwd: stableWorkspace,
+      },
+    });
+    // The host stores the session through the codec, as a JSON column.
+    const saved = sessionCodec.deserialize(JSON.parse(JSON.stringify(sessionCodec.serialize(first.sessionParams ?? null))));
+    runChildProcess.mockClear();
+    syncDirectoryToSsh.mockClear();
+
+    await execute({
+      ...base,
+      runId: "run-2",
+      runtime: { sessionId: "session_123", sessionParams: saved, sessionDisplayId: "session_123", taskKey: "task-1" },
+      executionTarget: target("lease-2"),
+    });
+
+    const call = runChildProcess.mock.calls.find((entry) => Array.isArray(entry[2]) && entry[2].includes("run")) as
+      | [string, string, string[], { remoteExecution?: { remoteCwd: string } | null }]
+      | undefined;
+    expect(call?.[2]).toContain("--session");
+    expect(call?.[2]).toContain("session_123");
+    expect(call?.[3].remoteExecution?.remoteCwd).toBe(stableWorkspace);
+    expect(logs.join("")).not.toContain("will not be resumed");
+    // Runtime files of run 2 stay private to run 2.
+    expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: "/remote/workspace/.paperclip-runtime/runs/run-2/opencode/skills",
+    }));
   });
 });

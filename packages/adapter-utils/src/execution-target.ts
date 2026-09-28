@@ -84,6 +84,7 @@ import {
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { isSshWorkspaceReuseKey } from "./ssh-workspace-layout.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import {
   runWithRuntimeParent,
@@ -164,6 +165,14 @@ export interface AdapterSshExecutionTarget
   leaseId?: string | null;
   remoteCwd: string;
   spec: SshRemoteExecutionSpec;
+  /**
+   * Set by the host when this run may stage its workspace at the stable path
+   * of this key (32 lowercase hex characters) instead of a new per-run
+   * directory. The host derives it from the agent, the task and the host
+   * workspace, and hands a key to one run at a time. Absent means the per-run
+   * layout.
+   */
+  workspaceReuseKey?: string | null;
 }
 
 /**
@@ -1433,6 +1442,10 @@ export function parseAdapterExecutionTarget(value: unknown): AdapterExecutionTar
       transport: "ssh",
       environmentId: readStringMeta(parsed, "environmentId"),
       leaseId: readStringMeta(parsed, "leaseId"),
+      // Only a well-formed key survives a round trip; anything else means the per-run layout.
+      ...(isSshWorkspaceReuseKey(parsed.workspaceReuseKey)
+        ? { workspaceReuseKey: parsed.workspaceReuseKey }
+        : {}),
       remoteCwd: spec.remoteCwd,
       spec,
       ...readBridgeSettingsFromParsedTarget(parsed),
@@ -1550,6 +1563,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
       workspaceLocalDir: input.workspaceLocalDir,
       workspaceRemoteDir: input.workspaceRemoteDir,
       syncWorkspace: input.syncWorkspace,
+      workspaceReuseKey: isSshWorkspaceReuseKey(target.workspaceReuseKey) ? target.workspaceReuseKey : null,
       assets: input.assets,
       additionalSources: input.additionalSources,
       onProgress: input.onProgress,
