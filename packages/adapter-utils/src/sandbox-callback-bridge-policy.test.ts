@@ -8,6 +8,7 @@ import {
   createFileSystemSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAuthorizer,
   describeNonCanonicalSandboxCallbackBridgePath,
+  normalizeSandboxCallbackBridgeInstructionWriteAgentIds,
   normalizeSandboxCallbackBridgePolicy,
   sandboxCallbackBridgeDirectories,
   startSandboxCallbackBridgeWorker,
@@ -27,11 +28,14 @@ function agent(request: RouteCase) {
 }
 
 const INSTRUCTION_WRITES_POLICY = "agent-with-instruction-writes" as const;
+// The agents the host lists as running in the run's environment.
+const WRITABLE_AGENTS = ["agent-2", "11111111-1111-4111-8111-111111111111"];
 
-function agentWithInstructionWrites(request: RouteCase) {
+function agentWithInstructionWrites(request: RouteCase, instructionWriteAgentIds: readonly string[] = WRITABLE_AGENTS) {
   return authorizeSandboxCallbackBridgeRequestForPolicy(request, {
     policy: INSTRUCTION_WRITES_POLICY,
     companyId: COMPANY,
+    instructionWriteAgentIds,
   });
 }
 
@@ -259,7 +263,7 @@ const AGENT_DENIED: RouteCase[] = [
   { method: "POST", path: "/api/agents/agent-1/runtime-state/reset-session" },
   { method: "POST", path: "/api/agents/agent-1/claude-login" },
   { method: "POST", path: "/api/companies/co-1/agents" },
-  // Instruction writes (the first two are what `agent-with-instruction-writes` adds).
+  // Instruction writes (the first is what `agent-with-instruction-writes` adds).
   { method: "PUT", path: "/api/agents/agent-2/instructions-bundle/file" },
   { method: "PATCH", path: "/api/agents/agent-2/instructions-bundle" },
   { method: "DELETE", path: "/api/agents/agent-2/instructions-bundle/file" },
@@ -347,10 +351,9 @@ const AGENT_DENIED: RouteCase[] = [
   { method: "TRACE", path: "/api/issues/issue-1" },
 ];
 
-// The only routes `agent-with-instruction-writes` forwards beyond `agent`.
+// The only route `agent-with-instruction-writes` forwards beyond `agent`.
 const INSTRUCTION_WRITES: RouteCase[] = [
   { method: "PUT", path: "/api/agents/agent-2/instructions-bundle/file" },
-  { method: "PATCH", path: "/api/agents/agent-2/instructions-bundle" },
 ];
 
 function isInstructionWrite(request: RouteCase) {
@@ -518,19 +521,53 @@ describe("sandbox callback bridge route policies", () => {
       }
     });
 
-    it("forwards the instruction bundle update and file write, which the agent policy refuses", () => {
+    it("forwards an instruction file write for a listed agent, which the agent policy refuses", () => {
       for (const request of INSTRUCTION_WRITES) {
         expect(agent(request), `${request.method} ${request.path}`).toContain('bridge policy "agent"');
         expect(restricted(request)).toBe(`Route not allowed: ${request.method} ${request.path}`);
         expect(agentWithInstructionWrites(request), `${request.method} ${request.path}`).toBeNull();
       }
-      // Case and trailing-slash variants the server router matches pass too.
+      // Case and trailing-slash variants the server router matches pass too,
+      // and an agent id matches whatever case the path or the list uses.
       for (const request of [
         { method: "put", path: "/api/agents/agent-2/Instructions-Bundle/file" },
         { method: "PUT", path: "/api/agents/agent-2/instructions-bundle/file/" },
-        { method: "PATCH", path: "/API/Agents/agent-2/instructions-bundle/" },
+        { method: "PUT", path: "/API/Agents/AGENT-2/instructions-bundle/file" },
+        { method: "PUT", path: "/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle/file" },
       ]) {
         expect(agentWithInstructionWrites(request), `${request.method} ${request.path}`).toBeNull();
+      }
+      expect(agentWithInstructionWrites(INSTRUCTION_WRITES[0]!, ["  AGENT-2 "])).toBeNull();
+    });
+
+    it("refuses an instruction file write for an agent the host did not list", () => {
+      const denialFor = (request: RouteCase, ids?: readonly string[]) => {
+        const denial = ids === undefined
+          ? agentWithInstructionWrites(request)
+          : agentWithInstructionWrites(request, ids);
+        expect(denial, `${request.method} ${request.path}`).toContain(`bridge policy "${INSTRUCTION_WRITES_POLICY}"`);
+        expect(denial).toContain("agents that run in this run's execution environment");
+        expect(denial).toContain("retrying this route will not succeed");
+      };
+      // Another agent, and a listed agent named by something other than its id.
+      denialFor({ method: "PUT", path: "/api/agents/agent-3/instructions-bundle/file" });
+      denialFor({ method: "PUT", path: "/api/agents/me/instructions-bundle/file" });
+      denialFor({ method: "PUT", path: "/api/agents/agent-2x/instructions-bundle/file" });
+      // No list, an empty list, or a list with nothing usable opens nothing.
+      for (const ids of [[], [""], ["   "]]) {
+        denialFor(INSTRUCTION_WRITES[0]!, ids);
+      }
+      expect(authorizeSandboxCallbackBridgeRequestForPolicy(INSTRUCTION_WRITES[0]!, {
+        policy: INSTRUCTION_WRITES_POLICY,
+        companyId: COMPANY,
+      })).toContain("agents that run in this run's execution environment");
+    });
+
+    it("normalizes the listed agent ids and drops anything that is not a non-empty string", () => {
+      expect(normalizeSandboxCallbackBridgeInstructionWriteAgentIds([" Agent-2 ", "agent-2", "", "  ", 7, null, {}]))
+        .toEqual(["agent-2"]);
+      for (const value of [undefined, null, "agent-2", { 0: "agent-2" }, 1]) {
+        expect(normalizeSandboxCallbackBridgeInstructionWriteAgentIds(value), JSON.stringify(value)).toEqual([]);
       }
     });
 
@@ -548,6 +585,9 @@ describe("sandbox callback bridge route policies", () => {
 
     it("keeps refusing instruction file deletes and every other instruction bundle write", () => {
       for (const request of [
+        // Changing the bundle settings stays closed; a file write needs none.
+        { method: "PATCH", path: "/api/agents/agent-2/instructions-bundle" },
+        { method: "PATCH", path: "/API/Agents/agent-2/instructions-bundle/" },
         { method: "DELETE", path: "/api/agents/agent-2/instructions-bundle/file" },
         { method: "DELETE", path: "/api/agents/agent-2/Instructions-Bundle/file/" },
         { method: "DELETE", path: "/api/agents/agent-2/instructions-bundle" },
@@ -570,17 +610,20 @@ describe("sandbox callback bridge route policies", () => {
       }
     });
 
-    it("keeps the other deny rules in force on the opened instruction routes", () => {
+    it("keeps the other deny rules in force on the opened instruction route", () => {
+      // Listed, so only the other deny rules can refuse these.
+      const listed = [...WRITABLE_AGENTS, "secret-agent", "my-secrets", "agent%2d2"];
       for (const request of [
         // A path segment that names secrets is refused before anything is lifted.
         { method: "PUT", path: "/api/agents/secret-agent/instructions-bundle/file" },
-        { method: "PATCH", path: "/api/agents/my-secrets/instructions-bundle" },
+        { method: "PUT", path: "/api/agents/my-secrets/instructions-bundle/file" },
         // Encoded characters are refused outright.
         { method: "PUT", path: "/api/agents/agent-2/instructions%2Dbundle/file" },
-        { method: "PATCH", path: "/api/agents/agent%2D2/instructions-bundle" },
+        { method: "PUT", path: "/api/agents/agent%2D2/instructions-bundle/file" },
       ]) {
-        expect(agentWithInstructionWrites(request), `${request.method} ${request.path}`)
-          .toContain(`bridge policy "${INSTRUCTION_WRITES_POLICY}"`);
+        const denial = agentWithInstructionWrites(request, listed);
+        expect(denial, `${request.method} ${request.path}`).toContain(`bridge policy "${INSTRUCTION_WRITES_POLICY}"`);
+        expect(denial).toContain("Secret values, credentials");
       }
       for (const request of [
         { method: "PUT", path: "/api/agents/agent-2/instructions-bundle/../file" },
@@ -694,28 +737,34 @@ describe("sandbox callback bridge worker route policy", () => {
     expect(forwarded).toEqual(["GET /api/companies/co-1/heartbeat-runs"]);
   });
 
-  it("forwards instruction bundle writes only under agent-with-instruction-writes, never file deletes", async () => {
+  it("forwards instruction file writes only under agent-with-instruction-writes, for listed agents only", async () => {
     const requests: RouteCase[] = [
       { method: "PUT", path: "/api/agents/agent-2/instructions-bundle/file" },
+      { method: "PUT", path: "/api/agents/agent-3/instructions-bundle/file" },
       { method: "PATCH", path: "/api/agents/agent-2/instructions-bundle" },
       { method: "DELETE", path: "/api/agents/agent-2/instructions-bundle/file" },
     ];
     const opened = await runQueuedRequests(
       requests,
-      createSandboxCallbackBridgeAuthorizer({ policy: INSTRUCTION_WRITES_POLICY, companyId: COMPANY }),
+      createSandboxCallbackBridgeAuthorizer({
+        policy: INSTRUCTION_WRITES_POLICY,
+        companyId: COMPANY,
+        instructionWriteAgentIds: ["agent-2"],
+      }),
     );
-    expect(opened.responses.map((response) => response.status)).toEqual([200, 200, 403]);
-    expect(opened.responses[2]!.body.error).toContain(`bridge policy "${INSTRUCTION_WRITES_POLICY}"`);
-    expect(opened.forwarded).toEqual([
-      "PUT /api/agents/agent-2/instructions-bundle/file",
-      "PATCH /api/agents/agent-2/instructions-bundle",
-    ]);
+    expect(opened.responses.map((response) => response.status)).toEqual([200, 403, 403, 403]);
+    for (const response of opened.responses.slice(1)) {
+      expect(response.body.error).toContain(`bridge policy "${INSTRUCTION_WRITES_POLICY}"`);
+    }
+    expect(opened.forwarded).toEqual(["PUT /api/agents/agent-2/instructions-bundle/file"]);
 
-    const closed = await runQueuedRequests(
-      requests,
-      createSandboxCallbackBridgeAuthorizer({ policy: "agent", companyId: COMPANY }),
-    );
-    expect(closed.responses.map((response) => response.status)).toEqual([403, 403, 403]);
-    expect(closed.forwarded).toEqual([]);
+    for (const authorizer of [
+      createSandboxCallbackBridgeAuthorizer({ policy: INSTRUCTION_WRITES_POLICY, companyId: COMPANY }),
+      createSandboxCallbackBridgeAuthorizer({ policy: "agent", companyId: COMPANY, instructionWriteAgentIds: ["agent-2"] }),
+    ]) {
+      const closed = await runQueuedRequests(requests, authorizer);
+      expect(closed.responses.map((response) => response.status)).toEqual([403, 403, 403, 403]);
+      expect(closed.forwarded).toEqual([]);
+    }
   });
 });

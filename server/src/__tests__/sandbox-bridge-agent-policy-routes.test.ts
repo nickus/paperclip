@@ -153,10 +153,14 @@ function samplePaths(routePath: string): Array<{ path: string; values: Record<st
 
 type RoutePolicy = "agent" | "agent-with-instruction-writes";
 
+// Every sampled agent id is listed as running in the run's environment, so the
+// inventory shows the widest surface the instruction-writes policy can open.
+const LISTED_INSTRUCTION_WRITE_AGENT_IDS = ["sample-id"];
+
 function allowed(policy: RoutePolicy, method: string, path: string): boolean {
   return authorizeSandboxCallbackBridgeRequestForPolicy(
     { method, path },
-    { policy, companyId: RUN_COMPANY_ID },
+    { policy, companyId: RUN_COMPANY_ID, instructionWriteAgentIds: LISTED_INSTRUCTION_WRITE_AGENT_IDS },
   ) === null;
 }
 
@@ -276,18 +280,22 @@ describe("agent bridge policy route inventory", () => {
     }
   });
 
-  it("agent-with-instruction-writes forwards exactly the instruction bundle update and file write on top of agent", () => {
+  it("agent-with-instruction-writes forwards exactly the instruction file write on top of agent", () => {
     const changed = [...new Set(routes
       .filter((route) => classify(route, "agent-with-instruction-writes") !== classify(route))
       .map((route) => `${classify(route, "agent-with-instruction-writes")} ${route.method} ${route.path}`))]
       .sort();
     expect(changed).toEqual([
-      "ALLOW PATCH /api/agents/:id/instructions-bundle",
       "ALLOW PUT /api/agents/:id/instructions-bundle/file",
     ]);
     const byKey = new Map(routes.map((route) => [`${route.method} ${route.path}`, route]));
-    const deleteFile = byKey.get("DELETE /api/agents/:id/instructions-bundle/file");
-    expect(deleteFile, "DELETE /api/agents/:id/instructions-bundle/file is registered").toBeDefined();
-    expect(decisionOf(deleteFile!, "agent-with-instruction-writes")).toBe("deny");
+    for (const key of [
+      "DELETE /api/agents/:id/instructions-bundle/file",
+      "PATCH /api/agents/:id/instructions-bundle",
+    ]) {
+      const route = byKey.get(key);
+      expect(route, `${key} is registered`).toBeDefined();
+      expect(decisionOf(route!, "agent-with-instruction-writes"), key).toBe("deny");
+    }
   });
 });

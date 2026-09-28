@@ -685,13 +685,25 @@ describe("agent instructions bundle routes", () => {
       });
     }
 
-    function bridgeDecision(method: string, path: string, policy: "agent" | "agent-with-instruction-writes") {
-      return authorizeSandboxCallbackBridgeRequestForPolicy({ method, path }, { policy, companyId: "company-1" });
+    // The host lists the target agent as running in the run's environment.
+    function bridgeDecision(
+      method: string,
+      path: string,
+      policy: "agent" | "agent-with-instruction-writes",
+      instructionWriteAgentIds: readonly string[] = [TARGET_AGENT_ID],
+    ) {
+      return authorizeSandboxCallbackBridgeRequestForPolicy(
+        { method, path },
+        { policy, companyId: "company-1", instructionWriteAgentIds },
+      );
     }
 
-    it("passes the bridge only under the opened policy, and never for deletes", () => {
+    it("passes the bridge only for a file write to a listed agent under the opened policy", () => {
       expect(bridgeDecision("PUT", FILE_PATH, "agent-with-instruction-writes")).toBeNull();
-      expect(bridgeDecision("PATCH", BUNDLE_PATH, "agent-with-instruction-writes")).toBeNull();
+      expect(bridgeDecision("PUT", FILE_PATH, "agent-with-instruction-writes", [])).toContain("Route not allowed");
+      expect(bridgeDecision("PUT", FILE_PATH, "agent-with-instruction-writes", [COACH_AGENT_ID]))
+        .toContain("Route not allowed");
+      expect(bridgeDecision("PATCH", BUNDLE_PATH, "agent-with-instruction-writes")).toContain("Route not allowed");
       expect(bridgeDecision("DELETE", FILE_PATH, "agent-with-instruction-writes")).toContain("Route not allowed");
       expect(bridgeDecision("PUT", FILE_PATH, "agent")).toContain("Route not allowed");
       expect(bridgeDecision("PATCH", BUNDLE_PATH, "agent")).toContain("Route not allowed");
@@ -715,7 +727,8 @@ describe("agent instructions bundle routes", () => {
     });
 
     it("still refuses a suggest-only agent's bundle update without an accepted change consent", async () => {
-      expect(bridgeDecision("PATCH", BUNDLE_PATH, "agent-with-instruction-writes")).toBeNull();
+      // The bridge refuses this route; a local run reaches the same check.
+      expect(bridgeDecision("PATCH", BUNDLE_PATH, "agent-with-instruction-writes")).toContain("Route not allowed");
       mockSuggestOnlyCoach();
       const { db } = consentDb([]);
 

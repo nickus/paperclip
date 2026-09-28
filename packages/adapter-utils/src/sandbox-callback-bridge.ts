@@ -504,8 +504,9 @@ const WRITE_METHODS = ["POST", "PUT", "PATCH", "DELETE"] as const;
 
 /**
  * Every write under an agent's instruction bundle. Only the
- * `agent-with-instruction-writes` policy lifts this rule, and only for the
- * requests {@link AGENT_INSTRUCTION_WRITE_BRIDGE_ALLOW_RULES} matches.
+ * `agent-with-instruction-writes` policy lifts this rule, and only for a
+ * request {@link AGENT_INSTRUCTION_FILE_WRITE_BRIDGE_ROUTE} matches whose
+ * target agent the host listed for the run.
  */
 const AGENT_INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE: AgentBridgeRouteRule = {
   methods: WRITE_METHODS,
@@ -513,16 +514,41 @@ const AGENT_INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE: AgentBridgeRouteRule = {
 };
 
 /**
- * The instruction bundle writes the `agent-with-instruction-writes` policy
- * forwards: updating the bundle settings and writing one file. The server
- * decides each one with the same agent configuration check a local run gets,
- * which requires an accepted change consent for agents that may only suggest
- * changes. Deleting a file stays refused under every policy.
+ * The one instruction bundle write the `agent-with-instruction-writes` policy
+ * forwards: writing one file, `PUT /api/agents/:id/instructions-bundle/file`.
+ * The capture is the target agent id. Changing the bundle settings (`PATCH
+ * .../instructions-bundle`) and deleting a file stay refused under every
+ * policy; a file write creates a managed bundle when the agent has none.
  */
-export const AGENT_INSTRUCTION_WRITE_BRIDGE_ALLOW_RULES: readonly AgentBridgeRouteRule[] = [
-  { methods: ["PATCH"], path: /^\/api\/agents\/[^/]+\/instructions-bundle$/ },
-  { methods: ["PUT"], path: /^\/api\/agents\/[^/]+\/instructions-bundle\/file$/ },
-];
+export const AGENT_INSTRUCTION_FILE_WRITE_BRIDGE_ROUTE = {
+  methods: ["PUT"],
+  path: /^\/api\/agents\/([^/]+)\/instructions-bundle\/file$/,
+} as const satisfies AgentBridgeRouteRule;
+
+/**
+ * The target agent id of an instruction file write, lowercased as the path
+ * was, or null when the request is not one.
+ */
+function agentInstructionFileWriteTarget(method: string, matchPath: string): string | null {
+  if (!(AGENT_INSTRUCTION_FILE_WRITE_BRIDGE_ROUTE.methods as readonly string[]).includes(method)) return null;
+  return AGENT_INSTRUCTION_FILE_WRITE_BRIDGE_ROUTE.path.exec(matchPath)?.[1] ?? null;
+}
+
+/**
+ * Normalize the agent ids a run may write instructions for: trimmed,
+ * lowercased, non-empty strings. Anything else is dropped, so a malformed
+ * value never widens the set.
+ */
+export function normalizeSandboxCallbackBridgeInstructionWriteAgentIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const ids = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+    const id = entry.trim().toLowerCase();
+    if (id.length > 0) ids.add(id);
+  }
+  return [...ids];
+}
 
 /**
  * Routes the `agent` policy refuses even when an allow rule below would match.
@@ -684,6 +710,14 @@ function agentPolicyDenial(policy: SandboxCallbackBridgePolicy, method: string, 
   );
 }
 
+function instructionWriteTargetDenial(policy: SandboxCallbackBridgePolicy, method: string, path: string): string {
+  return (
+    `Route not allowed (bridge policy "${policy}"): ${method} ${path}. ` +
+    "Instruction files can only be written for agents that run in this run's execution environment, " +
+    "named by agent id; retrying this route will not succeed."
+  );
+}
+
 export interface SandboxCallbackBridgeAuthorizerOptions {
   /** The route policy. Absent or unknown values mean `restricted`. */
   policy?: SandboxCallbackBridgePolicy | string | null;
@@ -694,6 +728,14 @@ export interface SandboxCallbackBridgeAuthorizerOptions {
    * the bridge, in addition to the server's own company check.
    */
   companyId?: string | null;
+  /**
+   * The agents whose instruction files the `agent-with-instruction-writes`
+   * policy may write, by id: the agents that run in the same execution
+   * environment as this run. A write for any other agent, or for an agent
+   * named by shortname, is refused at the bridge whatever grants the run's
+   * agent holds. Absent or empty means no instruction writes at all.
+   */
+  instructionWriteAgentIds?: readonly string[] | null;
 }
 
 /**
@@ -707,8 +749,10 @@ export interface SandboxCallbackBridgeAuthorizerOptions {
  * the server's router does; it applies the deny rules, then the company
  * check, then the allow families, and refuses everything else.
  * `agent-with-instruction-writes` does the same, except that it lifts the
- * instruction bundle write deny rule for exactly the requests
- * {@link AGENT_INSTRUCTION_WRITE_BRIDGE_ALLOW_RULES} matches and forwards them.
+ * instruction bundle write deny rule for a request
+ * {@link AGENT_INSTRUCTION_FILE_WRITE_BRIDGE_ROUTE} matches, when its target
+ * agent is one of `instructionWriteAgentIds`, and forwards it. Every other
+ * deny rule still applies to that request.
  */
 export function authorizeSandboxCallbackBridgeRequestForPolicy(
   request: Pick<SandboxCallbackBridgeRequest, "method" | "path">,
@@ -732,15 +776,25 @@ export function authorizeSandboxCallbackBridgeRequestForPolicy(
   }
   const lowered = request.path.toLowerCase();
   const matchPath = lowered.length > 1 && lowered.endsWith("/") ? lowered.slice(0, -1) : lowered;
-  // An instruction bundle write this policy opens. Only the instruction bundle
-  // write deny rule is lifted for it; every other deny rule still applies.
-  const openedInstructionWrite =
-    policy === "agent-with-instruction-writes" &&
-    agentPolicyRouteMatches(AGENT_INSTRUCTION_WRITE_BRIDGE_ALLOW_RULES, method, matchPath);
-  const denyRules = openedInstructionWrite
-    ? AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES.filter((rule) => rule !== AGENT_INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE)
-    : AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES;
-  if (agentPolicyRouteMatches(denyRules, method, matchPath)) {
+  // An instruction file write this policy may open. Only the instruction
+  // bundle write deny rule is lifted for it, and only when the host listed its
+  // target agent for this run; every other deny rule still applies.
+  const instructionWriteTarget = policy === "agent-with-instruction-writes"
+    ? agentInstructionFileWriteTarget(method, matchPath)
+    : null;
+  if (instructionWriteTarget !== null) {
+    const otherDenyRules = AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES
+      .filter((rule) => rule !== AGENT_INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE);
+    if (agentPolicyRouteMatches(otherDenyRules, method, matchPath)) {
+      return agentPolicyDenial(policy, method, request.path);
+    }
+    const writableAgentIds = normalizeSandboxCallbackBridgeInstructionWriteAgentIds(options.instructionWriteAgentIds);
+    if (!writableAgentIds.includes(instructionWriteTarget)) {
+      return instructionWriteTargetDenial(policy, method, request.path);
+    }
+    return null;
+  }
+  if (agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES, method, matchPath)) {
     return agentPolicyDenial(policy, method, request.path);
   }
   // A run with no bound company reaches no company-scoped path at all, so a
@@ -751,19 +805,25 @@ export function authorizeSandboxCallbackBridgeRequestForPolicy(
     return `Route not allowed (bridge policy "${policy}"): ${method} ${request.path}. ` +
       "Runs can only reach their own company.";
   }
-  if (openedInstructionWrite || agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, method, matchPath)) {
+  if (agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, method, matchPath)) {
     return null;
   }
   return agentPolicyDenial(policy, method, request.path);
 }
 
-/** Build a request authorizer bound to one policy and run company. */
+/**
+ * Build a request authorizer bound to one policy, run company and set of
+ * agents whose instructions the run may write.
+ */
 export function createSandboxCallbackBridgeAuthorizer(
   options: SandboxCallbackBridgeAuthorizerOptions = {},
 ): (request: Pick<SandboxCallbackBridgeRequest, "method" | "path">) => string | null {
   const bound: SandboxCallbackBridgeAuthorizerOptions = {
     policy: normalizeSandboxCallbackBridgePolicy(options.policy),
     companyId: options.companyId ?? null,
+    instructionWriteAgentIds: Object.freeze(
+      normalizeSandboxCallbackBridgeInstructionWriteAgentIds(options.instructionWriteAgentIds),
+    ),
   };
   return (request) => authorizeSandboxCallbackBridgeRequestForPolicy(request, bound);
 }

@@ -2311,7 +2311,7 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
-  it("forwards instruction bundle writes only when the target's policy opens them", async () => {
+  it("forwards instruction file writes only when the target's policy opens them, for listed agents", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-instructions-"));
     cleanupDirs.push(rootDir);
     const remoteCwd = path.join(rootDir, "workspace");
@@ -2355,6 +2355,8 @@ describe("sandbox adapter execution targets", () => {
     const bundleBody = JSON.stringify({ entryFile: "AGENTS.md" });
     const writes = [
       { method: "PUT", route: "/api/agents/agent-2/instructions-bundle/file", body: fileBody },
+      // An agent the host did not list for this run.
+      { method: "PUT", route: "/api/agents/agent-3/instructions-bundle/file", body: fileBody },
       { method: "PATCH", route: "/api/agents/agent-2/instructions-bundle", body: bundleBody },
       { method: "DELETE", route: "/api/agents/agent-2/instructions-bundle/file?path=AGENTS.md", body: null },
     ];
@@ -2392,22 +2394,35 @@ describe("sandbox adapter execution targets", () => {
 
     try {
       const agentPolicy = await statusesThroughBridge(
-        { ...baseTarget, paperclipApiBridgePolicy: "agent" },
+        { ...baseTarget, paperclipApiBridgePolicy: "agent", paperclipApiBridgeInstructionWriteAgentIds: ["agent-2"] },
         "run-bridge-agent-instructions",
       );
-      expect(agentPolicy.map((result) => result.status)).toEqual([403, 403, 403]);
+      expect(agentPolicy.map((result) => result.status)).toEqual([403, 403, 403, 403]);
+      expect(forwarded).toEqual([]);
+
+      // The policy alone, with no agents listed, opens nothing.
+      const unlisted = await statusesThroughBridge(
+        { ...baseTarget, paperclipApiBridgePolicy: "agent-with-instruction-writes" },
+        "run-bridge-instruction-writes-unlisted",
+      );
+      expect(unlisted.map((result) => result.status)).toEqual([403, 403, 403, 403]);
       expect(forwarded).toEqual([]);
 
       const opened = await statusesThroughBridge(
-        { ...baseTarget, paperclipApiBridgePolicy: "agent-with-instruction-writes" },
+        {
+          ...baseTarget,
+          paperclipApiBridgePolicy: "agent-with-instruction-writes",
+          paperclipApiBridgeInstructionWriteAgentIds: ["agent-2"],
+        },
         "run-bridge-instruction-writes",
       );
-      expect(opened.map((result) => result.status)).toEqual([200, 200, 403]);
-      expect(opened[2]!.error).toContain('bridge policy "agent-with-instruction-writes"');
-      // The two writes reach the API unchanged; the delete never does.
+      expect(opened.map((result) => result.status)).toEqual([200, 403, 403, 403]);
+      for (const result of opened.slice(1)) {
+        expect(result.error).toContain('bridge policy "agent-with-instruction-writes"');
+      }
+      // Only the listed agent's file write reaches the API, unchanged.
       expect(forwarded).toEqual([
         { request: "PUT /api/agents/agent-2/instructions-bundle/file", body: fileBody },
-        { request: "PATCH /api/agents/agent-2/instructions-bundle", body: bundleBody },
       ]);
     } finally {
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));

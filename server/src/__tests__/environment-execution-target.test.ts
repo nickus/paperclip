@@ -357,11 +357,85 @@ describe("resolveEnvironmentExecutionTarget", () => {
       paperclipApiBridgePolicy: "agent",
       paperclipApiBridgeCompanyId: "company-1",
     });
-    expect(await resolveFor({ ...sshConfig, paperclipApiBridgePolicy: "agent-with-instruction-writes" })).toMatchObject({
-      transport: "ssh",
+    expect(await resolveFor({ ...sshConfig, paperclipApiBridgePolicy: "agent" }))
+      .not.toHaveProperty("paperclipApiBridgeInstructionWriteAgentIds");
+  });
+
+  it("lists the agents that run in the run's environment for the instruction-writes policy only", async () => {
+    // Rows the agent query returns: the company's live agents whose default
+    // environment is the run's environment. An adapter that cannot run there
+    // is dropped.
+    const agentRows = [
+      { id: "BBBBBBBB-0000-4000-8000-000000000002", adapterType: "claude_local" },
+      { id: "aaaaaaaa-0000-4000-8000-000000000001", adapterType: "codex_local" },
+      { id: "cccccccc-0000-4000-8000-000000000003", adapterType: "process" },
+    ];
+    const agentQueries: unknown[] = [];
+    const db = {
+      select: () => ({
+        from: () => ({
+          where: async (condition: unknown) => {
+            agentQueries.push(condition);
+            return agentRows;
+          },
+        }),
+      }),
+    };
+    const sshConfig = {
+      host: "ssh.example.test",
+      port: 22,
+      username: "paperclip",
+      remoteWorkspacePath: "/srv/paperclip",
+      privateKey: null,
+      knownHosts: null,
+      strictHostKeyChecking: true,
+    };
+    const resolveFor = async (
+      driver: "ssh" | "sandbox",
+      config: Record<string, unknown>,
+      environmentId: string | null = "env-1",
+    ) => {
+      mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver, config });
+      return resolveEnvironmentExecutionTarget({
+        db: db as never,
+        companyId: "company-1",
+        adapterType: "claude_local",
+        environment: { id: environmentId ?? undefined, driver, config: {} },
+        leaseId: "lease-1",
+        leaseMetadata: {},
+        lease: null,
+        environmentRuntime: null,
+      });
+    };
+    const expectedIds = ["aaaaaaaa-0000-4000-8000-000000000001", "bbbbbbbb-0000-4000-8000-000000000002"];
+
+    expect(await resolveFor("ssh", { ...sshConfig, paperclipApiBridgePolicy: "agent-with-instruction-writes" }))
+      .toMatchObject({
+        transport: "ssh",
+        paperclipApiBridgePolicy: "agent-with-instruction-writes",
+        paperclipApiBridgeCompanyId: "company-1",
+        paperclipApiBridgeInstructionWriteAgentIds: expectedIds,
+      });
+    expect(await resolveFor("sandbox", {
+      provider: "fake-plugin",
+      reuseLease: false,
       paperclipApiBridgePolicy: "agent-with-instruction-writes",
-      paperclipApiBridgeCompanyId: "company-1",
+    })).toMatchObject({
+      transport: "sandbox",
+      paperclipApiBridgePolicy: "agent-with-instruction-writes",
+      paperclipApiBridgeInstructionWriteAgentIds: expectedIds,
     });
+    expect(agentQueries).toHaveLength(2);
+
+    // Other policies, and a run with no environment id, list nobody and never
+    // query agents.
+    for (const policy of [undefined, "agent"]) {
+      expect(await resolveFor("ssh", { ...sshConfig, paperclipApiBridgePolicy: policy }))
+        .not.toHaveProperty("paperclipApiBridgeInstructionWriteAgentIds");
+    }
+    expect(await resolveFor("ssh", { ...sshConfig, paperclipApiBridgePolicy: "agent-with-instruction-writes" }, null))
+      .not.toHaveProperty("paperclipApiBridgeInstructionWriteAgentIds");
+    expect(agentQueries).toHaveLength(2);
   });
 
   it("stamps the environment's bridge policy and the run company on sandbox targets", async () => {
@@ -390,15 +464,6 @@ describe("resolveEnvironmentExecutionTarget", () => {
         paperclipApiBridgePolicy: "agent",
         paperclipApiBridgeCompanyId: "company-1",
       });
-    expect(await resolveFor({
-      provider: "fake-plugin",
-      reuseLease: false,
-      paperclipApiBridgePolicy: "agent-with-instruction-writes",
-    })).toMatchObject({
-      transport: "sandbox",
-      paperclipApiBridgePolicy: "agent-with-instruction-writes",
-      paperclipApiBridgeCompanyId: "company-1",
-    });
   });
 
   it("resolves SSH execution targets for grok_local", async () => {

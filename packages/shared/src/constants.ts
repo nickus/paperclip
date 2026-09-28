@@ -588,12 +588,18 @@ export type EnvironmentDriver = (typeof ENVIRONMENT_DRIVERS)[number];
  *   unscrubbed host output, irreversible deletes, costs, and instance/company
  *   administration). The server still authorizes every forwarded call for
  *   the agent.
- * - `agent-with-instruction-writes` is `agent` plus instruction bundle
- *   writes: `PATCH /api/agents/:id/instructions-bundle` and
- *   `PUT /api/agents/:id/instructions-bundle/file`. The server's agent
- *   configuration check (including the change-consent gate for agents that
- *   may only suggest changes) still decides each write. Deleting instruction
- *   files stays refused.
+ * - `agent-with-instruction-writes` is `agent` plus one instruction write,
+ *   `PUT /api/agents/:id/instructions-bundle/file`, and only for agents whose
+ *   default environment is the run's environment (the host lists their ids
+ *   when the run starts; a shortname or any other agent is refused). The
+ *   server's agent configuration check still decides each write. A direct
+ *   `agents:configure` grant writes with no confirmation; the single root
+ *   CEO agent holds an unscoped one by default, so under this policy it can
+ *   rewrite the instructions of every agent in its environment, its own
+ *   included. An agent with only `agents:suggest-changes` needs a
+ *   change-consent `request_confirmation`, created in an earlier run and
+ *   accepted by a board user. Changing bundle settings, deleting
+ *   instruction files and writing the legacy prompt template stay refused.
  */
 export const SANDBOX_CALLBACK_BRIDGE_POLICIES = ["restricted", "agent", "agent-with-instruction-writes"] as const;
 export type SandboxCallbackBridgePolicy = (typeof SANDBOX_CALLBACK_BRIDGE_POLICIES)[number];
