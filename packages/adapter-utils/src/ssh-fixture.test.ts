@@ -561,6 +561,8 @@ describe("ssh env-lab fixture", () => {
       expect(argv.split(value).length - 1).toBe(0);
     }
     expect(target.stdinPrefix?.split(token).length).toBe(2);
+    // The remote login shell parses the script first; keep it on one line.
+    expect(String(target.args.at(-1))).not.toContain("\n");
     const withoutEnv = await buildSshSpawnTarget({
       spec: {
         host: "ssh.example.test",

@@ -195,14 +195,17 @@ export function buildSshStdinEnvHandoff(
   // Values may span lines; the header counts the lines that follow it.
   const lineCount = exportLines.split("\n").length - 1;
   return {
+    // The script itself stays on one line (the newline comes from printf):
+    // the remote login shell parses it first, and not every login shell
+    // accepts a newline inside quotes.
     read: [
       "{ { IFS= read -r __pc_env_n",
       "&& case $__pc_env_n in ''|*[!0-9]*) false;; esac",
-      "&& __pc_env=",
-      `&& while [ "$__pc_env_n" -gt 0 ]; do IFS= read -r __pc_env_l || exit 125; __pc_env="$__pc_env$__pc_env_l\n"; __pc_env_n=$((__pc_env_n - 1)); done; }`,
+      "&& __pc_env= && __pc_nl=$(printf '\\nx') && __pc_nl=${__pc_nl%x}",
+      `&& while [ "$__pc_env_n" -gt 0 ]; do IFS= read -r __pc_env_l || exit 125; __pc_env="$__pc_env$__pc_env_l$__pc_nl"; __pc_env_n=$((__pc_env_n - 1)); done; }`,
       "|| { echo 'paperclip: could not read the command environment from stdin' >&2; exit 125; }; }",
     ].join(" "),
-    apply: '{ eval "$__pc_env" || exit 125; unset __pc_env __pc_env_l __pc_env_n; }',
+    apply: '{ eval "$__pc_env" || exit 125; unset __pc_env __pc_env_l __pc_env_n __pc_nl; }',
     stdinPrefix: `${lineCount}\n${exportLines}`,
   };
 }
