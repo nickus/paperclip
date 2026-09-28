@@ -76,6 +76,8 @@ describeEmbeddedPostgres("environment of agents created by agents", () => {
     await tempDb?.cleanup();
   });
 
+  // Hires and creates both check the environment driver against the adapter,
+  // so every agent here uses an adapter that can run in a sandbox environment.
   async function seed(options: { requireBoardApprovalForNewAgents: boolean }) {
     const nonce = randomUUID().slice(0, 8);
     const [isolated, other] = await db
@@ -100,7 +102,7 @@ describeEmbeddedPostgres("environment of agents created by agents", () => {
         companyId: company!.id,
         name: "Hiring Manager",
         role: "general",
-        adapterType: "process",
+        adapterType: "codex_local",
         adapterConfig: {},
         runtimeConfig: {},
         permissions: { canCreateAgents: true },
@@ -142,7 +144,7 @@ describeEmbeddedPostgres("environment of agents created by agents", () => {
           .send({
             name: `Builder ${String(defaultEnvironmentId)}`,
             role: "engineer",
-            adapterType: "process",
+            adapterType: "codex_local",
             ...(defaultEnvironmentId === undefined ? {} : { defaultEnvironmentId }),
           });
         expect(res.status, JSON.stringify(res.body)).toBe(201);
@@ -156,7 +158,7 @@ describeEmbeddedPostgres("environment of agents created by agents", () => {
     const before = await agentCount(company.id);
     const res = await request(createApp(db, agentActor))
       .post(`/api/companies/${company.id}/agent-hires`)
-      .send({ name: "Escapee", role: "engineer", adapterType: "process", defaultEnvironmentId: other.id });
+      .send({ name: "Escapee", role: "engineer", adapterType: "codex_local", defaultEnvironmentId: other.id });
 
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("own execution environment");
@@ -167,7 +169,7 @@ describeEmbeddedPostgres("environment of agents created by agents", () => {
     const { company, isolated, agentActor } = await seed({ requireBoardApprovalForNewAgents: false });
     const res = await request(createApp(db, agentActor))
       .post(`/api/companies/${company.id}/agent-hires`)
-      .send({ name: "Teammate", role: "engineer", adapterType: "process", defaultEnvironmentId: isolated.id });
+      .send({ name: "Teammate", role: "engineer", adapterType: "codex_local", defaultEnvironmentId: isolated.id });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await environmentOf(res.body.agent.id)).toBe(isolated.id);
@@ -201,7 +203,7 @@ describeEmbeddedPostgres("environment of agents created by agents", () => {
       companyIds: [company.id],
     }))
       .post(`/api/companies/${company.id}/agent-hires`)
-      .send({ name: "Board pick", role: "engineer", adapterType: "process", defaultEnvironmentId: other.id });
+      .send({ name: "Board pick", role: "engineer", adapterType: "codex_local", defaultEnvironmentId: other.id });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await environmentOf(res.body.agent.id)).toBe(other.id);
