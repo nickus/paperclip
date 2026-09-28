@@ -84,6 +84,17 @@ export const SANDBOX_REUSED_BUILD_DIR_NAMES = [
 ] as const;
 // The reused build directories at any depth, left out of the restore: they
 // belong to the kept sandbox, not to the host workspace.
+//
+// Matching is by directory name only, like the pod-side stash and restore of
+// these directories and like the heavy directory excludes. With
+// `preserveBuildDirs` on, these names are therefore reserved anywhere in the
+// workspace: a source directory that uses one (a tracked `target/` or `venv/`,
+// for example) is still staged into the sandbox, but a run's changes inside it
+// are never restored to the host. This is intentional: build output is not
+// told apart from source by content, and restoring such directories would
+// bring back ones the host deleted. Keep source out of directories with these
+// names, or do not reuse the sandbox for such a workspace (`preserveBuildDirs`
+// is on exactly when the execution target reuses its sandbox).
 const SANDBOX_REUSED_BUILD_DIR_EXCLUDES = SANDBOX_REUSED_BUILD_DIR_NAMES.flatMap((entry) => [
   entry,
   `${entry}/*`,
