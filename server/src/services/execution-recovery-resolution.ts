@@ -216,6 +216,18 @@ export async function deliverReconciledExecutions(
       and(
         eq(issueRecoveryActions.status, "resolved"),
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+        // A paused, terminated or unapproved owner cannot accept the wake. Its
+        // delivery stays pending until the owner is invokable again, and is
+        // left out of the batch so it never crowds out deliverable rows.
+        sql`not exists (
+          select 1 from ${agents}
+          where ${agents.companyId} = ${issueRecoveryActions.companyId}
+            and ${agents.id} = ${issueRecoveryActions.returnOwnerAgentId}
+            and ${agents.status} in (${sql.join(
+              [...DIRECT_NON_INVOKABLE_STATUSES].map((status) => sql`${status}`),
+              sql`, `,
+            )})
+        )`,
       ),
     )
     .limit(25);
@@ -253,14 +265,6 @@ export async function deliverReconciledExecutions(
           .where(pendingDecision);
         continue;
       }
-      // A paused, terminated or unapproved owner cannot accept the wake. Keep
-      // the delivery pending without a rejected attempt on every sweep; it is
-      // delivered once the owner becomes invokable again.
-      const [owner] = await db
-        .select({ status: agents.status })
-        .from(agents)
-        .where(and(eq(agents.companyId, action.companyId), eq(agents.id, action.returnOwnerAgentId)));
-      if (owner && DIRECT_NON_INVOKABLE_STATUSES.has(owner.status)) continue;
       const run = await wake(action.returnOwnerAgentId, {
         source: "automation",
         triggerDetail: "system",

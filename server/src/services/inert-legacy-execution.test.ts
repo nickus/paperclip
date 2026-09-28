@@ -4,6 +4,7 @@ import {
   describeInertRunEvidence,
   INERT_RUN_AUTO_RECONCILE_ENV,
   isInertRunAutoReconcileEnabled,
+  isOperatorStoppedRun,
 } from "./inert-legacy-execution.js";
 
 const inert = {
@@ -28,6 +29,8 @@ const inert = {
   scheduledRetryAttempt: 0,
   scheduledRetryReason: null,
   contextSnapshot: { issueId: "issue-1" },
+  errorCode: "agent_paused" as string | null,
+  resultJson: null as Record<string, unknown> | null,
 };
 
 describe("assessInertLegacyRunRow", () => {
@@ -59,8 +62,21 @@ describe("assessInertLegacyRunRow", () => {
     ["token usage", { usageJson: { usage: { inputTokens: 12 } } }, "usage_recorded"],
     ["consumed retries", { scheduledRetryAttempt: 2 }, "retry_budget_consumed"],
     ["reconciled continuation", { contextSnapshot: { source: "execution.reconciled" } }, "continuation_of_reconciled_run"],
+    ["a board Stop", { resultJson: { cancelledByActorType: "user", cancelledByUserId: "user-1" } }, "operator_stopped"],
+    ["a board-attributed stop", { resultJson: { cancelledByActorType: "board" } }, "operator_stopped"],
+    ["an interrupt by comment", { errorCode: "operator_interrupted" }, "operator_stopped"],
+    ["a chat control stop", { errorCode: "chat_control_completed_source" }, "operator_stopped"],
+    ["an unresolved chat control stop", { errorCode: "chat_control_recovery_proof_unresolved" }, "operator_stopped"],
   ] as const)("refuses a run with %s", (_label, patch, reason) => {
     expect(assessInertLegacyRunRow({ ...inert, ...patch } as typeof inert)).toEqual({ inert: false, reason });
+  });
+});
+
+describe("isOperatorStoppedRun", () => {
+  it("does not treat system stops as operator stops", () => {
+    expect(isOperatorStoppedRun({ errorCode: "agent_paused", resultJson: null })).toBe(false);
+    expect(isOperatorStoppedRun({ errorCode: "cancelled", resultJson: { cancelledByActorType: "agent" } })).toBe(false);
+    expect(isOperatorStoppedRun({ errorCode: null, resultJson: {} })).toBe(false);
   });
 });
 

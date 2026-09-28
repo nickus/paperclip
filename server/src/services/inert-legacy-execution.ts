@@ -7,6 +7,10 @@ import {
   heartbeatRuns,
   type Db,
 } from "@paperclipai/db";
+import {
+  CHAT_CONTROL_RECOVERY_STOP_CODE,
+  CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
+} from "./chat-control-recovery-stop.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
@@ -33,6 +37,29 @@ const INERT_TERMINAL_STATUSES = ["cancelled", "failed"] as const;
 // Only system bookkeeping may exist for a run that never reached its adapter.
 const INERT_RUN_EVENT_TYPES = ["lifecycle", "error"] as const;
 const RELEASED_LEASE_STATUSES = ["released", "expired", "failed"] as const;
+// Error codes of deliberate operator stops: interrupt-by-comment and the chat
+// control stops. The board Stop and subtree pause/cancel routes stamp
+// `resultJson.cancelledByActorType` instead.
+const OPERATOR_STOP_ERROR_CODES = [
+  "operator_interrupted",
+  CHAT_CONTROL_RECOVERY_STOP_CODE,
+  CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
+] as const;
+const OPERATOR_STOP_ACTOR_TYPES = ["user", "board"] as const;
+
+/**
+ * True when an operator deliberately stopped the run (board Stop, subtree
+ * pause/cancel, interrupt-by-comment, chat control stop). Recovery stands down
+ * for these runs, and an automatic continuation would undo the operator's
+ * decision, so their holds always stay with an operator. An agent or budget
+ * pause is not a stop of this kind: the continuation waits until the agent can
+ * be invoked again.
+ */
+export function isOperatorStoppedRun(run: Pick<Run, "errorCode" | "resultJson">) {
+  if ((OPERATOR_STOP_ERROR_CODES as readonly string[]).includes(run.errorCode ?? "")) return true;
+  const actorType = run.resultJson?.cancelledByActorType;
+  return typeof actorType === "string" && (OPERATOR_STOP_ACTOR_TYPES as readonly string[]).includes(actorType);
+}
 
 export function isInertRunAutoReconcileEnabled(env: NodeJS.ProcessEnv = process.env) {
   const value = env[INERT_RUN_AUTO_RECONCILE_ENV]?.trim().toLowerCase();
@@ -44,7 +71,8 @@ export function isInertRunAutoReconcileEnabled(env: NodeJS.ProcessEnv = process.
  * controller claims a run in the `preparing` stage and moves it to
  * `dispatching` (while still running) immediately before `adapter.execute`.
  * A terminal run still in `preparing` therefore never handed work to a
- * provider. Null-safe: every branch evaluates to true or false.
+ * provider. Runs an operator stopped are excluded (see `isOperatorStoppedRun`).
+ * Null-safe: every branch evaluates to true or false.
  */
 export function inertLegacyRunRowCondition(): SQL {
   return sql`(
@@ -62,6 +90,14 @@ export function inertLegacyRunRowCondition(): SQL {
     and ${heartbeatRuns.lastOutputAt} is null
     and ${heartbeatRuns.lastOutputSeq} = 0
     and coalesce(${heartbeatRuns.lastOutputBytes}, 0) = 0
+    and coalesce(${heartbeatRuns.errorCode}, '') not in (${sql.join(
+      OPERATOR_STOP_ERROR_CODES.map((code) => sql`${code}`),
+      sql`, `,
+    )})
+    and coalesce(${heartbeatRuns.resultJson}->>'cancelledByActorType', '') not in (${sql.join(
+      OPERATOR_STOP_ACTOR_TYPES.map((actorType) => sql`${actorType}`),
+      sql`, `,
+    )})
   )`;
 }
 
@@ -128,12 +164,16 @@ export function assessInertLegacyRunRow(
     | "scheduledRetryAttempt"
     | "scheduledRetryReason"
     | "contextSnapshot"
+    | "errorCode"
+    | "resultJson"
   >,
 ): { inert: true } | { inert: false; reason: string } {
   const fail = (reason: string) => ({ inert: false as const, reason });
   if (run.runtimeMode !== "legacy") return fail("runtime_not_legacy");
   if (!(INERT_TERMINAL_STATUSES as readonly string[]).includes(run.status)) return fail("status_not_eligible");
   if (!run.finishedAt) return fail("not_finished");
+  // The operator chose to stop this run; continuing it would undo that choice.
+  if (isOperatorStoppedRun(run)) return fail("operator_stopped");
   // Null means the run predates the dispatch fence, or never used it: unknown.
   if (run.executionStage !== "preparing") return fail("adapter_dispatch_not_excluded");
   if (run.processPid != null || run.processGroupId != null || run.processStartedAt)

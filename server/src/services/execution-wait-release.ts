@@ -293,9 +293,12 @@ async function releaseForAction(
       triggerDetail: "system",
       reason: "issue_recovery_action_restored",
       idempotencyKey: heldExecutionWaitReleaseIdempotencyKey(action.id),
+      // The closed action is referenced as `releasedRecoveryActionId`, never as
+      // `recoveryActionId`: that key makes the wake recovery-scoped, so the
+      // agent would be told to recover the task instead of doing the work.
       payload: {
         issueId: task.id,
-        recoveryActionId: action.id,
+        releasedRecoveryActionId: action.id,
         mutation: "execution_hold_released",
         releasedExecutionWaitIds: ownerReceipts.map((receipt) => receipt.id),
         heldSignalCount: ownerReceipts.reduce((sum, receipt) => sum + 1 + (receipt.coalescedCount ?? 0), 0),
@@ -307,7 +310,7 @@ async function releaseForAction(
         taskId: task.id,
         wakeReason: "issue_recovery_action_restored",
         source: HELD_EXECUTION_WAIT_RELEASE_SOURCE,
-        recoveryActionId: action.id,
+        releasedRecoveryActionId: action.id,
       },
     });
   } catch (err) {

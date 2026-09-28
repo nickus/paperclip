@@ -52,6 +52,8 @@ import {
   reportSkippedDependencyWake,
 } from "../services/issue-dependency-wakeups.js";
 import { logger } from "../middleware/logger.js";
+import { buildPaperclipWakePayload } from "../services/heartbeat.js";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -137,6 +139,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
     issueId: string;
     finishedAt?: Date;
     overrides?: Partial<typeof heartbeatRuns.$inferInsert>;
+    stop?: Partial<typeof heartbeatRuns.$inferInsert>;
   }) {
     const runId = randomUUID();
     const finishedAt = input.finishedAt ?? new Date();
@@ -169,7 +172,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       db,
       run: run!,
       status: "cancelled",
-      patch: { finishedAt, error: "Cancelled due to agent pause", errorCode: "agent_paused" },
+      patch: { finishedAt, error: "Cancelled due to agent pause", errorCode: "agent_paused", ...input.stop },
     });
     expect(updated?.status).toBe("cancelled");
     return updated!;
@@ -423,6 +426,93 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       });
     });
 
+    it("keeps a board operator's Stop: no automatic continuation", async () => {
+      const { companyId, agentId, issueId } = await seedCompany();
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId, agentId, invocationSource: "assignment", status: "running",
+        runtimeMode: "legacy", executionStage: "preparing", controllerBootId: randomUUID(),
+        startedAt: new Date(Date.now() - 30_000), contextSnapshot: { issueId }, nextEventSeq: 10,
+      });
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      // The call the board-only run cancel route makes.
+      const cancelled = await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: null },
+      });
+      expect(cancelled).toMatchObject({ status: "cancelled", executionStage: "preparing" });
+      const [action] = await legacyActions(issueId);
+      expect(action).toMatchObject({ status: "active" });
+
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 0, reconciled: 0 });
+      // No reconciliation window either: the regular disposition applies at once.
+      await settleUnrecoverableExecutions(db, new Date());
+      const [settled] = await legacyActions(issueId);
+      expect(settled).toMatchObject({ status: "resolved", evidence: { automaticRecovery: { replay: "blocked" } } });
+      expect(settled!.evidence).not.toHaveProperty("executionReconciliation");
+
+      const wake = vi.fn();
+      await deliverReconciledExecutions(db, wake as never);
+      expect(wake).not.toHaveBeenCalled();
+      expect(await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued"),
+      ))).toHaveLength(0);
+    });
+
+    it.each([
+      ["a subtree pause or cancel", { resultJson: { cancelledByActorType: "user", cancelledByUserId: null } }],
+      ["an interrupt by comment", { errorCode: "operator_interrupted" }],
+      ["a chat control stop", { errorCode: "chat_control_completed_source" }],
+    ])("leaves a run stopped by %s to an operator", async (_label, stop) => {
+      const { companyId, agentId, issueId } = await seedCompany();
+      await seedStoppedRun({ companyId, agentId, issueId, stop });
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ checked: 0, reconciled: 0 });
+      await settleUnrecoverableExecutions(db, new Date());
+      expect((await legacyActions(issueId))[0]).toMatchObject({
+        status: "resolved",
+        evidence: { automaticRecovery: { replay: "blocked" } },
+      });
+    });
+
+    it("does not let continuations waiting for paused owners crowd out other owners", async () => {
+      const paused = await seedCompany();
+      for (let i = 0; i < 25; i += 1) {
+        const issueId = randomUUID();
+        await db.insert(issues).values({
+          id: issueId, companyId: paused.companyId, title: `Task ${i}`, status: "in_progress",
+          priority: "medium", assigneeAgentId: paused.agentId, issueNumber: 10 + i,
+          identifier: `PS-${i}-${issueId.slice(0, 4)}`,
+        });
+        await seedStoppedRun({ companyId: paused.companyId, agentId: paused.agentId, issueId });
+      }
+      await seedStoppedRun(paused);
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, paused.agentId));
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 25 });
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
+
+      const active = await seedCompany();
+      const [activeAction] = await (async () => {
+        await seedStoppedRun(active);
+        expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
+        return legacyActions(active.issueId);
+      })();
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      await deliverReconciledExecutions(db, wake);
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect(wake).toHaveBeenCalledWith(active.agentId, expect.objectContaining({
+        idempotencyKey: `execution-reconciliation:${activeAction!.id}`,
+      }));
+      const pausedPending = (await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.companyId, paused.companyId)))
+        .filter((row) => row.evidence.continuationDelivery === "pending");
+      expect(pausedPending).toHaveLength(26);
+
+      // Delivered once the owner is invokable again.
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, paused.agentId));
+      await deliverReconciledExecutions(db, wake);
+      expect(wake).toHaveBeenCalledTimes(26);
+    });
+
     it("does not chain automatic continuations", async () => {
       const { companyId, agentId, issueId } = await seedCompany();
       await seedStoppedRun({
@@ -545,12 +635,18 @@ describeEmbeddedPostgres("execution recovery holds", () => {
         idempotencyKey: heldExecutionWaitReleaseIdempotencyKey(action.id),
         payload: expect.objectContaining({
           issueId,
-          recoveryActionId: action.id,
+          releasedRecoveryActionId: action.id,
           releasedExecutionWaitIds: [receipt.id],
           heldSignalCount: 2,
         }),
-        contextSnapshot: expect.objectContaining({ issueId, source: "execution.hold_released" }),
+        contextSnapshot: expect.objectContaining({
+          issueId, source: "execution.hold_released", releasedRecoveryActionId: action.id,
+        }),
       }));
+      // Not recovery-scoped: the released wake asks for the work itself.
+      const [, opts] = wake.mock.calls[0] as unknown as [string, { payload: object; contextSnapshot: object }];
+      expect(opts.payload).not.toHaveProperty("recoveryActionId");
+      expect(opts.contextSnapshot).not.toHaveProperty("recoveryActionId");
       const [released] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id));
       expect(released!.payload).toMatchObject({
         executionWait: { releasedByRecoveryActionId: action.id, releaseOutcome: "delivered", releaseRunId: runId },
@@ -561,6 +657,28 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       // Idempotent across sweeps.
       expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ checked: 0 });
       expect(wake).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["cancelled by an operator", { status: "cancelled", outcome: "cancelled" }],
+      ["restored by an operator", { status: "resolved", outcome: "restored" }],
+    ] as const)("tells the owner to do the work, not to recover, when the hold was %s", async (_label, closed) => {
+      const { companyId, agentId, issueId, action } = await holdDependencyAndCommentWakes();
+      await db.update(issueRecoveryActions).set({ ...closed, resolvedAt: new Date(), updatedAt: new Date() })
+        .where(eq(issueRecoveryActions.id, action.id));
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      expect(await deliverReleasedExecutionWaits(db, wake)).toMatchObject({ delivered: 1 });
+      const [, opts] = wake.mock.calls[0] as unknown as [string, { contextSnapshot: Record<string, unknown> }];
+
+      // Render exactly what the adapter would receive for this wake.
+      const wakePayload = await buildPaperclipWakePayload({
+        db, companyId, agentId, contextSnapshot: { ...opts.contextSnapshot },
+      });
+      expect(wakePayload).toMatchObject({ reason: "issue_recovery_action_restored", recovery: null });
+      const prompt = renderPaperclipWakePrompt(wakePayload);
+      expect(prompt).toContain("Ship the feature");
+      expect(prompt).not.toContain("Recovery contract");
+      expect(prompt).not.toContain("recovery cause:");
     });
 
     it("does not wake again when the owner already ran on the task after the held signals", async () => {
