@@ -1049,6 +1049,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           return { providerLeaseId: `sandbox-${acquiredSandboxes}`, metadata: leaseMetadata };
         }
         if (method === "environmentReleaseLease") return undefined;
+        // The stop-and-retain release of the first run keeps its sandbox.
+        if (method === "environmentStopLease") return { providerLeaseId: params.providerLeaseId, state: "stopped" };
         if (method === "environmentResumeLease") {
           // Hold both resumes until the other has also picked the released
           // lease, so both runs reach the lease handoff with the same lease.
@@ -1063,6 +1065,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         supportedMethods: [
           "environmentResumeLease",
           "environmentReleaseLease",
+          "environmentStopLease",
           "environmentDestroyLease",
         ],
       })),
