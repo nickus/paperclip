@@ -82,6 +82,14 @@ export const SANDBOX_REUSED_BUILD_DIR_NAMES = [
   ".mypy_cache",
   ".tox",
 ] as const;
+// The reused build directories at any depth, left out of the restore: they
+// belong to the kept sandbox, not to the host workspace.
+const SANDBOX_REUSED_BUILD_DIR_EXCLUDES = SANDBOX_REUSED_BUILD_DIR_NAMES.flatMap((entry) => [
+  entry,
+  `${entry}/*`,
+  `*/${entry}`,
+  `*/${entry}/*`,
+]);
 
 export interface SandboxRemoteExecutionSpec {
   transport: "sandbox";
@@ -1247,6 +1255,11 @@ export async function prepareSandboxManagedRuntime(input: {
     input.preserveAbsentOnRestore,
     input.workspaceExclude,
     gitIgnoredExcludes,
+    // A reused sandbox keeps its build directories between runs (see
+    // `preserveBuildDirs`), including ones the host no longer has. Restoring
+    // them would bring back a directory the host deleted, for example in a
+    // workspace another task's run shares.
+    input.preserveBuildDirs ? SANDBOX_REUSED_BUILD_DIR_EXCLUDES : undefined,
   );
   const repositories = gitSnapshot?.repositories ?? [];
   const workspaceRestoreExclude = mergeExcludes(restoreExclude, repositories.map((repo) => repo.path));
@@ -1791,6 +1804,7 @@ export async function prepareSandboxManagedRuntime(input: {
                 workspaceInboundMode: "adopt_remote",
                 workspaceGitSnapshot: repository.snapshot,
                 workspaceExclude: nestedExclude,
+                preserveBuildDirs: input.preserveBuildDirs,
                 workspaceBaseline: {
                   exclude: mergeExcludes(
                     SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
