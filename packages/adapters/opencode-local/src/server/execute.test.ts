@@ -439,4 +439,82 @@ describe("execute — model-endpoint preflight", () => {
     expect(result.errorCode ?? null).toBeNull();
     expect(runProcessMock).toHaveBeenCalledTimes(1);
   });
+
+  it("unreachable: sets bootstrap execution-recovery evidence so the server can safely retry", async () => {
+    fetchMock.mockRejectedValue(new Error("ECONNREFUSED"));
+
+    const result = await execute(baseCtx());
+
+    expect(result.errorCode).toBe("model_endpoint_unreachable");
+    expect(result.resultJson).toMatchObject({
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+    });
+  });
+
+  it("unresolved {env:VAR} placeholder: fails open instead of failing closed on a URL fetch cannot parse", async () => {
+    // expandEnvPlaceholders (runtime-config.ts) deliberately leaves a
+    // placeholder intact when the server-side env lacks the variable, for
+    // OpenCode itself to resolve at spawn time. Passing that straight to
+    // fetch() throws "Failed to parse URL", which must not fail the run.
+    vi.stubEnv(
+      "PAPERCLIP_OPENCODE_PROVIDERS",
+      JSON.stringify({ acme_gateway: { options: { baseURL: "{env:GATEWAY_BASE_URL}" } } }),
+    );
+
+    const result = await execute(baseCtx());
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.errorCode ?? null).toBeNull();
+    expect(runProcessMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("credentialed baseURL: fails open and never sends or logs the credentials", async () => {
+    // fetch() itself refuses to construct a request to a URL with userinfo
+    // ("Request cannot be constructed from a URL that includes credentials"),
+    // and the baseURL must never reach a log line or error message unredacted.
+    const loggedLines: string[] = [];
+    vi.stubEnv(
+      "PAPERCLIP_OPENCODE_PROVIDERS",
+      JSON.stringify({ acme_gateway: { options: { baseURL: "http://user:hunter2@gateway.example/v1" } } }),
+    );
+
+    const result = await execute(
+      baseCtx({ onLog: async (_stream: string, chunk: string) => { loggedLines.push(chunk); } }),
+    );
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.errorCode ?? null).toBeNull();
+    expect(runProcessMock).toHaveBeenCalledTimes(1);
+    expect(loggedLines.join("")).not.toContain("hunter2");
+  });
+
+  it("non-http(s) baseURL: fails open instead of probing a protocol fetch cannot GET", async () => {
+    vi.stubEnv(
+      "PAPERCLIP_OPENCODE_PROVIDERS",
+      JSON.stringify({ acme_gateway: { options: { baseURL: "ftp://gateway.example/v1" } } }),
+    );
+
+    const result = await execute(baseCtx());
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.errorCode ?? null).toBeNull();
+    expect(runProcessMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("unreachable: logs and reports only the origin+pathname, never a query string", async () => {
+    vi.stubEnv(
+      "PAPERCLIP_OPENCODE_PROVIDERS",
+      JSON.stringify({ acme_gateway: { options: { baseURL: "http://gateway.example/v1?token=abc123" } } }),
+    );
+    fetchMock.mockRejectedValue(new Error("ECONNREFUSED"));
+    const loggedLines: string[] = [];
+
+    const result = await execute(
+      baseCtx({ onLog: async (_stream: string, chunk: string) => { loggedLines.push(chunk); } }),
+    );
+
+    expect(result.errorCode).toBe("model_endpoint_unreachable");
+    expect(result.errorMessage).not.toContain("token=abc123");
+    expect(loggedLines.join("")).not.toContain("token=abc123");
+  });
 });

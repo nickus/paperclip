@@ -15,6 +15,14 @@ export function executionFailureRetryCount(run: {
     const count = run.contextSnapshot?.failureRetriesBeforeWorkspaceWait;
     if (typeof count === "number" && Number.isInteger(count) && count >= 0) return count;
   }
+  if (run.scheduledRetryReason === "model_endpoint_unreachable_retry") {
+    // Same shape as ai_connection_busy/workspace_busy above: a down model
+    // endpoint is an outage wait, not a failed provider attempt, so its own
+    // retry count must not feed the reconciliation gate's failure budget —
+    // only the count from BEFORE the outage began does.
+    const count = run.contextSnapshot?.failureRetriesBeforeModelEndpointWait;
+    if (typeof count === "number" && Number.isInteger(count) && count >= 0) return count;
+  }
   // Historical ambiguous counters remain conservative rather than resetting.
   return run.scheduledRetryAttempt ?? 0;
 }

@@ -16,6 +16,20 @@ describe("failure attempts across resource waits", () => {
     expect(executionFailureRetryCount({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 12,
       contextSnapshot: { failureRetriesBeforeWorkspaceWait: 1 } })).toBe(1);
   });
+  it("preserves prior failures through repeated model-endpoint-outage waits, not the outage's own retry count", () => {
+    // scheduledRetryAttempt here is the outage's OWN attempt counter (how
+    // many times this particular endpoint outage has been retried, used for
+    // backoff escalation), which must not leak into the reconciliation
+    // gate's failure budget — only the frozen pre-outage count does.
+    expect(executionFailureRetryCount({ scheduledRetryReason: "model_endpoint_unreachable_retry", scheduledRetryAttempt: 12,
+      contextSnapshot: { failureRetriesBeforeModelEndpointWait: 0 } })).toBe(0);
+    expect(executionFailureRetryCount({ scheduledRetryReason: "model_endpoint_unreachable_retry", scheduledRetryAttempt: 12,
+      contextSnapshot: { failureRetriesBeforeModelEndpointWait: 1 } })).toBe(1);
+    for (const count of [undefined, -1, 1.5, "0"]) {
+      expect(executionFailureRetryCount({ scheduledRetryReason: "model_endpoint_unreachable_retry", scheduledRetryAttempt: 4,
+        contextSnapshot: { failureRetriesBeforeModelEndpointWait: count } })).toBe(4);
+    }
+  });
   it("does not trust a caller-supplied count outside a server-created workspace retry", () => {
     expect(executionFailureRetryCount({ scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 2,
       contextSnapshot: { failureRetriesBeforeWorkspaceWait: 0 } })).toBe(2);

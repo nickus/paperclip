@@ -801,6 +801,29 @@ function isModelEndpointUnreachableRun(
 ): boolean {
   return run.errorCode === MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE;
 }
+
+// How many times THIS endpoint outage has already been retried — distinct
+// from executionFailureRetryCount, which (once a run carries
+// MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON) freezes at the failure count from
+// BEFORE the outage began, so repeated outage retries don't trip the
+// legacy-execution reconciliation gate's `>= 2` budget (see
+// execution-recovery-attempt.ts and legacyExecutionNeedsReconciliation).
+// The backoff schedule needs the opposite number: scheduledRetryAttempt IS
+// that per-outage counter for this reason (see the nextAttempt handling in
+// scheduleBoundedRetryForRun), so read it directly here instead.
+function modelEndpointUnreachableOutageAttempt(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "scheduledRetryReason" | "scheduledRetryAttempt">,
+): number {
+  return run.scheduledRetryReason === MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON
+    ? Math.max(0, run.scheduledRetryAttempt ?? 0)
+    : 0;
+}
+export {
+  MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE,
+  MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON,
+  MODEL_ENDPOINT_UNREACHABLE_RETRY_WAKE_REASON,
+  MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_ATTEMPTS,
+};
 export {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
@@ -15156,6 +15179,7 @@ export function heartbeatService(
     const nextAttempt =
       (retryReason === WORKSPACE_BUSY_RETRY_REASON ||
       retryReason === AI_CONNECTION_BUSY_RETRY_REASON ||
+      retryReason === MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON ||
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
         ? (run.scheduledRetryAttempt ?? 0)
         : executionFailureRetryCount(run)) + 1;
@@ -15356,6 +15380,9 @@ export function heartbeatService(
           : {}),
         ...(retryReason === AI_CONNECTION_BUSY_RETRY_REASON
           ? { failureRetriesBeforeAiConnectionWait: executionFailureRetryCount(run) }
+          : {}),
+        ...(retryReason === MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON
+          ? { failureRetriesBeforeModelEndpointWait: executionFailureRetryCount(run) }
           : {}),
         ...(shouldQuarantineWorkspaceForRetry
           ? {
@@ -24789,7 +24816,7 @@ export function heartbeatService(
               wakeReason: MODEL_ENDPOINT_UNREACHABLE_RETRY_WAKE_REASON,
               maxAttempts: MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_ATTEMPTS,
               delayMs: computeModelEndpointUnreachableRetryDelayMs(
-                executionFailureRetryCount(livenessRun) + 1,
+                modelEndpointUnreachableOutageAttempt(livenessRun) + 1,
               ),
             });
           } else if (

@@ -62,6 +62,11 @@ import {
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
+  MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE,
+  MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON,
+  MODEL_ENDPOINT_UNREACHABLE_RETRY_WAKE_REASON,
+  MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_ATTEMPTS,
+  computeModelEndpointUnreachableRetryDelayMs,
   heartbeatService,
 } from "../services/heartbeat.ts";
 
@@ -2064,6 +2069,105 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+
+  it("keeps queuing model-endpoint-outage retries at 5, then 10, then 20 minutes without tripping the legacy-execution reconciliation gate", async () => {
+    // Regression coverage for a bug where a model-endpoint preflight failure
+    // (opencode-local's execute(), before opencode ever spawns — see
+    // MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE) never got a deferred retry
+    // scheduled at all: scheduleBoundedRetryForRun's legacyExecutionNeedsReconciliation
+    // check requires resultJson.executionRecovery bootstrap evidence, AND
+    // (even with that evidence present) its own `executionFailureRetryCount
+    // >= 2` gate tripped after only two outage retries because the outage's
+    // own attempt count was being read as if it were the "real" failure
+    // count. This proves a *third* retry (which the >= 2 gate would have
+    // blocked before the fix) is still scheduled, with the delay still
+    // escalating correctly.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const firstRunId = randomUUID();
+    const now = new Date("2026-04-20T18:00:00.000Z");
+
+    await seedRetryFixture({
+      runId: firstRunId,
+      companyId,
+      agentId,
+      now,
+      errorCode: MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE,
+      adapterType: "opencode_local",
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      },
+    });
+
+    const scheduleOpts = (attempt: number, at: Date) => ({
+      now: at,
+      random: () => 0.5,
+      retryReason: MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON,
+      wakeReason: MODEL_ENDPOINT_UNREACHABLE_RETRY_WAKE_REASON,
+      maxAttempts: MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_ATTEMPTS,
+      delayMs: computeModelEndpointUnreachableRetryDelayMs(attempt),
+    });
+
+    // Attempt 1: 5 minutes.
+    const first = await heartbeat.scheduleBoundedRetry(firstRunId, scheduleOpts(1, now));
+    expect(first.outcome).toBe("scheduled");
+    if (first.outcome !== "scheduled") return;
+    expect(first.dueAt.getTime()).toBe(now.getTime() + 5 * 60_000);
+    expect(first.run.scheduledRetryReason).toBe(MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON);
+    expect(first.run.scheduledRetryAttempt).toBe(1);
+    expect((first.run.contextSnapshot as Record<string, unknown> | null)?.failureRetriesBeforeModelEndpointWait).toBe(0);
+
+    // The scheduled retry itself fails again — the endpoint is still down.
+    await db.update(heartbeatRuns).set({
+      status: "failed",
+      error: "still unreachable",
+      errorCode: MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE,
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      finishedAt: first.dueAt,
+      updatedAt: first.dueAt,
+    }).where(eq(heartbeatRuns.id, first.run.id));
+
+    // Attempt 2: 10 minutes. This is the point the pre-fix `>= 2` gate would
+    // still have allowed (it only starts blocking on the THIRD attempt).
+    const second = await heartbeat.scheduleBoundedRetry(first.run.id, scheduleOpts(2, first.dueAt));
+    expect(second.outcome).toBe("scheduled");
+    if (second.outcome !== "scheduled") return;
+    expect(second.dueAt.getTime()).toBe(first.dueAt.getTime() + 10 * 60_000);
+    expect(second.run.scheduledRetryAttempt).toBe(2);
+    expect((second.run.contextSnapshot as Record<string, unknown> | null)?.failureRetriesBeforeModelEndpointWait).toBe(0);
+
+    await db.update(heartbeatRuns).set({
+      status: "failed",
+      error: "still unreachable",
+      errorCode: MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE,
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      finishedAt: second.dueAt,
+      updatedAt: second.dueAt,
+    }).where(eq(heartbeatRuns.id, second.run.id));
+
+    // Attempt 3: 20 minutes — this is exactly the attempt the bug made
+    // impossible. Before the fix, executionFailureRetryCount(run) read the
+    // outage's own attempt count (2) off scheduledRetryAttempt, so
+    // `>= 2` was already true and legacyExecutionNeedsReconciliation
+    // returned true, so scheduleBoundedRetryForRun returned
+    // `not_scheduled` / `legacy_execution_requires_reconciliation` here
+    // instead of scheduling anything.
+    const third = await heartbeat.scheduleBoundedRetry(second.run.id, scheduleOpts(3, second.dueAt));
+    expect(third.outcome).toBe("scheduled");
+    if (third.outcome !== "scheduled") return;
+    expect(third.dueAt.getTime()).toBe(second.dueAt.getTime() + 20 * 60_000);
+    expect(third.run.scheduledRetryAttempt).toBe(3);
+    expect((third.run.contextSnapshot as Record<string, unknown> | null)?.failureRetriesBeforeModelEndpointWait).toBe(0);
+
+    // Exactly four runs exist total: the original plus one per retry — no
+    // duplicates, and nothing was ever rejected as needing reconciliation.
+    const runCount = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId))
+      .then((rows) => rows[0]?.count ?? 0);
+    expect(runCount).toBe(4);
   });
 
   describe("run-dispatch module transactions", () => {
