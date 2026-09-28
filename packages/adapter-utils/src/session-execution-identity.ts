@@ -13,13 +13,28 @@ export function serializeSessionExecutionIdentity(value: unknown): Record<string
 }
 
 /**
- * Session codecs keep the execution identity of sandbox sessions only. Without
- * it a saved sandbox session is compared against `{}` on the next run and can
- * never resume. SSH identities are left out so SSH sessions keep their current
- * behavior.
+ * Keeps the execution identity of sandbox sessions only. Without it a saved
+ * sandbox session is compared against `{}` on the next run and can never
+ * resume. For adapters whose session store lives in a per-run directory on an
+ * SSH host, so an SSH session could not be resumed even with a matching
+ * identity.
  */
 export function serializeSandboxSessionExecutionIdentity(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if ((value as Record<string, unknown>).transport !== "sandbox") return null;
+  return serializeSessionExecutionIdentity(value);
+}
+
+/**
+ * Keeps the execution identity of sandbox and SSH sessions, for adapters whose
+ * CLI keeps its session store in a home directory that outlives the run. An
+ * SSH identity keeps only host, port, username and remote working directory;
+ * the key material of the connection is never stored. Any other transport is
+ * dropped.
+ */
+export function serializeRemoteSessionExecutionIdentity(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const transport = (value as Record<string, unknown>).transport;
+  if (transport !== "sandbox" && transport !== "ssh") return null;
   return serializeSessionExecutionIdentity(value);
 }
