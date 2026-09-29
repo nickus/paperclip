@@ -1834,26 +1834,50 @@ for file in /etc/resolv.conf /etc/hosts /etc/nsswitch.conf /etc/ssl/certs /etc/s
     printf 'PAPERCLIP_RUNNER_NETWORK_ROOT\0%s\0' "$parent/$(basename "$file")"
   fi
 done
-cwd=$(pwd -P)
-top=$(git rev-parse --show-toplevel 2>/dev/null) || top=
-if [ -n "$top" ] && [ "$(cd "$top" && pwd -P)" = "$cwd" ]; then
-  for kind in --git-common-dir --git-dir; do
-    root=$(git rev-parse --path-format=absolute "$kind" 2>/dev/null) || continue
-    root=$(cd "$root" && pwd -P) || continue
-    printf 'PAPERCLIP_GIT_METADATA_ROOT\0%s\0' "$root"
-  done
+case "$2" in
+  /*) cd -P "$2" 2>/dev/null && workspace=1 || workspace= ;;
+  *) workspace= ;;
+esac
+if [ -n "$workspace" ]; then
+  cwd=$(pwd -P)
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || top=
+  if [ -n "$top" ] && [ "$(cd "$top" && pwd -P)" = "$cwd" ]; then
+    for kind in --git-common-dir --git-dir; do
+      root=$(git rev-parse --path-format=absolute "$kind" 2>/dev/null) || continue
+      root=$(cd "$root" && pwd -P) || continue
+      printf 'PAPERCLIP_GIT_METADATA_ROOT\0%s\0' "$root"
+    done
+  fi
 fi
 printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
 `;
+    // A sandbox provider may still be starting the sandbox when this probe,
+    // often the first command of a run on a fresh lease, reaches it, and a
+    // provider can bound that start-up wait by the command's own timeout. Give
+    // sandbox targets the environment's command timeout (or the default the
+    // sandbox install step uses) instead of a budget sized for the probe alone.
+    const timeoutMs = remote.transport === "sandbox" ? remote.timeoutMs ?? 300_000 : 15_000;
     const result = await adapterExecutionTargetCommandRunner(remote).execute({
-      command: "sh", args: ["-c", probe, "paperclip-git-context", input.hostCredentials ? "host" : "managed"],
+      command: "sh",
       // The caller's cwd belongs to the controller. Copied sandbox/SSH
-      // workspaces can live at a different path on the execution target.
-      cwd: remote.remoteCwd, timeoutMs: 15_000,
+      // workspaces can live at a different path on the execution target, and
+      // that path need not exist yet: sandbox workspaces are staged later in
+      // the run. Start from the filesystem root, which always exists, and let
+      // the script enter the workspace itself, reading Git metadata only when
+      // that succeeds. This also keeps discovery on the workspace for a
+      // provider that does not apply the requested cwd.
+      args: ["-c", probe, "paperclip-git-context", input.hostCredentials ? "host" : "managed", remote.remoteCwd],
+      cwd: "/", timeoutMs,
     });
-    if (result.exitCode !== 0) throw new Error("Could not read execution-target Git context");
+    if (result.exitCode !== 0) {
+      // Report only how the probe failed, never its output: in host-credential
+      // mode the output carries credentials.
+      throw new Error(result.timedOut
+        ? `Could not read execution-target Git context: the probe timed out after ${timeoutMs} ms`
+        : `Could not read execution-target Git context: the probe exited with status ${result.exitCode ?? "unknown"}`);
+    }
     const payload = result.stdout.split("\0PAPERCLIP_GIT_CONTEXT_V1\0")[1]?.split("\0PAPERCLIP_GIT_CONTEXT_END\0")[0];
-    if (payload === undefined) throw new Error("Could not read execution-target Git context");
+    if (payload === undefined) throw new Error("Could not read execution-target Git context: the probe output was incomplete");
     discovered = {};
     const records = payload.split("\0");
     const roots: string[] = [];

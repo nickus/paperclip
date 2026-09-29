@@ -124,7 +124,57 @@ describe("managed GitHub launcher environment", () => {
     expect(env.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBe("enabled");
     expect(env.PAPERCLIP_GIT_METADATA_ROOTS).toBe("[]");
     expect(JSON.parse(env.PAPERCLIP_RUNNER_NETWORK_ROOTS!)).not.toHaveLength(0);
-    expect(fixture.runner.execute).toHaveBeenCalledWith(expect.objectContaining({ cwd: fixture.root }));
+    expect(fixture.runner.execute).toHaveBeenCalledWith(expect.objectContaining({ args: expect.arrayContaining([fixture.root]) }));
+  });
+
+  it.each([false, true])("reads the Git context before the remote workspace exists (host credentials: %s)", async (hostCredentials) => {
+    const fixture = await sandbox("usr/bin");
+    // A sandbox workspace is staged later in the run; the provider runs each
+    // command in the requested directory, so a missing one cannot start.
+    const target = { ...fixture.target, remoteCwd: path.join(fixture.root, "workspace-not-staged-yet") };
+    const env = await prepareGitHubExecutionEnvironment({
+      target, cwd: fixture.root, env: {}, hostCredentials, networkAccess: true,
+    });
+
+    expect(env.PAPERCLIP_GIT_METADATA_ROOTS).toBe("[]");
+    expect(JSON.parse(env.PAPERCLIP_RUNNER_NETWORK_ROOTS!)).not.toHaveLength(0);
+    expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe(hostCredentials ? "host" : "managed");
+    if (hostCredentials) expect(env.PAPERCLIP_GITHUB_HOST_HOME).toBe(fixture.root);
+  });
+
+  it("reads Git metadata from the workspace when the provider ignores the requested cwd", async () => {
+    const fixture = await sandbox("usr/bin");
+    await rm(path.join(fixture.bin, "git"));
+    await exec("git", ["init", fixture.root]);
+    const execute = fixture.runner.execute.getMockImplementation()!;
+    fixture.runner.execute.mockImplementation(async (input) => execute({ ...input, cwd: os.tmpdir() }));
+
+    const env = await prepareGitHubExecutionEnvironment({
+      target: fixture.target, cwd: fixture.root, env: {}, hostCredentials: false, networkAccess: true,
+    });
+
+    expect(JSON.parse(env.PAPERCLIP_GIT_METADATA_ROOTS!)).toEqual([await realpath(path.join(fixture.root, ".git"))]);
+  });
+
+  it("gives a starting sandbox its command timeout instead of a fixed probe budget", async () => {
+    const fixture = await sandbox("usr/bin");
+    // Model a provider that waits for a fresh sandbox to start within the
+    // command's own budget and reports a timeout when it does not start in time.
+    const startupMs = 60_000;
+    const execute = fixture.runner.execute.getMockImplementation()!;
+    fixture.runner.execute.mockImplementation(async (input) => (input.timeoutMs ?? 0) < startupMs
+      ? { exitCode: null, signal: null, timedOut: true, stdout: "", stderr: "", pid: null, startedAt: new Date().toISOString() }
+      : execute({ ...input, timeoutMs: 15_000 }));
+
+    const env = await prepareGitHubExecutionEnvironment({
+      target: fixture.target, cwd: fixture.root, env: {}, hostCredentials: false, networkAccess: true,
+    });
+    expect(JSON.parse(env.PAPERCLIP_RUNNER_NETWORK_ROOTS!)).not.toHaveLength(0);
+
+    // A configured environment command timeout is honored, and a timeout says so.
+    await expect(prepareGitHubExecutionEnvironment({
+      target: { ...fixture.target, timeoutMs: 5_000 }, cwd: fixture.root, env: {}, hostCredentials: false, networkAccess: true,
+    })).rejects.toThrow("Could not read execution-target Git context: the probe timed out after 5000 ms");
   });
 
   it("reads Git metadata from the SSH workspace instead of an existing controller directory", async () => {
