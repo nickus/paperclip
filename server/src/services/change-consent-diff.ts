@@ -1,4 +1,7 @@
 import path from "node:path";
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmFromMarkdown } from "mdast-util-gfm";
+import { gfm } from "micromark-extension-gfm";
 
 /**
  * Binds an instruction file write to the diff its change-consent card showed.
@@ -20,9 +23,15 @@ import path from "node:path";
  * A line that moves shows as both removed and added, which nets to no change.
  * A diff made against an older version of the file does not match.
  *
- * Only what the board user was shown counts: HTML comments, which the card
- * renderer drops, are skipped, and a fence inside one is not read. Line order
- * and indentation are not compared, so a write may still reorder or re-indent
+ * Only what the board user was shown counts. The card renderer parses
+ * `detailsMarkdown` as CommonMark with GitHub extensions, so this module parses
+ * it with the same parser rather than scanning lines: a diff block is a fenced
+ * code block whose language is `diff`, exactly where the renderer draws one.
+ * Text that only looks like a fence (inside an HTML block or comment, inside a
+ * longer or different fence, or after a lone carriage return the renderer
+ * treats as a line ending) is not read, and neither are footnote definitions,
+ * which the renderer drops unless a reference points at them. Line order and
+ * indentation are not compared, so a write may still reorder or re-indent
  * lines the file already has.
  */
 
@@ -37,18 +46,8 @@ export interface DisplayedDiffSection {
   removed: string[];
 }
 
-const FENCE_OPEN = /^([ \t]*)(`{3,}|~{3,})[ \t]*diff(?:[ \t].*)?$/i;
-const FENCE_CLOSE = /^[ \t]*(`{3,}|~{3,})[ \t]*$/;
-
-function indentWidth(line: string) {
-  return line.length - line.trimStart().length;
-}
-
-function stripIndent(line: string, width: number) {
-  let index = 0;
-  while (index < width && index < line.length && (line[index] === " " || line[index] === "\t")) index += 1;
-  return line.slice(index);
-}
+// CommonMark line endings: a line feed, a carriage return, or both.
+const LINE_ENDING = /\r\n|\r|\n/;
 
 function normalizeDisplayedPath(value: string) {
   return path.posix.normalize(value.replaceAll("\\", "/")).replace(/^\/+/, "");
@@ -94,55 +93,38 @@ function readDiffBlock(lines: string[], sections: DisplayedDiffSection[]) {
   }
 }
 
+/** The parts of a Markdown syntax tree node this module reads. */
+interface MarkdownNode {
+  type: string;
+  lang?: string | null;
+  value?: string;
+  children?: MarkdownNode[];
+}
+
 /**
- * The file sections of every fenced ```diff block a card displays.
- *
- * The reading errs towards not counting a line: a line is read only when the
- * card renderer certainly shows it. Nothing after an HTML comment opener is
- * read until the comment closes, since the renderer drops comments. A fence
- * opened with indentation ends at the first non-blank line indented less,
- * where the list item or indented block that holds it ends.
+ * The file sections of every fenced ```diff block a card displays, in
+ * document order, read from the same CommonMark and GitHub-flavoured syntax
+ * tree the card renderer draws.
  */
 export function parseDisplayedDiff(markdown: string | null | undefined): DisplayedDiffSection[] {
   const sections: DisplayedDiffSection[] = [];
   if (!markdown) return sections;
-  const lines = markdown.split(/\r?\n/);
-  let index = 0;
-  while (index < lines.length) {
-    const line = lines[index]!;
-    const commentStart = line.indexOf("<!--");
-    if (commentStart >= 0) {
-      let closed = line.indexOf("-->", commentStart + 4) >= 0;
-      index += 1;
-      while (!closed && index < lines.length) {
-        closed = lines[index]!.includes("-->");
-        index += 1;
+  const tree = fromMarkdown(markdown, {
+    extensions: [gfm()],
+    mdastExtensions: [gfmFromMarkdown()],
+  }) as MarkdownNode;
+  const visit = (node: MarkdownNode) => {
+    // Shown only where a reference points at it, so never counted as shown.
+    if (node.type === "footnoteDefinition") return;
+    if (node.type === "code") {
+      if (node.lang?.toLowerCase() === "diff" && typeof node.value === "string") {
+        readDiffBlock(node.value.split(LINE_ENDING), sections);
       }
-      continue;
+      return;
     }
-    const open = FENCE_OPEN.exec(line);
-    const indent = open?.[1]?.length ?? 0;
-    const fence = open?.[2] ?? "";
-    // A backtick in a backtick fence's info string makes the line inline code.
-    if (!open || (fence[0] === "`" && line.slice(indent + fence.length).includes("`"))) {
-      index += 1;
-      continue;
-    }
-    const body: string[] = [];
-    index += 1;
-    while (index < lines.length) {
-      const bodyLine = lines[index]!;
-      const close = FENCE_CLOSE.exec(bodyLine);
-      if (close && close[1]![0] === fence[0] && close[1]!.length >= fence.length) {
-        index += 1;
-        break;
-      }
-      if (indent > 0 && bodyLine.trim().length > 0 && indentWidth(bodyLine) < indent) break;
-      body.push(stripIndent(bodyLine, indent));
-      index += 1;
-    }
-    readDiffBlock(body, sections);
-  }
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(tree);
   return sections;
 }
 
@@ -183,8 +165,10 @@ export function displayedDiffCoversFileWrite(input: {
 
   const shownAdded = countLines(sections.flatMap((section) => section.added));
   const shownRemoved = countLines(sections.flatMap((section) => section.removed));
-  const before = countLines((input.previousContent ?? "").split(/\r?\n/));
-  const after = countLines(input.nextContent.split(/\r?\n/));
+  // Split the file where the card's lines split, so a carriage return cannot
+  // join text to a line the card shows on its own.
+  const before = countLines((input.previousContent ?? "").split(LINE_ENDING));
+  const after = countLines(input.nextContent.split(LINE_ENDING));
 
   const lines = new Set([...before.keys(), ...after.keys(), ...shownAdded.keys(), ...shownRemoved.keys()]);
   for (const line of lines) {

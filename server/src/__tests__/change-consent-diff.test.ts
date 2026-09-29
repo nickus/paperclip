@@ -53,15 +53,16 @@ describe("parseDisplayedDiff", () => {
     ]);
   });
 
-  it("skips what the card renderer does not show", () => {
-    // Block comments, comments opened after a list marker, and comments
-    // opened mid-line hide everything up to their end.
-    for (const hidden of [
-      "<!--\n```diff\n+hidden\n```\n-->",
-      "- note <!--\n  ```diff\n  +hidden\n  ```\n  -->",
-      "text <!-- start\n```diff\n+hidden\n```\nend -->",
+  it("reads HTML comments the way the card renderer does", () => {
+    // A block comment hides everything up to its end.
+    expect(parseDisplayedDiff("<!--\n```diff\n+hidden\n```\n-->")).toEqual([]);
+    // A comment that is not closed before a fence is plain text, and the
+    // fence after it is drawn as a diff block.
+    for (const shown of [
+      "- note <!--\n  ```diff\n  +shown\n  ```\n  -->",
+      "text <!-- start\n```diff\n+shown\n```\nend -->",
     ]) {
-      expect(parseDisplayedDiff(hidden), hidden).toEqual([]);
+      expect(parseDisplayedDiff(shown), shown).toEqual([{ paths: [], added: ["shown"], removed: [] }]);
     }
     // A backtick in a backtick fence's info string makes the line inline code,
     // so what follows is not a fence body.
@@ -70,6 +71,29 @@ describe("parseDisplayedDiff", () => {
     expect(parseDisplayedDiff("- item\n  ```diff\n  +shown\n- next item\n<!--\n+hidden\n-->")).toEqual([
       { paths: [], added: ["shown"], removed: [] },
     ]);
+  });
+
+  it("reads a fence only where the card renderer draws one", () => {
+    // Each card shows `+safe` in a diff block; everything else is either
+    // hidden from the board user or drawn as plain text, never as a diff.
+    const cases: Array<[string, string]> = [
+      // A lone carriage return ends a line, so the fence closes early and the
+      // comment after it is dropped.
+      ["lone carriage return", "```diff\n+safe\r```\r<!--\r+hidden\r-->\r```diff\n```"],
+      // A tab (or four spaces) before the fence makes an indented code block,
+      // which a less indented comment ends.
+      ["tab-indented fence", "```diff\n+safe\n```\n\t```diff\n\t+plain\n <!--\n +hidden\n x -->\n\t```"],
+      // A footnote definition is dropped unless something references it.
+      ["footnote definition", "```diff\n+safe\n```\n\n[^note]:\n    ```diff\n    +hidden\n    ```"],
+      // A fence inside another fence is text; the outer fence's close ends it.
+      ["fence in a tilde fence", "```diff\n+safe\n```\n~~~\n```diff\n+plain\n~~~\n<!--\n+hidden\nx -->"],
+      ["fence in a shorter fence", "```diff\n+safe\n```\n```\n````diff\n+plain\n```\n<!--\n+hidden\nx -->"],
+      // An HTML block runs to the next blank line, where the comment starts.
+      ["fence in an HTML block", "```diff\n+safe\n```\n<div>\n```diff\n+plain\n\n<!--\n+hidden\nx -->"],
+    ];
+    for (const [name, markdown] of cases) {
+      expect(parseDisplayedDiff(markdown), name).toEqual([{ paths: [], added: ["safe"], removed: [] }]);
+    }
   });
 });
 
@@ -114,6 +138,15 @@ describe("displayedDiffCoversFileWrite", () => {
     // The file gained a line since the card was made.
     expect(covers(EDIT, { previousContent: "# Agent\n\n- Old rule.\n- Later rule.\n", nextContent: "# Agent\n\n- New rule.\n" }))
       .toBe(false);
+  });
+
+  it("splits the file where the card splits its lines", () => {
+    // The card shows one added line; a carriage return in the file cannot
+    // join more text to that line.
+    const card = "```diff\n+safe\r```\r<!--\r+hidden\r-->\r```diff\n```";
+    expect(covers(card, { previousContent: "", nextContent: "safe\r```\r<!--\r+hidden\r-->\r```diff\n" })).toBe(false);
+    expect(covers(card, { previousContent: "", nextContent: "safe\n" })).toBe(true);
+    expect(covers("```diff\r\n+a\r+b\r```", { previousContent: "", nextContent: "a\rb" })).toBe(true);
   });
 
   it("refuses a card with no fenced diff for the file", () => {
