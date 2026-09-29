@@ -1803,9 +1803,14 @@ process.stdout.write("\0" + JSON.stringify(env) + "\0");
   if (remote) {
     // A legacy SSH host may run a standalone agent binary without Node. Use
     // only the shell and Git, and emit bounded, NUL-framed environment records.
-    const probe = String.raw`
+    // The mode and workspace path are quoted into the script itself rather
+    // than passed as positional parameters: a command runner may forward only
+    // the "-c" script (the SSH runner does), which would silently drop them.
+    const probe = `paperclip_auth_mode=${shellQuote(input.hostCredentials ? "host" : "managed")}
+paperclip_workspace=${shellQuote(remote.remoteCwd)}
+` + String.raw`
 printf '\0PAPERCLIP_GIT_CONTEXT_V1\0'
-if [ "$1" = host ]; then
+if [ "$paperclip_auth_mode" = host ]; then
   for key in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN PAPERCLIP_GIT_TOKEN GH_CONFIG_DIR GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM GIT_CONFIG_COUNT GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_ASKPASS SSH_ASKPASS SSH_AUTH_SOCK GIT_SSH_COMMAND GIT_SSH; do
     eval 'value=${"$"}{'"$key"'-}'
     [ -z "$value" ] || printf '%s\0%s\0' "$key" "$value"
@@ -1834,8 +1839,8 @@ for file in /etc/resolv.conf /etc/hosts /etc/nsswitch.conf /etc/ssl/certs /etc/s
     printf 'PAPERCLIP_RUNNER_NETWORK_ROOT\0%s\0' "$parent/$(basename "$file")"
   fi
 done
-case "$2" in
-  /*) cd -P "$2" 2>/dev/null && workspace=1 || workspace= ;;
+case "$paperclip_workspace" in
+  /*) cd -P "$paperclip_workspace" 2>/dev/null && workspace=1 || workspace= ;;
   *) workspace= ;;
 esac
 if [ -n "$workspace" ]; then
@@ -1866,7 +1871,7 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
       // the script enter the workspace itself, reading Git metadata only when
       // that succeeds. This also keeps discovery on the workspace for a
       // provider that does not apply the requested cwd.
-      args: ["-c", probe, "paperclip-git-context", input.hostCredentials ? "host" : "managed", remote.remoteCwd],
+      args: ["-c", probe, "paperclip-git-context"],
       cwd: "/", timeoutMs,
     });
     if (result.exitCode !== 0) {
