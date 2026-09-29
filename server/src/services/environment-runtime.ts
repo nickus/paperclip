@@ -1212,6 +1212,20 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   };
 }
 
+// An SSH lease owns no provider resource. It records which host and directory
+// a run used, and its release is database bookkeeping only. Settling a stranded
+// SSH lease therefore needs no remote action, but only for a lease this driver
+// could have acquired: never treat an unexpected provider resource as an SSH
+// no-op cleanup.
+function assertSshBookkeepingLease(lease: Pick<EnvironmentLease, "provider" | "providerLeaseId">): void {
+  if (
+    lease.provider !== "ssh" ||
+    (lease.providerLeaseId !== null && !lease.providerLeaseId.startsWith("ssh://"))
+  ) {
+    throw new Error("SSH lease cleanup cannot release a provider resource.");
+  }
+}
+
 function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   const environmentsSvc = environmentService(db);
 
@@ -1253,6 +1267,34 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
 
     async releaseRunLease(input) {
       return await environmentsSvc.releaseLease(input.lease.id, input.status);
+    },
+
+    async retryPendingSandboxTeardown({ lease }) {
+      // A lease can reach pending_cleanup without its run's own release, for
+      // example through the orphaned-active-lease recovery after a restart.
+      // Nothing on the host belongs to the lease, so this runs no remote
+      // command and removes no directory: the remote workspace path can be
+      // shared by other leases and environments. The caller releases the
+      // lease. No termination receipt is returned, because nothing on the
+      // host was stopped.
+      assertSshBookkeepingLease(lease);
+      return undefined;
+    },
+
+    async destroyRunLease(input) {
+      // Destroying an SSH lease is the same bookkeeping release as
+      // releaseRunLease; the remote host and directory are left untouched.
+      assertSshBookkeepingLease(input.lease);
+      const attemptId = input.lease.metadata?.pendingCleanupAttemptId;
+      return await environmentsSvc.releaseLease(input.lease.id, "expired", {
+        // A cleanup sweep that claimed this lease fences the release to its
+        // own attempt, so a superseded attempt cannot settle the lease.
+        ...(input.lease.status === "pending_cleanup" && typeof attemptId === "string"
+          ? { expectedPendingCleanupAttemptId: attemptId }
+          : {}),
+        failureReason: input.failureReason,
+        cleanupStatus: "success",
+      });
     },
 
     async realizeWorkspace(input) {
