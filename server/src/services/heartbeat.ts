@@ -1346,6 +1346,16 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+// Only a real executor adds to activeRunExecutions, and a test cannot hold one
+// open at an exact point. This marks a run as executing in this process so the
+// guards that consult the set (lease sweeps, reapers) can be tested directly.
+// The returned function removes the mark.
+export function markRunExecutionActiveForTests(runId: string): () => void {
+  activeRunExecutions.add(runId);
+  return () => {
+    activeRunExecutions.delete(runId);
+  };
+}
 // A legacy process adapter's signal exit can race the operator cancellation CAS while
 // its owned process group is still being joined. Keep that exit from becoming
 // a successful result (or a competing failure) before Stop settles. This is an

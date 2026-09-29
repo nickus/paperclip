@@ -37,7 +37,11 @@ import {
   adapterExecutionControls,
   createAdapterExecutionControl,
 } from "../services/adapter-execution-control.ts";
-import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/heartbeat.ts";
+import {
+  heartbeatService,
+  markRunExecutionActiveForTests,
+  type HeartbeatEnvironmentRuntime,
+} from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -283,7 +287,25 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     },
   );
 
-  it("test_skips_a_lease_whose_run_is_still_executing_in_this_process", async () => {
+  // An executor in this process registers its run in two places: the run
+  // execution set from the start of the run, and the adapter execution control
+  // once the adapter is invoked. Either one means the executor is still alive
+  // and releases the lease itself.
+  it.each([
+    {
+      label: "adapter execution control",
+      claim: (runId: string) => {
+        adapterExecutionControls.set(runId, createAdapterExecutionControl());
+        return () => {
+          adapterExecutionControls.delete(runId);
+        };
+      },
+    },
+    {
+      label: "run execution",
+      claim: (runId: string) => markRunExecutionActiveForTests(runId),
+    },
+  ])("test_skips_a_lease_whose_run_is_still_executing_in_this_process ($label)", async ({ claim }) => {
     const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
     const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed", finishedAt: oldEnough() });
     const leaseId = await insertActiveLease({
@@ -293,7 +315,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
       updatedAt: oldEnough(),
     });
     // The run's executor is still alive here and releases the lease itself.
-    adapterExecutionControls.set(runId, createAdapterExecutionControl());
+    const release = claim(runId);
 
     try {
       const heartbeat = heartbeatService(db);
@@ -302,7 +324,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
       expect(result).toEqual({ recovered: 0 });
       expect((await leaseRow(leaseId))?.status).toBe("active");
     } finally {
-      adapterExecutionControls.delete(runId);
+      release();
     }
 
     // Once the executor is gone, the same lease is an orphan.
