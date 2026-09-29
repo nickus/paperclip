@@ -588,8 +588,15 @@ export type EnvironmentDriver = (typeof ENVIRONMENT_DRIVERS)[number];
  *   unscrubbed host output, irreversible deletes, costs, and instance/company
  *   administration). The server still authorizes every forwarded call for
  *   the agent.
+ * - `steward` is `agent` plus writes to other agents' instruction bundles and
+ *   the company skill library (create a skill, edit a skill file). It is meant
+ *   for the environment of a single reviewer agent that applies improvements
+ *   to its colleagues, and refuses hire requests so the policy does not pass
+ *   to new agents. The server still authorizes each write: instruction writes
+ *   need a change grant, while skill writes follow the company skill policy,
+ *   which allows them when the company has none.
  */
-export const SANDBOX_CALLBACK_BRIDGE_POLICIES = ["restricted", "agent"] as const;
+export const SANDBOX_CALLBACK_BRIDGE_POLICIES = ["restricted", "agent", "steward"] as const;
 export type SandboxCallbackBridgePolicy = (typeof SANDBOX_CALLBACK_BRIDGE_POLICIES)[number];
 
 export const ENVIRONMENT_STATUSES = ["active", "archived"] as const;

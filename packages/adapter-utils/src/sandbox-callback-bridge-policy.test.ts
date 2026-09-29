@@ -26,6 +26,10 @@ function agent(request: RouteCase) {
   return authorizeSandboxCallbackBridgeRequestForPolicy(request, { policy: "agent", companyId: COMPANY });
 }
 
+function steward(request: RouteCase) {
+  return authorizeSandboxCallbackBridgeRequestForPolicy(request, { policy: "steward", companyId: COMPANY });
+}
+
 // Every route the restricted allowlist carries, one sample each.
 const RESTRICTED_ALLOWED: RouteCase[] = [
   { method: "POST", path: "/runtime-tools/github/credentials" },
@@ -338,6 +342,63 @@ const AGENT_DENIED: RouteCase[] = [
   { method: "TRACE", path: "/api/issues/issue-1" },
 ];
 
+// The only writes the `steward` policy adds on top of `agent`.
+const STEWARD_ONLY_ALLOWED: RouteCase[] = [
+  { method: "PATCH", path: "/api/agents/agent-2/instructions-bundle" },
+  { method: "PUT", path: "/api/agents/agent-2/instructions-bundle/file" },
+  { method: "POST", path: "/api/companies/co-1/skills" },
+  { method: "PATCH", path: "/api/companies/co-1/skills/skill-1/files" },
+];
+
+// Routes next to the steward additions that `steward` still refuses: other
+// methods and sub-paths on the same resources, the rest of the skill write
+// surface, and the agent-record, permission, lifecycle, history and secret
+// routes a reviewer must never reach.
+const STEWARD_DENIED: RouteCase[] = [
+  // Instruction bundle: only PATCH on the bundle and PUT on a file.
+  { method: "POST", path: "/api/agents/agent-2/instructions-bundle" },
+  { method: "PUT", path: "/api/agents/agent-2/instructions-bundle" },
+  { method: "DELETE", path: "/api/agents/agent-2/instructions-bundle" },
+  { method: "POST", path: "/api/agents/agent-2/instructions-bundle/file" },
+  { method: "PATCH", path: "/api/agents/agent-2/instructions-bundle/file" },
+  { method: "DELETE", path: "/api/agents/agent-2/instructions-bundle/file" },
+  { method: "PUT", path: "/api/agents/agent-2/instructions-bundle/file/extra" },
+  { method: "PUT", path: "/api/agents/agent-2/instructions-bundle/other" },
+  // Skills: no import, install, update, reset, fork, rename, delete,
+  // metadata/sharing change, version publish, or file delete.
+  { method: "PUT", path: "/api/companies/co-1/skills" },
+  { method: "PATCH", path: "/api/companies/co-1/skills" },
+  { method: "POST", path: "/api/companies/co-1/skills/import" },
+  { method: "POST", path: "/api/companies/co-1/skills/install-catalog" },
+  { method: "POST", path: "/api/companies/co-1/skills/scan-projects" },
+  { method: "PATCH", path: "/api/companies/co-1/skills/skill-1" },
+  { method: "DELETE", path: "/api/companies/co-1/skills/skill-1" },
+  { method: "DELETE", path: "/api/companies/co-1/skills/skill-1/files" },
+  { method: "PUT", path: "/api/companies/co-1/skills/skill-1/files" },
+  { method: "POST", path: "/api/companies/co-1/skills/skill-1/files" },
+  { method: "POST", path: "/api/companies/co-1/skills/skill-1/versions" },
+  { method: "POST", path: "/api/companies/co-1/skills/skill-1/install-update" },
+  { method: "POST", path: "/api/companies/co-1/skills/skill-1/reset" },
+  { method: "POST", path: "/api/companies/co-1/skills/skill-1/fork" },
+  { method: "POST", path: "/api/companies/co-1/skills/skill-1/rename" },
+  { method: "POST", path: "/api/skills/catalog" },
+  // Agent record, permissions, lifecycle, config history, keys, secrets.
+  { method: "PATCH", path: "/api/agents/agent-2" },
+  { method: "PUT", path: "/api/agents/agent-2" },
+  { method: "DELETE", path: "/api/agents/agent-2" },
+  { method: "PATCH", path: "/api/agents/agent-2/permissions" },
+  { method: "PATCH", path: "/api/agents/agent-2/budgets" },
+  { method: "POST", path: "/api/agents/agent-2/terminate" },
+  { method: "POST", path: "/api/agents/agent-2/pause" },
+  { method: "POST", path: "/api/agents/agent-2/config-revisions/rev-1/rollback" },
+  { method: "PATCH", path: "/api/agents/agent-2/config-revisions/rev-1" },
+  { method: "POST", path: "/api/agents/agent-2/keys" },
+  { method: "GET", path: "/api/agents/agent-2/secrets" },
+  { method: "PUT", path: "/api/agents/agent-2/secrets/API_KEY" },
+  { method: "PATCH", path: "/api/companies/co-1/skills/secret-helper/files" },
+  { method: "POST", path: "/api/companies/co-1/agents" },
+];
+
 // Paths no policy may forward: each one either leaves the API origin or
 // normalizes into a route other than the one a rule would have matched.
 const NON_CANONICAL: RouteCase[] = [
@@ -361,9 +422,13 @@ const NON_CANONICAL: RouteCase[] = [
 ];
 
 describe("sandbox callback bridge route policies", () => {
-  it("reads only the literal \"agent\" as the wider policy", () => {
+  it("reads only the literals \"agent\" and \"steward\" as wider policies", () => {
     expect(normalizeSandboxCallbackBridgePolicy("agent")).toBe("agent");
-    for (const value of [undefined, null, "", "restricted", "AGENT", "Agent", " agent", "open", 1, true, {}]) {
+    expect(normalizeSandboxCallbackBridgePolicy("steward")).toBe("steward");
+    for (const value of [
+      undefined, null, "", "restricted", "AGENT", "Agent", " agent", "open", 1, true, {},
+      "STEWARD", "Steward", "steward ", " steward",
+    ]) {
       expect(normalizeSandboxCallbackBridgePolicy(value)).toBe("restricted");
     }
   });
@@ -380,7 +445,7 @@ describe("sandbox callback bridge route policies", () => {
     });
 
     it("keeps refusing routes only the agent policy opens, with the unchanged message", () => {
-      for (const request of [...AGENT_ONLY_ALLOWED, ...AGENT_DENIED]) {
+      for (const request of [...AGENT_ONLY_ALLOWED, ...AGENT_DENIED, ...STEWARD_ONLY_ALLOWED, ...STEWARD_DENIED]) {
         expect(restricted(request)).toBe(`Route not allowed: ${request.method} ${request.path}`);
       }
     });
@@ -414,6 +479,14 @@ describe("sandbox callback bridge route policies", () => {
         expect(denial, `${request.method} ${request.path}`).not.toBeNull();
         expect(denial).toContain('bridge policy "agent"');
         expect(denial).toContain(`${request.method.toUpperCase()} ${request.path}`);
+        expect(denial).toContain("retrying this route will not succeed");
+      }
+    });
+
+    it("still refuses the writes only the steward policy adds", () => {
+      for (const request of STEWARD_ONLY_ALLOWED) {
+        const denial = agent(request);
+        expect(denial, `${request.method} ${request.path}`).toContain('bridge policy "agent"');
         expect(denial).toContain("retrying this route will not succeed");
       }
     });
@@ -474,15 +547,89 @@ describe("sandbox callback bridge route policies", () => {
     });
   });
 
-  it("refuses non-canonical paths under both policies", () => {
+  describe("steward", () => {
+    it("forwards everything the agent policy forwards except hire requests", () => {
+      const hires = [...RESTRICTED_ALLOWED, ...AGENT_ONLY_ALLOWED].filter((request) => request.path.endsWith("/agent-hires"));
+      expect(hires).toEqual([{ method: "POST", path: "/api/companies/co-1/agent-hires" }]);
+      for (const request of [...RESTRICTED_ALLOWED, ...AGENT_ONLY_ALLOWED]) {
+        if (hires.includes(request)) continue;
+        expect(steward(request), `${request.method} ${request.path}`).toBeNull();
+      }
+    });
+
+    it("refuses hire requests, which would place a new agent in the same environment", () => {
+      for (const request of [
+        { method: "POST", path: "/api/companies/co-1/agent-hires" },
+        { method: "POST", path: "/api/companies/co-1/agent-hires/" },
+        { method: "POST", path: "/API/Companies/co-1/Agent-Hires" },
+        { method: "PUT", path: "/api/companies/co-1/agent-hires" },
+      ]) {
+        const denial = steward(request);
+        expect(denial, `${request.method} ${request.path}`).toContain('bridge policy "steward"');
+        expect(denial).toContain("retrying this route will not succeed");
+      }
+      expect(agent({ method: "POST", path: "/api/companies/co-1/agent-hires" })).toBeNull();
+    });
+
+    it("adds instruction-bundle writes and company skill create and file edits", () => {
+      for (const request of STEWARD_ONLY_ALLOWED) {
+        expect(steward(request), `${request.method} ${request.path}`).toBeNull();
+      }
+      // Case and trailing-slash variants the server router matches pass too.
+      expect(steward({ method: "put", path: "/api/Agents/agent-2/Instructions-Bundle/File/" })).toBeNull();
+      expect(steward({ method: "PATCH", path: "/api/agents/agent-2/instructions-bundle/" })).toBeNull();
+    });
+
+    it("refuses every other route the agent policy refuses, naming the steward policy", () => {
+      const added = new Set(STEWARD_ONLY_ALLOWED.map((request) => `${request.method} ${request.path}`));
+      const stillDenied = AGENT_DENIED.filter((request) => !added.has(`${request.method} ${request.path}`));
+      // Only the two instruction writes leave the agent deny fixture.
+      expect(AGENT_DENIED.length - stillDenied.length).toBe(2);
+      for (const request of [...stillDenied, ...STEWARD_DENIED]) {
+        const denial = steward(request);
+        expect(denial, `${request.method} ${request.path}`).not.toBeNull();
+        expect(denial).toContain('bridge policy "steward"');
+        expect(denial).toContain(`${request.method.toUpperCase()} ${request.path}`);
+      }
+    });
+
+    it("refuses encoded, case-folded and cross-company variants of its extra routes", () => {
+      for (const request of [
+        { method: "PUT", path: "/api/agents/agent-2/instructions-bundle/%66ile" },
+        { method: "PATCH", path: "/api/agents/agent-2/%69nstructions-bundle" },
+        { method: "GET", path: "/API/Agents/agent-2/SECRETS/" },
+        { method: "PATCH", path: "/api/Agents/agent-2/" },
+        { method: "POST", path: "/api/agents/agent-2/Config-Revisions/rev-1/rollback" },
+        { method: "POST", path: "/api/agents/agent-2/TERMINATE" },
+      ]) {
+        expect(steward(request), `${request.method} ${request.path}`).toContain('bridge policy "steward"');
+      }
+      for (const request of [
+        { method: "POST", path: `/api/companies/${OTHER_COMPANY}/skills` },
+        { method: "PATCH", path: `/api/companies/${OTHER_COMPANY}/skills/skill-1/files` },
+      ]) {
+        expect(steward(request)).toContain("Runs can only reach their own company");
+      }
+      for (const companyId of [undefined, null, ""]) {
+        expect(authorizeSandboxCallbackBridgeRequestForPolicy(
+          { method: "POST", path: `/api/companies/${COMPANY}/skills` },
+          { policy: "steward", companyId },
+        )).toContain("Runs can only reach their own company");
+      }
+    });
+  });
+
+  it("refuses non-canonical paths under every policy", () => {
     for (const request of NON_CANONICAL) {
       expect(describeNonCanonicalSandboxCallbackBridgePath(request.path), JSON.stringify(request.path)).not.toBeNull();
-      for (const policy of ["restricted", "agent"] as const) {
+      for (const policy of ["restricted", "agent", "steward"] as const) {
         const denial = authorizeSandboxCallbackBridgeRequestForPolicy(request, { policy, companyId: COMPANY });
         expect(denial, `${policy} ${JSON.stringify(request.path)}`).toMatch(/^Route not allowed: GET /);
       }
     }
-    for (const request of [...RESTRICTED_ALLOWED, ...AGENT_ONLY_ALLOWED, ...AGENT_DENIED]) {
+    for (const request of [
+      ...RESTRICTED_ALLOWED, ...AGENT_ONLY_ALLOWED, ...AGENT_DENIED, ...STEWARD_ONLY_ALLOWED, ...STEWARD_DENIED,
+    ]) {
       expect(describeNonCanonicalSandboxCallbackBridgePath(request.path), request.path).toBeNull();
     }
   });
@@ -568,5 +715,32 @@ describe("sandbox callback bridge worker route policy", () => {
       expect(response.body.error).toContain('bridge policy "agent"');
     }
     expect(forwarded).toEqual(["GET /api/companies/co-1/heartbeat-runs"]);
+  });
+
+  it("forwards the steward additions only when the worker is bound to the steward policy", async () => {
+    const requests: RouteCase[] = [
+      { method: "PUT", path: "/api/agents/agent-2/instructions-bundle/file" },
+      { method: "POST", path: "/api/companies/co-1/skills" },
+      { method: "POST", path: "/api/agents/agent-2/terminate" },
+      { method: "POST", path: "/api/companies/co-1/agent-hires" },
+    ];
+    const asSteward = await runQueuedRequests(
+      requests,
+      createSandboxCallbackBridgeAuthorizer({ policy: "steward", companyId: COMPANY }),
+    );
+    expect(asSteward.responses.map((response) => response.status)).toEqual([200, 200, 403, 403]);
+    expect(asSteward.responses[2]!.body.error).toContain('bridge policy "steward"');
+    expect(asSteward.responses[3]!.body.error).toContain('bridge policy "steward"');
+    expect(asSteward.forwarded).toEqual([
+      "PUT /api/agents/agent-2/instructions-bundle/file",
+      "POST /api/companies/co-1/skills",
+    ]);
+
+    const asAgent = await runQueuedRequests(
+      requests,
+      createSandboxCallbackBridgeAuthorizer({ policy: "agent", companyId: COMPANY }),
+    );
+    expect(asAgent.responses.map((response) => response.status)).toEqual([403, 403, 403, 200]);
+    expect(asAgent.forwarded).toEqual(["POST /api/companies/co-1/agent-hires"]);
   });
 });

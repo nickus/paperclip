@@ -17,7 +17,9 @@ import { OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH } from "../services/tool-access.
  * should. This test statically lists every route the server registers,
  * evaluates the `agent` policy for it, and compares the result with a
  * checked-in snapshot. A new or reclassified route fails the test until the
- * snapshot is reviewed and updated (`vitest -u`).
+ * snapshot is reviewed and updated (`vitest -u`). The `steward` policy is
+ * checked against the same inventory: it may differ from `agent` only by the
+ * routes it is documented to add.
  */
 
 const SRC_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -162,10 +164,12 @@ function samplePaths(routePath: string): Array<{ path: string; values: Record<st
   return samples.map((sample) => ({ ...sample, path: sample.path.replace(/:[A-Za-z0-9_]+\??/g, "sample-id") }));
 }
 
-function allowed(method: string, path: string): boolean {
+type WidePolicy = "agent" | "steward";
+
+function allowed(method: string, path: string, policy: WidePolicy): boolean {
   return authorizeSandboxCallbackBridgeRequestForPolicy(
     { method, path },
-    { policy: "agent", companyId: RUN_COMPANY_ID },
+    { policy, companyId: RUN_COMPANY_ID },
   ) === null;
 }
 
@@ -174,7 +178,7 @@ function allowed(method: string, path: string): boolean {
  * samples. A `router.use` mount is tried for every method, at its own path and
  * one level below it.
  */
-function classify(route: RouteEntry): string {
+function classify(route: RouteEntry, policy: WidePolicy = "agent"): string {
   const probes: Array<{ label: string; method: string; path: string }> = [];
   for (const sample of samplePaths(route.path)) {
     const valueLabel = Object.entries(sample.values).map(([name, value]) => `${name}=${value}`).join(",");
@@ -187,14 +191,14 @@ function classify(route: RouteEntry): string {
       probes.push({ label: valueLabel, method: route.method, path: sample.path });
     }
   }
-  const allowedLabels = probes.filter((probe) => allowed(probe.method, probe.path)).map((probe) => probe.label);
+  const allowedLabels = probes.filter((probe) => allowed(probe.method, probe.path, policy)).map((probe) => probe.label);
   if (allowedLabels.length === 0) return "DENY";
   if (allowedLabels.length === probes.length) return "ALLOW";
   return `MIXED (allows ${allowedLabels.join("; ")})`;
 }
 
-function decisionOf(route: RouteEntry): "allow" | "deny" | "mixed" {
-  const decision = classify(route);
+function decisionOf(route: RouteEntry, policy: WidePolicy = "agent"): "allow" | "deny" | "mixed" {
+  const decision = classify(route, policy);
   return decision === "ALLOW" ? "allow" : decision === "DENY" ? "deny" : "mixed";
 }
 
@@ -283,5 +287,45 @@ describe("agent bridge policy route inventory", () => {
       expect(route, `${key} is registered`).toBeDefined();
       expect(decisionOf(route!), key).toBe("allow");
     }
+  });
+});
+
+describe("steward bridge policy route inventory", () => {
+  const { routes } = listServerRoutes();
+
+  it("differs from the agent policy only by instruction-bundle writes, company skill create and file edits, and hires", () => {
+    const changed = [...new Set(routes
+      .filter((route) => classify(route, "steward") !== classify(route, "agent"))
+      .map((route) => `${classify(route, "steward")} ${route.method} ${route.path}`))].sort();
+    expect(changed).toEqual([
+      "ALLOW PATCH /api/agents/:id/instructions-bundle",
+      "ALLOW PATCH /api/companies/:companyId/skills/:skillId/files",
+      "ALLOW POST /api/companies/:companyId/skills",
+      "ALLOW PUT /api/agents/:id/instructions-bundle/file",
+      // A hired agent runs in its creator's environment and would inherit
+      // the steward policy.
+      "DENY POST /api/companies/:companyId/agent-hires",
+    ]);
+  });
+
+  it("keeps denying the agent record, permissions, budgets, lifecycle, config history, keys and secrets", () => {
+    const mustDeny = routes.filter((route) => {
+      const path = route.path.toLowerCase();
+      return (
+        /(?:^|\/)[^/]*secret[^/]*(?:\/|$)/.test(path) ||
+        /^\/api\/agents\/:[a-z]+\/(?:keys|permissions|budgets|connections)(?:\/|$)/.test(path) ||
+        (route.method !== "GET" && /^\/api\/agents\/:[a-z]+$/.test(path)) ||
+        (route.method !== "GET" &&
+          /^\/api\/agents\/:[a-z]+\/(?:config-revisions|pause|resume|approve|terminate|clear-error|claude-login|heartbeat|runtime-state)(?:\/|$)/
+            .test(path)) ||
+        (route.method === "DELETE" && /^\/api\/agents\/:[a-z]+\/instructions-bundle(?:\/|$)/.test(path)) ||
+        (route.method !== "GET" && /^\/api\/companies\/:companyid\/(?:agents|agent-hires)(?:\/|$)/.test(path)) ||
+        /^\/api\/(?:companies\/:companyid\/)?environments?(?:\/|$)/.test(path)
+      );
+    });
+    expect(mustDeny.length).toBeGreaterThan(40);
+    const forwarded = mustDeny.filter((route) => decisionOf(route, "steward") !== "deny")
+      .map((route) => `${route.method} ${route.path} (${route.file})`);
+    expect(forwarded).toEqual([]);
   });
 });

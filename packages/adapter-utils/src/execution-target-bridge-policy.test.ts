@@ -34,8 +34,20 @@ describe("Paperclip API bridge policy on execution targets", () => {
     }
   });
 
+  it("keeps the steward policy through a plain-object round trip", () => {
+    for (const target of [sshTarget, sandboxTarget]) {
+      const parsed = parseAdapterExecutionTarget({
+        ...target,
+        paperclipApiBridgePolicy: "steward",
+        paperclipApiBridgeCompanyId: "company-1",
+      });
+      expect(parsed).toMatchObject({ paperclipApiBridgePolicy: "steward", paperclipApiBridgeCompanyId: "company-1" });
+      expect(adapterExecutionTargetPaperclipApiBridgePolicy(parsed)).toBe("steward");
+    }
+  });
+
   it("fails closed to the restricted policy for any other value", () => {
-    for (const value of [undefined, null, "restricted", "AGENT", "open", 1]) {
+    for (const value of [undefined, null, "restricted", "AGENT", "STEWARD", " steward", "open", 1]) {
       for (const target of [sshTarget, sandboxTarget]) {
         const parsed = parseAdapterExecutionTarget({ ...target, paperclipApiBridgePolicy: value });
         expect(parsed).not.toBeNull();
