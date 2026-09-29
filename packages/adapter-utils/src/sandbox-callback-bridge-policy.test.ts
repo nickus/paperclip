@@ -548,10 +548,27 @@ describe("sandbox callback bridge route policies", () => {
   });
 
   describe("steward", () => {
-    it("forwards everything the agent policy forwards", () => {
+    it("forwards everything the agent policy forwards except hire requests", () => {
+      const hires = [...RESTRICTED_ALLOWED, ...AGENT_ONLY_ALLOWED].filter((request) => request.path.endsWith("/agent-hires"));
+      expect(hires).toEqual([{ method: "POST", path: "/api/companies/co-1/agent-hires" }]);
       for (const request of [...RESTRICTED_ALLOWED, ...AGENT_ONLY_ALLOWED]) {
+        if (hires.includes(request)) continue;
         expect(steward(request), `${request.method} ${request.path}`).toBeNull();
       }
+    });
+
+    it("refuses hire requests, which would place a new agent in the same environment", () => {
+      for (const request of [
+        { method: "POST", path: "/api/companies/co-1/agent-hires" },
+        { method: "POST", path: "/api/companies/co-1/agent-hires/" },
+        { method: "POST", path: "/API/Companies/co-1/Agent-Hires" },
+        { method: "PUT", path: "/api/companies/co-1/agent-hires" },
+      ]) {
+        const denial = steward(request);
+        expect(denial, `${request.method} ${request.path}`).toContain('bridge policy "steward"');
+        expect(denial).toContain("retrying this route will not succeed");
+      }
+      expect(agent({ method: "POST", path: "/api/companies/co-1/agent-hires" })).toBeNull();
     });
 
     it("adds instruction-bundle writes and company skill create and file edits", () => {
@@ -705,13 +722,15 @@ describe("sandbox callback bridge worker route policy", () => {
       { method: "PUT", path: "/api/agents/agent-2/instructions-bundle/file" },
       { method: "POST", path: "/api/companies/co-1/skills" },
       { method: "POST", path: "/api/agents/agent-2/terminate" },
+      { method: "POST", path: "/api/companies/co-1/agent-hires" },
     ];
     const asSteward = await runQueuedRequests(
       requests,
       createSandboxCallbackBridgeAuthorizer({ policy: "steward", companyId: COMPANY }),
     );
-    expect(asSteward.responses.map((response) => response.status)).toEqual([200, 200, 403]);
+    expect(asSteward.responses.map((response) => response.status)).toEqual([200, 200, 403, 403]);
     expect(asSteward.responses[2]!.body.error).toContain('bridge policy "steward"');
+    expect(asSteward.responses[3]!.body.error).toContain('bridge policy "steward"');
     expect(asSteward.forwarded).toEqual([
       "PUT /api/agents/agent-2/instructions-bundle/file",
       "POST /api/companies/co-1/skills",
@@ -721,7 +740,7 @@ describe("sandbox callback bridge worker route policy", () => {
       requests,
       createSandboxCallbackBridgeAuthorizer({ policy: "agent", companyId: COMPANY }),
     );
-    expect(asAgent.responses.map((response) => response.status)).toEqual([403, 403, 403]);
-    expect(asAgent.forwarded).toEqual([]);
+    expect(asAgent.responses.map((response) => response.status)).toEqual([403, 403, 403, 200]);
+    expect(asAgent.forwarded).toEqual(["POST /api/companies/co-1/agent-hires"]);
   });
 });

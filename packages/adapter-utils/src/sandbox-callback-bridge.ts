@@ -663,9 +663,16 @@ export const AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRout
  * The `steward` deny list: every `agent` deny rule except the one on
  * instruction-bundle writes. Secrets, keys, connections, the agent record,
  * permissions, budgets, lifecycle, config revisions and the rest stay denied.
+ *
+ * It also refuses hire requests. An agent created by another agent runs in
+ * its creator's environment, and the route policy belongs to the
+ * environment, so a hire made from a `steward` run would hand the new agent
+ * the same instruction and skill writes.
  */
-export const STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRouteRule[] =
-  AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES.filter((rule) => rule !== INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE);
+export const STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRouteRule[] = [
+  ...AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES.filter((rule) => rule !== INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE),
+  { methods: WRITE_METHODS, path: /^\/api\/companies\/[^/]+\/agent-hires(?:\/|$)/ },
+];
 
 /**
  * The writes the `steward` policy forwards on top of the `agent` allow rules,
@@ -676,9 +683,11 @@ export const STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRou
  * installs, skill deletes and skill metadata or sharing changes stay refused.
  *
  * The policy is meant for the environment of one dedicated reviewer agent.
- * The server still authorizes each call: instruction writes need a change
- * grant on the target agent, and skill writes go through the company skill
- * policy.
+ * The server still authorizes each call: instruction writes, including the
+ * reviewer's own, need an unscoped `agents:configure` grant (or
+ * `agents:suggest-changes` plus accepted consent). Skill writes need no
+ * grant: the company skill policy decides them, and a company without one
+ * allows them.
  */
 export const STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRouteRule[] = [
   { methods: ["PATCH"], path: /^\/api\/agents\/[^/]+\/instructions-bundle$/ },
