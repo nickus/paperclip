@@ -18839,7 +18839,10 @@ export function heartbeatService(
   // run turns terminal. So a run-owned lease is an orphan only once its run
   // has been terminal for the whole backoff window (the same rule as
   // reconcileStaleTerminalRunLeasePage), and never while an executor in this
-  // process still owns the run.
+  // process still owns the run. A native run's lease is never an orphan here:
+  // its executor deliberately keeps the lease past a terminal-looking status
+  // while a same-run resume or workspace finalization is scheduled, and its
+  // finalization coordinator releases it afterwards.
   async function sweepOrphanedActiveLeases(opts: {
     backoffMs: number;
   }): Promise<{ recovered: number }> {
@@ -18868,6 +18871,9 @@ export function heartbeatService(
               inArray(heartbeatRuns.status, [
                 ...HEARTBEAT_RUN_TERMINAL_STATUSES,
               ]),
+              // Native runs can be resumed or finalized after a terminal-looking
+              // status; their coordinator owns the lease lifecycle.
+              ne(heartbeatRuns.runtimeMode, "native"),
               // The run has been terminal for the whole backoff window, not
               // just for the moment between its status write and its own
               // lease release. A legacy row without finishedAt falls back to

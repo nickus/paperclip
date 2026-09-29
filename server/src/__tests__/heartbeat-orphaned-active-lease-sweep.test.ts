@@ -118,6 +118,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     status: string;
     finishedAt?: Date | null;
     updatedAt?: Date;
+    runtimeMode?: "legacy" | "native";
   }): Promise<string> {
     const id = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -127,6 +128,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
       invocationSource: "on_demand",
       status: input.status,
       nextEventSeq: 1,
+      ...(input.runtimeMode !== undefined ? { runtimeMode: input.runtimeMode } : {}),
       ...(input.finishedAt !== undefined ? { finishedAt: input.finishedAt } : {}),
       ...(input.updatedAt !== undefined ? { updatedAt: input.updatedAt } : {}),
     });
@@ -331,6 +333,35 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     const heartbeat = heartbeatService(db);
     expect(await heartbeat.sweepOrphanedActiveLeases({ backoffMs: 0 })).toEqual({ recovered: 1 });
     expect((await leaseRow(leaseId))?.status).toBe("pending_cleanup");
+  });
+
+  // A native run's executor keeps its lease past a terminal-looking status
+  // while a same-run resume or workspace finalization is scheduled, and its
+  // finalization coordinator releases the lease afterwards.
+  it("test_leaves_a_native_run_lease_to_its_finalization_coordinator", async () => {
+    const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
+    const nativeRunId = await insertHeartbeatRun({
+      companyId, agentId, status: "failed", finishedAt: oldEnough(), runtimeMode: "native",
+    });
+    const legacyRunId = await insertHeartbeatRun({
+      companyId, agentId, status: "failed", finishedAt: oldEnough(), runtimeMode: "legacy",
+    });
+    const nativeLeaseId = await insertActiveLease({
+      companyId, environmentId, heartbeatRunId: nativeRunId, updatedAt: oldEnough(),
+    });
+    const legacyLeaseId = await insertActiveLease({
+      companyId, environmentId, heartbeatRunId: legacyRunId, updatedAt: oldEnough(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepOrphanedActiveLeases({ backoffMs: 5 * 60 * 1000 });
+
+    expect(result).toEqual({ recovered: 1 });
+    expect(await leaseRow(nativeLeaseId)).toMatchObject({ status: "active", failureReason: null });
+    expect(await leaseRow(legacyLeaseId)).toMatchObject({
+      status: "pending_cleanup",
+      failureReason: "orphaned_active_lease_recovered",
+    });
   });
 
   it("test_flips_an_active_lease_when_its_heartbeat_run_id_is_null", async () => {
