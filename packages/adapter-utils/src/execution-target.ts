@@ -155,7 +155,7 @@ export interface AdapterLocalExecutionTarget extends AdapterExecutionTargetWorks
 interface AdapterRemoteExecutionTargetBridgeSettings {
   /**
    * Route policy for this run's Paperclip API bridge. Absent or any value
-   * other than `"agent"` keeps the restricted allowlist.
+   * other than `"agent"` or `"steward"` keeps the restricted allowlist.
    */
   paperclipApiBridgePolicy?: SandboxCallbackBridgePolicy | null;
   /**
@@ -592,8 +592,8 @@ export function adapterExecutionTargetUsesPaperclipBridge(
 
 /**
  * Read the Paperclip API bridge route policy off a target. Only a remote
- * target stamped with the literal `"agent"` returns `"agent"`; everything else
- * fails closed to `"restricted"`.
+ * target stamped with the literal `"agent"` or `"steward"` returns that
+ * policy; everything else fails closed to `"restricted"`.
  */
 export function adapterExecutionTargetPaperclipApiBridgePolicy(
   target: AdapterExecutionTarget | null | undefined,
@@ -607,7 +607,9 @@ function readBridgeSettingsFromParsedTarget(
   parsed: Record<string, unknown>,
 ): AdapterRemoteExecutionTargetBridgeSettings {
   return {
-    ...(parsed.paperclipApiBridgePolicy === "agent" ? { paperclipApiBridgePolicy: "agent" as const } : {}),
+    ...(parsed.paperclipApiBridgePolicy === "agent" || parsed.paperclipApiBridgePolicy === "steward"
+      ? { paperclipApiBridgePolicy: parsed.paperclipApiBridgePolicy }
+      : {}),
     ...(typeof parsed.paperclipApiBridgeCompanyId === "string" && parsed.paperclipApiBridgeCompanyId.trim()
       ? { paperclipApiBridgeCompanyId: parsed.paperclipApiBridgeCompanyId.trim() }
       : {}),

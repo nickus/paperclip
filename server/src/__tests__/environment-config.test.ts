@@ -46,7 +46,7 @@ describe("environment config helpers", () => {
       username: "ssh-user",
       remoteWorkspacePath: "/srv/paperclip/workspace",
     };
-    for (const policy of ["restricted", "agent"] as const) {
+    for (const policy of ["restricted", "agent", "steward"] as const) {
       expect(normalizeEnvironmentConfig({
         driver: "ssh",
         config: { ...ssh, paperclipApiBridgePolicy: policy },
@@ -61,7 +61,7 @@ describe("environment config helpers", () => {
       })).toMatchObject({ paperclipApiBridgePolicy: policy });
     }
     expect(normalizeEnvironmentConfig({ driver: "ssh", config: ssh })).not.toHaveProperty("paperclipApiBridgePolicy");
-    for (const policy of ["open", "AGENT", "", true]) {
+    for (const policy of ["open", "AGENT", "Steward", "steward ", "", true]) {
       expect(() => normalizeEnvironmentConfig({
         driver: "ssh",
         config: { ...ssh, paperclipApiBridgePolicy: policy },

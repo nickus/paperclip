@@ -449,12 +449,15 @@ export function authorizeSandboxCallbackBridgeRequestWithRoutes(
 // ---------------------------------------------------------------------------
 
 /**
- * Read a bridge route policy from untrusted config. Only the literal
- * `"agent"` selects the wider policy; every other value, including a missing
- * one, keeps the `restricted` allowlist, so a typo never widens access.
+ * Read a bridge route policy from untrusted config. Only the literals
+ * `"agent"` and `"steward"` select a wider policy; every other value,
+ * including a missing one, keeps the `restricted` allowlist, so a typo never
+ * widens access.
  */
 export function normalizeSandboxCallbackBridgePolicy(value: unknown): SandboxCallbackBridgePolicy {
-  return value === "agent" ? "agent" : "restricted";
+  // Exact, case-sensitive matches only.
+  if (value === "agent" || value === "steward") return value;
+  return "restricted";
 }
 
 const CANONICAL_PATH_CHECK_BASE = "http://bridge.invalid";
@@ -499,6 +502,13 @@ interface AgentBridgeRouteRule {
 const ALL_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
 const WRITE_METHODS = ["POST", "PUT", "PATCH", "DELETE"] as const;
 
+// Any write to an agent's instructions bundle. Kept as its own rule so the
+// `steward` policy can drop exactly this one and nothing else.
+const INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE: AgentBridgeRouteRule = {
+  methods: WRITE_METHODS,
+  path: /^\/api\/agents\/[^/]+\/instructions-bundle(?:\/|$)/,
+};
+
 /**
  * Routes the `agent` policy refuses even when an allow rule below would match.
  * Each one either returns credential material, or lets a run change where or
@@ -519,8 +529,11 @@ export const AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRoute
   { methods: WRITE_METHODS, path: /^\/api\/agents\/[^/]+$/ },
   {
     methods: WRITE_METHODS,
-    path: /^\/api\/agents\/[^/]+\/(?:permissions|budgets|pause|resume|approve|terminate|clear-error|claude-login|heartbeat|runtime-state|config-revisions|instructions-bundle)(?:\/|$)/,
+    path: /^\/api\/agents\/[^/]+\/(?:permissions|budgets|pause|resume|approve|terminate|clear-error|claude-login|heartbeat|runtime-state|config-revisions)(?:\/|$)/,
   },
+  // Instruction writes. The `steward` policy drops only this rule (see
+  // STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES).
+  INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE,
   // Board-only issue recovery and host workspace file reads.
   { methods: ALL_METHODS, path: /^\/api\/issues\/[^/]+\/admin(?:\/|$)/ },
   { methods: ALL_METHODS, path: /^\/api\/issues\/[^/]+\/recovery-actions\/retry-workspace-export$/ },
@@ -646,23 +659,53 @@ export const AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRout
   { methods: ["POST"], path: /^\/runtime-tools\/github\/credentials$/ },
 ];
 
+/**
+ * The `steward` deny list: every `agent` deny rule except the one on
+ * instruction-bundle writes. Secrets, keys, connections, the agent record,
+ * permissions, budgets, lifecycle, config revisions and the rest stay denied.
+ */
+export const STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRouteRule[] =
+  AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES.filter((rule) => rule !== INSTRUCTIONS_BUNDLE_WRITE_DENY_RULE);
+
+/**
+ * The writes the `steward` policy forwards on top of the `agent` allow rules,
+ * and nothing more: replacing another agent's instructions bundle settings or
+ * one of its instruction files, creating a company skill, and editing a
+ * company skill file. Assigning skills to an agent (`skills/sync`) is already
+ * on the `agent` list. Deleting instruction files, skill imports, catalog
+ * installs, skill deletes and skill metadata or sharing changes stay refused.
+ *
+ * The policy is meant for the environment of one dedicated reviewer agent.
+ * The server still authorizes each call: instruction writes need a change
+ * grant on the target agent, and skill writes go through the company skill
+ * policy.
+ */
+export const STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRouteRule[] = [
+  { methods: ["PATCH"], path: /^\/api\/agents\/[^/]+\/instructions-bundle$/ },
+  { methods: ["PUT"], path: /^\/api\/agents\/[^/]+\/instructions-bundle\/file$/ },
+  { methods: ["POST"], path: new RegExp(`${COMPANY}\\/skills$`) },
+  { methods: ["PATCH"], path: new RegExp(`${COMPANY}\\/skills\\/[^/]+\\/files$`) },
+];
+
 function agentPolicyRouteMatches(rules: readonly AgentBridgeRouteRule[], method: string, path: string): boolean {
   return rules.some((rule) => rule.methods.includes(method) && rule.path.test(path));
 }
 
-function agentPolicyDenial(method: string, path: string): string {
+function agentPolicyDenial(policy: WidePolicy, method: string, path: string): string {
   return (
-    `Route not allowed (bridge policy "agent"): ${method} ${path}. ` +
+    `Route not allowed (bridge policy "${policy}"): ${method} ${path}. ` +
     "Secret values, credentials, environment configuration and administration APIs are not reachable " +
     "from isolated agent runs; retrying this route will not succeed."
   );
 }
 
+type WidePolicy = Exclude<SandboxCallbackBridgePolicy, "restricted">;
+
 export interface SandboxCallbackBridgeAuthorizerOptions {
   /** The route policy. Absent or unknown values mean `restricted`. */
   policy?: SandboxCallbackBridgePolicy | string | null;
   /**
-   * The company the run belongs to. Under the `agent` policy a
+   * The company the run belongs to. Under the `agent` and `steward` policies a
    * `/api/companies/:companyId/...` path for any other company is refused at
    * the bridge, in addition to the server's own company check.
    */
@@ -678,7 +721,10 @@ export interface SandboxCallbackBridgeAuthorizerOptions {
  * applies {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST} unchanged.
  * `agent` matches case-insensitively and ignores one trailing slash, the way
  * the server's router does; it applies the deny rules, then the company
- * check, then the allow families, and refuses everything else.
+ * check, then the allow families, and refuses everything else. `steward`
+ * runs the same steps with {@link STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES}
+ * and the `agent` allow rules plus
+ * {@link STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES}.
  */
 export function authorizeSandboxCallbackBridgeRequestForPolicy(
   request: Pick<SandboxCallbackBridgeRequest, "method" | "path">,
@@ -698,25 +744,32 @@ export function authorizeSandboxCallbackBridgeRequestForPolicy(
   // see (the router matches literal routes on the raw path, but decodes
   // parameters), so the wider policy accepts no encoded characters at all.
   if (request.path.includes("%")) {
-    return agentPolicyDenial(method, request.path);
+    return agentPolicyDenial(policy, method, request.path);
   }
   const lowered = request.path.toLowerCase();
   const matchPath = lowered.length > 1 && lowered.endsWith("/") ? lowered.slice(0, -1) : lowered;
-  if (agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES, method, matchPath)) {
-    return agentPolicyDenial(method, request.path);
+  const steward = policy === "steward";
+  const denyRules = steward ? STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES : AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES;
+  if (agentPolicyRouteMatches(denyRules, method, matchPath)) {
+    return agentPolicyDenial(policy, method, request.path);
   }
   // A run with no bound company reaches no company-scoped path at all, so a
   // target that stamps the policy but not the company fails closed.
   const companyId = options.companyId?.trim().toLowerCase() || null;
   const companyMatch = /^\/api\/companies\/([^/]+)/.exec(matchPath);
   if (companyMatch && companyMatch[1] !== companyId) {
-    return `Route not allowed (bridge policy "agent"): ${method} ${request.path}. ` +
+    return `Route not allowed (bridge policy "${policy}"): ${method} ${request.path}. ` +
       "Runs can only reach their own company.";
   }
   if (agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, method, matchPath)) {
     return null;
   }
-  return agentPolicyDenial(method, request.path);
+  // The steward additions are checked after the shared allow rules, so the
+  // `agent` policy never reaches them.
+  if (steward && agentPolicyRouteMatches(STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, method, matchPath)) {
+    return null;
+  }
+  return agentPolicyDenial(policy, method, request.path);
 }
 
 /** Build a request authorizer bound to one policy and run company. */
