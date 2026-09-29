@@ -124,7 +124,11 @@ describe("managed GitHub launcher environment", () => {
     expect(env.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBe("enabled");
     expect(env.PAPERCLIP_GIT_METADATA_ROOTS).toBe("[]");
     expect(JSON.parse(env.PAPERCLIP_RUNNER_NETWORK_ROOTS!)).not.toHaveLength(0);
-    expect(fixture.runner.execute).toHaveBeenCalledWith(expect.objectContaining({ args: expect.arrayContaining([fixture.root]) }));
+    // The probe targets the remote workspace, never the controller's cwd.
+    const [probe] = fixture.runner.execute.mock.calls[0]!;
+    expect(probe.cwd).toBe("/");
+    expect(probe.args?.[1]).toContain(`paperclip_workspace=${ssh.shellQuote(fixture.root)}`);
+    expect(JSON.stringify(probe)).not.toContain("controller-only");
   });
 
   it.each([false, true])("reads the Git context before the remote workspace exists (host credentials: %s)", async (hostCredentials) => {
@@ -194,6 +198,41 @@ describe("managed GitHub launcher environment", () => {
     });
 
     expect(JSON.parse(env.PAPERCLIP_GIT_METADATA_ROOTS!)).toEqual([await realpath(path.join(fixture.root, ".git"))]);
+  });
+
+  it.each([false, true])("reads the Git context through the real SSH command runner (host credentials: %s)", async (hostCredentials) => {
+    const fixture = await sandbox("ssh-toolchain/bin");
+    // A workspace path with quotes and command substitution must reach the
+    // probe as data through every layer of SSH quoting.
+    const workspace = path.join(fixture.root, "ws it's $(cd;touch injected)");
+    await mkdir(workspace);
+    await exec("git", ["init", workspace]);
+    // Stand in for the ssh client: run the remote command string the way sshd
+    // hands it to the login shell, in a clean environment that models the SSH
+    // host. The command runner forwards only the command string, so this
+    // exercises exactly what reaches a real SSH host.
+    const sshBin = path.join(fixture.root, "fake-ssh-bin");
+    await mkdir(sshBin);
+    await writeFile(path.join(sshBin, "ssh"), [
+      "#!/bin/sh",
+      'for last; do :; done',
+      `exec env -i HOME=${ssh.shellQuote(fixture.root)} PATH=/usr/local/bin:/usr/bin:/bin GH_TOKEN=ssh-host-token /bin/sh -c "$last"`,
+      "",
+    ].join("\n"), { mode: 0o700 });
+    vi.stubEnv("PATH", `${sshBin}:${process.env.PATH ?? ""}`);
+    const target = { kind: "remote" as const, transport: "ssh" as const, remoteCwd: workspace,
+      spec: { host: "ssh.example.test", port: 22, username: "runner", remoteCwd: workspace,
+        remoteWorkspacePath: workspace, privateKey: null, knownHosts: null, strictHostKeyChecking: false } };
+
+    const env = await prepareGitHubExecutionEnvironment({
+      target, cwd: path.join(fixture.root, "controller-only"), env: {}, hostCredentials, networkAccess: true,
+    });
+
+    expect(JSON.parse(env.PAPERCLIP_GIT_METADATA_ROOTS!)).toEqual([await realpath(path.join(workspace, ".git"))]);
+    await expect(readFile(path.join(fixture.root, "injected"))).rejects.toThrow();
+    expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe(hostCredentials ? "host" : "managed");
+    expect(env.GH_TOKEN).toBe(hostCredentials ? "ssh-host-token" : undefined);
+    expect(env.PAPERCLIP_GITHUB_HOST_HOME).toBe(hostCredentials ? fixture.root : undefined);
   });
 
   it("uses target Git configuration without importing controller credentials", async () => {
