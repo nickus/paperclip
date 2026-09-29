@@ -761,6 +761,24 @@ export class ReusableSandboxResumeError extends Error {
   }
 }
 
+/**
+ * The environment driver resolved for a lease does not implement the requested
+ * lifecycle step. The message names only the driver key and the step, so a
+ * caller can classify this failure by its type without reading any
+ * provider-supplied text.
+ */
+export class EnvironmentDriverStepUnsupportedError extends Error {
+  readonly driverKey: string;
+  readonly step: "orphan_sandbox_teardown" | "lease_destroy";
+
+  constructor(input: { driverKey: string; step: "orphan_sandbox_teardown" | "lease_destroy"; message: string }) {
+    super(input.message);
+    this.name = "EnvironmentDriverStepUnsupportedError";
+    this.driverKey = input.driverKey;
+    this.step = input.step;
+  }
+}
+
 export class RunnerHarnessBackupUnavailableError extends Error {
   readonly providerLeaseId: string;
 
@@ -4245,9 +4263,11 @@ export function environmentRuntimeService(
     }): Promise<unknown> {
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
       if (!driver.retryPendingSandboxTeardown) {
-        throw new Error(
-          `Environment driver "${driver.driver}" does not support orphan sandbox teardown.`,
-        );
+        throw new EnvironmentDriverStepUnsupportedError({
+          driverKey: driver.driver,
+          step: "orphan_sandbox_teardown",
+          message: `Environment driver "${driver.driver}" does not support orphan sandbox teardown.`,
+        });
       }
       return await driver.retryPendingSandboxTeardown(input);
     },
@@ -4506,7 +4526,11 @@ export function environmentRuntimeService(
     async destroyRunLease(input: EnvironmentDriverLeaseInput): Promise<EnvironmentLease | null> {
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
       if (!driver.destroyRunLease) {
-        throw new Error(`Environment driver "${driver.driver}" does not support lease destroy.`);
+        throw new EnvironmentDriverStepUnsupportedError({
+          driverKey: driver.driver,
+          step: "lease_destroy",
+          message: `Environment driver "${driver.driver}" does not support lease destroy.`,
+        });
       }
       return await driver.destroyRunLease(input);
     },

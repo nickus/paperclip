@@ -34,6 +34,10 @@ vi.mock("../middleware/logger.js", () => ({
 }));
 
 import { logger } from "../middleware/logger.ts";
+import {
+  environmentRuntimeService,
+  type EnvironmentRuntimeDriver,
+} from "../services/environment-runtime.ts";
 import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -1105,6 +1109,69 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
       errorKind: "destroy_failed",
     });
   });
+
+  // A lease whose driver has no teardown for it fails every retry the same way,
+  // so its log line names that cause apart from a failed provider destroy. It
+  // still carries no exception text.
+  it.each([
+    { path: "recorded teardown", leasePolicy: "ephemeral" },
+    { path: "lease destroy", leasePolicy: "reuse_by_environment" },
+  ] as const)(
+    "test_pending_cleanup_retry_logs_teardown_unsupported_when_the_driver_lacks_the_step ($path)",
+    async ({ leasePolicy }) => {
+      const { companyId, environmentId } = await seedCompanyAndEnvironment();
+      const leaseId = await insertPendingCleanupLease({
+        companyId,
+        environmentId,
+        updatedAt: new Date(Date.now() - 60 * 60 * 1000),
+        metadata: { driver: "bookkeeping-only" },
+      });
+      await db.update(environmentLeases).set({ leasePolicy }).where(eq(environmentLeases.id, leaseId));
+
+      // A registered driver that implements neither teardown step.
+      const bookkeepingOnlyDriver: EnvironmentRuntimeDriver = {
+        driver: "bookkeeping-only",
+        acquireRunLease: vi.fn(async () => {
+          throw new Error("acquire is not part of this test");
+        }),
+        releaseRunLease: vi.fn(async () => null),
+        resolveCapabilities: vi.fn(async () => {
+          throw new Error("capabilities are not part of this test");
+        }),
+      };
+      const heartbeat = heartbeatService(db, {
+        environmentRuntime: environmentRuntimeService(db, { drivers: [bookkeepingOnlyDriver] }),
+      });
+
+      const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+      expect(result).toEqual({ swept: 1, destroyed: 0, capped: 0 });
+      expect(bookkeepingOnlyDriver.releaseRunLease).not.toHaveBeenCalled();
+      const row = await db
+        .select({ status: environmentLeases.status })
+        .from(environmentLeases)
+        .where(eq(environmentLeases.id, leaseId))
+        .then((rows) => rows[0]);
+      expect(row?.status).toBe("pending_cleanup");
+
+      const retryCall = vi
+        .mocked(logger.warn)
+        .mock.calls.find((call) => call[1] === "pending_cleanup lease retry failed");
+      expect(retryCall).toBeDefined();
+      const record = retryCall?.[0] as Record<string, unknown>;
+      expect(record).toMatchObject({
+        errorKind: "teardown_unsupported",
+        leaseId,
+        environmentId,
+        attempts: 1,
+      });
+      expect(JSON.stringify(record)).not.toContain("does not support");
+      expect(record).not.toHaveProperty("err");
+      expect(record).not.toHaveProperty("message");
+      expect(record).not.toHaveProperty("stack");
+      expect(record).not.toHaveProperty("cause");
+    },
+  );
 
   // The outer sweep catch logs a failure of the sweep itself. It must log a
   // constant errorKind only, never an error-derived string in the name or code.

@@ -616,6 +616,7 @@ import { environmentService } from "./environments.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
 import { retryChatControlAdmission } from "./chat-control-admission-retry.js";
 import {
+  EnvironmentDriverStepUnsupportedError,
   environmentRuntimeService,
   type ProviderResourceDisposition,
 } from "./environment-runtime.js";
@@ -735,6 +736,10 @@ export const STALE_TERMINAL_RUN_LEASE_GRACE_MS = 10 * 60 * 1000;
 // trusted enum. The pending_cleanup sweep logs never read the exception. Each
 // catch site logs a constant, locally generated `errorKind` instead.
 const PENDING_CLEANUP_RETRY_ERROR_KIND = "destroy_failed";
+// The lease's environment driver has no teardown for it, so every retry fails
+// the same way until the driver gains one. Logged apart from destroy_failed so
+// a lease stuck for that reason is visible without reading the exception.
+const PENDING_CLEANUP_TEARDOWN_UNSUPPORTED_ERROR_KIND = "teardown_unsupported";
 const PENDING_CLEANUP_SWEEP_ERROR_KIND = "sweep_failed";
 const ORPHANED_ACTIVE_LEASE_SWEEP_ERROR_KIND = "orphaned_active_lease_sweep_failed";
 const STALE_TERMINAL_RUN_LEASE_RELEASE_ERROR_KIND = "stale_terminal_run_lease_release_failed";
@@ -19117,7 +19122,7 @@ export function heartbeatService(
             destroyed += 1;
           }
         }
-      } catch {
+      } catch (error) {
         // The recorded-data teardown throws on failure, so revert the lease to
         // pending_cleanup for a later sweep. The claimed attempt still counts
         // for backoff, so requests stay bounded. The `destroyRunLease`
@@ -19131,10 +19136,15 @@ export function heartbeatService(
           });
         }
         // Log a constant errorKind only. The exception can carry a credential in
-        // its name, code, message, cause, or stack, so the sweep never reads it.
+        // its name, code, message, cause, or stack, so the sweep never reads
+        // any of them. Only the type check below classifies it: the runtime
+        // constructs that error class locally when the lease's driver lacks the
+        // step, so it carries no provider-supplied text.
         logger.warn(
           {
-            errorKind: PENDING_CLEANUP_RETRY_ERROR_KIND,
+            errorKind: error instanceof EnvironmentDriverStepUnsupportedError
+              ? PENDING_CLEANUP_TEARDOWN_UNSUPPORTED_ERROR_KIND
+              : PENDING_CLEANUP_RETRY_ERROR_KIND,
             leaseId: row.id,
             environmentId: row.environmentId,
             attempts: attempts + 1,
