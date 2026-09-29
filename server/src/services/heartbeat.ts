@@ -18817,10 +18817,24 @@ export function heartbeatService(
   // sweep finds both stranded classes and moves each lease to pending_cleanup,
   // so the existing pending_cleanup sweep tears the sandbox down from the
   // data already on the lease row.
+  //
+  // A run writes its terminal status before its own executor releases the
+  // lease, and the lease's updatedAt says nothing about when the run ended: a
+  // run longer than the backoff has a lease that looks stale the moment the
+  // run turns terminal. So a run-owned lease is an orphan only once its run
+  // has been terminal for the whole backoff window (the same rule as
+  // reconcileStaleTerminalRunLeasePage), and never while an executor in this
+  // process still owns the run.
   async function sweepOrphanedActiveLeases(opts: {
     backoffMs: number;
   }): Promise<{ recovered: number }> {
     const cutoff = new Date(Date.now() - opts.backoffMs);
+    // Runs whose executor is alive in this process; that executor releases
+    // their leases itself. Excluding them in the query keeps them from
+    // filling the fixed-size page.
+    const liveRunIds = [
+      ...new Set([...activeRunExecutions, ...adapterExecutionControls.keys()]),
+    ];
 
     const rows = await db
       .select({ lease: environmentLeases })
@@ -18833,11 +18847,31 @@ export function heartbeatService(
         and(
           eq(environmentLeases.status, "active"),
           or(
+            // A lease with no run keeps the lease-age rule alone.
             isNull(environmentLeases.heartbeatRunId),
-            inArray(heartbeatRuns.status, [
-              ...HEARTBEAT_RUN_TERMINAL_STATUSES,
-            ]),
+            and(
+              inArray(heartbeatRuns.status, [
+                ...HEARTBEAT_RUN_TERMINAL_STATUSES,
+              ]),
+              // The run has been terminal for the whole backoff window, not
+              // just for the moment between its status write and its own
+              // lease release. A legacy row without finishedAt falls back to
+              // the run's last update.
+              or(
+                lte(heartbeatRuns.finishedAt, cutoff),
+                and(
+                  isNull(heartbeatRuns.finishedAt),
+                  lte(heartbeatRuns.updatedAt, cutoff),
+                ),
+              ),
+            ),
           ),
+          liveRunIds.length > 0
+            ? or(
+                isNull(environmentLeases.heartbeatRunId),
+                notInArray(environmentLeases.heartbeatRunId, liveRunIds),
+              )
+            : undefined,
           lte(environmentLeases.updatedAt, cutoff),
         ),
       )
@@ -18846,6 +18880,15 @@ export function heartbeatService(
 
     let recovered = 0;
     for (const { lease } of rows) {
+      // Re-check just before the flip: an executor in this process may have
+      // claimed the run after the query above ran.
+      if (
+        lease.heartbeatRunId &&
+        (activeRunExecutions.has(lease.heartbeatRunId) ||
+          adapterExecutionControls.has(lease.heartbeatRunId))
+      ) {
+        continue;
+      }
       // A provider resource id names one physical sandbox. A different lease
       // row can still hold that same resource in a live status, so this sweep
       // must not tear down a sandbox that a different lease still owns.

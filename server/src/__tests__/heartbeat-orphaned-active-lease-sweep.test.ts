@@ -33,6 +33,10 @@ vi.mock("../middleware/logger.js", () => ({
 }));
 
 import { logger } from "../middleware/logger.ts";
+import {
+  adapterExecutionControls,
+  createAdapterExecutionControl,
+} from "../services/adapter-execution-control.ts";
 import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -108,6 +112,8 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     companyId: string;
     agentId: string;
     status: string;
+    finishedAt?: Date | null;
+    updatedAt?: Date;
   }): Promise<string> {
     const id = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -117,6 +123,8 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
       invocationSource: "on_demand",
       status: input.status,
       nextEventSeq: 1,
+      ...(input.finishedAt !== undefined ? { finishedAt: input.finishedAt } : {}),
+      ...(input.updatedAt !== undefined ? { updatedAt: input.updatedAt } : {}),
     });
     return id;
   }
@@ -194,7 +202,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
 
   it("test_flips_an_active_lease_when_its_run_is_failed", async () => {
     const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
-    const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed" });
+    const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed", finishedAt: oldEnough() });
     const leaseId = await insertActiveLease({
       companyId,
       environmentId,
@@ -226,6 +234,81 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     expect(result).toEqual({ recovered: 0 });
     const row = await leaseRow(leaseId);
     expect(row?.status).toBe("active");
+  });
+
+  // A run writes its terminal status before its own executor releases the
+  // lease. A run longer than the backoff has a lease whose updatedAt is already
+  // older than the cutoff, so only the time since the run ended can tell an
+  // orphan from a lease its executor is about to release.
+  it.each([
+    { label: "finishedAt", recent: { finishedAt: "recent" }, old: { finishedAt: "old" } },
+    { label: "updatedAt without finishedAt", recent: { updatedAt: "recent" }, old: { updatedAt: "old" } },
+  ] as const)(
+    "test_waits_until_the_run_has_been_terminal_for_the_backoff_window ($label)",
+    async ({ recent, old }) => {
+      const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
+      const justNow = new Date(Date.now() - 1000);
+      const at = (value: "recent" | "old" | undefined) =>
+        value === "recent" ? justNow : value === "old" ? oldEnough() : undefined;
+      const runFields = (spec: { finishedAt?: "recent" | "old"; updatedAt?: "recent" | "old" }) =>
+        "finishedAt" in spec
+          ? { finishedAt: at(spec.finishedAt), updatedAt: at(spec.finishedAt) }
+          : { finishedAt: null, updatedAt: at(spec.updatedAt) };
+      const justFinishedRunId = await insertHeartbeatRun({
+        companyId, agentId, status: "succeeded", ...runFields(recent),
+      });
+      const longFinishedRunId = await insertHeartbeatRun({
+        companyId, agentId, status: "succeeded", ...runFields(old),
+      });
+      // Both leases were acquired when their runs started, long before now.
+      const justFinishedLeaseId = await insertActiveLease({
+        companyId, environmentId, heartbeatRunId: justFinishedRunId, updatedAt: oldEnough(),
+      });
+      const longFinishedLeaseId = await insertActiveLease({
+        companyId, environmentId, heartbeatRunId: longFinishedRunId, updatedAt: oldEnough(),
+      });
+
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.sweepOrphanedActiveLeases({ backoffMs: 5 * 60 * 1000 });
+
+      expect(result).toEqual({ recovered: 1 });
+      expect(await leaseRow(justFinishedLeaseId)).toMatchObject({
+        status: "active",
+        failureReason: null,
+      });
+      expect(await leaseRow(longFinishedLeaseId)).toMatchObject({
+        status: "pending_cleanup",
+        failureReason: "orphaned_active_lease_recovered",
+      });
+    },
+  );
+
+  it("test_skips_a_lease_whose_run_is_still_executing_in_this_process", async () => {
+    const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
+    const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed", finishedAt: oldEnough() });
+    const leaseId = await insertActiveLease({
+      companyId,
+      environmentId,
+      heartbeatRunId: runId,
+      updatedAt: oldEnough(),
+    });
+    // The run's executor is still alive here and releases the lease itself.
+    adapterExecutionControls.set(runId, createAdapterExecutionControl());
+
+    try {
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.sweepOrphanedActiveLeases({ backoffMs: 0 });
+
+      expect(result).toEqual({ recovered: 0 });
+      expect((await leaseRow(leaseId))?.status).toBe("active");
+    } finally {
+      adapterExecutionControls.delete(runId);
+    }
+
+    // Once the executor is gone, the same lease is an orphan.
+    const heartbeat = heartbeatService(db);
+    expect(await heartbeat.sweepOrphanedActiveLeases({ backoffMs: 0 })).toEqual({ recovered: 1 });
+    expect((await leaseRow(leaseId))?.status).toBe("pending_cleanup");
   });
 
   it("test_flips_an_active_lease_when_its_heartbeat_run_id_is_null", async () => {
@@ -283,7 +366,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
 
   it("test_skips_a_lease_when_another_live_lease_holds_the_same_provider_lease_id", async () => {
     const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
-    const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed" });
+    const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed", finishedAt: oldEnough() });
     const sharedProviderLeaseId = "sandbox://fake/shared-resource";
     const orphanedLeaseId = await insertActiveLease({
       companyId,
@@ -312,7 +395,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
 
   it("test_defers_a_guarded_lease_instead_of_leaving_it_at_the_front_of_the_page", async () => {
     const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
-    const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed" });
+    const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed", finishedAt: oldEnough() });
     const sharedProviderLeaseId = "sandbox://fake/shared-resource";
     const orphanedLeaseId = await insertActiveLease({
       companyId,
@@ -412,12 +495,14 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
   });
 
   it("test_stops_the_recovered_sandbox_on_the_same_reaper_tick", async () => {
-    const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
-    const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed" });
+    const { companyId, environmentId } = await seedCompanyAgentAndEnvironment();
+    // A lease with no run. The periodic tick releases a legacy run's stale
+    // lease earlier, through the stale terminal-run reconciliation, so a
+    // run-less lease is the one that reaches this sweep on that tick.
     const leaseId = await insertActiveLease({
       companyId,
       environmentId,
-      heartbeatRunId: runId,
+      heartbeatRunId: null,
       updatedAt: oldEnough(),
     });
 
