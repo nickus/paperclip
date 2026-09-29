@@ -1511,6 +1511,23 @@ export const requestConfirmationSecretProposalPayloadSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
+/**
+ * The one instruction file write a change consent bound to
+ * `agent:{agentId}:instructions` allows: the file, the SHA-256 of its full new
+ * content (UTF-8), and whether the write also clears the legacy prompt
+ * template. The server normalizes `path` when the card is created.
+ */
+export const requestConfirmationInstructionsFileChangePayloadSchema = z.object({
+  version: z.literal(1).optional().default(1),
+  path: z.string().trim().min(1).max(1000),
+  contentSha256: z
+    .string()
+    .trim()
+    .regex(/^[0-9a-fA-F]{64}$/, "contentSha256 must be the 64-character hex SHA-256 of the file's full new content")
+    .transform((value) => value.toLowerCase()),
+  clearLegacyPromptTemplate: z.boolean().optional().default(false),
+});
+
 export const requestConfirmationPayloadSchema = z.object({
   version: z.literal(1),
   prompt: z.string().trim().min(1).max(1000),
@@ -1531,6 +1548,7 @@ export const requestConfirmationPayloadSchema = z.object({
   target: requestConfirmationTargetSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
+  instructionsFileChange: requestConfirmationInstructionsFileChangePayloadSchema.optional(),
 });
 
 export const requestCheckboxConfirmationOptionSchema = z.object({

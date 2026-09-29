@@ -28,6 +28,7 @@ import type {
 } from "@paperclipai/adapter-utils";
 import { IssueThreadInteractionCard } from "@/components/IssueThreadInteractionCard";
 import { ConnectionIntentInteractionBody } from "@/features/connections/ConnectionIntentInteractionBody";
+import { InstructionsFileChangeSummary } from "@/components/InstructionsFileChangeSummary";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import type { MentionOption } from "@/components/MarkdownEditor";
 import { Button } from "@/components/ui/button";
@@ -232,10 +233,16 @@ function InteractionActionError({ message }: { message: string | null }) {
   );
 }
 
-function Details({ children }: { children?: ReactNode }) {
+function Details({
+  children,
+  defaultOpen = false,
+}: {
+  children?: ReactNode;
+  defaultOpen?: boolean;
+}) {
   if (!children) return null;
   return (
-    <details className="mt-2">
+    <details className="mt-2" open={defaultOpen}>
       <summary className="flex cursor-pointer list-none items-center gap-1 text-xs font-medium text-muted-foreground">
         <ChevronDown aria-hidden className="h-3.5 w-3.5" /> Details
       </summary>
@@ -523,6 +530,9 @@ function ReceiptDisclosure({
               {interaction.payload.detailsMarkdown}
             </MarkdownBody>
           </div>
+        ) : null}
+        {interaction.payload.instructionsFileChange ? (
+          <InstructionsFileChangeSummary change={interaction.payload.instructionsFileChange} />
         ) : null}
         {interaction.payload.toolAction ? (
           <div className="rounded-sm bg-muted/45 px-3 py-2.5 text-sm">
@@ -871,11 +881,19 @@ function ConfirmationCard({
         </div>
       )}
       {!isPlanConfirmation && interaction.payload.detailsMarkdown ? (
-        <Details>
+        // An instruction change shows its diff up front: accepting the card
+        // allows exactly that write.
+        <Details defaultOpen={Boolean(interaction.payload.instructionsFileChange)}>
           <MarkdownBody externalReferences={externalReferences}>
             {interaction.payload.detailsMarkdown}
           </MarkdownBody>
         </Details>
+      ) : null}
+      {interaction.payload.instructionsFileChange ? (
+        <InstructionsFileChangeSummary
+          className="mt-3"
+          change={interaction.payload.instructionsFileChange}
+        />
       ) : null}
       {interaction.payload.toolAction ? (
         <div className="mt-3 space-y-2 rounded-sm bg-muted/45 px-3 py-2.5 text-sm">

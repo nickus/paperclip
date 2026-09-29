@@ -588,8 +588,26 @@ export type EnvironmentDriver = (typeof ENVIRONMENT_DRIVERS)[number];
  *   unscrubbed host output, irreversible deletes, costs, and instance/company
  *   administration). The server still authorizes every forwarded call for
  *   the agent.
+ * - `agent-with-instruction-writes` is `agent` plus one instruction write,
+ *   `PUT /api/agents/:id/instructions-bundle/file`, for an agent of the
+ *   run's company named by id (a shortname or `me` is refused). The server's
+ *   agent configuration check still decides each write, and for a run that
+ *   reaches the API through this bridge it always requires a change-consent
+ *   `request_confirmation` created in an earlier run and accepted by a board
+ *   user, whose displayed diff shows that exact write; the write consumes
+ *   it. That holds for a direct `agents:configure` grant too, and the server
+ *   refuses a bridged run's other ways to store instruction content (prompt
+ *   templates, instructions configuration, config rollback), so no bridged
+ *   run changes an agent's instructions without a person accepting the
+ *   change. Changing bundle settings, deleting instruction files and writing
+ *   the legacy prompt template stay refused.
+ *
+ * Skill assignment (`POST /api/agents/:id/skills/sync`, forwarded under
+ * every policy) is not an instruction write: it picks skills from the
+ * company library, whose content no bridged run can change, and the agent
+ * configuration check alone decides it.
  */
-export const SANDBOX_CALLBACK_BRIDGE_POLICIES = ["restricted", "agent"] as const;
+export const SANDBOX_CALLBACK_BRIDGE_POLICIES = ["restricted", "agent", "agent-with-instruction-writes"] as const;
 export type SandboxCallbackBridgePolicy = (typeof SANDBOX_CALLBACK_BRIDGE_POLICIES)[number];
 
 export const ENVIRONMENT_STATUSES = ["active", "archived"] as const;

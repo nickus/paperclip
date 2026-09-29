@@ -15,6 +15,7 @@ import { Router, type NextFunction, type Request, type Response } from "express"
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
@@ -63,7 +64,7 @@ import {
 import { trackAgentCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
 import { inheritNativeRunnerAdapterConfig } from "../services/native-runtime/native-agent-runtime-inheritance.js";
-import { agentInstructionsBundleMode } from "../services/agent-instructions.js";
+import { agentInstructionsBundleMode, normalizeAgentInstructionsFilePath } from "../services/agent-instructions.js";
 import {
   agentService,
   agentInstructionsService,
@@ -218,7 +219,7 @@ import {
   DEVICE_LOGIN_PROVIDER_UNSUPPORTED_CODE,
   type CredentialPromotion,
 } from "../services/device-login-service.js";
-import type { AdapterAuthSessionOwnerResponse } from "@paperclipai/shared";
+import type { AdapterAuthSessionOwnerResponse, RequestConfirmationPayload } from "@paperclipai/shared";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_KIMI_LOCAL_MODEL } from "@paperclipai/adapter-kimi-local";
@@ -241,8 +242,14 @@ import {
   agentInstructionsChangeTargetKey,
   agentProfileChangeTargetKey,
   changeConsentGateService,
+  instructionsFileChangeMatchesWrite,
+  instructionsFileContentSha256,
   touchesAgentProfileChangeConsentFields,
+  type ChangeConsentReceipt,
+  type InstructionsFileWrite,
 } from "../services/change-consent-gate.js";
+import { displayedDiffCoversFileWrite } from "../services/change-consent-diff.js";
+import { agentRequestUsesPaperclipApiBridge } from "../services/run-api-bridge.js";
 import {
   PaperclipRunnerProviderProfileError,
   resolvePaperclipRunnerProviderProfile,
@@ -251,6 +258,50 @@ import { managedAgentProfileService } from "../services/managed-agent-profiles.j
 import { remoteAgentProfileService } from "../services/remote-agent-profiles.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
+const BRIDGED_RUN_CHANGE_CONSENT_REQUIRED =
+  "Runs in a remote execution environment need an accepted change consent for this change, "
+  + "even with agents:configure: a request_confirmation bound to this target, created in an earlier run "
+  + "and accepted by a board user.";
+const BRIDGED_RUN_INSTRUCTIONS_FILE_WRITES_ONLY =
+  "Runs in a remote execution environment change agent instructions only by writing a bundle file "
+  + "(PUT /api/agents/{agentId}/instructions-bundle/file) under an accepted change consent that names the write.";
+const INSTRUCTIONS_CHANGE_CONSENT_FILE_WRITES_ONLY =
+  "A change consent for agent instructions allows only the one bundle file write it names "
+  + "(PUT /api/agents/{agentId}/instructions-bundle/file). Changing bundle settings or deleting instruction files "
+  + "needs a direct agents:configure grant.";
+const INSTRUCTION_FILE_CHANGE_CONSENT_MISMATCH =
+  "An accepted change consent for this agent's instructions exists, but none allows this exact write; none was consumed.";
+
+// What the accepted card must carry for one instruction file write.
+function instructionFileChangeConsentRequirement(write: InstructionsFileWrite) {
+  return `The accepted card must name this exact write in payload.instructionsFileChange (path "${write.path}", `
+    + `contentSha256 "${write.contentSha256}", the SHA-256 of the full content sent, and clearLegacyPromptTemplate `
+    + `${write.clearLegacyPromptTemplate}), and show it in a fenced \`\`\`diff block of its detailsMarkdown: `
+    + "name the file with `--- a/<path>` and `+++ b/<path>` headers (lines before any header belong to the entry file), "
+    + "show every line the write adds as a `+` line and every line it removes as a `-` line, "
+    + "against the file as it is now, and show no change the write does not make.";
+}
+
+// Adapter config keys that hold the prompt an adapter renders for every run.
+const PROMPT_TEMPLATE_CONFIG_KEYS = ["promptTemplate", "bootstrapPromptTemplate"] as const;
+
+/**
+ * What a change consent must show for one change, so that a card a board user
+ * accepted for one change cannot apply another.
+ */
+interface ChangeConsentBinding {
+  /** Appended to the refusal when no accepted card shows this change. */
+  requirement: string;
+  /** The refusal when an accepted card exists but does not show this change. */
+  mismatch: string;
+  /** Added to the refusal's details, so the caller can compare its card. */
+  details?: Record<string, unknown>;
+  /**
+   * Builds the check that a card's payload shows this change. Called only
+   * when the change needs a card, before any card is consumed.
+   */
+  prepare: () => Promise<(payload: RequestConfirmationPayload) => boolean>;
+}
 
 function requireAgentSkillAssignmentMode(req: Request, _res: Response, next: NextFunction) {
   if (!AGENT_SKILL_ASSIGNMENT_MODES.includes(req.body?.mode)) {
@@ -526,6 +577,9 @@ export function agentRoutes(
     "agentsMdPath",
   ] as const;
   const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET: ReadonlySet<string> = new Set(KNOWN_INSTRUCTIONS_BUNDLE_KEYS);
+  // The pseudo-file path the instructions service maps onto
+  // adapterConfig.promptTemplate (see services/agent-instructions.ts).
+  const LEGACY_PROMPT_TEMPLATE_FILE_PATH = "promptTemplate.legacy.md";
 
   const router = Router();
   const svc = agentService(db);
@@ -2798,61 +2852,221 @@ export function agentRoutes(
     }
   }
 
+  // Whether an agent's request comes from a run in a remote execution
+  // environment, which reaches the API through that environment's bridge. It
+  // is decided from the host's records of where the run executes (see
+  // agentRequestUsesPaperclipApiBridge), never from request input beyond the
+  // credential: for an agent JWT that is its signed run claim, which the bridge
+  // forwards and a run cannot change.
+  async function agentRequestIsBridged(req: Request, companyId: string) {
+    if (req.actor.type !== "agent") return false;
+    if (!req.actor.agentId) return true;
+    return agentRequestUsesPaperclipApiBridge(db, {
+      companyId,
+      agentId: req.actor.agentId,
+      runId: req.actor.runId,
+      source: req.actor.source,
+    });
+  }
+
+  /**
+   * Authorize a protected agent change (instructions or profile). Returns the
+   * change consent the change consumed, if it needed one, so the caller can
+   * give it back when the change then fails to apply.
+   *
+   * An agent needs a board-accepted change consent, which the change
+   * consumes, when it holds only a suggest grant, and also under a direct
+   * change grant when its request comes from a run in a remote execution
+   * environment. `consent` binds the card to this exact change; without one,
+   * a bridged run cannot change instructions at all.
+   */
   async function assertCanApplyProtectedAgentChange(
     req: Request,
     targetAgent: { id: string; companyId: string },
     targetKeys: string[],
-  ) {
+    options: { consent?: ChangeConsentBinding } = {},
+  ): Promise<ChangeConsentReceipt | null> {
     if (!hasCompanyAccess(req, targetAgent.companyId)) {
       throw notFound("Agent not found");
     }
     assertCompanyAccess(req, targetAgent.companyId);
-    const changeScope = { requiresChangeGrant: true };
+    // Name the target agent so a change grant scoped to agent ids or to a
+    // management subtree can match it. Without it every scoped grant fails
+    // closed and only company-wide grants apply.
+    const changeScope = { requiresChangeGrant: true, targetAgentId: targetAgent.id };
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:update",
       resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
       scope: changeScope,
     });
-    if (decision.allowed) {
-      return;
+    const suggestOnly = !decision.allowed
+      && decision.reason === "deny_missing_consent"
+      && req.actor.type === "agent"
+      && targetKeys.length > 0;
+    if (!decision.allowed && !suggestOnly) {
+      throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
     }
+    const bridged = await agentRequestIsBridged(req, targetAgent.companyId);
+    if (decision.allowed && !bridged) return null;
 
-    if (decision.reason === "deny_missing_consent" && req.actor.type === "agent" && targetKeys.length > 0) {
-      try {
-        await changeConsentGateService(db).assertConsented({
-          companyId: targetAgent.companyId,
-          actorAgentId: req.actor.agentId,
-          actorRunId: req.actor.runId ?? null,
-          targetKeys,
-        });
-      } catch (err) {
-        if (err instanceof HttpError && err.status === 403) {
-          throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
-        }
-        throw err;
-      }
-
+    // From here on the change needs a card. Every check that can still refuse
+    // it runs before a card is consumed, so a refused change never spends one.
+    //
+    // An instructions card names one bundle file write, so it can only apply
+    // that write: any other instructions change (bundle settings, deleting a
+    // file) cannot be made under a card.
+    if (
+      !options.consent
+      && targetKeys.some((key) => key === agentInstructionsChangeTargetKey(targetAgent.id))
+    ) {
+      throw forbidden(
+        bridged ? BRIDGED_RUN_INSTRUCTIONS_FILE_WRITES_ONLY : INSTRUCTIONS_CHANGE_CONSENT_FILE_WRITES_ONLY,
+        { reason: "deny_missing_consent" },
+      );
+    }
+    let refusal: { explanation: string; details: Record<string, unknown> };
+    if (decision.allowed) {
+      refusal = { explanation: BRIDGED_RUN_CHANGE_CONSENT_REQUIRED, details: { reason: "deny_missing_consent" } };
+    } else {
       const consentedDecision = await access.decide({
         actor: req.actor,
         action: "agent_config:update",
         resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
         scope: { ...changeScope, consentedChange: true },
       });
-      if (consentedDecision.allowed) {
-        return;
+      if (!consentedDecision.allowed) {
+        throw forbidden(consentedDecision.explanation, authorizationDeniedDetails(consentedDecision));
       }
-      throw forbidden(consentedDecision.explanation, authorizationDeniedDetails(consentedDecision));
+      refusal = { explanation: decision.explanation, details: authorizationDeniedDetails(decision) };
     }
-
-    throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+    let mismatch: typeof refusal | undefined;
+    if (options.consent) {
+      const details = { ...refusal.details, ...options.consent.details };
+      mismatch = {
+        explanation: `${options.consent.mismatch} ${options.consent.requirement}`,
+        details: { ...details, code: "change_consent_mismatch" },
+      };
+      refusal = { explanation: `${refusal.explanation} ${options.consent.requirement}`, details };
+    }
+    const matchesChange = options.consent ? await options.consent.prepare() : undefined;
+    return consumeChangeConsentOrForbid(req, targetAgent.companyId, targetKeys, refusal, matchesChange, mismatch);
   }
 
-  async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {
-    await assertCanApplyProtectedAgentChange(
+  // Consume a board-accepted change consent for `targetKeys` (one that
+  // `matchesChange` accepts, when given), or refuse the change with `refusal`,
+  // or with `mismatch` when accepted cards exist but none shows this change.
+  // A refused change consumes no card.
+  async function consumeChangeConsentOrForbid(
+    req: Request,
+    companyId: string,
+    targetKeys: string[],
+    refusal: { explanation: string; details: Record<string, unknown> },
+    matchesChange?: (payload: RequestConfirmationPayload) => boolean,
+    mismatch?: { explanation: string; details: Record<string, unknown> },
+  ): Promise<ChangeConsentReceipt> {
+    let receipt: ChangeConsentReceipt | null = null;
+    let mismatched = false;
+    try {
+      receipt = await changeConsentGateService(db).consume({
+        companyId,
+        actorAgentId: req.actor.agentId,
+        actorRunId: req.actor.runId ?? null,
+        targetKeys,
+        matchesChange,
+      });
+    } catch (err) {
+      if (!(err instanceof HttpError && err.status === 403)) throw err;
+      mismatched = (err.details as { code?: unknown } | undefined)?.code === "change_consent_mismatch";
+    }
+    if (!receipt) {
+      const denial = mismatched && mismatch ? mismatch : refusal;
+      throw forbidden(denial.explanation, denial.details);
+    }
+    return receipt;
+  }
+
+  async function assertCanManageInstructionsPath(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+    options: { consent?: ChangeConsentBinding } = {},
+  ) {
+    return assertCanApplyProtectedAgentChange(
       req,
       targetAgent,
       [agentInstructionsChangeTargetKey(targetAgent.id)],
+      options,
+    );
+  }
+
+  // Binds a change consent to one instruction file write. The card must name
+  // exactly this write in payload.instructionsFileChange (file, SHA-256 of the
+  // full content, clearLegacyPromptTemplate), and its diff must show it
+  // (see services/change-consent-diff.ts).
+  function instructionFileWriteConsent(
+    targetAgent: Parameters<typeof instructions.readFile>[0],
+    filePath: string,
+    write: { content: string; clearLegacyPromptTemplate?: boolean },
+  ): ChangeConsentBinding {
+    const fileWrite: InstructionsFileWrite = {
+      path: filePath,
+      contentSha256: instructionsFileContentSha256(write.content),
+      clearLegacyPromptTemplate: write.clearLegacyPromptTemplate === true,
+    };
+    return {
+      requirement: instructionFileChangeConsentRequirement(fileWrite),
+      mismatch: INSTRUCTION_FILE_CHANGE_CONSENT_MISMATCH,
+      details: { instructionsFileChange: fileWrite },
+      prepare: async () => {
+        const bundle = await instructions.getBundle(targetAgent);
+        const entryFile = normalizeAgentInstructionsFilePath(bundle.entryFile || "AGENTS.md");
+        const previousContent = await instructions.readFile(targetAgent, filePath).then(
+          (file) => file.content,
+          (err: unknown) => {
+            // A file (or a bundle) that does not exist yet has no content.
+            if (err instanceof HttpError && err.status === 404) return null;
+            throw err;
+          },
+        );
+        return (payload) => instructionsFileChangeMatchesWrite(payload.instructionsFileChange, fileWrite)
+          && displayedDiffCoversFileWrite({
+            detailsMarkdown: payload.detailsMarkdown,
+            filePath,
+            entryFile,
+            previousContent,
+            nextContent: write.content,
+          });
+      },
+    };
+  }
+
+  // A run in a remote execution environment changes instructions only through
+  // a bundle file write under an accepted change consent, and profile fields
+  // only on their own, under one. Other routes that could store an agent's
+  // prompt templates, instructions configuration or profile fields (agent
+  // PATCH, config rollback) refuse such a change from a bridged run, whatever
+  // its grants. Runs on the host are not affected.
+  async function assertBridgedRunLeavesProtectedAgentFields(
+    req: Request,
+    existing: { companyId: string; adapterConfig: unknown },
+    next: { adapterConfig?: Record<string, unknown> | null; profileFields?: readonly string[] },
+  ) {
+    if (req.actor.type !== "agent") return;
+    const currentAdapterConfig = asRecord(existing.adapterConfig) ?? {};
+    const changed = [
+      ...(next.adapterConfig
+        ? [...PROMPT_TEMPLATE_CONFIG_KEYS, ...KNOWN_INSTRUCTIONS_BUNDLE_KEYS]
+          .filter((key) => !isDeepStrictEqual(next.adapterConfig![key], currentAdapterConfig[key]))
+          .map((key) => `adapterConfig.${key}`)
+        : []),
+      ...(next.profileFields ?? []),
+    ];
+    if (changed.length === 0) return;
+    if (!(await agentRequestIsBridged(req, existing.companyId))) return;
+    throw forbidden(
+      `Runs in a remote execution environment cannot change ${changed.join(", ")} here. `
+        + "Write instruction bundle files, or send profile fields on their own, under an accepted change consent.",
+      { reason: "deny_missing_consent" },
     );
   }
 
@@ -4362,6 +4576,12 @@ export function agentRoutes(
       await assertSelectableAdapterType(rollbackAdapterType);
     }
     const rollbackAdapterConfig = asRecord(rollbackConfig.adapterConfig) ?? {};
+    await assertBridgedRunLeavesProtectedAgentFields(req, existing, {
+      adapterConfig: rollbackAdapterConfig,
+      profileFields: AGENT_PROFILE_CHANGE_CONSENT_FIELDS.filter((key) =>
+        hasOwn(rollbackConfig, key) && !isDeepStrictEqual(rollbackConfig[key], (existing as Record<string, unknown>)[key]),
+      ),
+    });
     assertExternalInstructionsAdmin(req, existing);
     assertExternalInstructionsAdmin(req, {
       ...existing,
@@ -5175,29 +5395,60 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    await assertCanManageInstructionsPath(req, existing);
+    // Every check that does not depend on the caller's grants runs before
+    // authorization, so a write that would fail anyway never consumes an
+    // accepted change consent.
+    //
+    // The legacy pseudo-file is not a bundle file: writing it replaces
+    // adapterConfig.promptTemplate. Agents write real bundle files only.
+    if (
+      req.actor.type === "agent"
+      && (req.body.path === LEGACY_PROMPT_TEMPLATE_FILE_PATH
+        || normalizeAgentInstructionsFilePath(req.body.path) === LEGACY_PROMPT_TEMPLATE_FILE_PATH)
+    ) {
+      throw forbidden(
+        `Agent-authenticated callers cannot write ${LEGACY_PROMPT_TEMPLATE_FILE_PATH}; write the bundle's entry file instead.`,
+      );
+    }
     assertExternalInstructionsAdmin(req, existing);
+    // Throws 422 for a path outside the bundle root.
+    const filePath = normalizeAgentInstructionsFilePath(req.body.path);
+    const consentReceipt = await assertCanManageInstructionsPath(req, existing, {
+      consent: instructionFileWriteConsent(existing, filePath, req.body),
+    });
 
     const actor = getActorInfo(req);
-    const result = await instructions.writeFile(existing, req.body.path, req.body.content, {
-      clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate,
-    });
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
-      existing.companyId,
-      result.adapterConfig,
-      { strictMode: strictSecretsMode, adapterType: existing.adapterType },
-    );
-    await svc.update(
-      id,
-      { adapterConfig: normalizedAdapterConfig },
-      {
-        recordRevision: {
-          createdByAgentId: actor.agentId,
-          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-          source: "instructions_bundle_file_put",
+    let result: Awaited<ReturnType<typeof instructions.writeFile>>;
+    try {
+      result = await instructions.writeFile(existing, req.body.path, req.body.content, {
+        clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate,
+      });
+      const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+        existing.companyId,
+        result.adapterConfig,
+        { strictMode: strictSecretsMode, adapterType: existing.adapterType },
+      );
+      await svc.update(
+        id,
+        { adapterConfig: normalizedAdapterConfig },
+        {
+          recordRevision: {
+            createdByAgentId: actor.agentId,
+            createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+            source: "instructions_bundle_file_put",
+          },
         },
-      },
-    );
+      );
+    } catch (err) {
+      // The write did not apply: give the consent back so the same change can
+      // be retried.
+      if (consentReceipt) {
+        await changeConsentGateService(db).release(consentReceipt).catch((releaseErr: unknown) => {
+          logger.warn({ err: releaseErr, interactionId: consentReceipt.interactionId }, "Could not release a change consent");
+        });
+      }
+      throw err;
+    }
 
     await logActivity(db, {
       companyId: existing.companyId,
@@ -5420,6 +5671,15 @@ export function agentRoutes(
     const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
       (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
     );
+    await assertBridgedRunLeavesProtectedAgentFields(req, existing, {
+      adapterConfig: touchesAdapterConfiguration ? (asRecord(patchData.adapterConfig) ?? {}) : null,
+      // Profile fields sent with other changes skip the change consent below.
+      profileFields: profileOnlyChange
+        ? []
+        : AGENT_PROFILE_CHANGE_CONSENT_FIELDS.filter((key) =>
+          hasOwn(patchData, key) && !isDeepStrictEqual(patchData[key], (existing as Record<string, unknown>)[key]),
+        ),
+    });
     if (profileOnlyChange) {
       await assertCanApplyAgentProfileChange(req, existing);
     } else {

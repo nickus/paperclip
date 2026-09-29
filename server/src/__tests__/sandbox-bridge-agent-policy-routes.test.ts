@@ -142,6 +142,10 @@ function listServerRoutes(): { routes: RouteEntry[]; unmounted: string[]; unreso
   return { routes, unmounted, unresolved };
 }
 
+// The placeholder for a route parameter. It is shaped like an id, since the
+// instruction-writes policy opens a write only for an agent named by id.
+const SAMPLE_ID = "00000000-0000-4000-8000-000000000000";
+
 /** Every concrete path to try for a route pattern. */
 function samplePaths(routePath: string): Array<{ path: string; values: Record<string, string> }> {
   // Company-scoped routes use the run's own company; enumerated parameters
@@ -159,13 +163,15 @@ function samplePaths(routePath: string): Array<{ path: string; values: Record<st
       })),
     );
   }
-  return samples.map((sample) => ({ ...sample, path: sample.path.replace(/:[A-Za-z0-9_]+\??/g, "sample-id") }));
+  return samples.map((sample) => ({ ...sample, path: sample.path.replace(/:[A-Za-z0-9_]+\??/g, SAMPLE_ID) }));
 }
 
-function allowed(method: string, path: string): boolean {
+type RoutePolicy = "agent" | "agent-with-instruction-writes";
+
+function allowed(policy: RoutePolicy, method: string, path: string): boolean {
   return authorizeSandboxCallbackBridgeRequestForPolicy(
     { method, path },
-    { policy: "agent", companyId: RUN_COMPANY_ID },
+    { policy, companyId: RUN_COMPANY_ID },
   ) === null;
 }
 
@@ -174,27 +180,27 @@ function allowed(method: string, path: string): boolean {
  * samples. A `router.use` mount is tried for every method, at its own path and
  * one level below it.
  */
-function classify(route: RouteEntry): string {
+function classify(route: RouteEntry, policy: RoutePolicy = "agent"): string {
   const probes: Array<{ label: string; method: string; path: string }> = [];
   for (const sample of samplePaths(route.path)) {
     const valueLabel = Object.entries(sample.values).map(([name, value]) => `${name}=${value}`).join(",");
     if (route.method === "USE") {
       for (const method of METHODS) {
         probes.push({ label: method, method, path: sample.path });
-        probes.push({ label: `${method} /*`, method, path: `${sample.path}/sample-id` });
+        probes.push({ label: `${method} /*`, method, path: `${sample.path}/${SAMPLE_ID}` });
       }
     } else {
       probes.push({ label: valueLabel, method: route.method, path: sample.path });
     }
   }
-  const allowedLabels = probes.filter((probe) => allowed(probe.method, probe.path)).map((probe) => probe.label);
+  const allowedLabels = probes.filter((probe) => allowed(policy, probe.method, probe.path)).map((probe) => probe.label);
   if (allowedLabels.length === 0) return "DENY";
   if (allowedLabels.length === probes.length) return "ALLOW";
   return `MIXED (allows ${allowedLabels.join("; ")})`;
 }
 
-function decisionOf(route: RouteEntry): "allow" | "deny" | "mixed" {
-  const decision = classify(route);
+function decisionOf(route: RouteEntry, policy: RoutePolicy = "agent"): "allow" | "deny" | "mixed" {
+  const decision = classify(route, policy);
   return decision === "ALLOW" ? "allow" : decision === "DENY" ? "deny" : "mixed";
 }
 
@@ -282,6 +288,30 @@ describe("agent bridge policy route inventory", () => {
       const route = byKey.get(key);
       expect(route, `${key} is registered`).toBeDefined();
       expect(decisionOf(route!), key).toBe("allow");
+    }
+  });
+
+  it("agent-with-instruction-writes forwards exactly the instruction file write on top of agent", () => {
+    const changed = [...new Set(routes
+      .filter((route) => classify(route, "agent-with-instruction-writes") !== classify(route))
+      .map((route) => `${classify(route, "agent-with-instruction-writes")} ${route.method} ${route.path}`))]
+      .sort();
+    expect(changed).toEqual([
+      "ALLOW PUT /api/agents/:id/instructions-bundle/file",
+    ]);
+    const byKey = new Map(routes.map((route) => [`${route.method} ${route.path}`, route]));
+    for (const key of [
+      "DELETE /api/agents/:id/instructions-bundle/file",
+      "PATCH /api/agents/:id/instructions-bundle",
+    ]) {
+      const route = byKey.get(key);
+      expect(route, `${key} is registered`).toBeDefined();
+      expect(decisionOf(route!, "agent-with-instruction-writes"), key).toBe("deny");
+    }
+    // The opened write names its agent by id; `me` and shortnames stay refused.
+    for (const reference of ["me", "sample-agent", SAMPLE_ID.slice(1)]) {
+      const path = `/api/agents/${reference}/instructions-bundle/file`;
+      expect(allowed("agent-with-instruction-writes", "PUT", path), path).toBe(false);
     }
   });
 });

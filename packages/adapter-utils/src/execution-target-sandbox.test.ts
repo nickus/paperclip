@@ -2529,6 +2529,121 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
+  it("forwards instruction file writes only when the target's policy opens them, for agents named by id", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-instructions-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
+    await mkdir(runtimeRootDir, { recursive: true });
+
+    // Records what reached the API server, including the request body.
+    const forwarded: Array<{ request: string; body: string }> = [];
+    const apiServer = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        forwarded.push({ request: `${req.method ?? "GET"} ${req.url ?? "/"}`, body: Buffer.concat(chunks).toString("utf8") });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      apiServer.once("error", reject);
+      apiServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = apiServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected the bridge test API server to listen on a TCP port.");
+    }
+    const apiPort = address.port;
+
+    const baseTarget: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+      timeoutMs: 30_000,
+      streamRunLogs: false,
+      paperclipApiBridgeCompanyId: "co-1",
+    };
+    const fileBody = JSON.stringify({ path: "AGENTS.md", content: "# Updated\n" });
+    const bundleBody = JSON.stringify({ entryFile: "AGENTS.md" });
+    const targetAgentId = "22222222-2222-4222-8222-222222222222";
+    const writes = [
+      { method: "PUT", route: `/api/agents/${targetAgentId}/instructions-bundle/file`, body: fileBody },
+      // A target named by shortname rather than by id.
+      { method: "PUT", route: "/api/agents/agent-2/instructions-bundle/file", body: fileBody },
+      { method: "PATCH", route: `/api/agents/${targetAgentId}/instructions-bundle`, body: bundleBody },
+      { method: "DELETE", route: `/api/agents/${targetAgentId}/instructions-bundle/file?path=AGENTS.md`, body: null },
+    ];
+
+    async function statusesThroughBridge(target: AdapterSandboxExecutionTarget, runId: string) {
+      const bridge = await startAdapterExecutionTargetPaperclipBridge({
+        runId,
+        target,
+        runtimeRootDir,
+        adapterKey: "codex",
+        hostApiToken: "real-run-jwt",
+        hostApiUrl: `http://127.0.0.1:${apiPort}`,
+      });
+      try {
+        const results: Array<{ status: number; error: string | null }> = [];
+        for (const write of writes) {
+          const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}${write.route}`, {
+            method: write.method,
+            // The in-sandbox gateway takes only JSON bodies for writes, deletes included.
+            headers: {
+              authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
+              accept: "application/json",
+              "content-type": "application/json",
+            },
+            ...(write.body ? { body: write.body } : {}),
+          });
+          const body = await response.json() as { error?: string };
+          results.push({ status: response.status, error: body.error ?? null });
+        }
+        return results;
+      } finally {
+        await bridge?.stop();
+      }
+    }
+
+    try {
+      const agentPolicy = await statusesThroughBridge(
+        { ...baseTarget, paperclipApiBridgePolicy: "agent" },
+        "run-bridge-agent-instructions",
+      );
+      expect(agentPolicy.map((result) => result.status)).toEqual([403, 403, 403, 403]);
+      expect(forwarded).toEqual([]);
+
+      const opened = await statusesThroughBridge(
+        { ...baseTarget, paperclipApiBridgePolicy: "agent-with-instruction-writes" },
+        "run-bridge-instruction-writes",
+      );
+      expect(opened.map((result) => result.status)).toEqual([200, 403, 403, 403]);
+      for (const result of opened.slice(1)) {
+        expect(result.error).toContain('bridge policy "agent-with-instruction-writes"');
+      }
+      // Only the file write naming its target by id reaches the API, unchanged.
+      expect(forwarded).toEqual([
+        { request: `PUT /api/agents/${targetAgentId}/instructions-bundle/file`, body: fileBody },
+      ]);
+
+      // A target with no bound company opens no instruction write either.
+      const unbound = await statusesThroughBridge(
+        { ...baseTarget, paperclipApiBridgeCompanyId: null, paperclipApiBridgePolicy: "agent-with-instruction-writes" },
+        "run-bridge-instruction-writes-unbound",
+      );
+      expect(unbound.map((result) => result.status)).toEqual([403, 403, 403, 403]);
+      expect(forwarded).toHaveLength(1);
+    } finally {
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
   it("creates a sandbox run log tail factory when bridge streaming is enabled", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-stream-"));
     cleanupDirs.push(rootDir);

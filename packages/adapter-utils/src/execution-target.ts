@@ -155,11 +155,12 @@ export interface AdapterLocalExecutionTarget extends AdapterExecutionTargetWorks
 interface AdapterRemoteExecutionTargetBridgeSettings {
   /**
    * Route policy for this run's Paperclip API bridge. Absent or any value
-   * other than `"agent"` keeps the restricted allowlist.
+   * other than `"agent"` or `"agent-with-instruction-writes"` keeps the
+   * restricted allowlist.
    */
   paperclipApiBridgePolicy?: SandboxCallbackBridgePolicy | null;
   /**
-   * The company the run belongs to. The `agent` bridge policy refuses
+   * The company the run belongs to. The wider bridge policies refuse
    * company-scoped paths for any other company.
    */
   paperclipApiBridgeCompanyId?: string | null;
@@ -592,8 +593,8 @@ export function adapterExecutionTargetUsesPaperclipBridge(
 
 /**
  * Read the Paperclip API bridge route policy off a target. Only a remote
- * target stamped with the literal `"agent"` returns `"agent"`; everything else
- * fails closed to `"restricted"`.
+ * target stamped with one of the exact wider policy names returns that
+ * policy; everything else fails closed to `"restricted"`.
  */
 export function adapterExecutionTargetPaperclipApiBridgePolicy(
   target: AdapterExecutionTarget | null | undefined,
@@ -606,8 +607,10 @@ export function adapterExecutionTargetPaperclipApiBridgePolicy(
 function readBridgeSettingsFromParsedTarget(
   parsed: Record<string, unknown>,
 ): AdapterRemoteExecutionTargetBridgeSettings {
+  // Keep only an exact wider policy name; anything else stays unset (restricted).
+  const policy = normalizeSandboxCallbackBridgePolicy(parsed.paperclipApiBridgePolicy);
   return {
-    ...(parsed.paperclipApiBridgePolicy === "agent" ? { paperclipApiBridgePolicy: "agent" as const } : {}),
+    ...(policy !== "restricted" ? { paperclipApiBridgePolicy: policy } : {}),
     ...(typeof parsed.paperclipApiBridgeCompanyId === "string" && parsed.paperclipApiBridgeCompanyId.trim()
       ? { paperclipApiBridgeCompanyId: parsed.paperclipApiBridgeCompanyId.trim() }
       : {}),

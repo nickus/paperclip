@@ -336,6 +336,42 @@ describe("TaskChatInteractionCard", () => {
     ).toBeNull();
   });
 
+  it("shows the instruction file write a pending change-consent card allows, with its diff open", () => {
+    const hash = "fedcba9876543210".repeat(4);
+    flushSync(() => {
+      root.render(
+        <TooltipProvider>
+          <ThemeProvider>
+            <TaskChatInteractionCard
+              item={interactionItem(
+                createRequestConfirmation({
+                  payload: {
+                    version: 1,
+                    prompt: "Apply this instruction change?",
+                    detailsMarkdown: "```diff\n+New rule.\n```",
+                    target: { type: "custom", key: "agent:agent-2:instructions" },
+                    instructionsFileChange: {
+                      version: 1,
+                      path: "AGENTS.md",
+                      contentSha256: hash,
+                      clearLegacyPromptTemplate: false,
+                    },
+                  },
+                }),
+              )}
+              presentation="takeover"
+            />
+          </ThemeProvider>
+        </TooltipProvider>,
+      );
+    });
+    const summary = container.querySelector('[data-testid="instructions-file-change"]');
+    expect(summary?.textContent).toContain("AGENTS.md");
+    expect(summary?.textContent).toContain(hash);
+    expect(summary?.textContent).not.toContain("legacy prompt template");
+    expect(container.querySelector("details")?.open).toBe(true);
+  });
+
   it("keeps the plan revision in the header and hides the prompt while requesting changes", async () => {
     const interaction = createRequestConfirmation({
       sourceRunId: "run-plan",

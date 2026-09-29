@@ -11,7 +11,8 @@ const FILE_KEY = "instructionsFilePath";
 const PROMPT_KEY = "promptTemplate";
 /** @deprecated Use the managed instructions bundle system instead. */
 const BOOTSTRAP_PROMPT_KEY = "bootstrapPromptTemplate";
-const LEGACY_PROMPT_TEMPLATE_PATH = "promptTemplate.legacy.md";
+/** The pseudo-file that stands for `adapterConfig.promptTemplate`; not a bundle file. */
+export const LEGACY_PROMPT_TEMPLATE_PATH = "promptTemplate.legacy.md";
 const IGNORED_INSTRUCTIONS_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "Desktop.ini"]);
 const IGNORED_INSTRUCTIONS_DIRECTORY_NAMES = new Set([
   ".git",
@@ -117,6 +118,14 @@ function normalizeRelativeFilePath(candidatePath: string): string {
     throw unprocessable("Instructions file path must stay within the bundle root");
   }
   return normalized;
+}
+
+/**
+ * The bundle-relative path a write or read of `candidatePath` resolves to.
+ * Throws 422 for a path that leaves the bundle root.
+ */
+export function normalizeAgentInstructionsFilePath(candidatePath: string): string {
+  return normalizeRelativeFilePath(candidatePath);
 }
 
 function resolvePathWithinRoot(rootPath: string, relativePath: string): string {

@@ -106,6 +106,7 @@ import {
   runWorkspaceIsFinalized,
 } from "./issues.js";
 import { questionResponseDeliveryValues } from "./question-response-delivery.js";
+import { isChangeConsentTargetKey, prepareChangeConsentPayload } from "./change-consent-gate.js";
 import {
   cancelPendingIssueInteractionChatPublications,
   enqueueIssueInteractionChatPublications,
@@ -392,6 +393,13 @@ export function resolveInteractionPolicy(args: {
   governance: InteractionResolverGovernance;
   hasToolAction: boolean;
   hasSecretProposal?: boolean;
+  /**
+   * The card is bound to a change-consent target (see
+   * `isChangeConsentTargetKey`). Accepting it authorizes a protected change,
+   * so only a board user may resolve it, whatever the request or company
+   * governance says.
+   */
+  hasChangeConsentTarget?: boolean;
 }) {
   const kindGovernance = args.governance[args.kind];
   const requestedPolicyInput =
@@ -406,7 +414,7 @@ export function resolveInteractionPolicy(args: {
   let effectiveResolverPolicy = requestedResolverPolicy;
   let effectiveResolverPolicySource: IssueThreadInteractionEffectiveResolverPolicySource =
     "requested";
-  if (args.hasToolAction || args.hasSecretProposal) {
+  if (args.hasToolAction || args.hasSecretProposal || args.hasChangeConsentTarget) {
     effectiveResolverPolicy = "human_only";
     effectiveResolverPolicySource = "governed_action";
   } else if (kindGovernance?.cap) {
@@ -853,10 +861,12 @@ function normalizeCreateInteractionInput(
     case "request_confirmation":
       return {
         ...input,
-        payload: {
+        // A card bound to an agent's instructions must name the exact file
+        // write it allows; this checks that and normalizes the proposal.
+        payload: prepareChangeConsentPayload({
           ...input.payload,
           supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
-        },
+        }),
       };
     case "request_checkbox_confirmation":
       return {
@@ -3333,6 +3343,10 @@ export function issueThreadInteractionService(
         hasSecretProposal:
           data.kind === "request_confirmation" &&
           data.payload.secretProposal !== undefined,
+        hasChangeConsentTarget:
+          data.kind === "request_confirmation" &&
+          data.payload.target?.type === "custom" &&
+          isChangeConsentTargetKey(data.payload.target.key),
       });
       const normalizedData = {
         ...data,

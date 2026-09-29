@@ -1347,6 +1347,23 @@ export interface RequestConfirmationConnectionAuthorizationPayload {
   requestingAgentName?: string | null;
 }
 
+/**
+ * The one instruction file write a change consent bound to
+ * `agent:{agentId}:instructions` allows. Accepting the card allows exactly this
+ * write: the file at `path`, with content whose SHA-256 is `contentSha256`,
+ * and the same `clearLegacyPromptTemplate` flag. Any other write is refused
+ * and leaves the card unspent.
+ */
+export interface RequestConfirmationInstructionsFileChangePayload {
+  version: 1;
+  /** Bundle-relative file path, normalized by the server (e.g. `AGENTS.md`). */
+  path: string;
+  /** Lowercase hex SHA-256 of the file's full new content, UTF-8 encoded. */
+  contentSha256: string;
+  /** Whether the write also clears the agent's legacy prompt template. */
+  clearLegacyPromptTemplate: boolean;
+}
+
 export type ConnectionIntentPhase = "requested" | "authorizing" | "needs_retry";
 
 /**
@@ -1393,6 +1410,7 @@ export interface RequestConfirmationPayload {
   toolAction?: RequestConfirmationToolActionPayload;
   secretProposal?: RequestConfirmationSecretProposalPayload;
   connectionAuthorization?: RequestConfirmationConnectionAuthorizationPayload;
+  instructionsFileChange?: RequestConfirmationInstructionsFileChangePayload;
 }
 
 export interface RequestCheckboxConfirmationOption {

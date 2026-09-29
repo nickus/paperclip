@@ -332,6 +332,48 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("matches agent- and subtree-scoped change grants against the target agent in the requested scope", async () => {
+    const company = await createCompany(db, "ScopedAgentChangeGrant");
+    const allowlistAgent = await createAgent(db, company.id);
+    const managerAgent = await createAgent(db, company.id);
+    const reportAgent = await createAgent(db, company.id, { reportsTo: managerAgent.id });
+    const listedTarget = await createAgent(db, company.id);
+    const outsideAgent = await createAgent(db, company.id);
+    await grantAgentPermission(db, company.id, allowlistAgent.id, "agents:configure", {
+      agentIds: [listedTarget.id],
+    });
+    await grantAgentPermission(db, company.id, managerAgent.id, "agents:configure", {
+      subtreeRootAgentIds: [managerAgent.id],
+    });
+
+    const authz = authorizationService(db);
+    const decideChange = (actorAgentId: string, targetAgentId: string, scope: Record<string, unknown>) =>
+      authz.decide({
+        actor: { type: "agent", agentId: actorAgentId, companyId: company.id, source: "agent_key" },
+        action: "agent_config:update",
+        resource: { type: "agent", companyId: company.id, agentId: targetAgentId },
+        scope,
+      });
+
+    for (const [actorAgentId, targetAgentId] of [
+      [allowlistAgent.id, listedTarget.id],
+      [managerAgent.id, reportAgent.id],
+      [managerAgent.id, managerAgent.id],
+    ] as const) {
+      await expect(decideChange(actorAgentId, targetAgentId, { requiresChangeGrant: true, targetAgentId }))
+        .resolves.toMatchObject({ allowed: true, reason: "allow_direct_change" });
+      // A scope that does not name the target cannot match a scoped grant.
+      await expect(decideChange(actorAgentId, targetAgentId, { requiresChangeGrant: true }))
+        .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+    }
+    for (const actorAgentId of [allowlistAgent.id, managerAgent.id]) {
+      await expect(decideChange(actorAgentId, outsideAgent.id, {
+        requiresChangeGrant: true,
+        targetAgentId: outsideAgent.id,
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+    }
+  });
+
   it("enforces direct or consented suggest grants for skill configuration changes", async () => {
     const company = await createCompany(db, "SkillChangeGrant");
     const directAgent = await createAgent(db, company.id);

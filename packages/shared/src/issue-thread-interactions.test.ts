@@ -222,6 +222,33 @@ describe("issue thread interaction schemas", () => {
     }
   });
 
+  it("parses the instruction file write a change consent names", () => {
+    const hash = "A".repeat(64);
+    const parsed = requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Apply this instruction change?",
+      target: { type: "custom", key: "agent:agent-1:instructions" },
+      instructionsFileChange: { path: " AGENTS.md ", contentSha256: hash },
+    });
+    expect(parsed.instructionsFileChange).toEqual({
+      version: 1,
+      path: "AGENTS.md",
+      contentSha256: "a".repeat(64),
+      clearLegacyPromptTemplate: false,
+    });
+
+    for (const contentSha256 of ["", "abc", "g".repeat(64), "a".repeat(63), "a".repeat(65)]) {
+      expect(
+        requestConfirmationPayloadSchema.safeParse({
+          version: 1,
+          prompt: "Apply this instruction change?",
+          instructionsFileChange: { path: "AGENTS.md", contentSha256 },
+        }).success,
+        contentSha256,
+      ).toBe(false);
+    }
+  });
+
   it("parses ask_user_questions supersede flags and expired results", () => {
     const parsed = createIssueThreadInteractionSchema.parse({
       kind: "ask_user_questions",

@@ -31,6 +31,7 @@ import {
 } from "../lib/issue-thread-interactions";
 import { cn, formatDateTime, formatShortDate } from "../lib/utils";
 import { InteractionAudienceLine } from "./InteractionAudienceLine";
+import { InstructionsFileChangeSummary } from "./InstructionsFileChangeSummary";
 import { MarkdownBody, type MarkdownExternalReferenceMap } from "./MarkdownBody";
 import { Button } from "./ui/button";
 import { Checkbox } from "./ui/checkbox";
@@ -2617,6 +2618,9 @@ function RequestConfirmationCard({
             <div className="border-t border-border/60 pt-3 text-sm">
               <MarkdownBody externalReferences={externalReferences}>{interaction.payload.detailsMarkdown}</MarkdownBody>
             </div>
+          ) : null}
+          {interaction.payload.instructionsFileChange ? (
+            <InstructionsFileChangeSummary change={interaction.payload.instructionsFileChange} />
           ) : null}
           <RequestConfirmationTargetChip
             interaction={interaction}

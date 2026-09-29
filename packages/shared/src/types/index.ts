@@ -747,6 +747,7 @@ export type {
   ConnectionIntentPayload,
   ConnectionIntentResult,
   RequestConfirmationSecretProposalPayload,
+  RequestConfirmationInstructionsFileChangePayload,
   RequestConfirmationSecretProposalResult,
   RequestCheckboxConfirmationOption,
   RequestCheckboxConfirmationPayload,

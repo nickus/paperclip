@@ -682,6 +682,16 @@ function interactionVerbs(kind: string, payload: Record<string, unknown>) {
       description: "Submit answers to the pending questions.",
     });
   }
+  if (kind === "request_confirmation" && payload.instructionsFileChange && typeof payload.instructionsFileChange === "object") {
+    // A change consent for an agent's instructions allows one exact file
+    // write. It is accepted from the full card, which shows that write, never
+    // from a collapsed row.
+    return decisionVerbs({
+      id: "review",
+      label: "Review change",
+      description: "Open the card to review the instruction change before accepting it.",
+    });
+  }
   if (kind === "request_confirmation") {
     const acceptLabel = typeof payload.acceptLabel === "string" && payload.acceptLabel.trim()
       ? payload.acceptLabel.trim()

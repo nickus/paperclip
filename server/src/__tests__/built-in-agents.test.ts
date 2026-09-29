@@ -39,6 +39,7 @@ import {
   validateBuiltInAgentDefinitions,
 } from "../services/built-in-agents.ts";
 import { readBuiltInAgentMarker, withBuiltInAgentMarker } from "../services/built-in-agent-metadata.ts";
+import { instructionsFileContentSha256 } from "../services/change-consent-gate.ts";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -1478,6 +1479,10 @@ describeEmbeddedPostgres("built-in agents", () => {
           revisionId: "proposal-v1",
           label: "Target Coder AGENTS.md diff",
         },
+        instructionsFileChange: {
+          path: "AGENTS.md",
+          contentSha256: instructionsFileContentSha256(acceptedInstructions),
+        },
       },
     }, {
       agentId: coach.id,
@@ -1533,6 +1538,12 @@ describeEmbeddedPostgres("built-in agents", () => {
           key: `agent:${target.id}:instructions`,
           revisionId: "proposal-v2",
           label: "Target Coder AGENTS.md rejected diff",
+        },
+        instructionsFileChange: {
+          path: "AGENTS.md",
+          contentSha256: instructionsFileContentSha256(
+            `${acceptedInstructions}\nThis rejected line must not be applied.\n`,
+          ),
         },
       },
     }, {
