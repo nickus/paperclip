@@ -43,25 +43,33 @@ const WORKER_BOOTSTRAP = `
 
 const _undefined = void 0;
 
+// Disable a global without letting one read-only binding abort the bootstrap.
+// Some engines expose getter-only globals (WebKit: caches, indexedDB, ...), and
+// in strict mode a plain assignment to those throws, which would stop the
+// worker before it installs its message handler. Try assignment, then an own
+// data property on self, then shadow the accessor on the prototype chain.
+function disableGlobal(name) {
+  try { self[name] = _undefined; } catch {}
+  if (self[name] === _undefined) return;
+  try {
+    Object.defineProperty(self, name, { value: _undefined, writable: false, configurable: false });
+    return;
+  } catch {}
+  for (let proto = Object.getPrototypeOf(self); proto; proto = Object.getPrototypeOf(proto)) {
+    if (!Object.getOwnPropertyDescriptor(proto, name)) continue;
+    try { Object.defineProperty(proto, name, { get: () => _undefined, configurable: false }); } catch {}
+    return;
+  }
+}
+
 // Network
-self.fetch = _undefined;
-self.XMLHttpRequest = _undefined;
-self.WebSocket = _undefined;
-self.EventSource = _undefined;
-self.RTCPeerConnection = _undefined;
-self.RTCDataChannel = _undefined;
-self.Request = _undefined;
-self.Response = _undefined;
-self.Headers = _undefined;
-self.Cache = _undefined;
-self.CacheStorage = _undefined;
-self.caches = _undefined;
+for (const name of [
+  "fetch", "XMLHttpRequest", "WebSocket", "EventSource", "RTCPeerConnection", "RTCDataChannel",
+  "Request", "Response", "Headers", "Cache", "CacheStorage", "caches",
+]) disableGlobal(name);
 
 // Import / eval escape hatches
-self.importScripts = _undefined;
-self.Worker = _undefined;
-self.SharedWorker = _undefined;
-self.Blob = _undefined;
+for (const name of ["importScripts", "Worker", "SharedWorker", "Blob"]) disableGlobal(name);
 if (self.URL) {
   try { Object.defineProperty(self.URL, "createObjectURL", { value: _undefined, writable: false, configurable: false }); } catch {}
   try { Object.defineProperty(self.URL, "revokeObjectURL", { value: _undefined, writable: false, configurable: false }); } catch {}
@@ -73,11 +81,11 @@ if (self.navigator) {
 }
 
 // Service worker / broadcast channel
-self.BroadcastChannel = _undefined;
+disableGlobal("BroadcastChannel");
 
 // IndexedDB (prevents persistent state exfiltration)
-self.indexedDB = _undefined;
-self.IDBFactory = _undefined;
+disableGlobal("indexedDB");
+disableGlobal("IDBFactory");
 
 // ── 2. Parser state ─────────────────────────────────────────────────────────
 
