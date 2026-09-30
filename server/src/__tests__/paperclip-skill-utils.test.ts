@@ -622,11 +622,86 @@ describe("paperclip skill utils", () => {
     expect(updateIssueSchema.safeParse({ blockedByIssueIds: ["ABC-12"] }).success).toBe(false);
   });
 
-  it("quotes blocked-status errors exactly as the server sends them", async () => {
+  it("documents the review-transition contract for moving an issue to in_review", async () => {
+    const cookbook = await fs.readFile(path.resolve("skills/paperclip/references/payload-cookbook.md"), "utf8");
+    const reviewerAgentId = "11111111-1111-4111-8111-111111111111";
+    const reviewerUserId = "board-user-42";
+    const interactionId = "22222222-2222-4222-8222-222222222222";
+    const comment = "Ready for review.";
+
+    // Every worked body the cookbook tells an agent to send, byte for byte.
+    expect(cookbook).toContain(
+      'executionPolicy: {stages: [{type: "review", participants: [{type: "agent", agentId: $reviewer}]}]},',
+    );
+    expect(cookbook).toContain(
+      '{status: "in_review", assigneeAgentId: null, assigneeUserId: $reviewerUserId, comment: $comment}',
+    );
+    expect(cookbook).toContain('{status: "in_review", reviewInteractionId: $interactionId, comment: $comment}');
+    expect(cookbook).toContain('{status: "done", comment: $comment}');
+    expect(cookbook).toContain('{status: "in_progress", comment: $comment}');
+
+    // Bare `{"status": "in_review"}` is exactly what drew the 422 in production:
+    // it is schema-valid (every field the disposition guard checks is optional),
+    // so the cookbook's five review paths are a business rule the validator
+    // cannot enforce, not something a schema-level fix can add. Pin that split.
+    expect(updateIssueSchema.safeParse({ status: "in_review" }).success).toBe(true);
+
+    // 1. Ask a colleague agent to review: execution-policy review stage.
+    const agentReviewBody = updateIssueSchema.parse({
+      status: "in_review",
+      executionPolicy: {
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+      comment,
+    });
+    expect(agentReviewBody.executionPolicy?.stages[0]).toMatchObject({
+      type: "review",
+      participants: [{ type: "agent", agentId: reviewerAgentId }],
+    });
+
+    // 2. Ask a human to review: direct assignee handoff.
+    expect(
+      updateIssueSchema.parse({
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: reviewerUserId,
+        comment,
+      }),
+    ).toMatchObject({ status: "in_review", assigneeAgentId: null, assigneeUserId: reviewerUserId });
+
+    // 3. Ask a human to review: bind a pending interaction instead.
+    expect(
+      updateIssueSchema.parse({ status: "in_review", reviewInteractionId: interactionId, comment }),
+    ).toMatchObject({ status: "in_review", reviewInteractionId: interactionId, comment });
+    expect(updateIssueSchema.safeParse({ status: "in_review", reviewInteractionId: "not-a-guid" }).success).toBe(
+      false,
+    );
+
+    // 4. Reviewer hands the issue back: approve, or request changes — both
+    // require the decision `comment` in the same body (enforced by the route,
+    // not the schema, so the schema itself only pins the field names/types).
+    expect(updateIssueSchema.parse({ status: "done", comment })).toMatchObject({ status: "done", comment });
+    expect(updateIssueSchema.parse({ status: "in_progress", comment })).toMatchObject({
+      status: "in_progress",
+      comment,
+    });
+
+    // An agent participant must set agentId and must not also set userId.
+    expect(
+      updateIssueSchema.safeParse({
+        status: "in_review",
+        executionPolicy: { stages: [{ type: "review", participants: [{ type: "agent", userId: reviewerUserId }] }] },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("quotes status-transition errors exactly as the server sends them", async () => {
     const cookbook = await fs.readFile(path.resolve("skills/paperclip/references/payload-cookbook.md"), "utf8");
     const serverSource = [
       await fs.readFile(path.resolve("server/src/routes/issues.ts"), "utf8"),
       await fs.readFile(path.resolve("server/src/services/issues.ts"), "utf8"),
+      await fs.readFile(path.resolve("server/src/services/issue-execution-policy.ts"), "utf8"),
+      await fs.readFile(path.resolve("server/src/services/issue-review-policy.ts"), "utf8"),
     ].join("\n");
     const errorRows = cookbook.split("\n").filter((line) => /^\| `(?:403|422)` /.test(line));
     const quoted = errorRows.flatMap((line) =>
@@ -637,9 +712,22 @@ describe("paperclip skill utils", () => {
       expect.arrayContaining([
         "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
         "Agents may only name themselves as an unblock owner",
+        "invalid_issue_disposition",
+        "Agent-authored updates that move an issue to in_review must include a real review path",
+        "reviewInteractionId must identify a pending non-tool confirmation created by",
+        "Approving a review or approval stage requires a comment.",
+        "Requesting changes requires a comment.",
+        "Include the decision comment in the same PATCH request; prior comments are not considered.",
+        "Only the active reviewer or approver can advance the current execution stage",
+        "review_policy_denied",
       ]),
     );
-    for (const message of quoted) expect(serverSource, message).toContain(`"${message}"`);
+    // A plain double-quoted match (the blocked-status messages) as well as a bare
+    // substring (the review-transition messages, which the server assembles from
+    // a template literal or a multi-part concatenation, so no single quoted JS
+    // string literal equals the whole rendered text) both count: either way, the
+    // exact wording has to appear verbatim in the code that produces it.
+    for (const message of quoted) expect(serverSource, message).toContain(message);
   });
 
   it("documents how the API rewrites escaped line breaks in text bodies", async () => {
