@@ -13,6 +13,19 @@ export const adapterExecutionControls = new Map<
   ReturnType<typeof createAdapterExecutionControl>
 >();
 
+/**
+ * Host-owned stop of a legacy sandbox run whose executor in this process
+ * still holds its environment lease. A sandbox command has no host process
+ * to signal, so a Stop that finds no adapter execution control (the run is
+ * still preparing, or its invocation could not be guarded) uses this handle
+ * to stop the work inside the sandbox. Resolves only after the provider
+ * verified the stop; the run's cancellation signal is aborted first.
+ */
+export const sandboxExecutionStops = new Map<
+  string,
+  (reason: Error) => Promise<void>
+>();
+
 // A Stop with no opted-in adapter may still be awaiting its terminal write.
 // Readiness must not pass that write using an earlier "running" snapshot.
 // These are in-process ordering barriers, never cancellation acknowledgments.

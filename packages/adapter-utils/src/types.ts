@@ -206,7 +206,20 @@ export interface AdapterRuntimeEvent {
 export interface AdapterExecutionContext {
   /** Run-scoped operator cancellation; adapters must settle before returning. */
   signal?: AbortSignal;
-  /** Opt in to signal-based cancellation before starting provider work. */
+  /**
+   * Take over cancellation of this invocation. After this call, the host cancels the run by
+   * aborting `signal` and waiting for the invocation to settle; ending the provider work is the
+   * adapter's job, and a confirmed stop is reported as `executionCancellation` acknowledged in the
+   * result. Call it before starting provider work.
+   *
+   * This is not a registration that adds protection. On a sandbox target the host already guards
+   * the invocation (see `executeWithSandboxCancellation`): when `signal` aborts, it stops the
+   * sandbox through `stopRemoteStartup`, which ends the processes inside it. Calling this switches
+   * that guard off for the rest of the invocation. Only call it if the adapter itself guarantees
+   * that its sandbox work stops once `signal` aborts, for example by cancelling the turn through
+   * its agent protocol or by calling `stopRemoteStartup`. An adapter that calls it without doing so
+   * leaves its commands running in the sandbox after the run is cancelled.
+   */
   onCancellationReady?: () => Promise<void>;
   /** Host-owned stop of this run's sandbox during setup or direct CLI execution. Resolves only after
    * provider termination is verified; never accepts an agent-selected lease. */
