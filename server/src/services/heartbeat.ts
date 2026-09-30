@@ -1402,12 +1402,17 @@ const nativeSessionResumeDispatchTimers = new Map<
 // lives in process memory only — a process restart clears it — and it sits at
 // module scope like activeRunExecutions above, so both the pure
 // resolveHeartbeatSchedulingSuppression() check and every heartbeatService()
-// instance see the same drain.
-let taskDrainState: { startedAt: Date; expiresAt: Date | null } | null = null;
+// instance see the same drain. A drain started with `persistAcrossRestart` is
+// also saved to disk by its caller (see task-drain-store.ts), and server
+// startup applies it again before it schedules any work.
+type TaskDrainState = {
+  startedAt: Date;
+  expiresAt: Date | null;
+  persistAcrossRestart?: boolean;
+};
+let taskDrainState: TaskDrainState | null = null;
 
-function readTaskDrain(
-  now: Date,
-): { startedAt: Date; expiresAt: Date | null } | null {
+function readTaskDrain(now: Date): TaskDrainState | null {
   if (
     taskDrainState &&
     taskDrainState.expiresAt !== null &&
@@ -1431,10 +1436,7 @@ export function computeTaskDrain(opts: { ttlMs?: number | null } = {}): {
 }
 
 /** Assign the given drain as the current task-drain state. */
-export function applyTaskDrain(drain: {
-  startedAt: Date;
-  expiresAt: Date | null;
-}): void {
+export function applyTaskDrain(drain: TaskDrainState): void {
   taskDrainState = drain;
 }
 
@@ -1457,12 +1459,14 @@ export function stopTaskDrain(): { wasActive: boolean } {
  * Report the task-drain state for this process only. `activeRuns` and
  * `pendingWakes` count in-process work. A process restart clears both
  * counters, even when the database still holds `running` rows for runs
- * this process did not finish.
+ * this process did not finish. `persistAcrossRestart` reports whether the
+ * current drain holds admission again after a restart.
  */
 export function getTaskDrainStatus(): {
   draining: boolean;
   startedAt: Date | null;
   expiresAt: Date | null;
+  persistAcrossRestart: boolean;
   activeRuns: number;
   pendingWakes: number;
   quiescent: boolean;
@@ -1474,6 +1478,7 @@ export function getTaskDrainStatus(): {
     draining: state !== null,
     startedAt: state?.startedAt ?? null,
     expiresAt: state?.expiresAt ?? null,
+    persistAcrossRestart: state?.persistAcrossRestart === true,
     activeRuns,
     pendingWakes,
     quiescent: activeRuns === 0 && pendingWakes === 0,

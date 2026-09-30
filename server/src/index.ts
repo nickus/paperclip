@@ -132,6 +132,8 @@ import {
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
+import { restoreSavedTaskDrainOnStartup } from "./services/task-drain-store.js";
+import { createHeartbeatStartupRecoveryGate } from "./heartbeat-startup-recovery-gate.js";
 import {
   createEmbeddedPostgresSupervisor,
   type EmbeddedPostgresSupervisor,
@@ -883,6 +885,11 @@ async function startServerWithDatabaseTeardown(
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;
+  // A task drain started with persistAcrossRestart holds run admission in
+  // this process too. Apply it before anything below can schedule work.
+  if (heartbeat) {
+    await restoreSavedTaskDrainOnStartup({ applyTaskDrain: heartbeat.applyTaskDrain, logger });
+  }
   const decisionServiceOptions = {
     wakeOriginAgent: createDecisionWakeOriginAgent(heartbeat?.wakeup ?? null),
   };
@@ -1147,6 +1154,13 @@ async function startServerWithDatabaseTeardown(
   }>) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  const heartbeatStartupRecoveryGate = createHeartbeatStartupRecoveryGate({
+    isSchedulingSuppressed: async () =>
+      heartbeat ? (await heartbeat.resolveSchedulingSuppression()).suppressed : true,
+    onError: (err) => {
+      logger.error({ err }, "startup heartbeat recovery held by a task drain failed; retrying on the next scheduler tick");
+    },
+  });
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1454,14 +1468,19 @@ async function startServerWithDatabaseTeardown(
     const heartbeatSchedulingSuppression = await heartbeat.resolveSchedulingSuppression();
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
-    // into a dead "running" row during startup recovery.
-    if (heartbeatSchedulingSuppression.suppressed) {
+    // into a dead "running" row during startup recovery. A task drain restored
+    // from a previous process holds this recovery until the drain ends (see
+    // heartbeat-startup-recovery-gate.ts); other suppression skips it.
+    if (
+      heartbeatSchedulingSuppression.suppressed &&
+      heartbeatSchedulingSuppression.reason !== "task_drain"
+    ) {
       logger.warn(
         { reason: heartbeatSchedulingSuppression.reason },
         "heartbeat scheduling suppressed for this runtime instance",
       );
     } else {
-      const startupHeartbeatRecovery = (async () => {
+      const runStartupHeartbeatRecovery = async () => {
         // Legacy remote recovery releases sandbox leases. Wait for provider
         // workers before cleanup or retry admission, including unmanaged installs.
         await app.locals.bundledPluginsStartup;
@@ -1586,12 +1605,21 @@ async function startServerWithDatabaseTeardown(
         if (swept.cleared > 0) {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
-      })().catch((err) => {
-        logger.error({ err }, "startup heartbeat recovery failed");
-        throw err;
-      });
-      trackHeartbeatSchedulerWork(startupHeartbeatRecovery);
-      await startupHeartbeatRecovery;
+      };
+      if (heartbeatSchedulingSuppression.suppressed) {
+        logger.warn(
+          { reason: heartbeatSchedulingSuppression.reason },
+          "startup heartbeat recovery waits for the task drain to end",
+        );
+        heartbeatStartupRecoveryGate.hold(runStartupHeartbeatRecovery);
+      } else {
+        const startupHeartbeatRecovery = runStartupHeartbeatRecovery().catch((err) => {
+          logger.error({ err }, "startup heartbeat recovery failed");
+          throw err;
+        });
+        trackHeartbeatSchedulerWork(startupHeartbeatRecovery);
+        await startupHeartbeatRecovery;
+      }
     }
 
     const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
@@ -1652,6 +1680,9 @@ async function startServerWithDatabaseTeardown(
       // captures the authoritative set of running heartbeat rows.
       trackHeartbeatSchedulerWork((async () => {
         if (heartbeatSchedulerStopped) return;
+        // Startup recovery that a restored task drain held back runs on the
+        // first tick after the drain ends; no tick work runs alongside it.
+        if ((await heartbeatStartupRecoveryGate.beforeTick()) === "skip") return;
         trackHeartbeatSchedulerWork(decisionExecutor.sweepExpired().catch((err: unknown) => {
           logger.error({ err }, "decision expiry sweep failed");
         }));

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  applyTaskDrain,
   getTaskDrainStatus,
   resolveHeartbeatSchedulingSuppression,
   startTaskDrain,
@@ -62,4 +63,14 @@ describe("heartbeat task drain", () => {
     expect(status.quiescent).toBe(true);
   });
 
+  it("status_reports_whether_the_drain_persists_across_a_restart", () => {
+    startTaskDrain({});
+    expect(getTaskDrainStatus().persistAcrossRestart).toBe(false);
+
+    applyTaskDrain({ startedAt: new Date(), expiresAt: null, persistAcrossRestart: true });
+    expect(getTaskDrainStatus()).toMatchObject({ draining: true, persistAcrossRestart: true });
+
+    stopTaskDrain();
+    expect(getTaskDrainStatus()).toMatchObject({ draining: false, persistAcrossRestart: false });
+  });
 });

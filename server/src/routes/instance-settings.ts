@@ -24,6 +24,7 @@ import {
   type ActivityPublication,
 } from "../services/index.js";
 import { environmentService } from "../services/environments.js";
+import { clearSavedTaskDrain, saveTaskDrain } from "../services/task-drain-store.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
 
@@ -115,6 +116,25 @@ function withTaskDrainTransition<T>(run: () => Promise<T>): Promise<T> {
     () => undefined,
   );
   return turn;
+}
+
+type TaskDrainStatus = ReturnType<ReturnType<typeof heartbeatService>["getTaskDrainStatus"]>;
+
+// A drain started with persistAcrossRestart keeps a saved copy on disk (see
+// task-drain-store.ts). A transition updates that copy before it writes its
+// audit rows, so a failed disk write fails the request with nothing changed.
+// When the audit write then fails, put the copy back in line with the live
+// drain, which that failed transition never changed.
+async function resyncSavedTaskDrain(live: TaskDrainStatus) {
+  try {
+    if (live.draining && live.persistAcrossRestart && live.startedAt) {
+      await saveTaskDrain({ startedAt: live.startedAt, expiresAt: live.expiresAt });
+    } else {
+      await clearSavedTaskDrain();
+    }
+  } catch (err) {
+    logger.error({ err }, "failed to restore the saved task drain after a failed transition");
+  }
 }
 
 export function instanceSettingsRoutes(db: Db) {
@@ -308,6 +328,7 @@ export function instanceSettingsRoutes(db: Db) {
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();
       const ttlMs = req.body.ttlMs ?? null;
+      const persistAcrossRestart = req.body.persistAcrossRestart === true;
       // The whole read-audit-apply sequence runs as one queued transition
       // (see withTaskDrainTransition above), so an overlapping start or
       // stop cannot commit its audit row, or apply its live state, out of
@@ -316,6 +337,15 @@ export function instanceSettingsRoutes(db: Db) {
       // not the moment it arrived and was queued behind another transition.
       const drain = await withTaskDrainTransition(async () => {
         const computed = heartbeat.computeTaskDrain({ ttlMs });
+        const next = persistAcrossRestart ? { ...computed, persistAcrossRestart: true } : computed;
+        const priorStatus = heartbeat.getTaskDrainStatus();
+        // The new drain replaces any saved one: save it when asked,
+        // otherwise make sure a restart does not bring an older one back.
+        if (persistAcrossRestart) {
+          await saveTaskDrain(computed);
+        } else {
+          await clearSavedTaskDrain();
+        }
         // One transaction for every company's audit row, so a write that
         // succeeds for one company and fails for another never leaves a
         // partial activity history behind — either every company gets the
@@ -339,19 +369,23 @@ export function instanceSettingsRoutes(db: Db) {
                 details: {
                   startedAt: computed.startedAt,
                   expiresAt: computed.expiresAt,
+                  ...(persistAcrossRestart ? { persistAcrossRestart: true } : {}),
                 },
               }, postCommitActivityPublications),
             ),
           ),
-        );
-        heartbeat.applyTaskDrain(computed);
+        ).catch(async (err: unknown) => {
+          await resyncSavedTaskDrain(priorStatus);
+          throw err;
+        });
+        heartbeat.applyTaskDrain(next);
         // The audit record already committed, so a failure to publish it
         // here is not a reason to undo the drain: reverting the in-memory
         // state at this point would desync it from the committed row.
         // Swallow a publish failure so it cannot turn a committed mutation
         // into a false 500.
         publishActivitiesBestEffort(postCommitActivityPublications, "instance.task_drain.started");
-        return computed;
+        return next;
       });
       res.json(drain);
     },
@@ -373,6 +407,10 @@ export function instanceSettingsRoutes(db: Db) {
       // detail and the response body below. A TTL that expires between two
       // separate reads would otherwise make the two values disagree.
       const wasActive = priorStatus.draining;
+      // Remove the saved copy first, so a restart after this stop never
+      // brings the drain back. A failed removal fails the request with the
+      // drain still in place.
+      await clearSavedTaskDrain();
       // See the POST handler above for why this is one transaction, and why
       // the drain mutation runs only after it commits.
       const postCommitActivityPublications: ActivityPublication[] = [];
@@ -395,7 +433,10 @@ export function instanceSettingsRoutes(db: Db) {
             }, postCommitActivityPublications),
           ),
         ),
-      );
+      ).catch(async (err: unknown) => {
+        await resyncSavedTaskDrain(priorStatus);
+        throw err;
+      });
       heartbeat.stopTaskDrain();
       // See the POST handler above for why a publish failure here is
       // swallowed instead of failing the route: the audit record already

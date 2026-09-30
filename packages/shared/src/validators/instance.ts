@@ -127,6 +127,10 @@ export const MAX_TASK_DRAIN_TTL_MS = 24 * 60 * 60 * 1000;
 
 export const startTaskDrainRequestSchema = z.object({
   ttlMs: z.number().int().positive().max(MAX_TASK_DRAIN_TTL_MS).nullable().optional(),
+  // A drain lives in process memory, so a restart ends it. Set this to keep
+  // the drain holding admission after the server restarts, until it is
+  // stopped or its TTL runs out.
+  persistAcrossRestart: z.boolean().optional(),
 }).strict();
 
 export type InstanceGeneralSettings = z.infer<typeof instanceGeneralSettingsSchema>;
