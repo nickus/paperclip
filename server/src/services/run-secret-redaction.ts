@@ -56,6 +56,14 @@ function redactText(input: string, values: string[]) {
   );
 }
 
+/**
+ * True for the context key that holds a run's encrypted redaction registry.
+ * Redacted copies of run data drop it (see redactRegisteredSecretValues).
+ */
+export function isRedactionRegistryKey(key: string) {
+  return key === REGISTRY_KEY;
+}
+
 export function redactRegisteredSecretValues<T>(input: T, values: string[]): T {
   if (typeof input === "string") return redactText(input, values) as T;
   if (Array.isArray(input)) return input.map((value) => redactRegisteredSecretValues(value, values)) as T;
@@ -66,7 +74,7 @@ export function redactRegisteredSecretValues<T>(input: T, values: string[]): T {
   if (!record) return input;
   return Object.fromEntries(
     Object.entries(record)
-      .filter(([key]) => key !== REGISTRY_KEY)
+      .filter(([key]) => !isRedactionRegistryKey(key))
       .map(([key, value]) => [key, redactRegisteredSecretValues(value, values)]),
   ) as T;
 }

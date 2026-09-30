@@ -598,6 +598,7 @@ import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import {
   contextSnapshotKeepingRedactionRegistry,
   createRunSecretRedactionRegistry,
+  isRedactionRegistryKey,
   redactRegisteredSecretValues,
 } from "./run-secret-redaction.js";
 import {
@@ -3690,12 +3691,17 @@ function boundRunEventValue(
     return "[Circular]";
   }
   seen.add(value);
-  const entries = Object.entries(value as Record<string, unknown>);
+  // Encrypted redaction registry material is dropped, as the run read routes
+  // drop it, so stored and published payloads match their responses.
+  const entries = Object.entries(value as Record<string, unknown>).filter(
+    ([key]) => !isRedactionRegistryKey(key),
+  );
   if (depth >= MAX_RUN_EVENT_PAYLOAD_DEPTH) {
     const bounded = {
       _truncated: true,
       type: "object",
-      keys: entries.map(([key]) => key).slice(0, 20),
+      // Listed keys become string values, so they are redacted like values.
+      keys: entries.slice(0, 20).map(([key]) => redactString(key)),
     };
     seen.delete(value);
     return bounded;
@@ -14177,14 +14183,10 @@ export function heartbeatService(
           redactCurrentUserText(rawMessage, currentUserRedactionOptions),
         )
       : rawMessage;
+    // The bound redacts every string it keeps before truncating it, so the
+    // bounded payload needs no second registered-secret pass.
     const boundedPayload = event.payload
-      ? redactRegisteredSecretValues(
-          boundHeartbeatRunEventPayloadForStorage(
-            event.payload,
-            redactRegistered,
-          ),
-          registeredSecrets ?? [],
-        )
+      ? boundHeartbeatRunEventPayloadForStorage(event.payload, redactRegistered)
       : event.payload;
     const secretSanitizedPayload = boundedPayload
       ? redactEventPayload(boundedPayload)

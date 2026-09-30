@@ -10,11 +10,12 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService } from "../services/heartbeat.ts";
+import { boundHeartbeatRunEventPayloadForStorage, heartbeatService } from "../services/heartbeat.ts";
 import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
 import {
   contextSnapshotKeepingRedactionRegistry,
   createRunSecretRedactionRegistry,
+  redactRegisteredSecretValues,
 } from "../services/run-secret-redaction.ts";
 import { REDACTED_EVENT_VALUE } from "../redaction.ts";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
@@ -81,7 +82,12 @@ describeEmbeddedPostgres("registered run secrets in live run output", () => {
           stream: "stdout",
           level: "info",
           message: `tool printed ${SECRET}`,
-          payload: { output: `value=${SECRET}`, nested: [{ text: SECRET }] },
+          payload: {
+            output: `value=${SECRET}`,
+            nested: [{ text: SECRET }],
+            // An adapter echoing run context can carry registry material.
+            context: { paperclipSecretRedactions: [{ material: { ciphertext: "opaque" } }] },
+          },
         });
         await ctx.onRuntimeProgress?.({
           phase: "running",
@@ -207,7 +213,7 @@ describeEmbeddedPostgres("registered run secrets in live run output", () => {
   });
 
   it("masks the secret in run events, progress and status payloads and in the stored events", async () => {
-    const { runId, heartbeat, events } = await runAgentThatPrintsSecret();
+    const { companyId, runId, heartbeat, events } = await runAgentThatPrintsSecret();
     const runEvents = events.filter((event) => event.payload.runId === runId);
     expect(runEvents.length).toBeGreaterThan(0);
     expect(JSON.stringify(runEvents)).not.toContain(SECRET);
@@ -219,10 +225,22 @@ describeEmbeddedPostgres("registered run secrets in live run output", () => {
       message: `tool printed ${REDACTED_EVENT_VALUE}`,
       payload: { output: `value=${REDACTED_EVENT_VALUE}`, nested: [{ text: REDACTED_EVENT_VALUE }] },
     });
-    const storedToolEvent = (await heartbeat.listEvents(runId)).find((event) => event.eventType === "tool.result");
+    const storedEvents = await heartbeat.listEvents(runId);
+    const storedToolEvent = storedEvents.find((event) => event.eventType === "tool.result");
     expect(storedToolEvent).toMatchObject({
       message: liveToolEvent!.payload.message,
       payload: liveToolEvent!.payload.payload,
+    });
+    // GET /heartbeat-runs/:runId/events applies the run's redaction on read;
+    // the live event carries exactly what it returns.
+    const routeToolEvent = (await createRunSecretRedactionRegistry(db).redactForRun(companyId, runId, storedEvents))
+      .find((event) => event.eventType === "tool.result");
+    expect(routeToolEvent?.message).toBe(liveToolEvent!.payload.message);
+    expect(routeToolEvent?.payload).toEqual(liveToolEvent!.payload.payload);
+    expect(liveToolEvent!.payload.payload).toEqual({
+      output: `value=${REDACTED_EVENT_VALUE}`,
+      nested: [{ text: REDACTED_EVENT_VALUE }],
+      context: {},
     });
 
     const progress = runEvents.find(
@@ -275,5 +293,43 @@ describeEmbeddedPostgres("registered run secrets in live run output", () => {
       .set({ contextSnapshot: contextSnapshotKeepingRedactionRegistry({ rewritten: "again" }) })
       .where(eq(heartbeatRuns.id, runId));
     expect(await readContext()).toEqual({ rewritten: "again" });
+  });
+});
+
+describe("registered run secrets in bounded run event payloads", () => {
+  const redact = (text: string) => redactRegisteredSecretValues(text, [SECRET]);
+
+  it("redacts every string it keeps, including listed keys, and drops registry material", () => {
+    // Nested to the depth where the bound replaces an object with its key list.
+    let deep: Record<string, unknown> = { [`key-${SECRET}`]: 1, other: SECRET };
+    for (let level = 0; level < 5; level += 1) deep = { level: deep };
+    const bounded = boundHeartbeatRunEventPayloadForStorage({
+      output: `value=${SECRET}`,
+      list: [SECRET, { text: SECRET }],
+      paperclipSecretRedactions: [{ material: { ciphertext: "opaque" } }],
+      nested: { paperclipSecretRedactions: [], kept: true },
+      deep,
+    }, redact);
+
+    const serialized = JSON.stringify(bounded);
+    expect(serialized).not.toContain(SECRET);
+    expect(serialized).not.toContain("paperclipSecretRedactions");
+    expect(serialized).toContain(`key-${REDACTED_EVENT_VALUE}`);
+    expect(bounded).toMatchObject({
+      output: `value=${REDACTED_EVENT_VALUE}`,
+      list: [REDACTED_EVENT_VALUE, { text: REDACTED_EVENT_VALUE }],
+      nested: { kept: true },
+    });
+    // The run read routes' redaction leaves the stored payload unchanged, so
+    // a single pass while bounding is enough.
+    expect(redactRegisteredSecretValues(bounded, [SECRET])).toEqual(bounded);
+  });
+
+  it("redacts a value before truncation can cut through it", () => {
+    // The bound keeps the first 16 KiB of a string; the value straddles the cut.
+    const prefix = "x".repeat(16 * 1024 - 5);
+    const bounded = boundHeartbeatRunEventPayloadForStorage({ text: `${prefix}${SECRET} tail` }, redact);
+    expect(bounded.text).toContain("[truncated");
+    expect(bounded.text).not.toContain(SECRET.slice(0, 5));
   });
 });
