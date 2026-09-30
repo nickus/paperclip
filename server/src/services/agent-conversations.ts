@@ -68,6 +68,7 @@ export function isConversationExecutionWake(
 ): boolean {
   return isConversation(issue) && (
     reason === "issue_blockers_resolved" ||
+    reason === "issue_blockers_cancelled" ||
     reason === "issue_children_completed" ||
     reason === "issue_unblock_requested"
   );

@@ -34,6 +34,7 @@ import {
   getIssueContinuationSummaryDocument,
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
+import { dependencyBlockersAwaitDecision } from "../../../services/issue-dependency-wakeups.js";
 import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
 import type {
   QueuedRunFacts,
@@ -430,8 +431,10 @@ export function createPostgresRunDispatchAdapter(
 
     const dependencyReadiness = await issuesSvcForRead.listDependencyReadiness(input.companyId, [issueId]);
     const readiness = dependencyReadiness.get(issueId);
+    // Cancelled blockers never resolve, so holding the retry for them would
+    // leave the issue waiting forever; the run asks the assignee to decide.
     facts.dependenciesBlocked =
-      readiness && !readiness.isDependencyReady
+      readiness && !readiness.isDependencyReady && !dependencyBlockersAwaitDecision(readiness)
         ? {
             unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
             unresolvedBlockerCount: readiness.unresolvedBlockerCount,

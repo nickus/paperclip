@@ -268,7 +268,9 @@ import {
 } from "../services/onboarding-first-task-assets.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  buildIssueBlockersCancelledWakeup,
   buildIssueBlockersResolvedWakeStateKey,
+  findExistingIssueBlockersCancelledWake,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../services/issue-dependency-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
@@ -1446,6 +1448,7 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_SOURCES = new Set([
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "issue_assigned",
   "issue_blockers_resolved",
+  "issue_blockers_cancelled",
   "issue_commented",
   "issue_comment_mentioned",
   "issue_dependencies_blocked",
@@ -2328,6 +2331,54 @@ function isClosedIssueStatus(
   status: string | null | undefined,
 ): status is "done" | "cancelled" {
   return status === "done" || status === "cancelled";
+}
+
+/**
+ * After a blocker is done or cancelled, wakes the assignee of every dependent
+ * whose remaining blockers are now all cancelled. Cancelled blockers never
+ * count as done, so without this wake such a dependent stays blocked and
+ * nobody is told.
+ */
+async function addBlockersCancelledWakeups(input: {
+  svc: Partial<
+    Pick<ReturnType<typeof issueService>, "listBlockedDependentsAwaitingDecision">
+  >;
+  db: Db;
+  blockerIssue: { id: string; companyId: string };
+  actor: { actorType: "user" | "agent" | "system"; actorId: string | null };
+  addWakeup: (
+    agentId: string,
+    wakeup: ReturnType<typeof buildIssueBlockersCancelledWakeup>,
+  ) => void;
+}) {
+  if (typeof input.svc.listBlockedDependentsAwaitingDecision !== "function") return;
+  const dependents = await input.svc.listBlockedDependentsAwaitingDecision(
+    input.blockerIssue.id,
+  );
+  for (const dependent of dependents) {
+    const wakeup = buildIssueBlockersCancelledWakeup({
+      dependentIssueId: dependent.id,
+      cancelledBlockerIssueIds: dependent.cancelledBlockerIssueIds,
+      blockedTransitionAt: dependent.blockedTransitionAt,
+      settledBlockerIssueId: input.blockerIssue.id,
+      source: "issue.blockers_cancelled",
+      requestedByActorType: input.actor.actorType,
+      requestedByActorId: input.actor.actorId,
+    });
+    try {
+      const existingWake = await findExistingIssueBlockersCancelledWake(input.db, {
+        companyId: input.blockerIssue.companyId,
+        idempotencyKey: wakeup.idempotencyKey,
+      });
+      if (existingWake) continue;
+    } catch (err) {
+      logger.warn(
+        { err, issueId: dependent.id, idempotencyKey: wakeup.idempotencyKey },
+        "failed to check existing cancelled-blocker wake",
+      );
+    }
+    input.addWakeup(dependent.assigneeAgentId, wakeup);
+  }
 }
 
 function shouldImplicitlyMoveCommentedIssueToTodo(input: {
@@ -14988,6 +15039,18 @@ export function issueRoutes(
             });
           }
         }
+        if (
+          !isClosedIssueStatus(existing.status) &&
+          isClosedIssueStatus(issue.status)
+        ) {
+          await addBlockersCancelledWakeups({
+            svc,
+            db,
+            blockerIssue: issue,
+            actor,
+            addWakeup,
+          });
+        }
 
         const restoredBlockedReadyDependency =
           issue.status === "blocked" &&
@@ -18434,6 +18497,18 @@ export function issueRoutes(
               blockedTransitionAt: dependent.blockedTransitionAt,
             });
           }
+        }
+        if (
+          !isClosedIssueStatus(issueBeforeCommentDecision.status) &&
+          isClosedIssueStatus(currentIssue.status)
+        ) {
+          await addBlockersCancelledWakeups({
+            svc,
+            db,
+            blockerIssue: currentIssue,
+            actor,
+            addWakeup,
+          });
         }
 
         const becameTerminal =

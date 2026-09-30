@@ -1306,4 +1306,331 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       },
     });
   });
+
+  async function seedBlockedDependent(blockers: Array<{ status: string; childOfDependent?: boolean }>) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const dependentIssueId = randomUUID();
+    const blockerIssueIds = blockers.map(() => randomUUID());
+    const prefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Planner",
+      role: "pm",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: dependentIssueId,
+      companyId,
+      title: "Ship the release notes",
+      identifier: `${prefix}-1`,
+      issueNumber: 1,
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+    await db.insert(issues).values(
+      blockers.map((blocker, index) => ({
+        id: blockerIssueIds[index]!,
+        companyId,
+        title: `Blocker ${index + 1}`,
+        identifier: `${prefix}-${index + 2}`,
+        issueNumber: index + 2,
+        status: blocker.status,
+        priority: "medium",
+        parentId: blocker.childOfDependent ? dependentIssueId : null,
+        responsibleUserId: "responsible-user",
+      })),
+    );
+    await db.insert(issueRelations).values(
+      blockerIssueIds.map((blockerIssueId) => ({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: dependentIssueId,
+        type: "blocks",
+      })),
+    );
+    return { companyId, agentId, dependentIssueId, blockerIssueIds };
+  }
+
+  async function waitForRunStatus(runId: string, status: string) {
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === status;
+    }, 10_000);
+    return db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  function adapterWakeForIssue(issueId: string) {
+    const call = mockAdapterExecute.mock.calls
+      .map((args) => (args as unknown[])[0] as { context?: Record<string, unknown> })
+      .find((input) => input?.context?.issueId === issueId);
+    return call?.context?.paperclipWake as Record<string, unknown> | undefined;
+  }
+
+  async function insertQueuedRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    contextSnapshot: Record<string, unknown>;
+  }) {
+    const wakeupRequestId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: String(input.contextSnapshot.wakeReason),
+      payload: { issueId: input.issueId },
+      status: "queued",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId,
+      contextSnapshot: { issueId: input.issueId, ...input.contextSnapshot },
+    });
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    return { runId, wakeupRequestId };
+  }
+
+  it("runs the assignee's wake and asks for a decision when the only remaining blocker is cancelled", async () => {
+    const { agentId, dependentIssueId, blockerIssueIds } = await seedBlockedDependent([
+      { status: "cancelled", childOfDependent: true },
+    ]);
+    const [cancelledBlockerId] = blockerIssueIds;
+
+    // The cancelled blocker is also the dependent's last open child, so the
+    // platform sends the usual child-completion wake.
+    const wake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      payload: { issueId: dependentIssueId, completedChildIssueId: cancelledBlockerId },
+      contextSnapshot: {
+        issueId: dependentIssueId,
+        wakeReason: "issue_children_completed",
+        source: "issue.children_completed",
+        completedChildIssueId: cancelledBlockerId,
+      },
+    });
+    expect(wake).not.toBeNull();
+
+    const run = await waitForRunStatus(wake!.id, "succeeded");
+    expect(run?.status).toBe("succeeded");
+    expect(run?.contextSnapshot).toMatchObject({
+      dependencyBlockersCancelled: true,
+      cancelledBlockerIssueIds: [cancelledBlockerId],
+      unresolvedBlockerIssueIds: [cancelledBlockerId],
+    });
+    expect(run?.contextSnapshot).not.toHaveProperty("dependencyBlockedInteraction");
+    expect(adapterWakeForIssue(dependentIssueId)).toMatchObject({
+      dependencyBlockersCancelled: true,
+      cancelledBlockerIssueIds: [cancelledBlockerId],
+      cancelledBlockerInstruction: expect.stringContaining(
+        "remove or replace the blocker relationship",
+      ),
+      unresolvedBlockerSummaries: [
+        expect.objectContaining({ id: cancelledBlockerId, status: "cancelled" }),
+      ],
+    });
+
+    // The dependency is still not satisfied: nothing was checked out for the
+    // assignee and the issue stays blocked until the assignee decides.
+    const dependent = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, dependentIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(dependent).toEqual({ status: "blocked", checkoutRunId: null });
+  });
+
+  it("keeps gating wakes while an open blocker remains beside a cancelled one", async () => {
+    const { companyId, agentId, dependentIssueId, blockerIssueIds } = await seedBlockedDependent([
+      { status: "cancelled" },
+      { status: "in_progress" },
+    ]);
+
+    const wake = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: dependentIssueId },
+      contextSnapshot: { issueId: dependentIssueId, wakeReason: "issue_assigned" },
+    });
+    expect(wake).toBeNull();
+    const skipped = await db
+      .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.payload} ->> 'issueId' = ${dependentIssueId}`);
+    expect(skipped).toEqual([{ status: "skipped", reason: "issue_dependencies_blocked" }]);
+
+    // A queued automatic run is cancelled at claim time, and its message names
+    // the event that will wake the assignee again.
+    const queued = await insertQueuedRun({
+      companyId,
+      agentId,
+      issueId: dependentIssueId,
+      contextSnapshot: { wakeReason: "issue_assigned" },
+    });
+    await heartbeat.resumeQueuedRuns();
+    const cancelled = await waitForRunStatus(queued.runId, "cancelled");
+    expect(cancelled?.errorCode).toBe("issue_dependencies_blocked");
+    expect(cancelled?.error).toBe(
+      "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when the open blockers are done or cancelled",
+    );
+    expect(adapterWakeForIssue(dependentIssueId)).toBeUndefined();
+
+    const reconciled = await heartbeat.reconcileResolvedDependencyWakes({ companyId });
+    expect(reconciled).toMatchObject({ healed: 0, blockerDecisionWakes: 0, notReadySkipped: 1 });
+    expect(blockerIssueIds).toHaveLength(2);
+  });
+
+  it("wakes the assignee once to decide after the last open blocker is cancelled", async () => {
+    const { companyId, agentId, dependentIssueId, blockerIssueIds } = await seedBlockedDependent([
+      { status: "cancelled" },
+      { status: "in_progress" },
+    ]);
+    await db
+      .update(issues)
+      .set({ status: "cancelled", updatedAt: new Date() })
+      .where(eq(issues.id, blockerIssueIds[1]!));
+
+    const reconciled = await heartbeat.reconcileResolvedDependencyWakes({ companyId });
+    expect(reconciled).toMatchObject({ healed: 1, blockerDecisionWakes: 1, issueIds: [dependentIssueId] });
+
+    const [decisionWake] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(decisionWake).toMatchObject({
+      reason: "issue_blockers_cancelled",
+      payload: expect.objectContaining({
+        issueId: dependentIssueId,
+        cancelledBlockerIssueIds: [...blockerIssueIds].sort(),
+      }),
+    });
+    const run = await waitForRunStatus(decisionWake!.runId!, "succeeded");
+    expect(run?.contextSnapshot).toMatchObject({
+      wakeReason: "issue_blockers_cancelled",
+      dependencyBlockersCancelled: true,
+      cancelledBlockerIssueIds: expect.arrayContaining(blockerIssueIds),
+    });
+    expect(adapterWakeForIssue(dependentIssueId)).toMatchObject({
+      reason: "issue_blockers_cancelled",
+      dependencyBlockersCancelled: true,
+    });
+
+    // The same decision is not requested again for the same blocked cycle.
+    const again = await heartbeat.reconcileResolvedDependencyWakes({ companyId });
+    expect(again).toMatchObject({ healed: 0, blockerDecisionWakes: 0, existingWakeSkipped: 1 });
+  });
+
+  it("delivers comments and interaction responses on a blocked issue but keeps retries gated", async () => {
+    const { companyId, agentId, dependentIssueId, blockerIssueIds } = await seedBlockedDependent([
+      { status: "in_progress" },
+    ]);
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId: dependentIssueId,
+      authorType: "user",
+      authorUserId: "responsible-user",
+      body: "Can you use the old template until the blocker lands?",
+    });
+
+    // A comment wake that a later automatic wake coalesced into: the wake
+    // reason is no longer a comment reason, but the comment is still pending.
+    const coalesced = await insertQueuedRun({
+      companyId,
+      agentId,
+      issueId: dependentIssueId,
+      contextSnapshot: {
+        wakeReason: "issue_blockers_resolved",
+        source: "issue.blockers_restored",
+        commentId,
+        wakeCommentId: commentId,
+        wakeCommentIds: [commentId],
+      },
+    });
+    await heartbeat.resumeQueuedRuns();
+    const commentRun = await waitForRunStatus(coalesced.runId, "succeeded");
+    expect(commentRun?.status).toBe("succeeded");
+    expect(adapterWakeForIssue(dependentIssueId)).toMatchObject({
+      dependencyBlockedInteraction: true,
+      unresolvedBlockerIssueIds: blockerIssueIds,
+    });
+
+    // A board answer to a confirmation carries the interaction, not a comment.
+    const answerWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId: dependentIssueId, mutation: "interaction" },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+      contextSnapshot: {
+        issueId: dependentIssueId,
+        interactionId: randomUUID(),
+        interactionKind: "request_confirmation",
+        interactionStatus: "rejected",
+        wakeReason: "issue_commented",
+        source: "issue.interaction.reject",
+      },
+    });
+    expect(answerWake).not.toBeNull();
+    const answerRun = await waitForRunStatus(answerWake!.id, "succeeded");
+    expect(answerRun?.contextSnapshot).toMatchObject({
+      dependencyBlockedInteraction: true,
+      unresolvedBlockerIssueIds: blockerIssueIds,
+    });
+
+    // A retry of an earlier run re-runs old input and stays gated.
+    const retry = await insertQueuedRun({
+      companyId,
+      agentId,
+      issueId: dependentIssueId,
+      contextSnapshot: {
+        wakeReason: "transient_failure_retry",
+        retryReason: "transient_failure_retry",
+        retryOfRunId: coalesced.runId,
+        wakeCommentId: commentId,
+        wakeCommentIds: [commentId],
+      },
+    });
+    await heartbeat.resumeQueuedRuns();
+    const retryRun = await waitForRunStatus(retry.runId, "cancelled");
+    expect(retryRun?.errorCode).toBe("issue_dependencies_blocked");
+  });
 });

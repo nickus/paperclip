@@ -54,6 +54,7 @@ export function buildNativeContinuationPrompt(input: {
     wake.fallbackFetchNeeded || wake.truncated || wake.recovery || continuation?.interruptedRunId ||
     (wake.externalChatExecutionBound && !externalChat) || wake.externalChatQuestionResponse ||
     wake.taskWatchdog || wake.livenessContinuation || wake.activeTreeHold ||
+    wake.dependencyBlockersCancelled ||
     wake.skillTest || wake.executionStage || wake.agentMessage ||
     wake.documentReviewContext || wake.planReviewContext || wake.annotationDeltas.length > 0
   ) return null;

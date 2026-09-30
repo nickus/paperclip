@@ -89,6 +89,48 @@ export function allowsIssueInteractionWake(
   return Boolean(deriveCommentId(contextSnapshot));
 }
 
+/**
+ * True for a wake that delivers a response to an issue thread interaction
+ * (an answered question, an accepted or rejected confirmation). Such a wake
+ * carries the interaction instead of a comment id.
+ */
+export function isIssueInteractionResponseWake(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): boolean {
+  if (readNonEmptyString(contextSnapshot?.wakeReason) !== "issue_commented") return false;
+  const interactionStatus = readNonEmptyString(contextSnapshot?.interactionStatus);
+  return Boolean(
+    readNonEmptyString(contextSnapshot?.interactionId) &&
+      interactionStatus &&
+      RESOLVED_INTERACTION_CONTINUATION_STATUSES.has(interactionStatus),
+  );
+}
+
+/**
+ * Decides whether a wake may run while issue dependencies are still blocked.
+ * New input on the issue has to reach the assignee, who can answer it without
+ * starting the blocked work:
+ * - a comment or mention wake (the interaction wake rule above);
+ * - a response to a thread interaction;
+ * - a queued run that still carries comment ids after a later automatic wake
+ *   coalesced into it and replaced its wake reason.
+ * Retries re-run earlier input and stay gated, as do all other wakes.
+ */
+export function allowsDependencyBlockedWake(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  allowedWakeReasons: ReadonlySet<string>,
+): boolean {
+  if (allowsIssueInteractionWake(contextSnapshot, allowedWakeReasons)) return true;
+  if (
+    readNonEmptyString(contextSnapshot?.retryReason) ||
+    readNonEmptyString(contextSnapshot?.retryOfRunId)
+  ) {
+    return false;
+  }
+  if (isIssueInteractionResponseWake(contextSnapshot)) return true;
+  return extractWakeCommentIds(contextSnapshot).length > 0;
+}
+
 export function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown): boolean {
   const context = parseObject(contextSnapshot);
   const interactionId = readNonEmptyString(context.interactionId);

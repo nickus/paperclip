@@ -29,6 +29,7 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   getDependencyReadiness: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  listBlockedDependentsAwaitingDecision: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
 }));
@@ -62,6 +63,7 @@ vi.mock("../services/index.js", () => ({
   heartbeatService: () => ({
     wakeup: mockWakeup,
     reportRunActivity: vi.fn(async () => undefined),
+    getActiveRunForAgent: vi.fn(async () => null),
   }),
   getIssueContinuationSummaryDocument: vi.fn(async () => null),
   instanceSettingsService: () => ({
@@ -180,6 +182,7 @@ describe("issue dependency wakeups in issue routes", () => {
       isDependencyReady: true,
     });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+    mockIssueService.listBlockedDependentsAwaitingDecision.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
   });
 
@@ -680,5 +683,46 @@ describe("issue dependency wakeups in issue routes", () => {
     expect(res.status).toBe(200);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("asks the dependent's assignee to decide when its last open blocker is cancelled", async () => {
+    const dependentIssueId = "33333333-3333-4333-8333-333333333333";
+    const earlierCancelledBlockerId = "44444444-4444-4444-8444-444444444444";
+    const blockedAt = new Date("2026-08-02T10:00:00.000Z");
+    mockIssueService.getById.mockResolvedValue(issueRecord({ status: "in_progress" }));
+    mockIssueService.update.mockResolvedValue(issueRecord({ status: "cancelled" }));
+    mockIssueService.listBlockedDependentsAwaitingDecision.mockResolvedValue([
+      {
+        id: dependentIssueId,
+        assigneeAgentId: "agent-2",
+        cancelledBlockerIssueIds: [earlierCancelledBlockerId, "issue-1"],
+        blockedTransitionAt: blockedAt,
+      },
+    ]);
+
+    const res = await request(await createApp())
+      .patch("/api/issues/issue-1")
+      .send({ status: "cancelled" });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockWakeup).toHaveBeenCalledWith(
+        "agent-2",
+        expect.objectContaining({
+          reason: "issue_blockers_cancelled",
+          payload: expect.objectContaining({
+            issueId: dependentIssueId,
+            settledBlockerIssueId: "issue-1",
+            cancelledBlockerIssueIds: ["44444444-4444-4444-8444-444444444444", "issue-1"],
+          }),
+          contextSnapshot: expect.objectContaining({
+            wakeReason: "issue_blockers_cancelled",
+            source: "issue.blockers_cancelled",
+          }),
+        }),
+      );
+    });
+    expect(mockIssueService.listBlockedDependentsAwaitingDecision).toHaveBeenCalledWith("issue-1");
+    expect(mockIssueService.listWakeableBlockedDependents).not.toHaveBeenCalled();
   });
 });

@@ -759,6 +759,13 @@ type PaperclipWakeBlockerSummary = {
   priority: string | null;
 };
 
+const CANCELLED_BLOCKER_DECISION_INSTRUCTION =
+  "Every remaining blocker of this issue is cancelled and will never complete. Decide now: remove or replace the blocker relationship, re-plan the work, or cancel the issue or hand it back.";
+
+function formatPaperclipWakeBlockerSummary(blocker: PaperclipWakeBlockerSummary) {
+  return `${blocker.identifier ?? blocker.id ?? "unknown"}${blocker.title ? ` ${blocker.title}` : ""}${blocker.status ? ` (${blocker.status})` : ""}`;
+}
+
 type PaperclipWakeTreeHoldSummary = {
   holdId: string | null;
   rootIssueId: string | null;
@@ -840,6 +847,10 @@ type PaperclipWakePayload = {
   // Technical English with brief decision context.
   simplifiedEnglishInteractions: boolean;
   dependencyBlockedInteraction: boolean;
+  // Every unresolved blocker is cancelled; the assignee must decide what to do.
+  dependencyBlockersCancelled: boolean;
+  cancelledBlockerIssueIds: string[];
+  cancelledBlockerInstruction: string | null;
   treeHoldInteraction: boolean;
   activeTreeHold: PaperclipWakeTreeHoldSummary | null;
   unresolvedBlockerIssueIds: string[];
@@ -1908,6 +1919,17 @@ export function normalizePaperclipWakePayload(
       payload.dependencyBlockedInteraction,
       false,
     ),
+    dependencyBlockersCancelled: asBoolean(
+      payload.dependencyBlockersCancelled,
+      false,
+    ),
+    cancelledBlockerIssueIds: Array.isArray(payload.cancelledBlockerIssueIds)
+      ? payload.cancelledBlockerIssueIds
+          .map((entry) => asString(entry, "").trim())
+          .filter(Boolean)
+      : [],
+    cancelledBlockerInstruction:
+      asString(payload.cancelledBlockerInstruction, "").trim() || null,
     treeHoldInteraction: asBoolean(payload.treeHoldInteraction, false),
     activeTreeHold,
     unresolvedBlockerIssueIds,
@@ -2031,6 +2053,7 @@ function hasNormalizedPaperclipExternalChatContext(
   return !(
     normalized.recovery ||
     normalized.dependencyBlockedInteraction ||
+    normalized.dependencyBlockersCancelled ||
     normalized.treeHoldInteraction ||
     normalized.activeTreeHold ||
     normalized.unresolvedBlockerIssueIds.length > 0 ||
@@ -2113,6 +2136,7 @@ function isNormalizedPaperclipExternalChatQuestionResponseTurn(
   return !(
     normalized.recovery ||
     normalized.dependencyBlockedInteraction ||
+    normalized.dependencyBlockersCancelled ||
     normalized.treeHoldInteraction ||
     normalized.activeTreeHold ||
     normalized.unresolvedBlockerIssueIds.length > 0 ||
@@ -2661,10 +2685,7 @@ function renderPaperclipWakePromptBody(
     );
     if (normalized.unresolvedBlockerSummaries.length > 0) {
       const blockers = normalized.unresolvedBlockerSummaries
-        .map(
-          (blocker) =>
-            `${blocker.identifier ?? blocker.id ?? "unknown"}${blocker.title ? ` ${blocker.title}` : ""}${blocker.status ? ` (${blocker.status})` : ""}`,
-        )
+        .map(formatPaperclipWakeBlockerSummary)
         .join("; ");
       lines.push(`- unresolved blockers: ${blockers}`);
     } else if (normalized.unresolvedBlockerIssueIds.length > 0) {
@@ -2672,6 +2693,22 @@ function renderPaperclipWakePromptBody(
         `- unresolved blocker issue ids: ${normalized.unresolvedBlockerIssueIds.join(", ")}`,
       );
     }
+  }
+  if (normalized.dependencyBlockersCancelled) {
+    const cancelledIds = new Set(normalized.cancelledBlockerIssueIds);
+    const cancelledBlockers = normalized.unresolvedBlockerSummaries.filter(
+      (blocker) => blocker.id !== null && cancelledIds.has(blocker.id),
+    );
+    if (cancelledBlockers.length > 0) {
+      lines.push(
+        `- cancelled blockers: ${cancelledBlockers.map(formatPaperclipWakeBlockerSummary).join("; ")}`,
+      );
+    } else if (cancelledIds.size > 0) {
+      lines.push(`- cancelled blocker issue ids: ${[...cancelledIds].join(", ")}`);
+    }
+    lines.push(
+      `- blocker decision required: ${normalized.cancelledBlockerInstruction ?? CANCELLED_BLOCKER_DECISION_INSTRUCTION}`,
+    );
   }
   if (normalized.treeHoldInteraction) {
     lines.push("- tree-hold interaction: yes");

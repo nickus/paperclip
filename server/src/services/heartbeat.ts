@@ -423,7 +423,7 @@ import {
   readManagedWorktreeInstanceOwnership,
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
-import { issueService } from "./issues.js";
+import { issueService, type IssueDependencyReadiness } from "./issues.js";
 import {
   blockRunnerGoalRecovery,
   failRunnerGoalAction,
@@ -441,7 +441,10 @@ import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
+  ISSUE_BLOCKERS_CANCELLED_INSTRUCTION,
+  ISSUE_BLOCKERS_CANCELLED_WAKE_REASON,
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  dependencyBlockersAwaitDecision,
   reportSkippedDependencyWake,
 } from "./issue-dependency-wakeups.js";
 import {
@@ -568,7 +571,7 @@ import {
   isNonAssigneeWorkspaceBusyRetry,
   extractWakeCommentIds,
   deriveCommentId,
-  allowsIssueInteractionWake,
+  allowsDependencyBlockedWake,
   isResolvedInteractionContinuationWakeContext,
 } from "../modules/run-dispatch/index.js";
 import {
@@ -1335,6 +1338,7 @@ function mergeAdapterRecoveryMetadata(input: {
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set([
   "approval_approved",
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  ISSUE_BLOCKERS_CANCELLED_WAKE_REASON,
   "issue_recovery_action_restored",
 ]);
 const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
@@ -1344,6 +1348,7 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "issue_comment_mentioned",
   "issue_reopened_via_comment",
   "issue_blockers_resolved",
+  ISSUE_BLOCKERS_CANCELLED_WAKE_REASON,
   "issue_children_completed",
   "issue_status_changed",
   "issue_tree_restored",
@@ -5804,6 +5809,54 @@ async function listUnresolvedBlockerSummaries(
     .orderBy(asc(issues.title));
 }
 
+const DEPENDENCY_WAKE_CONTEXT_KEYS = [
+  "dependencyBlockedInteraction",
+  "dependencyBlockersCancelled",
+  "cancelledBlockerIssueIds",
+  "cancelledBlockerInstruction",
+  "unresolvedBlockerIssueIds",
+  "unresolvedBlockerCount",
+  "unresolvedBlockerSummaries",
+] as const;
+
+/**
+ * Records on a wake context why the wake runs while the issue's dependencies
+ * are not ready. When every unresolved blocker is cancelled, the assignee is
+ * asked to decide what to do with them. Otherwise the wake is a bounded
+ * interaction that answers new input without starting the blocked work. A
+ * ready issue clears the markers so an outdated snapshot never reaches the
+ * prompt.
+ */
+async function applyDependencyWakeContext(
+  dbOrTx: Pick<Db, "select">,
+  input: {
+    companyId: string;
+    issueId: string;
+    context: Record<string, unknown>;
+    readiness: IssueDependencyReadiness | null | undefined;
+    runsAsAssignee: boolean;
+  },
+) {
+  const { context, readiness } = input;
+  for (const key of DEPENDENCY_WAKE_CONTEXT_KEYS) delete context[key];
+  if (!readiness || readiness.isDependencyReady) return;
+  context.unresolvedBlockerIssueIds = readiness.unresolvedBlockerIssueIds;
+  context.unresolvedBlockerCount = readiness.unresolvedBlockerCount;
+  context.unresolvedBlockerSummaries = await listUnresolvedBlockerSummaries(
+    dbOrTx,
+    input.companyId,
+    input.issueId,
+    readiness.unresolvedBlockerIssueIds,
+  );
+  if (input.runsAsAssignee && dependencyBlockersAwaitDecision(readiness)) {
+    context.dependencyBlockersCancelled = true;
+    context.cancelledBlockerIssueIds = readiness.cancelledBlockerIssueIds;
+    context.cancelledBlockerInstruction = ISSUE_BLOCKERS_CANCELLED_INSTRUCTION;
+  } else {
+    context.dependencyBlockedInteraction = true;
+  }
+}
+
 export function formatRuntimeWorkspaceWarningLog(warning: string) {
   return {
     stream: "stdout" as const,
@@ -8393,6 +8446,19 @@ export async function buildPaperclipWakePayload(input: {
     simplifiedEnglishInteractions: input.simplifiedEnglishInteractions === true,
     dependencyBlockedInteraction:
       input.contextSnapshot.dependencyBlockedInteraction === true,
+    dependencyBlockersCancelled:
+      input.contextSnapshot.dependencyBlockersCancelled === true,
+    cancelledBlockerIssueIds: Array.isArray(
+      input.contextSnapshot.cancelledBlockerIssueIds,
+    )
+      ? input.contextSnapshot.cancelledBlockerIssueIds.filter(
+          (value): value is string =>
+            typeof value === "string" && value.length > 0,
+        )
+      : [],
+    cancelledBlockerInstruction: readNonEmptyString(
+      input.contextSnapshot.cancelledBlockerInstruction,
+    ),
     treeHoldInteraction: input.contextSnapshot.treeHoldInteraction === true,
     activeTreeHold: parseObject(input.contextSnapshot.activeTreeHold),
     unresolvedBlockerIssueIds: Array.isArray(
@@ -17836,9 +17902,14 @@ export function heartbeatService(
       );
       const readiness = dependencyReadiness.get(issueId);
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
+      // Only an open blocker is worth waiting for: it wakes the assignee when
+      // it is done or cancelled. Cancelled blockers never resolve, so a wake
+      // on an issue that has only cancelled blockers runs and asks for a
+      // decision. New comments and interaction responses always get through.
       if (
         unresolvedBlockerCount > 0 &&
-        !allowsIssueInteractionWake(
+        !dependencyBlockersAwaitDecision(readiness) &&
+        !allowsDependencyBlockedWake(
           context,
           ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
         )
@@ -18424,7 +18495,7 @@ export function heartbeatService(
   ) {
     const now = new Date();
     const reason =
-      "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve";
+      "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when the open blockers are done or cancelled";
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt: now,
       error: reason,
@@ -21170,6 +21241,17 @@ export function heartbeatService(
             .listDependencyReadiness(agent.companyId, [issueId])
             .then((rows) => rows.get(issueId) ?? null)
         : null;
+      if (issueId && issueContext) {
+        // The blocker set can change between admission and start (a blocker is
+        // cancelled, or a comment joins a queued run), so describe it as it is now.
+        await applyDependencyWakeContext(db, {
+          companyId: agent.companyId,
+          issueId,
+          context,
+          readiness: issueDependencyReadiness,
+          runsAsAssignee: issueContext.assigneeAgentId === agent.id,
+        });
+      }
       if (
         issueId &&
         issueContext &&
@@ -28957,27 +29039,25 @@ export function heartbeatService(
           // Blocked descendants should stay idle until the final blocker resolves.
           // Human comment/mention wakes are the exception: they may run in a
           // bounded interaction mode so the assignee can answer or triage.
+          // Cancelled blockers never resolve, so when only cancelled blockers
+          // remain every wake runs and asks the assignee to decide.
           const blockedInteractionWake =
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
-            allowsIssueInteractionWake(
-              enrichedContextSnapshot,
-              ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-            );
+            (dependencyBlockersAwaitDecision(dependencyReadiness) ||
+              allowsDependencyBlockedWake(
+                enrichedContextSnapshot,
+                ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
+              ));
 
           if (blockedInteractionWake) {
-            enrichedContextSnapshot.dependencyBlockedInteraction = true;
-            enrichedContextSnapshot.unresolvedBlockerIssueIds =
-              dependencyReadiness.unresolvedBlockerIssueIds;
-            enrichedContextSnapshot.unresolvedBlockerCount =
-              dependencyReadiness.unresolvedBlockerCount;
-            enrichedContextSnapshot.unresolvedBlockerSummaries =
-              await listUnresolvedBlockerSummaries(
-                tx,
-                issue.companyId,
-                issue.id,
-                dependencyReadiness.unresolvedBlockerIssueIds,
-              );
+            await applyDependencyWakeContext(tx, {
+              companyId: issue.companyId,
+              issueId: issue.id,
+              context: enrichedContextSnapshot,
+              readiness: dependencyReadiness,
+              runsAsAssignee: issue.assigneeAgentId === agentId,
+            });
           }
 
           if (

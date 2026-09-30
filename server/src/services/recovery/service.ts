@@ -111,7 +111,10 @@ import {
 } from "../issue-execution-policy.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  buildIssueBlockersCancelledWakeup,
   buildIssueBlockersResolvedWakeStateKey,
+  dependencyBlockersAwaitDecision,
+  findExistingIssueBlockersCancelledWake,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
@@ -5545,6 +5548,7 @@ export function recoveryService(
       candidateLimitSkipped: 0,
       deferredOrFailed: 0,
       enqueueFailed: 0,
+      blockerDecisionWakes: 0,
       issueIds: [] as string[],
     };
 
@@ -5658,6 +5662,87 @@ export function recoveryService(
       candidatesByCompany.set(candidate.companyId, companyCandidates);
     }
 
+    async function emitBlockerDecisionWake(input: {
+      companyId: string;
+      candidate: (typeof candidates)[number] & { assigneeAgentId: string };
+      cancelledBlockerIssueIds: string[];
+    }) {
+      const { companyId, candidate } = input;
+      const agentId = candidate.assigneeAgentId;
+      const wakeup = buildIssueBlockersCancelledWakeup({
+        dependentIssueId: candidate.id,
+        cancelledBlockerIssueIds: input.cancelledBlockerIssueIds,
+        blockedTransitionAt: candidate.blockedTransitionAt,
+        source,
+        requestedByActorType: "system",
+        requestedByActorId,
+      });
+      if (
+        await findExistingIssueBlockersCancelledWake(db, {
+          companyId,
+          idempotencyKey: wakeup.idempotencyKey,
+        })
+      ) {
+        result.existingWakeSkipped += 1;
+        return;
+      }
+      if (
+        (await hasActiveExecutionPath(companyId, candidate.id, agentId)) ||
+        (await hasQueuedIssueWake(companyId, candidate.id, agentId))
+      ) {
+        result.livePathSkipped += 1;
+        return;
+      }
+      if (await hasPendingWakeInteraction(companyId, candidate.id)) {
+        result.interactionSkipped += 1;
+        return;
+      }
+      if (
+        await isAutomaticRecoverySuppressedByPauseHold(
+          db,
+          companyId,
+          candidate.id,
+          treeControlSvc,
+        )
+      ) {
+        result.pauseHoldSkipped += 1;
+        return;
+      }
+      try {
+        const wake = await deps.enqueueWakeup(agentId, wakeup);
+        if (!wake) {
+          result.deferredOrFailed += 1;
+          return;
+        }
+        result.healed += 1;
+        result.blockerDecisionWakes += 1;
+        result.issueIds.push(candidate.id);
+        await logActivity(db, {
+          companyId,
+          actorType: "system",
+          actorId: "issue_graph_liveness_backstop",
+          agentId,
+          runId: opts?.runId ?? null,
+          action: "issue.blockers_cancelled_wake_emitted",
+          entityType: "issue",
+          entityId: candidate.id,
+          details: {
+            source,
+            wakeupRunId: wake.id,
+            idempotencyKey: wakeup.idempotencyKey,
+            cancelledBlockerIssueIds: wakeup.payload.cancelledBlockerIssueIds,
+          },
+        });
+      } catch (err) {
+        result.deferredOrFailed += 1;
+        result.enqueueFailed += 1;
+        logger.warn(
+          { err, issueId: candidate.id, agentId, idempotencyKey: wakeup.idempotencyKey, source },
+          "failed to enqueue cancelled-blocker wake from issue graph liveness backstop",
+        );
+      }
+    }
+
     for (const [
       companyId,
       companyCandidates,
@@ -5672,6 +5757,16 @@ export function recoveryService(
         if (!agentId) continue;
 
         const readiness = readinessMap.get(candidate.id);
+        if (readiness && dependencyBlockersAwaitDecision(readiness)) {
+          // Only cancelled blockers remain, so this dependent never becomes
+          // ready. Ask its assignee once per cancelled set and blocked cycle.
+          await emitBlockerDecisionWake({
+            companyId,
+            candidate: { ...candidate, assigneeAgentId: agentId },
+            cancelledBlockerIssueIds: readiness.cancelledBlockerIssueIds,
+          });
+          continue;
+        }
         const resolvedBlockerIssueId = readiness?.blockerIssueIds[0] ?? null;
         if (
           !readiness ||

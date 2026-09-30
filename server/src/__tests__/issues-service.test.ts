@@ -4426,6 +4426,81 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ]);
   });
 
+  it("asks for a decision only when every remaining blocker is cancelled", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const doneBlocker = randomUUID();
+    const openBlocker = randomUUID();
+    const cancelledBlocker = randomUUID();
+    const blockedIssueId = randomUUID();
+    await db.insert(issues).values([
+      { id: doneBlocker, companyId, title: "Done blocker", status: "done", priority: "medium" },
+      { id: openBlocker, companyId, title: "Open blocker", status: "todo", priority: "medium" },
+      { id: cancelledBlocker, companyId, title: "Cancelled blocker", status: "cancelled", priority: "medium" },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked issue",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+
+    await svc.update(blockedIssueId, {
+      blockedByIssueIds: [doneBlocker, openBlocker, cancelledBlocker],
+    });
+    await expect(svc.getDependencyReadiness(blockedIssueId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      unresolvedBlockerCount: 2,
+      cancelledBlockerIssueIds: [cancelledBlocker],
+    });
+    // The open blocker can still resolve, so nobody is asked yet.
+    expect(await svc.listBlockedDependentsAwaitingDecision(cancelledBlocker)).toEqual([]);
+
+    await svc.update(openBlocker, { status: "cancelled" });
+
+    // Cancelled blockers never count as done ...
+    expect(await svc.listWakeableBlockedDependents(openBlocker)).toEqual([]);
+    // ... so the assignee is asked to decide what to do with them.
+    await expect(svc.listBlockedDependentsAwaitingDecision(openBlocker)).resolves.toEqual([
+      expect.objectContaining({
+        id: blockedIssueId,
+        assigneeAgentId,
+        cancelledBlockerIssueIds: expect.arrayContaining([openBlocker, cancelledBlocker]),
+      }),
+    ]);
+
+    // Replacing the cancelled blockers restores the ordinary done path.
+    await svc.update(blockedIssueId, { blockedByIssueIds: [doneBlocker] });
+    expect(await svc.listBlockedDependentsAwaitingDecision(doneBlocker)).toEqual([]);
+    await expect(svc.listWakeableBlockedDependents(doneBlocker)).resolves.toEqual([
+      expect.objectContaining({ id: blockedIssueId, blockerIssueIds: [doneBlocker] }),
+    ]);
+    await expect(svc.getDependencyReadiness(blockedIssueId)).resolves.toMatchObject({
+      isDependencyReady: true,
+      cancelledBlockerIssueIds: [],
+    });
+  });
+
   it("treats done blockers on a shared workspace as ready while a foreign issue is in-flight", async () => {
     const {
       companyId,

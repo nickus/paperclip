@@ -41,7 +41,10 @@ import {
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
-import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../issue-dependency-wakeups.js";
+import {
+  buildIssueBlockersCancelledWakeup,
+  buildIssueBlockersResolvedWakeIdempotencyKey,
+} from "../issue-dependency-wakeups.js";
 import {
   persistActivity,
   publishActivity,
@@ -2006,6 +2009,44 @@ export async function commitNativeStatusDecision(input: {
             completedChildIssueId: input.issueId,
             childIssueSummaries: parent.childIssueSummaries,
             childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+          },
+        });
+      }
+      // A dependent left with only cancelled blockers never becomes ready;
+      // its assignee is asked to decide instead.
+      const awaitingDecision =
+        await issueSvc.listBlockedDependentsAwaitingDecision(input.issueId);
+      for (const dependent of awaitingDecision) {
+        const wakeup = buildIssueBlockersCancelledWakeup({
+          dependentIssueId: dependent.id,
+          cancelledBlockerIssueIds: dependent.cancelledBlockerIssueIds,
+          blockedTransitionAt: dependent.blockedTransitionAt,
+          settledBlockerIssueId: input.issueId,
+          source: "native_status_decision",
+          requestedByActorType: "system",
+          requestedByActorId: "native-status-committer",
+        });
+        const wakeId = await enqueueWake({
+          tx: tx as unknown as Db,
+          companyId: input.companyId,
+          issueId: dependent.id,
+          agentId: dependent.assigneeAgentId,
+          reason: wakeup.reason,
+          idempotencyKey: wakeup.idempotencyKey,
+          payload: wakeup.payload,
+          contextSnapshot: {
+            cancelledBlockerIssueIds: wakeup.contextSnapshot.cancelledBlockerIssueIds,
+            settledBlockerIssueId: input.issueId,
+          },
+        });
+        materialized.push({
+          effectKind: "dependency_decision_wake",
+          targetType: "agent_wakeup_request",
+          targetId: wakeId,
+          payload: {
+            dependentIssueId: dependent.id,
+            settledBlockerIssueId: input.issueId,
+            cancelledBlockerIssueIds: wakeup.payload.cancelledBlockerIssueIds,
           },
         });
       }

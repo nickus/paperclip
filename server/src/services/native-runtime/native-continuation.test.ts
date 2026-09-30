@@ -45,6 +45,10 @@ describe("native continuation event projection", () => {
     const cut = { ...message, body: "Yes, please", bodyTruncated: true, bodyChars: 20_000 };
     expect(build({ ...wake, executionContinuation: { ...wake.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [cut] } } })).toBeNull();
   });
+  it("retains bootstrap framing for a child completion that leaves only cancelled blockers", () => {
+    // The compact delta has no place for the blocker decision the assignee must make.
+    expect(build({ ...wake, reason: "issue_children_completed", dependencyBlockersCancelled: true, cancelledBlockerIssueIds: ["child"] })).toBeNull();
+  });
   it.each([{ fallbackFetchNeeded: true }, { recovery: { cause: "interrupted" } }, { externalChatExecutionBound: true }, { reason: "issue_assigned" }])("retains bootstrap framing for special wakes: %j", (extra) => {
     expect(build({ ...wake, ...extra })).toBeNull();
   });
