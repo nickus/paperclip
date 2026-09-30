@@ -18,6 +18,7 @@ export const sessionCodec: AdapterSessionCodec = {
       readNonEmptyString(record.cwd) ??
       readNonEmptyString(record.workdir) ??
       readNonEmptyString(record.folder);
+    const mcpServerIdentity = readNonEmptyString(record.mcpServerIdentity);
     const workspaceId = readNonEmptyString(record.workspaceId) ?? readNonEmptyString(record.workspace_id);
     const repoUrl = readNonEmptyString(record.repoUrl) ?? readNonEmptyString(record.repo_url);
     const repoRef = readNonEmptyString(record.repoRef) ?? readNonEmptyString(record.repo_ref);
@@ -26,6 +27,7 @@ export const sessionCodec: AdapterSessionCodec = {
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(remoteExecution ? { remoteExecution } : {}),
+      ...(mcpServerIdentity ? { mcpServerIdentity } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
@@ -42,6 +44,7 @@ export const sessionCodec: AdapterSessionCodec = {
       readNonEmptyString(params.cwd) ??
       readNonEmptyString(params.workdir) ??
       readNonEmptyString(params.folder);
+    const mcpServerIdentity = readNonEmptyString(params.mcpServerIdentity);
     const workspaceId = readNonEmptyString(params.workspaceId) ?? readNonEmptyString(params.workspace_id);
     const repoUrl = readNonEmptyString(params.repoUrl) ?? readNonEmptyString(params.repo_url);
     const repoRef = readNonEmptyString(params.repoRef) ?? readNonEmptyString(params.repo_ref);
@@ -50,6 +53,7 @@ export const sessionCodec: AdapterSessionCodec = {
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(remoteExecution ? { remoteExecution } : {}),
+      ...(mcpServerIdentity ? { mcpServerIdentity } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
