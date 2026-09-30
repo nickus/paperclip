@@ -28,6 +28,15 @@ import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
+import {
+  AGENT_FAILURE_BREAKER_ACTIVITY_ACTION,
+  AGENT_FAILURE_BREAKER_SKIP_REASON,
+  AGENT_FAILURE_BREAKER_THRESHOLD,
+  describeAgentFailureBreaker,
+  hasHeldWakeForAgentFailureBreaker,
+  readAgentFailureBreaker,
+  type AgentFailureBreakerTrip,
+} from "./agent-failure-breaker.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
@@ -18367,6 +18376,36 @@ export function heartbeatService(
     return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
   }
 
+  /**
+   * The one board-visible notice for a tripped failure breaker: the agent's
+   * error reason (shown on the agent page and in the attention feed) says why
+   * automatic wakes stopped, and the activity log records the decision.
+   */
+  async function recordAgentFailureBreakerNotice(
+    agent: typeof agents.$inferSelect,
+    trip: AgentFailureBreakerTrip,
+    notice: string,
+  ) {
+    await db
+      .update(agents)
+      .set({ errorReason: truncateAgentErrorReason(notice), updatedAt: new Date() })
+      .where(and(eq(agents.id, agent.id), eq(agents.status, "error")));
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      action: AGENT_FAILURE_BREAKER_ACTIVITY_ACTION,
+      entityType: "agent",
+      entityId: agent.id,
+      details: {
+        errorCode: trip.errorCode,
+        consecutiveFailures: AGENT_FAILURE_BREAKER_THRESHOLD,
+        failedRunIds: trip.runIds,
+        reason: notice,
+      },
+    });
+  }
+
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
@@ -27588,6 +27627,22 @@ export function heartbeatService(
     if (source !== "timer" && !policy.wakeOnDemand) {
       await writeSkippedRequest("heartbeat.wakeOnDemand.disabled", {}, { wakeOnDemand: false });
       return null;
+    }
+
+    // Runs that keep failing the same way (a disabled secret, a bad model id,
+    // an unreachable environment) fail every automatic wake the same way too.
+    // Hold automatic wakes until a person changes the configuration, clears
+    // the agent's error, or starts a run that succeeds; wakes a person
+    // requests are never held.
+    if (opts.requestedByActorType !== "user" && agent.status === "error") {
+      const failureBreaker = await readAgentFailureBreaker(db, agent);
+      if (failureBreaker) {
+        const notice = describeAgentFailureBreaker(failureBreaker);
+        const alreadyNoticed = await hasHeldWakeForAgentFailureBreaker(db, agent, failureBreaker);
+        await writeSkippedRequest(AGENT_FAILURE_BREAKER_SKIP_REASON, { error: notice });
+        if (!alreadyNoticed) await recordAgentFailureBreakerNotice(agent, failureBreaker, notice);
+        return null;
+      }
     }
 
     const genericTimerWake =
