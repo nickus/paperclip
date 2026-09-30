@@ -44,6 +44,7 @@ import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import {
   buildIssueBlockersCancelledWakeup,
   buildIssueBlockersResolvedWakeIdempotencyKey,
+  buildIssueBlockersResolvedWakeStateKey,
 } from "../issue-dependency-wakeups.js";
 import {
   persistActivity,
@@ -1935,8 +1936,20 @@ export async function commitNativeStatusDecision(input: {
         : false;
       for (const dependent of dependents) {
         const isCompletedChildParent = parent?.id === dependent.id;
+        // A parent that is ready now that this child is done gets one wake
+        // that carries both the dependency and the child summaries. It stands
+        // in for the parent's issue_blockers_resolved wake, so it takes that
+        // wake's key: the ready-state key shared by the route-time,
+        // finalize-time and periodic dependency wakes. Those paths then see
+        // this ready state as covered and send no second wake, and a later
+        // blocked cycle of the parent gets a new key, so a child that is
+        // closed again after the parent was blocked on it again still wakes it.
         const idempotencyKey = isCompletedChildParent
-          ? `issue_children_completed:${dependent.id}:${input.issueId}`
+          ? buildIssueBlockersResolvedWakeStateKey({
+              dependentIssueId: dependent.id,
+              blockerIssueIds: dependent.blockerIssueIds,
+              blockedTransitionAt: dependent.blockedTransitionAt,
+            })
           : buildIssueBlockersResolvedWakeIdempotencyKey({
               dependentIssueId: dependent.id,
               resolvedBlockerIssueId: input.issueId,

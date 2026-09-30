@@ -9173,7 +9173,8 @@ export function issueService(db: Db) {
      * (`issue_blockers_resolved`, or `issue_blockers_cancelled` for a
      * cancelled blocker) already wakes the parent, so callers must not send a
      * second wake; the native status committer folds the child summaries into
-     * that single dependency wake instead.
+     * that single dependency wake instead, keyed like the dependency wake
+     * (`buildIssueBlockersResolvedWakeStateKey`), not with `idempotencyKey`.
      */
     getWakeableParentAfterChildCompletion: async (
       parentIssueId: string,
