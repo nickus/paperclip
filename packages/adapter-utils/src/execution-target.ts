@@ -52,6 +52,12 @@ import {
 } from "./sandbox-callback-bridge.js";
 import { sendSandboxCallbackBridgeForward } from "./sandbox-callback-bridge-tool-calls.js";
 import {
+  createSandboxCallbackBridgeMcpRelay,
+  paperclipApiOriginsForMcpRelay,
+  sandboxCallbackBridgeMcpMethodNotAllowed,
+} from "./sandbox-callback-bridge-mcp.js";
+import type { AdapterRuntimeMcpServer } from "./types.js";
+import {
   createHttp2BridgeServer,
   BridgeProcessCapacityError,
   type BridgeBodyReservation,
@@ -357,6 +363,18 @@ export interface AdapterExecutionTargetShellOptions {
 
 export interface AdapterExecutionTargetPaperclipBridgeHandle {
   env: Record<string, string>;
+  /**
+   * The run's Paperclip-managed MCP servers (the `runtimeMcpServers` passed to
+   * {@link startAdapterExecutionTargetPaperclipBridge}) as the execution target
+   * must address them: servers on the Paperclip API origin point at this
+   * bridge and use the bridge token, which the bridge swaps for each server's
+   * own token on the host. A server on that origin the bridge cannot relay is
+   * left out (the run log says which and why); servers on other origins are
+   * listed unchanged. Write the target's MCP client config from this list,
+   * not from the host-side one, once the bridge has started. Empty when the
+   * bridge was started without servers.
+   */
+  runtimeMcpServers?: AdapterRuntimeMcpServer[];
   /**
    * Present when the sandbox target opted into run-log streaming
    * (`streamRunLogs`). Create one handle per CLI attempt and pass it to
@@ -1391,6 +1409,71 @@ export async function ensureAdapterExecutionTargetFile(
     `mkdir -p ${shellQuote(path.posix.dirname(filePath))} && : > ${shellQuote(filePath)}`,
     options,
   );
+}
+
+/**
+ * Write a small text file on the execution target, readable by its owner only.
+ * The contents travel over the command's stdin, never on a command line or in
+ * the environment, so the file may carry credentials (for example an MCP
+ * client config holding the run's bridge token). The file is replaced
+ * atomically. Fails with the target's own error output.
+ */
+export async function writeAdapterExecutionTargetTextFile(
+  runId: string,
+  target: AdapterExecutionTarget | null | undefined,
+  filePath: string,
+  contents: string,
+  options: { timeoutSec?: number } = {},
+): Promise<void> {
+  if (!target || target.kind === "local") {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const partial = `${filePath}.${randomUUID()}.partial`;
+    await fs.writeFile(partial, contents, { mode: 0o600 });
+    await fs.rename(partial, filePath);
+    return;
+  }
+  if (!filePath.startsWith("/")) {
+    throw new Error(`File path must be an absolute POSIX path on the remote target: "${filePath}"`);
+  }
+  const partial = `${filePath}.partial`;
+  const script = [
+    "umask 077",
+    `mkdir -p ${shellQuote(path.posix.dirname(filePath))}`,
+    `cat > ${shellQuote(partial)}`,
+    `mv -f ${shellQuote(partial)} ${shellQuote(filePath)}`,
+  ].join(" && ");
+  const timeoutMs = (options.timeoutSec ?? 15) * 1000;
+  let result: { exitCode: number | null; timedOut?: boolean; stdout: string; stderr: string };
+  if (target.transport === "ssh") {
+    try {
+      result = { exitCode: 0, ...(await runSshCommand(target.spec, script, { stdin: contents, timeoutMs })) };
+    } catch (error) {
+      const failed = error as { code?: unknown; stdout?: string; stderr?: string; message?: string };
+      result = {
+        exitCode: typeof failed.code === "number" ? failed.code : null,
+        timedOut: failed.code === "ETIMEDOUT",
+        stdout: failed.stdout ?? "",
+        stderr: failed.stderr ?? failed.message ?? "",
+      };
+    }
+  } else {
+    result = await requireSandboxRunner(target).execute({
+      command: preferredSandboxShell(target),
+      args: shellCommandArgs(script),
+      cwd: target.remoteCwd,
+      stdin: contents,
+      timeoutMs,
+      // A one-shot exec, like the bridge's own file transfers: the lease's
+      // persistent session is a serialized shell, not a stdin channel.
+      bypassSession: true,
+    });
+  }
+  if (result.timedOut || result.exitCode !== 0) {
+    const detail = (result.stderr || result.stdout || "").trim();
+    throw new Error(
+      `Could not write "${filePath}" on the execution target${result.timedOut ? " (timed out)" : ""}${detail ? `: ${detail}` : "."}`,
+    );
+  }
 }
 
 /**
@@ -4543,6 +4626,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // narrow purpose (for example a credential broker) passes `"restricted"` so
   // it never inherits a wider policy meant for the agent's own API calls.
   routePolicy?: SandboxCallbackBridgePolicy | null;
+  // The run's Paperclip-managed MCP servers (`ctx.runtimeMcp.getServers()`).
+  // The bridge relays each one on a Paperclip API origin and returns the
+  // target-facing list as `runtimeMcpServers` on the handle.
+  runtimeMcpServers?: readonly AdapterRuntimeMcpServer[] | null;
 }): Promise<AdapterExecutionTargetPaperclipBridgeHandle | null> {
   if (!adapterExecutionTargetUsesPaperclipBridge(input.target)) {
     return null;
@@ -4564,7 +4651,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // One route authorizer for both transports, bound to the policy and company
   // the host stamped on the target. An unstamped target keeps the restricted
   // allowlist.
-  const authorizeBridgeRequest = createSandboxCallbackBridgeAuthorizer({
+  const authorizePolicyRequest = createSandboxCallbackBridgeAuthorizer({
     policy: input.routePolicy
       ? normalizeSandboxCallbackBridgePolicy(input.routePolicy)
       : adapterExecutionTargetPaperclipApiBridgePolicy(target),
@@ -4602,6 +4689,16 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // :: -> [::1]), so the fallback is always loopback-reachable.
   // input.hostApiUrl stays available as an explicit override seam.
   const hostApiUrl = input.hostApiUrl?.trim() || resolveDefaultPaperclipApiUrl();
+  // The run's managed MCP servers on a Paperclip API origin are relayed: the
+  // target calls them at the bridge with the bridge token, and the forward
+  // below swaps in each server's own token. Their exact paths are reachable
+  // under every route policy; see sandbox-callback-bridge-mcp.ts.
+  const mcpRelay = createSandboxCallbackBridgeMcpRelay({
+    servers: input.runtimeMcpServers,
+    paperclipOrigins: paperclipApiOriginsForMcpRelay(hostApiUrl),
+  });
+  const authorizeBridgeRequest = (request: { method: string; path: string }): string | null =>
+    mcpRelay.routeFor(request.path) ? null : authorizePolicyRequest(request);
   const shellCommand = adapterExecutionTargetShellCommand(target);
   const runner = adapterExecutionTargetCommandRunner(target);
   const bridgeTimeoutMs =
@@ -4613,6 +4710,29 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     "stdout",
     `[paperclip] Starting sandbox callback bridge for ${input.adapterKey} in ${bridgeRuntimeDir}.\n`,
   );
+  // Said once per run, when the bridge is up.
+  const logMcpRelay = async () => {
+    if (mcpRelay.relayedNames.length > 0) {
+      await onLog(
+        "stdout",
+        `[paperclip] Relaying ${mcpRelay.relayedNames.length} Paperclip-managed MCP server(s) through the callback bridge: ${mcpRelay.relayedNames.join(", ")}.\n`,
+      );
+    }
+    if (mcpRelay.externalNames.length > 0) {
+      await onLog(
+        "stderr",
+        `[paperclip] Not relaying ${mcpRelay.externalNames.length} managed MCP server(s) that are not on the Paperclip API origin: ${mcpRelay.externalNames.join(", ")}. The environment must reach them at their own address.\n`,
+      );
+    }
+    if (mcpRelay.withheld.length > 0) {
+      // Names and reasons only; a withheld server's URL or token is never logged.
+      const detail = mcpRelay.withheld.map((entry) => `${entry.name} (${entry.reason})`).join("; ");
+      await onLog(
+        "stderr",
+        `[paperclip] Withholding ${mcpRelay.withheld.length} managed MCP server(s) that the callback bridge cannot relay: ${detail}. They are not configured in this run's environment.\n`,
+      );
+    }
+  };
 
   const bridgeAsset = await createSandboxCallbackBridgeAsset();
 
@@ -4684,7 +4804,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       if (typeof value !== "string" || value.trim().length === 0) continue;
       headers.set(key, value);
     }
-    headers.set("authorization", `Bearer ${hostApiToken}`);
+    // A relayed managed MCP server authenticates with its own token, never
+    // the host API token (unless that is the server's own credential).
+    const mcpRoute = mcpRelay.routeFor(request.path);
+    if (mcpRoute && method !== "POST") return sandboxCallbackBridgeMcpMethodNotAllowed();
+    headers.set("authorization", `Bearer ${mcpRoute ? mcpRoute.token : hostApiToken}`);
     headers.set("x-paperclip-run-id", input.runId);
     // Abort the forward when the caller aborts the request (its per-iteration
     // timeout or watchdog fired, or the broker's forward budget ended), or after
@@ -5047,12 +5171,14 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             });
             await onLog("stdout", "[paperclip] Sandbox run log streaming enabled for this run.\n");
           }
+          await logMcpRelay();
           return {
             env: {
               PAPERCLIP_API_URL: sandboxOrigin,
               PAPERCLIP_API_KEY: bridgeToken,
               PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
             },
+            runtimeMcpServers: mcpRelay.serversFor({ baseUrl: sandboxOrigin, token: bridgeToken }),
             runLogTail: duplexRunLogTail,
             readRunDisposition: (): DuplexBrokerRunDisposition => dispositionLatch.disposition,
             // Atomically read the latch and mark the orderly completion for the
@@ -5133,6 +5259,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     await onLog("stdout", "[paperclip] Sandbox run log streaming enabled for this run.\n");
   }
 
+  await logMcpRelay();
   return {
     env: {
       PAPERCLIP_API_URL: server.baseUrl,
@@ -5140,6 +5267,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       PAPERCLIP_API_BRIDGE_MODE: "queue_v1",
       PAPERCLIP_BRIDGE_QUEUE_DIR: queueDir,
     },
+    runtimeMcpServers: mcpRelay.serversFor({ baseUrl: server.baseUrl, token: bridgeToken }),
     runLogTail,
     stop: async () => {
       await Promise.allSettled([

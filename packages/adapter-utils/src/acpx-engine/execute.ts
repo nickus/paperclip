@@ -11,6 +11,7 @@ import type {
   AdapterBillingType,
   AdapterExecutionContext,
   AdapterExecutionResult,
+  AdapterRuntimeMcpServer,
   UsageSummary,
 } from "@paperclipai/adapter-utils";
 import {
@@ -1903,12 +1904,6 @@ async function buildRuntime(input: {
     url,
     connectionId,
   }));
-  const mcpServers: NonNullable<AcpRuntimeOptions["mcpServers"]> = runtimeMcpServers.map((server) => ({
-    type: "http",
-    name: server.name,
-    url: server.url,
-    headers: [{ name: "Authorization", value: `Bearer ${server.token}` }],
-  }));
   // Resolve the wall-clock timeout through the shared execution-target
   // resolver so sandbox-backed runs pick up the 4h backstop default while
   // local/SSH runs keep the historical "0 = no adapter timeout" behavior.
@@ -2351,6 +2346,9 @@ async function buildRuntime(input: {
           hostApiToken: env.PAPERCLIP_API_KEY,
           enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(remoteTarget),
           duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(remoteTarget),
+          // The in-sandbox agent reaches the managed MCP servers through this
+          // bridge; see `mcpServers` in the prepared runtime below.
+          runtimeMcpServers,
           onLog: input.ctx.onLog,
           getRuntimeParentContext: input.getRuntimeParentContext,
           runtimeSpan: input.runtimeSpan,
@@ -2576,10 +2574,25 @@ async function buildRuntime(input: {
     },
     childStderrLogPath,
     paperclipClaudeSettings,
-    mcpServers,
+    // The agent opens these from wherever it runs. In a remote sandbox that is
+    // the bridge's target-facing list (bridge address and token), which is
+    // rebuilt for every run's bridge; the session identity above stays on the
+    // host-side list so a resumed session still matches.
+    mcpServers: acpRuntimeMcpServers(paperclipBridge?.runtimeMcpServers ?? runtimeMcpServers),
     mcpIdentity,
     stepMetrics,
   };
+}
+
+function acpRuntimeMcpServers(
+  servers: readonly AdapterRuntimeMcpServer[],
+): NonNullable<AcpRuntimeOptions["mcpServers"]> {
+  return servers.map((server) => ({
+    type: "http",
+    name: server.name,
+    url: server.url,
+    headers: [{ name: "Authorization", value: `Bearer ${server.token}` }],
+  }));
 }
 
 function sessionConfigOptions(prepared: AcpxPreparedRuntime): Array<{ key: string; value: string }> {

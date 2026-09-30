@@ -5,6 +5,7 @@ import type { Db } from "@paperclipai/db";
 
 const mocks = vi.hoisted(() => ({
   validate: vi.fn(async () => undefined),
+  validateActiveRun: vi.fn(async () => undefined),
   search: vi.fn(),
   request: vi.fn(),
 }));
@@ -27,6 +28,7 @@ vi.mock("../runtime-tools-token.js", () => ({
 vi.mock("../services/connection-intents.js", () => ({
   connectionIntentService: () => ({
     validate: mocks.validate,
+    validateActiveRun: mocks.validateActiveRun,
     search: mocks.search,
     request: mocks.request,
   }),
@@ -35,6 +37,7 @@ vi.mock("../services/connection-intents.js", () => ({
 const { runtimeConnectionIntentRoutes } = await import("../routes/connection-intents.js");
 const { mcpGatewayProtocolRoutes } = await import("../routes/tool-gateway.js");
 const { errorHandler } = await import("../middleware/index.js");
+const { conflict, forbidden, unprocessable } = await import("../errors.js");
 
 function createApp() {
   const app = express();
@@ -53,7 +56,10 @@ function rpc(app: express.Express, body: Record<string, unknown>) {
 
 describe("runtime tools MCP endpoint protocol responses", () => {
   beforeEach(() => {
-    mocks.validate.mockClear();
+    mocks.validate.mockReset();
+    mocks.validate.mockResolvedValue(undefined);
+    mocks.validateActiveRun.mockReset();
+    mocks.validateActiveRun.mockResolvedValue(undefined);
     mocks.search.mockReset();
     mocks.request.mockReset();
   });
@@ -106,12 +112,89 @@ describe("runtime tools MCP endpoint protocol responses", () => {
   it("still revalidates the run and rejects a missing token before answering", async () => {
     const app = createApp();
     await rpc(app, { jsonrpc: "2.0", id: 1, method: "prompts/list" });
-    expect(mocks.validate).toHaveBeenCalledTimes(1);
+    expect(mocks.validateActiveRun).toHaveBeenCalledTimes(1);
 
     const res = await request(app)
       .post("/mcp/runtime-tools")
       .send({ jsonrpc: "2.0", id: 1, method: "prompts/list" });
     expect(res.status).toBe(401);
+  });
+
+  it("refuses the handshake once the token's run is no longer live", async () => {
+    mocks.validateActiveRun.mockRejectedValue(forbidden("Runtime tool token is no longer active"));
+    const app = createApp();
+    const res = await rpc(app, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    expect(res.status).toBe(403);
+    const get = await request(app).get("/mcp/runtime-tools").set("Authorization", "Bearer runtime-token");
+    expect(get.status).toBe(403);
+  });
+
+  it("completes the handshake for a live run that cannot make connection requests", async () => {
+    // A run woken by a mention on another agent's task, or with no task at
+    // all: the task preconditions fail, but the token and its run are valid.
+    mocks.validate.mockRejectedValue(conflict("The requesting agent no longer owns this task"));
+    const app = createApp();
+
+    const initialize = await rpc(app, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    expect(initialize.status).toBe(200);
+    expect(initialize.body.result.serverInfo).toEqual({ name: "paperclip-runtime-tools", version: "1" });
+
+    const list = await rpc(app, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    expect(list.status).toBe(200);
+    expect(list.body.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
+      "connections_search",
+      "connection_request",
+    ]);
+
+    const get = await request(app).get("/mcp/runtime-tools").set("Authorization", "Bearer runtime-token");
+    expect(get.status).toBe(200);
+    expect(mocks.validateActiveRun).toHaveBeenCalledTimes(3);
+  });
+
+  it("reports a connection request the run cannot make as an MCP tool error", async () => {
+    mocks.search.mockRejectedValue(conflict("The requesting agent no longer owns this task"));
+    mocks.request.mockRejectedValue(unprocessable("Connection requests require a task-bound heartbeat run"));
+    const app = createApp();
+
+    const search = await rpc(app, {
+      jsonrpc: "2.0",
+      id: "s-1",
+      method: "tools/call",
+      params: { name: "connections_search", arguments: { query: "github" } },
+    });
+    expect(search.status).toBe(200);
+    expect(search.body).toEqual({
+      jsonrpc: "2.0",
+      id: "s-1",
+      result: { content: [{ type: "text", text: "The requesting agent no longer owns this task" }], isError: true },
+    });
+
+    const requested = await rpc(app, {
+      jsonrpc: "2.0",
+      id: "r-1",
+      method: "tools/call",
+      params: { name: "connection_request", arguments: { service: "github" } },
+    });
+    expect(requested.status).toBe(200);
+    expect(requested.body.result).toEqual({
+      content: [{ type: "text", text: "Connection requests require a task-bound heartbeat run" }],
+      isError: true,
+    });
+  });
+
+  it("returns connection tool results for a run that can make requests", async () => {
+    mocks.search.mockResolvedValue({ results: [] });
+    const res = await rpc(createApp(), {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "connections_search", arguments: { query: "github" } },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.result).toEqual({
+      content: [{ type: "text", text: JSON.stringify({ results: [] }) }],
+      structuredContent: { results: [] },
+    });
   });
 });
 

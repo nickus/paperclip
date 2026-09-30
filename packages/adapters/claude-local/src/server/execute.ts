@@ -23,6 +23,7 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
   startAdapterExecutionTargetPaperclipBridge,
+  writeAdapterExecutionTargetTextFile,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -81,6 +82,7 @@ import {
   prepareClaudeConfigSeed,
   resolveManagedClaudeRuntimeStateDir,
   resolveSharedClaudeConfigDir,
+  renderPaperclipClaudeMcpConfig,
   writePaperclipClaudeMcpConfig,
 } from "./claude-config.js";
 import {
@@ -561,7 +563,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const localMcpConfigPath = await writePaperclipClaudeMcpConfig({
     stateDir: claudeRuntimeStateDir,
     runId,
-    servers: runtimeMcpServers,
+    // A remote target gets its servers once the callback bridge is up (see
+    // below): it addresses them through the bridge, so no server token is
+    // staged into the environment.
+    servers: executionTargetIsRemote ? [] : runtimeMcpServers,
   });
   const localMcpConfigDir = path.dirname(localMcpConfigPath);
   const sharedClaudeConfigDir = config.managedAiConnection ? asString(configEnv.CLAUDE_CONFIG_DIR, "") : resolveSharedClaudeConfigDir(process.env);
@@ -726,6 +731,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       adapterKey: "claude",
       timeoutSec,
       hostApiToken: env.PAPERCLIP_API_KEY,
+      runtimeMcpServers,
       onLog,
     });
     if (paperclipBridge) {
@@ -739,6 +745,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (remoteClaudeConfigDir) {
         loggedEnv.CLAUDE_CONFIG_DIR = remoteClaudeConfigDir;
       }
+    }
+  }
+  if (executionTargetIsRemote && runtimeMcpServers.length > 0) {
+    // The servers as this target reaches them: through the bridge when it
+    // relays them, otherwise at the address the host handed over.
+    try {
+      await writeAdapterExecutionTargetTextFile(
+        runId,
+        runtimeExecutionTarget,
+        effectiveMcpConfigPath,
+        renderPaperclipClaudeMcpConfig(paperclipBridge?.runtimeMcpServers ?? runtimeMcpServers),
+        { timeoutSec: 60 },
+      );
+    } catch (error) {
+      await paperclipBridge?.stop().catch(() => undefined);
+      throw error;
     }
   }
   let effectiveEffort = effort;

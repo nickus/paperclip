@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createServer as createHttpServer } from "node:http";
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { TOOL_CALL_CLIENT_TIMEOUT_MS } from "@paperclipai/shared/tool-call-timeouts";
@@ -84,6 +85,57 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
 `;
   await fs.writeFile(commandPath, script, "utf8");
   await fs.chmod(commandPath, 0o755);
+}
+
+// A Claude stand-in that connects to every server in its --mcp-config the way
+// an MCP client does (POST initialize with the configured headers) and records
+// what it got back.
+async function writeMcpConnectingClaudeCommand(commandPath: string): Promise<void> {
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+
+(async () => {
+  const argv = process.argv.slice(2);
+  fs.readFileSync(0, "utf8");
+  const mcpConfigIndex = argv.indexOf("--mcp-config");
+  const mcpConfigPath = mcpConfigIndex >= 0 ? argv[mcpConfigIndex + 1] : null;
+  const mcpConfigContents = mcpConfigPath ? fs.readFileSync(mcpConfigPath, "utf8") : null;
+  const servers = mcpConfigContents ? JSON.parse(mcpConfigContents).mcpServers : {};
+  const connections = [];
+  for (const [name, server] of Object.entries(servers)) {
+    const response = await fetch(server.url, {
+      method: "POST",
+      headers: { ...server.headers, "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    connections.push({ name, status: response.status, body: await response.text() });
+  }
+  fs.writeFileSync(process.env.PAPERCLIP_TEST_CAPTURE_PATH, JSON.stringify({
+    argv,
+    mcpConfigContents,
+    connections,
+    paperclipApiUrl: process.env.PAPERCLIP_API_URL || null,
+    paperclipApiKey: process.env.PAPERCLIP_API_KEY || null,
+  }), "utf8");
+  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "44444444-4444-4444-8444-444444444444", model: "claude-sonnet" }));
+  console.log(JSON.stringify({ type: "result", session_id: "44444444-4444-4444-8444-444444444444", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }));
+})().catch((error) => {
+  console.error(String(error && error.stack || error));
+  process.exit(1);
+});
+`;
+  await fs.writeFile(commandPath, script, "utf8");
+  await fs.chmod(commandPath, 0o755);
+}
+
+async function readTextFilesUnder(dir: string): Promise<string[]> {
+  const entries = await fs.readdir(dir, { withFileTypes: true, recursive: true }).catch(() => []);
+  const contents: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    contents.push(await fs.readFile(path.join(entry.parentPath, entry.name), "utf8").catch(() => ""));
+  }
+  return contents;
 }
 
 async function writeHelpWithoutEffortClaudeCommand(commandPath: string): Promise<void> {
@@ -989,6 +1041,114 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
       await fs.rm(root, { recursive: true, force: true });
     }
   }, 10_000);
+
+  it("connects to the run's managed MCP servers through the callback bridge in a sandbox", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-sandbox-mcp-"));
+    const localWorkspace = path.join(root, "workspace");
+    const remoteWorkspace = path.join(root, "sandbox");
+    const binDir = path.join(root, "bin");
+    const commandPath = path.join(binDir, "claude");
+    const capturePath = path.join(root, "capture.json");
+    const previousHome = process.env.HOME;
+    const previousPath = process.env.PATH;
+    await fs.mkdir(localWorkspace, { recursive: true });
+    await fs.mkdir(remoteWorkspace, { recursive: true });
+    await fs.mkdir(binDir, { recursive: true });
+    await fs.mkdir(path.join(root, ".claude"), { recursive: true });
+    await writeMcpConnectingClaudeCommand(commandPath);
+
+    // The Paperclip API the bridge forwards to, and that the servers live on.
+    const received: Array<{ route: string; auth: string | null }> = [];
+    const apiServer = createHttpServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        received.push({ route: `${req.method} ${req.url}`, auth: req.headers.authorization ?? null });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: req.url } } }));
+      });
+    });
+    await new Promise<void>((resolve) => apiServer.listen(0, "127.0.0.1", () => resolve()));
+    const port = (apiServer.address() as { port: number }).port;
+    const apiUrl = `http://127.0.0.1:${port}`;
+    vi.stubEnv("PAPERCLIP_API_URL", apiUrl);
+    vi.stubEnv("PAPERCLIP_LISTEN_HOST", "127.0.0.1");
+    vi.stubEnv("PAPERCLIP_LISTEN_PORT", String(port));
+    const servers: AdapterRuntimeMcpServer[] = [
+      { name: "Paperclip connections", url: `${apiUrl}/mcp/runtime-tools`, token: "runtime-tools-canary", connectionId: "paperclip-runtime-tools" },
+      { name: "paperclip-assigned", url: `${apiUrl}/mcp/gateways/gw_1`, token: "gateway-canary", connectionId: "assignment:abc" },
+    ];
+    process.env.HOME = root;
+    process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? ""}`;
+
+    try {
+      const result = await execute({
+        runId: "run-sandbox-mcp",
+        agent: { id: "agent-1", companyId: "company-1", name: "Claude Coder", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: localWorkspace,
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        executionTarget: {
+          kind: "remote",
+          transport: "sandbox",
+          providerKey: "e2b",
+          environmentId: "env-1",
+          leaseId: "lease-1",
+          remoteCwd: remoteWorkspace,
+          timeoutMs: 30_000,
+          runner: createLocalSandboxRunner(),
+          streamRunLogs: false,
+        },
+        runtimeMcp: { getServers: () => servers.map((server) => ({ ...server })) },
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(0);
+      const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as {
+        mcpConfigContents: string;
+        connections: Array<{ name: string; status: number; body: string }>;
+        paperclipApiUrl: string;
+        paperclipApiKey: string;
+      };
+      expect(capture.paperclipApiUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+      expect(capture.paperclipApiUrl).not.toBe(apiUrl);
+      expect(capture.connections).toEqual([
+        { name: "Paperclip connections", status: 200, body: expect.stringContaining("/mcp/runtime-tools") },
+        { name: "paperclip-assigned", status: 200, body: expect.stringContaining("/mcp/gateways/gw_1") },
+      ]);
+      const config = JSON.parse(capture.mcpConfigContents) as {
+        mcpServers: Record<string, { url: string; headers: Record<string, string> }>;
+      };
+      expect(config.mcpServers["Paperclip connections"]).toMatchObject({
+        url: `${capture.paperclipApiUrl}/mcp/runtime-tools`,
+        headers: { Authorization: `Bearer ${capture.paperclipApiKey}` },
+      });
+      // Each server authenticated with its own token on the host side.
+      expect(received).toEqual([
+        { route: "POST /mcp/runtime-tools", auth: "Bearer runtime-tools-canary" },
+        { route: "POST /mcp/gateways/gw_1", auth: "Bearer gateway-canary" },
+      ]);
+      // No server token ever reached the sandbox.
+      for (const content of await readTextFilesUnder(remoteWorkspace)) {
+        expect(content).not.toContain("runtime-tools-canary");
+        expect(content).not.toContain("gateway-canary");
+      }
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      vi.unstubAllEnvs();
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it("resumes the saved session on a follow-up run in the same reusable sandbox", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-sandbox-reuse-"));

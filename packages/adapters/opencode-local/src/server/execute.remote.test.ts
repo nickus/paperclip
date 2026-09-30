@@ -129,6 +129,13 @@ describe("opencode remote execution", () => {
     }
   });
 
+  // The runtime configs written to the target with writeAdapterExecutionTargetTextFile.
+  function deliveredConfigs(remoteConfigDir: string): Array<Record<string, unknown>> {
+    return (runSshCommand.mock.calls as unknown as Array<[unknown, string, { stdin?: string } | undefined]>)
+      .filter(([, command]) => command.includes(`${remoteConfigDir}/opencode/opencode.json`))
+      .map(([, , options]) => JSON.parse(options?.stdin ?? "{}") as Record<string, unknown>);
+  }
+
   it.each([false, true])("prepares the workspace, syncs OpenCode skills, and restores workspace changes for remote SSH execution (managed=%s)", async (managed) => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-"));
     cleanupDirs.push(rootDir);
@@ -555,18 +562,25 @@ describe("opencode remote execution", () => {
 
     const first = await run("run-1", [assigned], null);
 
+    // Staged before the bridge is up without the servers; delivered once it is
+    // (this bridge relays nothing, so at the address the host handed over).
     expect(shipped).toHaveLength(1);
     expect(shipped[0]?.mode).toBe(0o600);
-    expect(shipped[0]?.contents.mcp).toEqual({
-      "paperclip-assigned": {
-        type: "remote",
-        url: assigned.url,
-        headers: { Authorization: `Bearer ${gatewayToken}` },
-        oauth: false,
-        enabled: true,
-        timeout: 330_000,
-      },
-    });
+    expect(shipped[0]?.contents.mcp).toBeUndefined();
+    expect(deliveredConfigs("/remote/workspace/.paperclip-runtime/runs/run-1/opencode/xdgConfig")).toEqual([
+      expect.objectContaining({
+        mcp: {
+          "paperclip-assigned": {
+            type: "remote",
+            url: assigned.url,
+            headers: { Authorization: `Bearer ${gatewayToken}` },
+            oauth: false,
+            enabled: true,
+            timeout: 330_000,
+          },
+        },
+      }),
+    ]);
     const runCall = runChildProcess.mock.calls.find((entry) => Array.isArray(entry[2]) && entry[2].includes("run")) as
       | [string, string, string[], { env: Record<string, string> }]
       | undefined;
@@ -589,5 +603,84 @@ describe("opencode remote execution", () => {
     const fresh = runChildProcess.mock.calls.find((entry) => Array.isArray(entry[2]) && entry[2].includes("run"));
     expect(fresh?.[2]).not.toContain("--session");
     expect(logs.join("")).toContain("was saved with a different runtime MCP server set");
+  });
+  it("addresses the run's managed MCP servers through the callback bridge on an SSH target", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-mcp-bridge-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    const servers = [
+      { name: "Paperclip projects", url: "https://paperclip.example.test/api/mcp/project-tools", token: "run-jwt-canary", connectionId: "paperclip-project-tools" },
+      { name: "paperclip-assigned", url: "https://paperclip.example.test/mcp/gateways/gw_1", token: "gateway-token-canary", connectionId: "assignment:abc" },
+    ];
+    startAdapterExecutionTargetPaperclipBridge.mockImplementationOnce((async (input: {
+      runtimeMcpServers?: typeof servers;
+    }) => ({
+      env: {
+        PAPERCLIP_API_URL: "http://127.0.0.1:4310",
+        PAPERCLIP_API_KEY: "bridge-token",
+        PAPERCLIP_API_BRIDGE_MODE: "queue_v1",
+      },
+      runtimeMcpServers: (input.runtimeMcpServers ?? []).map((server) => ({
+        ...server,
+        url: `http://127.0.0.1:4310${new URL(server.url).pathname}`,
+        token: "bridge-token",
+      })),
+      stop: async () => {},
+    })) as never);
+    const shipped: string[] = [];
+    syncDirectoryToSsh.mockImplementation(async (input: { localDir: string; remoteDir: string }) => {
+      if (!input.remoteDir.endsWith("/xdgConfig")) return;
+      shipped.push(await readFile(path.join(input.localDir, "opencode", "opencode.json"), "utf8"));
+    });
+    const logs: string[] = [];
+
+    await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode Builder", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "opencode", model: "opencode/gpt-5-nano" },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      runtimeMcp: { getServers: () => servers.map((server) => ({ ...server })) },
+      authToken: "run-jwt-canary",
+      onLog: async (_stream, chunk) => { logs.push(chunk); },
+    });
+
+    expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledWith(expect.objectContaining({
+      runtimeMcpServers: servers,
+    }));
+    expect(shipped).toHaveLength(1);
+    expect(JSON.parse(shipped[0]!).mcp).toBeUndefined();
+    const delivered = deliveredConfigs("/remote/workspace/.paperclip-runtime/runs/run-1/workspace/.paperclip-runtime/opencode/xdgConfig");
+    expect(delivered).toHaveLength(1);
+    // The rest of the prepared config ships unchanged.
+    expect(delivered[0]).toMatchObject({ permission: "allow" });
+    expect(delivered[0]!.mcp).toEqual({
+      Paperclip_projects: expect.objectContaining({
+        url: "http://127.0.0.1:4310/api/mcp/project-tools",
+        headers: { Authorization: "Bearer bridge-token" },
+      }),
+      "paperclip-assigned": expect.objectContaining({
+        url: "http://127.0.0.1:4310/mcp/gateways/gw_1",
+        headers: { Authorization: "Bearer bridge-token" },
+      }),
+    });
+    expect(logs.join("")).toContain("Added 2 Paperclip-managed MCP server(s) to the runtime OpenCode config");
+    const runCall = runChildProcess.mock.calls.find((entry) => Array.isArray(entry[2]) && entry[2].includes("run"));
+    const everything = JSON.stringify([shipped, delivered, runCall, logs]);
+    expect(everything).not.toContain("gateway-token-canary");
+    expect(everything).not.toContain("run-jwt-canary");
   });
 });

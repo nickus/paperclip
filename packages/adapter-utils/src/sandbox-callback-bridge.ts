@@ -11,6 +11,7 @@ import {
   sandboxBridgeEnvelopeLimit,
   type SandboxCallbackBridgeBody,
 } from "./sandbox-callback-bridge-body.js";
+import { sandboxBridgeAuthorizationSource } from "./sandbox-callback-bridge-auth.js";
 import type { BridgeBodyReservation } from "./http2-bridge-server.js";
 import {
   isSandboxCallbackBridgeToolCallRoute,
@@ -2761,6 +2762,7 @@ ${DUPLEX_GATEWAY_CODEC_SOURCE}
 // handler releases what it reserved once the body is no longer needed.
 ${BRIDGE_PROCESS_BODY_LEDGER_SOURCE}
 ${sandboxBridgeBodyCodecSource()}
+${sandboxBridgeAuthorizationSource()}
 
 // HTTP/2's multiplier matches HTTP2_BRIDGE_MAX_CONCURRENT_STREAMS (4) in
 // http2-bridge-server.ts, doubled because readBodyBytes reserves a body's
@@ -2934,10 +2936,9 @@ async function runFileGateway() {
     let dispatched = false;
     let liveRequestFile = null;
     try {
-      const auth = req.headers.authorization || "";
-      const receivedToken = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
-      if (!tokensMatch(receivedToken)) {
-        writeJsonResponse(res, 401, { error: "Invalid bridge token." });
+      const authorizationFailure = checkBridgeAuthorization(req.headers.authorization, req.rawHeaders, tokensMatch);
+      if (authorizationFailure) {
+        writeJsonResponse(res, 401, authorizationFailure);
         return;
       }
 
@@ -3234,10 +3235,9 @@ function runHttp2Gateway() {
     // deadline timeout all reach the same finally.
     let releaseBodyReservation = null;
     try {
-      const auth = req.headers.authorization || "";
-      const receivedToken = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
-      if (!tokensMatch(receivedToken)) {
-        writeJsonResponse(res, 401, { error: "Invalid bridge token." });
+      const authorizationFailure = checkBridgeAuthorization(req.headers.authorization, req.rawHeaders, tokensMatch);
+      if (authorizationFailure) {
+        writeJsonResponse(res, 401, authorizationFailure);
         return;
       }
       if (unavailable) {

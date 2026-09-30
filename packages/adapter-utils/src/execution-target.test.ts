@@ -1,5 +1,8 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { access, readFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as ssh from "./ssh.js";
 import * as serverUtils from "./server-utils.js";
@@ -12,6 +15,7 @@ import {
   resolveAdapterExecutionTargetCwd,
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
+  writeAdapterExecutionTargetTextFile,
 } from "./execution-target.js";
 
 describe("runAdapterExecutionTargetShellCommand", () => {
@@ -474,5 +478,122 @@ describe("adapterExecutionTargetReusesSandbox", () => {
     expect(adapterExecutionTargetReusesSandbox(sandbox)).toBe(false);
     expect(adapterExecutionTargetReusesSandbox({ kind: "local" })).toBe(false);
     expect(adapterExecutionTargetReusesSandbox(null)).toBe(false);
+  });
+});
+
+describe("writeAdapterExecutionTargetTextFile", () => {
+  const cleanupDirs: string[] = [];
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    while (cleanupDirs.length > 0) {
+      await rm(cleanupDirs.pop()!, { recursive: true, force: true });
+    }
+  });
+
+  // Runs a target shell script on this machine with the given stdin.
+  function runScript(script: string, stdin: string) {
+    return new Promise<{ stdout: string; stderr: string; code: number }>((resolve) => {
+      const child = execFile("/bin/sh", ["-c", script], (error, stdout, stderr) => {
+        resolve({ stdout, stderr, code: error ? Number((error as { code?: number }).code ?? 1) : 0 });
+      });
+      child.stdin?.end(stdin);
+    });
+  }
+
+  const contents = JSON.stringify({ mcpServers: { a: { headers: { Authorization: "Bearer secret-canary" } } } });
+  const sshSpec = {
+    host: "ssh.example.test",
+    port: 22,
+    username: "ssh-user",
+    remoteCwd: "/srv/paperclip/workspace",
+    remoteWorkspacePath: "/srv/paperclip/workspace",
+    privateKey: null,
+    knownHosts: null,
+    strictHostKeyChecking: true,
+  };
+
+  it("writes an owner-only file on a local target", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-write-target-file-"));
+    cleanupDirs.push(dir);
+    const filePath = path.join(dir, "nested", "config.json");
+    await writeAdapterExecutionTargetTextFile("run-1", { kind: "local" }, filePath, contents);
+    expect(await readFile(filePath, "utf8")).toBe(contents);
+    expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+  });
+
+  it("sends the contents over stdin on an SSH target, never on the command line", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-write-target-file-"));
+    cleanupDirs.push(dir);
+    const filePath = path.join(dir, "mcp", "config.json");
+    const runSshCommandSpy = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, script, options) => {
+      const result = await runScript(script, options?.stdin ?? "");
+      if (result.code !== 0) throw Object.assign(new Error("remote command failed"), result);
+      return { stdout: result.stdout, stderr: result.stderr };
+    });
+    await writeAdapterExecutionTargetTextFile(
+      "run-1",
+      { kind: "remote", transport: "ssh", remoteCwd: sshSpec.remoteCwd, spec: sshSpec },
+      filePath,
+      contents,
+    );
+    expect(await readFile(filePath, "utf8")).toBe(contents);
+    expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+    expect(runSshCommandSpy).toHaveBeenCalledTimes(1);
+    const [, script, options] = runSshCommandSpy.mock.calls[0]!;
+    expect(script).not.toContain("secret-canary");
+    expect(options?.env).toBeUndefined();
+    expect(options?.stdin).toBe(contents);
+  });
+
+  it("reports a failed SSH write with the target's error output", async () => {
+    vi.spyOn(ssh, "runSshCommand").mockRejectedValue(
+      Object.assign(new Error("Command failed"), { code: 1, stdout: "", stderr: "mkdir: permission denied" }),
+    );
+    await expect(writeAdapterExecutionTargetTextFile(
+      "run-1",
+      { kind: "remote", transport: "ssh", remoteCwd: sshSpec.remoteCwd, spec: sshSpec },
+      "/srv/paperclip/workspace/config.json",
+      contents,
+    )).rejects.toThrow('Could not write "/srv/paperclip/workspace/config.json" on the execution target: mkdir: permission denied');
+  });
+
+  it("sends the contents over stdin on a sandbox target", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-write-target-file-"));
+    cleanupDirs.push(dir);
+    const filePath = path.join(dir, "mcp", "config.json");
+    const calls: Array<{ args?: string[]; env?: Record<string, string>; stdin?: string; bypassSession?: boolean }> = [];
+    const runner = {
+      execute: async (input: {
+        command: string;
+        args?: string[];
+        env?: Record<string, string>;
+        stdin?: string;
+        bypassSession?: boolean;
+      }) => {
+        calls.push(input);
+        const result = await runScript(input.args?.[1] ?? "", input.stdin ?? "");
+        return {
+          exitCode: result.code,
+          signal: null,
+          timedOut: false,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          pid: null,
+          startedAt: new Date().toISOString(),
+        };
+      },
+    };
+    await writeAdapterExecutionTargetTextFile(
+      "run-1",
+      { kind: "remote", transport: "sandbox", remoteCwd: dir, runner },
+      filePath,
+      contents,
+    );
+    expect(await readFile(filePath, "utf8")).toBe(contents);
+    expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+    expect(JSON.stringify(calls[0]?.args)).not.toContain("secret-canary");
+    expect(calls[0]?.env).toBeUndefined();
+    expect(calls[0]?.stdin).toBe(contents);
+    expect(calls[0]?.bypassSession).toBe(true);
   });
 });

@@ -155,12 +155,62 @@ export function buildOpenCodeRuntimeMcpConfig(
   return entries;
 }
 
+/**
+ * Put the run's managed MCP servers into an OpenCode config, keeping the
+ * user's own MCP servers except where a managed server takes the same name
+ * (and so the same tool names). Returns the notes to log.
+ */
+function mergeOpenCodeRuntimeMcpServers(
+  config: Record<string, unknown>,
+  servers: AdapterRuntimeMcpServer[],
+): string[] {
+  const managedMcp = buildOpenCodeRuntimeMcpConfig(servers);
+  const inheritedMcp = isPlainObject(config.mcp) ? config.mcp : {};
+  const keptMcp: Record<string, unknown> = {};
+  const replacedMcp: string[] = [];
+  for (const [key, value] of Object.entries(inheritedMcp)) {
+    if (Object.hasOwn(managedMcp, openCodeMcpServerKey(key))) replacedMcp.push(key);
+    else keptMcp[key] = value;
+  }
+  config.mcp = { ...keptMcp, ...managedMcp };
+  const notes = [
+    `Added ${servers.length} Paperclip-managed MCP server(s) to the runtime OpenCode config: ${Object.keys(managedMcp).join(", ")}.`,
+  ];
+  if (replacedMcp.length > 0) {
+    notes.push(
+      `Paperclip-managed MCP servers replace the OpenCode MCP server(s) of the same name from the user config: ${replacedMcp.join(", ")}.`,
+    );
+  }
+  return notes;
+}
+
+/**
+ * The runtime `opencode.json` text with the run's managed MCP servers added.
+ * A remote run calls this once its callback bridge is up, with the servers as
+ * the target reaches them, and ships the result to the target.
+ */
+export function renderOpenCodeRuntimeConfigWithMcpServers(
+  configText: string,
+  servers: AdapterRuntimeMcpServer[],
+): { text: string; notes: string[] } {
+  const parsed = JSON.parse(configText) as unknown;
+  const config = isPlainObject(parsed) ? { ...parsed } : {};
+  const notes = mergeOpenCodeRuntimeMcpServers(config, servers);
+  return { text: `${JSON.stringify(config, null, 2)}\n`, notes };
+}
+
 export async function prepareOpenCodeRuntimeConfig(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
   targetIsRemote?: boolean;
   /** Paperclip-managed MCP servers of this run (`ctx.runtimeMcp.getServers()`). */
   runtimeMcpServers?: AdapterRuntimeMcpServer[];
+  /**
+   * Prepare the config for the managed MCP servers but leave them out: a
+   * remote run adds them with {@link renderOpenCodeRuntimeConfigWithMcpServers}
+   * once its callback bridge is up, so no server token is staged before that.
+   */
+  deferRuntimeMcpServers?: boolean;
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
   const runtimeMcpServers = input.runtimeMcpServers ?? [];
@@ -211,26 +261,12 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     nextConfig: Record<string, unknown>,
     notes: string[],
   ): Promise<PreparedOpenCodeRuntimeConfig> => {
-    if (runtimeMcpServers.length > 0) {
-      const managedMcp = buildOpenCodeRuntimeMcpConfig(runtimeMcpServers);
-      // Keep the user's own MCP servers, except where a Paperclip-managed
-      // server takes the same name (and so the same tool names).
-      const inheritedMcp = isPlainObject(nextConfig.mcp) ? nextConfig.mcp : {};
-      const keptMcp: Record<string, unknown> = {};
-      const replacedMcp: string[] = [];
-      for (const [key, value] of Object.entries(inheritedMcp)) {
-        if (Object.hasOwn(managedMcp, openCodeMcpServerKey(key))) replacedMcp.push(key);
-        else keptMcp[key] = value;
-      }
-      nextConfig.mcp = { ...keptMcp, ...managedMcp };
+    if (runtimeMcpServers.length > 0 && input.deferRuntimeMcpServers) {
       notes.push(
-        `Added ${runtimeMcpServers.length} Paperclip-managed MCP server(s) to the runtime OpenCode config: ${Object.keys(managedMcp).join(", ")}.`,
+        `Prepared the runtime OpenCode config for ${runtimeMcpServers.length} Paperclip-managed MCP server(s); they are added once the callback bridge is up.`,
       );
-      if (replacedMcp.length > 0) {
-        notes.push(
-          `Paperclip-managed MCP servers replace the OpenCode MCP server(s) of the same name from the user config: ${replacedMcp.join(", ")}.`,
-        );
-      }
+    } else if (runtimeMcpServers.length > 0) {
+      notes.push(...mergeOpenCodeRuntimeMcpServers(nextConfig, runtimeMcpServers));
     }
     // The runtime config can carry credentials (MCP bearer tokens, resolved
     // provider keys), so it is written owner-only. The copied entry is removed

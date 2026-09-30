@@ -155,16 +155,11 @@ export function resolveManagedClaudeRuntimeStateDir(
   return path.join(instanceRoot, "companies", companyId, "agents", agentId, "claude-runtime");
 }
 
-export async function writePaperclipClaudeMcpConfig(input: {
-  stateDir: string;
-  runId: string;
-  servers: AdapterRuntimeMcpServer[];
-}): Promise<string> {
-  const configDir = path.join(input.stateDir, "runs", input.runId, "mcp");
-  const configPath = path.join(configDir, "mcp-config.json");
+/** The `--mcp-config` JSON for a run's Paperclip-managed MCP servers. */
+export function renderPaperclipClaudeMcpConfig(servers: AdapterRuntimeMcpServer[]): string {
   const usedNames = new Set<string>();
   const mcpServers: Record<string, unknown> = {};
-  for (const server of input.servers) {
+  for (const server of servers) {
     let name = server.name;
     if (usedNames.has(name)) name = `${name}-${server.connectionId.slice(0, 8)}`;
     let suffix = 2;
@@ -185,8 +180,18 @@ export async function writePaperclipClaudeMcpConfig(input: {
       timeout: TOOL_CALL_CLIENT_TIMEOUT_MS,
     };
   }
+  return JSON.stringify({ mcpServers });
+}
+
+export async function writePaperclipClaudeMcpConfig(input: {
+  stateDir: string;
+  runId: string;
+  servers: AdapterRuntimeMcpServer[];
+}): Promise<string> {
+  const configDir = path.join(input.stateDir, "runs", input.runId, "mcp");
+  const configPath = path.join(configDir, "mcp-config.json");
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(configPath, JSON.stringify({ mcpServers }), { mode: 0o600 });
+  await fs.writeFile(configPath, renderPaperclipClaudeMcpConfig(input.servers), { mode: 0o600 });
   return configPath;
 }
 

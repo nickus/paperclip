@@ -9,7 +9,7 @@ import {
   connectionsSearchInputSchema,
   declineConnectionIntentSchema,
 } from "@paperclipai/shared";
-import { forbidden, unauthorized } from "../errors.js";
+import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { verifyRuntimeToolsToken } from "../runtime-tools-token.js";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { logActivity } from "../services/activity-log.js";
@@ -58,7 +58,7 @@ export function runtimeConnectionIntentRoutes(db: Db) {
   });
 
   router.get("/mcp/runtime-tools", async (req, res) => {
-    await service.validate(runtimeClaims(req));
+    await service.validateActiveRun(runtimeClaims(req));
     res.json({ name: "paperclip-runtime-tools", protocolVersion: "2025-03-26" });
   });
 
@@ -67,7 +67,12 @@ export function runtimeConnectionIntentRoutes(db: Db) {
     // Streamable HTTP lifecycle calls are token uses too. Revalidate the bound
     // run before initialize/list as well as before an actual tool call so an
     // ended heartbeat cannot keep probing the endpoint with a once-valid token.
-    await service.validate(claims);
+    // Only the run is checked here: the task preconditions of a connection
+    // request (a task-bound run whose agent owns an open task) belong to the
+    // tool calls. Checking them here failed the MCP handshake for every run
+    // woken on a task it does not own, so the client marked the whole server
+    // as failed and the run lost the tools even after taking the task.
+    await service.validateActiveRun(claims);
     const request = req.body as { jsonrpc?: string; id?: unknown; method?: string; params?: unknown };
     const id = request.id ?? null;
     if (request.method === "initialize") {
@@ -108,15 +113,30 @@ export function runtimeConnectionIntentRoutes(db: Db) {
         ? request.params as { name?: unknown; arguments?: unknown }
         : {};
       const name = typeof params.name === "string" ? params.name : "";
-      if (name === "connections_search") {
-        const input = connectionsSearchInputSchema.parse(params.arguments ?? {});
-        const result = await service.search(claims, input.query, { retryProviderChoice: input.retryProviderChoice });
-        res.json({ jsonrpc: "2.0", id, result: resultContent(result) });
-        return;
-      }
-      if (name === "connection_request") {
-        const input = connectionRequestInputSchema.parse(params.arguments ?? {});
-        const result = await service.request(claims, input.service, { selectionInteractionId: input.selectionInteractionId, targetService: input.targetService });
+      if (name === "connections_search" || name === "connection_request") {
+        let result: unknown;
+        try {
+          if (name === "connections_search") {
+            const input = connectionsSearchInputSchema.parse(params.arguments ?? {});
+            result = await service.search(claims, input.query, { retryProviderChoice: input.retryProviderChoice });
+          } else {
+            const input = connectionRequestInputSchema.parse(params.arguments ?? {});
+            result = await service.request(claims, input.service, { selectionInteractionId: input.selectionInteractionId, targetService: input.targetService });
+          }
+        } catch (error) {
+          // A request this run cannot make (no task, a task another agent
+          // owns, a closed task, ...) is a tool result the agent reads, not a
+          // transport failure of the whole server.
+          if (error instanceof HttpError && error.status < 500) {
+            res.json({
+              jsonrpc: "2.0",
+              id,
+              result: { content: [{ type: "text", text: error.message }], isError: true },
+            });
+            return;
+          }
+          throw error;
+        }
         res.json({ jsonrpc: "2.0", id, result: resultContent(result) });
         return;
       }

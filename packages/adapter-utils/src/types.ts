@@ -166,6 +166,15 @@ export interface AdapterRuntimeMcpServer {
 }
 
 export interface AdapterRuntimeMcpAccess {
+  /**
+   * The run's Paperclip-managed MCP servers, addressed from the host: URLs on
+   * the Paperclip API origin, each with its own bearer token. A remote
+   * execution target reaches them through the run's callback bridge instead:
+   * pass this list to `startAdapterExecutionTargetPaperclipBridge` as
+   * `runtimeMcpServers` and write the target's MCP client config from the
+   * handle's `runtimeMcpServers` once the bridge is up
+   * (`writeAdapterExecutionTargetTextFile` delivers a config file).
+   */
   getServers(): AdapterRuntimeMcpServer[];
 }
 

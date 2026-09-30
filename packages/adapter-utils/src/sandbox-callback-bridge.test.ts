@@ -1,5 +1,5 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -251,7 +251,8 @@ describe("sandbox callback bridge", () => {
     });
     expect(unauthorizedResponse.status).toBe(401);
     await expect(unauthorizedResponse.json()).resolves.toMatchObject({
-      error: "Invalid bridge token.",
+      code: "bridge_token_invalid",
+      error: expect.stringContaining("Authorization: Bearer $PAPERCLIP_API_KEY"),
     });
 
     expect(seenRequests).toHaveLength(1);
@@ -3896,6 +3897,61 @@ describe("sandbox callback bridge", () => {
     cleanupFns.push(() => gateway.stop());
     return { ...gateway, bridgeToken, queueDir };
   }
+
+  it.each(["queue", "http2"])("explains each refused Authorization header on %s without echoing it", async mode => {
+    const handled = vi.fn(async () => ({
+      status: 200, headers: { "content-type": "application/json" }, body: Buffer.from(JSON.stringify({ ok: true })),
+    }));
+    const bridgeToken = createSandboxCallbackBridgeToken();
+    const gateway = mode === "queue"
+      ? await startQueueGatewayForFileTest({ maxBodyBytes: 1024, handleRequest: handled })
+      : { ...await startHttp2GatewayForTest({ bridgeToken, maxBodyBytes: 1024, forwardRequest: handled }), bridgeToken };
+    const token = gateway.bridgeToken;
+    const wrongToken = createSandboxCallbackBridgeToken();
+    // node:http sends each array element as its own header line, the way
+    // `curl -H` given twice does; fetch would fold them into one value.
+    const send = (authorization?: string | string[]) => new Promise<{ status: number; body: string }>((resolve, reject) => {
+      // A flat name/value list, one entry per header line. Node adds no Host
+      // header to a raw list.
+      const headers = ["host", new URL(gateway.baseUrl).host, ...(authorization === undefined ? [] : [authorization].flat())
+        .flatMap((value) => ["authorization", value])];
+      const request = httpRequest(`${gateway.baseUrl}/api/agents/me`, { headers }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+        response.on("error", reject);
+      });
+      request.on("error", reject);
+      request.end();
+    });
+
+    const cases: Array<[string | string[] | undefined, string, string]> = [
+      [undefined, "bridge_authorization_missing", "no Authorization header"],
+      [[`Bearer ${wrongToken}`, `Bearer ${token}`], "bridge_authorization_repeated", "2 Authorization headers"],
+      [`Bearer${token}`, "bridge_authorization_malformed", "no space between Bearer and the token"],
+      [`bearer ${token}`, "bridge_authorization_malformed", "capital B"],
+      ["Bearer ", "bridge_authorization_malformed", "nothing follows Bearer"],
+      [token, "bridge_authorization_malformed", "does not start with the word Bearer"],
+      [`Bearer ${wrongToken}`, "bridge_token_invalid", "not valid for this run"],
+    ];
+    for (const [authorization, code, detail] of cases) {
+      const response = await send(authorization);
+      expect(response.status, code).toBe(401);
+      const body = JSON.parse(response.body) as { code: string; error: string };
+      expect(body.code).toBe(code);
+      expect(body.error).toContain(detail);
+      expect(body.error).toContain("Authorization: Bearer $PAPERCLIP_API_KEY");
+      expect(response.body).not.toContain(token);
+      expect(response.body).not.toContain(wrongToken);
+    }
+    expect(handled).not.toHaveBeenCalled();
+
+    // The accepted form is unchanged, including a repeated header whose first
+    // value is the run's own token (Node keeps the first one).
+    expect((await send(`Bearer ${token}`)).status).toBe(200);
+    expect((await send([`Bearer ${token}`, `Bearer ${wrongToken}`])).status).toBe(200);
+    expect(handled).toHaveBeenCalledTimes(2);
+  });
 
   it.each(["queue", "http2"])("preserves multipart bytes at the configured limit on %s and rejects overflow before forwarding", async mode => {
     const maxBodyBytes = 1024;
