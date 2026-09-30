@@ -56,6 +56,12 @@ const mockWorkspaceDiffReprojection = vi.hoisted(() => ({
   project: vi.fn(),
   persist: vi.fn(),
 }));
+const mockRunStreamJson = vi.hoisted(() => ({
+  loadRunStreamJsonMeta: vi.fn(),
+  readRunStreamJsonPage: vi.fn(),
+  createStreamJsonStringRedactor: vi.fn(() => (value: string) => value),
+  isStreamJsonEnabled: vi.fn(() => true),
+}));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockQueueRuntimeRequestResolution = vi.hoisted(() => vi.fn());
 const mockAccessService = vi.hoisted(() => ({
@@ -103,6 +109,8 @@ function registerModuleMocks() {
   vi.doMock("../services/run-secret-redaction.js", () => ({
     createRunSecretRedactionRegistry: () => mockRunSecretRedactionRegistry,
   }));
+
+  vi.doMock("../services/run-stream-json.js", () => mockRunStreamJson);
 
   vi.doMock("../services/provider-trace-store.js", () => ({
     providerTraceStore: () => mockProviderTraceStore,
@@ -280,6 +288,7 @@ describe("agent live run routes", () => {
     vi.doUnmock("../services/instance-settings.js");
     vi.doUnmock("../services/issues.js");
     vi.doUnmock("../adapters/index.js");
+    vi.doUnmock("../services/run-stream-json.js");
     vi.doUnmock("../routes/agents.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
@@ -964,6 +973,140 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(202);
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "agent:wake" }));
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({ manualUserWake: true }));
+  });
+
+  describe("run log in claude-stream-json format", () => {
+    const runId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const logPath = `/api/heartbeat-runs/${runId}/log`;
+    const meta = {
+      id: runId,
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: null,
+      adapterType: "claude_local",
+      status: "running",
+      logStore: "local_file",
+      logRef: `logs/${runId}.ndjson`,
+    };
+    const page = {
+      runId,
+      format: "claude-stream-json",
+      translator: "claude_local@1",
+      sid: "abcdefghij",
+      items: [
+        {
+          cursor: "claude_local@1/abcdefghij/0.0",
+          prev: null,
+          offset: 0,
+          k: 0,
+          lines: 1,
+          seq: 1,
+          ts: "2026-04-10T09:30:00.000Z",
+          stream: "stdout",
+          chunk: '{"type":"system","subtype":"init","session_id":"secret-session"}\n',
+        },
+      ],
+      nextCursor: "claude_local@1/abcdefghij/0.0",
+      complete: false,
+      runStatus: "running",
+      reset: false,
+    };
+
+    beforeEach(() => {
+      mockRunStreamJson.isStreamJsonEnabled.mockReturnValue(true);
+      mockRunStreamJson.loadRunStreamJsonMeta.mockResolvedValue(meta);
+      mockRunStreamJson.readRunStreamJsonPage.mockResolvedValue(page);
+    });
+
+    it("pages the translated log with the cursor options and redacts it like the raw log", async () => {
+      mockRunSecretRedactionRegistry.redactForRun.mockImplementationOnce(async (_companyId, _runId, value) =>
+        JSON.parse(JSON.stringify(value).replaceAll("secret-session", "***REDACTED***")),
+      );
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl).get(`${logPath}?format=claude-stream-json&after=claude_local%401%2Fabcdefghij%2F0.0&limitBytes=512`),
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.headers["cache-control"]).toBe("no-cache, no-store");
+      expect(mockRunStreamJson.readRunStreamJsonPage).toHaveBeenCalledWith(
+        expect.objectContaining({ redactString: expect.any(Function) }),
+        meta,
+        { after: "claude_local@1/abcdefghij/0.0", before: null, tail: false, limitBytes: 512 },
+      );
+      expect(mockRunSecretRedactionRegistry.redactForRun).toHaveBeenCalledWith("company-1", runId, page);
+      expect(res.body.items[0].chunk).toContain("***REDACTED***");
+      expect(res.body.items[0].chunk).not.toContain("secret-session");
+      expect(mockHeartbeatService.readLog).not.toHaveBeenCalled();
+    });
+
+    it("passes tail and before through", async () => {
+      await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl).get(`${logPath}?format=claude-stream-json&tail=1`),
+      );
+      expect(mockRunStreamJson.readRunStreamJsonPage).toHaveBeenLastCalledWith(
+        expect.anything(),
+        meta,
+        { after: null, before: null, tail: true, limitBytes: undefined },
+      );
+    });
+
+    it.each([
+      ["format=transcript", "Unsupported log format"],
+      ["format=claude-stream-json&offset=0", "offset cannot be combined with format"],
+      ["format=claude-stream-json&tail=yes", "tail must be 1 or 0"],
+      ["format=claude-stream-json&after=a&after=b", "after must be a single value"],
+    ])("rejects %s with 400", async (query, message) => {
+      const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl).get(`${logPath}?${query}`));
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain(message);
+      expect(mockRunStreamJson.readRunStreamJsonPage).not.toHaveBeenCalled();
+    });
+
+    it("rejects the format while the kill switch is set", async () => {
+      mockRunStreamJson.isStreamJsonEnabled.mockReturnValue(false);
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl).get(`${logPath}?format=claude-stream-json`),
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it("keeps missing and cross-company runs indistinguishable", async () => {
+      const app = await createApp({}, { type: "board", userId: "test-user", source: "session", companyIds: ["company-1"] });
+      for (const result of [null, { id: runId, companyId: "company-2" }]) {
+        mockHeartbeatService.getRunLogAccess.mockResolvedValueOnce(result);
+        const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`${logPath}?format=claude-stream-json`));
+        expect(res.status).toBe(404);
+        expect(res.body).toEqual({ error: "Heartbeat run not found" });
+      }
+      expect(mockRunStreamJson.readRunStreamJsonPage).not.toHaveBeenCalled();
+    });
+
+    it("applies the run telemetry check before translating", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: input.action !== "company_scope:read",
+        action: input.action,
+        reason: "deny",
+        explanation: "Denied by test.",
+      }));
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl).get(`${logPath}?format=claude-stream-json`),
+      );
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("Run telemetry");
+      expect(mockRunStreamJson.loadRunStreamJsonMeta).not.toHaveBeenCalled();
+    });
+
+    it("serves the raw log unchanged without format", async () => {
+      const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl).get(logPath));
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        runId,
+        store: "local_file",
+        logRef: `logs/${runId}.ndjson`,
+        content: "chunk",
+        nextOffset: 5,
+      });
+      expect(mockRunStreamJson.loadRunStreamJsonMeta).not.toHaveBeenCalled();
+    });
   });
 
   describe("exact failed chat run retry", () => {
