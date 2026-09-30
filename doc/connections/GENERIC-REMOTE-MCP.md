@@ -282,8 +282,10 @@ variable is read at call time; an unrecognized value is treated as `none`.
 
 Separately from this setting, the HTTP request log never records the body of a
 failed tool-call request (`POST /api/tool-gateway/tools/call`,
-`POST /mcp/gateways/:id`, `POST /api/tool-connections/:id/test-calls`); an
-approval-gated call answers `409`, so these bodies used to reach the log.
+`POST /mcp/gateways/:id`, `POST /api/tool-gateway/gateways/:id/mcp`,
+`POST /api/tool-connections/:id/test-calls`, and any other route served by the
+same handlers); an approval-gated call answers `409`, so these bodies used to
+reach the log.
 
 ## Curated definitions remain optional
 

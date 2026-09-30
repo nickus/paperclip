@@ -17,6 +17,7 @@ import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-
 import { forbidden, HttpError } from "../errors.js";
 import { accessService } from "../services/index.js";
 import { listConnectionLifecycleEvents } from "../services/tool-connection-activity.js";
+import { markToolCallContentResponse, toolCallContentRequest } from "../middleware/http-log-policy.js";
 
 const TOOL_ACTIVITY_EVENT_TYPES = [
   "call_completed",
@@ -61,6 +62,10 @@ async function handleMcpGatewayProtocol(
   toolGateway: ToolGatewayService,
   locator: { gatewayId?: string | null; gatewayPublicId?: string | null },
 ) {
+  // Every route that speaks the gateway protocol carries tool-call arguments
+  // (and resource/prompt parameters) in its body; keep them out of the HTTP
+  // failure log wherever this handler is mounted.
+  markToolCallContentResponse(res);
   try {
     const token = bearerToken(req);
     if (!token) {
@@ -558,7 +563,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
     }
   });
 
-  router.post("/tool-gateway/tools/call", async (req, res) => {
+  router.post("/tool-gateway/tools/call", toolCallContentRequest, async (req, res) => {
     try {
       const token = gatewayToken(req);
       if (!token) {

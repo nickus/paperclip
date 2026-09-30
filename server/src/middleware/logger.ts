@@ -6,6 +6,7 @@ import {
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
   isToolCallContentHttpRequest,
+  isToolCallContentResponse,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
 import {
@@ -175,10 +176,12 @@ export function createHttpLogger(baseLogger: Logger) {
         }
         // A failed tool call (including every call that waits for approval)
         // would otherwise log its arguments; the gateway audit is the record.
-        const toolCallContentRoute = isToolCallContentHttpRequest(
-          req.method,
-          requestClassificationUrl(req),
-        );
+        const toolCallContentRoute =
+          isToolCallContentResponse(res) ||
+          isToolCallContentHttpRequest(
+            req.method,
+            requestClassificationUrl(req),
+          );
         if (ctx) {
           const secretSensitiveRoute = isSecretSensitiveHttpRequest(
             req.method,

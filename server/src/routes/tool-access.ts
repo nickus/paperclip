@@ -53,6 +53,7 @@ import {
   updateToolProfileWithEntriesSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
+import { toolCallContentRequest } from "../middleware/http-log-policy.js";
 import { getActorInfo, assertBoard, assertCompanyAccess, assertInstanceAdmin, getAccessibleResource, hasCompanyAccess } from "./authz.js";
 import { badRequest, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { accessService, logActivity, toolAccessPolicyService, toolAccessService, vercelConnectIntegrationStatus } from "../services/index.js";
@@ -2002,7 +2003,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     res.json({ access: accessSummary });
   });
 
-  router.post("/tool-connections/:connectionId/test-calls", validate(toolConnectionTestCallSchema), async (req, res) => {
+  router.post("/tool-connections/:connectionId/test-calls", toolCallContentRequest, validate(toolConnectionTestCallSchema), async (req, res) => {
     assertBoard(req);
     if (!options.toolGateway) {
       res.status(501).json({ error: "Tool gateway service is not configured" });

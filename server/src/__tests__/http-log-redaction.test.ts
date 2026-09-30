@@ -10,6 +10,7 @@ import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { testAdapterEnvironmentSchema } from "@paperclipai/shared";
 import { createHttpLogger } from "../middleware/logger.js";
+import { toolCallContentRequest } from "../middleware/http-log-policy.js";
 
 describe("HTTP logger redaction", () => {
   it.each([
@@ -460,6 +461,7 @@ describe("HTTP logger redaction", () => {
   it.each([
     { path: "/api/tool-gateway/tools/call", body: { tool: "notes:update", parameters: { body: "private-note-canary" } } },
     { path: "/mcp/gateways/gw-1", body: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "notes:update", arguments: { body: "private-note-canary" } } } },
+    { path: "/api/tool-gateway/gateways/gw-1/mcp", body: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "notes:update", arguments: { body: "private-note-canary" } } } },
     { path: "/api/tool-connections/conn-1/test-calls", body: { toolName: "update", parameters: { body: "private-note-canary" } } },
   ])("keeps tool-call arguments out of failed $path logs", async ({ path, body }) => {
     const chunks: string[] = [];
@@ -496,6 +498,36 @@ describe("HTTP logger redaction", () => {
       expect(log.reqBody).toBe("[REDACTED]");
       expect(log.req.url).toBe(path);
     }
+  });
+
+  it("keeps tool-call arguments out of the failure log of a marked route at any path", async () => {
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(express.json());
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    // Not a known tool-call path: only the route's own marker protects it.
+    app.post("/custom/tool-proxy", toolCallContentRequest, (_req, res) => {
+      res.status(409).json({ reasonCode: "approval_required" });
+    });
+    app.post("/custom/other", (_req, res) => {
+      res.status(409).json({ reasonCode: "conflict" });
+    });
+
+    await request(app).post("/custom/tool-proxy").send({ arguments: { body: "private-note-canary" } }).expect(409);
+    await request(app).post("/custom/other").send({ note: "ordinary-body" }).expect(409);
+
+    const output = chunks.join("");
+    expect(output).not.toContain("private-note-canary");
+    const [marked, unmarked] = output.trim().split("\n").map((line) => JSON.parse(line));
+    expect(marked.reqBody).toBe("[REDACTED]");
+    // Other routes keep their (redacted-by-field) body for debugging.
+    expect(unmarked.reqBody).toEqual({ note: "ordinary-body" });
   });
 
   it.each([200, 403, 500])("redacts cloud credentials and assertions from HTTP %i logs", async (status) => {

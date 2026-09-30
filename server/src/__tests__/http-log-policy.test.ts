@@ -12,6 +12,8 @@ describe("isToolCallContentHttpRequest", () => {
       "/api/tool-gateway/tools/call",
       "/api/tool-gateway/tools/call/",
       "/mcp/gateways/gw-public-id",
+      "/api/tool-gateway/gateways/gw-1/mcp",
+      "/api/tool-gateway/gateways/gw-1/mcp/",
       "/api/tool-connections/conn-1/test-calls",
       "http://host.invalid/api/tool-gateway/tools/call?x=1",
     ]) {
@@ -19,6 +21,8 @@ describe("isToolCallContentHttpRequest", () => {
     }
     for (const [method, path] of [
       ["GET", "/mcp/gateways/gw-public-id"],
+      ["GET", "/api/tool-gateway/gateways/gw-1/mcp"],
+      ["POST", "/api/tool-gateway/gateways/gw-1/tokens"],
       ["GET", "/api/tool-connections/conn-1/test-calls/request-1"],
       ["POST", "/api/tool-gateway/sessions"],
       ["POST", "/api/tool-gateway/action-requests/request-1/approve"],
