@@ -41,13 +41,18 @@ import type {
   ToolTrustRuleArgumentFilters,
   ToolRiskLevel,
 } from "@paperclipai/shared";
-import { toolPolicyConditionsSchema } from "@paperclipai/shared";
+import { strictestToolContentRetention, toolPolicyConditionsSchema, type ToolContentRetention } from "@paperclipai/shared";
 import { badRequest, conflict, notFound, unprocessable } from "../errors.js";
 import {
   effectiveToolProfileBindings,
   profileIdsInBindingOrder,
 } from "./tool-profile-binding-precedence.js";
 import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
+import {
+  connectionContentRetention,
+  retainRedactionPlan,
+  retainToolContentSummary,
+} from "./tool-content-retention.js";
 
 type ToolAccessContext = {
   companyId: string;
@@ -288,6 +293,18 @@ function summarizeAndRedact(value: unknown): RedactionResult {
     },
   };
 }
+
+// A call on a connection that keeps no content stores the hash and size of its
+// arguments, never their text or the paths of their redacted fields.
+function retainRedaction(redaction: RedactionResult, retention: ToolContentRetention): RedactionResult {
+  if (retention !== "none") return redaction;
+  return {
+    summary: retainToolContentSummary(redaction.summary, retention),
+    redactionPlan: retainRedactionPlan(redaction.redactionPlan, retention),
+  };
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function decision(
   kind: ToolPolicyDecision,
@@ -838,11 +855,40 @@ export function toolAccessPolicyService(db: Db) {
     return deleted;
   }
 
+  // The retention of the connection a request targets. Resolved before any
+  // other check, so even a call denied for its context stores no content. A
+  // request that names both a connection and a catalog entry gets the stricter
+  // of the two connections' settings.
+  async function requestContentRetention(input: ToolAccessDecisionInput): Promise<ToolContentRetention> {
+    const connectionIds = new Set<string>();
+    const requestedConnectionId = input.request.connectionId;
+    if (typeof requestedConnectionId === "string" && UUID_PATTERN.test(requestedConnectionId)) {
+      connectionIds.add(requestedConnectionId);
+    }
+    const catalogEntryId = input.request.catalogEntryId;
+    if (typeof catalogEntryId === "string" && UUID_PATTERN.test(catalogEntryId)) {
+      const [entry] = await db
+        .select({ connectionId: toolCatalogEntries.connectionId })
+        .from(toolCatalogEntries)
+        .where(and(eq(toolCatalogEntries.id, catalogEntryId), eq(toolCatalogEntries.companyId, input.companyId)))
+        .limit(1);
+      if (entry?.connectionId) connectionIds.add(entry.connectionId);
+    }
+    if (connectionIds.size === 0) return "summary";
+    const retentions = await Promise.all(
+      [...connectionIds].map((connectionId) => connectionContentRetention(db, input.companyId, connectionId)),
+    );
+    return strictestToolContentRetention(...retentions);
+  }
+
   async function loadContext(input: ToolAccessDecisionInput): Promise<
     | { ok: true; ctx: ToolAccessContext; redaction: RedactionResult }
     | { ok: false; decision: ToolAccessDecision; redaction: RedactionResult }
   > {
-    const redaction = summarizeAndRedact(input.request.arguments ?? {});
+    const redaction = retainRedaction(
+      summarizeAndRedact(input.request.arguments ?? {}),
+      await requestContentRetention(input),
+    );
     let agentId = input.actor.agentId ?? (input.actor.actorType === "agent" ? input.actor.actorId : null);
     let heartbeatRunId = input.runContext?.heartbeatRunId ?? null;
     let issueId = input.runContext?.issueId ?? null;

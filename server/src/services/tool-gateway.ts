@@ -83,6 +83,7 @@ import type {
   ToolMcpGatewayTokenAction,
   ToolMcpGatewayTokenCreated,
   ToolMcpGatewayWithTokens,
+  ToolRedactedValueSummary,
   UpdateToolMcpGateway,
 } from "@paperclipai/shared";
 import {
@@ -90,6 +91,8 @@ import {
   DEFAULT_TOOL_CALL_TIMEOUT_MS,
   MAX_TOOL_CALL_TIMEOUT_MS,
   readConfiguredToolCallTimeoutMs,
+  strictestToolContentRetention,
+  type ToolContentRetention,
   isGitHubConnectorProfileId,
   isGoogleWorkspaceConnectorProfileId,
   type GitHubConnectorProfileId,
@@ -164,6 +167,15 @@ import {
   verifyToolArgumentsSignature,
 } from "./tool-content-guards.js";
 import { extendApprovedExecutionWaitDeadline } from "./approved-execution-wait.js";
+import {
+  connectionContentRetention,
+  isUnretainedSummary,
+  purgeSettledUnretainedActionArguments,
+  resolveConnectionContentRetention,
+  retainToolAuditDetails,
+  retainToolContentSummary,
+  retainToolErrorMessage,
+} from "./tool-content-retention.js";
 
 const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
@@ -312,6 +324,12 @@ export interface ToolGatewayDescriptor extends AgentToolDescriptor {
   catalogEntryId?: string | null;
   upstreamToolName?: string | null;
   providerMetadata?: ConnectedMcpGatewayMetadata | Record<string, unknown>;
+  /**
+   * What the gateway may store about calls to this tool, from its connection's
+   * `config.contentRetention` (or the instance default). Set on connected MCP
+   * descriptors; other connection-backed tools are looked up per call.
+   */
+  contentRetention?: ToolContentRetention;
 }
 
 export interface ToolGatewaySession {
@@ -901,13 +919,16 @@ function humanizeArgumentValue(value: unknown): string | null {
  */
 function buildHumanizedActionPreview(input: {
   tool: ToolGatewayDescriptor;
-  argumentsSummary: ReturnType<typeof summarizeToolValue>;
+  argumentsSummary: ToolRedactedValueSummary;
 }): string {
   const actionName = input.tool.displayName?.trim() || input.tool.name;
   const trustLine =
     input.tool.risk === "destructive"
       ? `${actionName}. This can permanently change or remove data.`
       : actionName;
+  if (input.argumentsSummary.contentRetention === "none") {
+    return `${trustLine} · Details are not saved for this connection`;
+  }
 
   let parsed: unknown;
   try {
@@ -1123,14 +1144,23 @@ export function createToolGatewayService(
   // Authorization links can contain one-time codes. Keep them briefly in memory;
   // persist only the redacted request and execution identifiers for recovery.
   const upstreamHandoffs = new Map<string, { pending: ToolUpstreamPending; expires: number }>();
-  async function retainUpstreamHandoff(invocationId: string, pending: ToolUpstreamPending) {
+  async function retainUpstreamHandoff(
+    invocationId: string,
+    pending: ToolUpstreamPending,
+    contentRetention: ToolContentRetention,
+  ) {
     for (const [id, value] of upstreamHandoffs) if (value.expires <= Date.now()) upstreamHandoffs.delete(id);
     while (upstreamHandoffs.size >= 256) upstreamHandoffs.delete(upstreamHandoffs.keys().next().value!);
     upstreamHandoffs.set(invocationId, { pending, expires: Date.now() + 15 * 60_000 });
     const summary = validateToolContent({
       value: { upstreamPending: { ...pending, links: [] } }, direction: "result", sensitiveMode: "redact", promptInjectionMode: "ignore",
     }).summary;
-    await db.update(toolInvocations).set({ resultSummary: summary }).where(eq(toolInvocations.id, invocationId));
+    // The provider's prompt describes the call. A connection that keeps no
+    // content recovers the handoff from memory only.
+    await db
+      .update(toolInvocations)
+      .set({ resultSummary: retainToolContentSummary(summary, contentRetention) })
+      .where(eq(toolInvocations.id, invocationId));
   }
   function recoverUpstreamHandoff(invocation: typeof toolInvocations.$inferSelect): ToolUpstreamPending | undefined {
     if (invocation.errorCode !== "provider_interaction_required") return undefined;
@@ -1151,6 +1181,19 @@ export function createToolGatewayService(
   const pluginToolDispatcher = options.pluginToolDispatcher;
   const interactions = issueThreadInteractionService(db);
   const policyService = toolAccessPolicyService(db);
+
+  /**
+   * What may be stored about a call to `tool`. Connected MCP descriptors carry
+   * their connection's setting; other connection-backed tools (chat, GitHub)
+   * are looked up. Tools without a connection keep summaries.
+   */
+  async function toolContentRetention(
+    companyId: string,
+    tool: ToolGatewayDescriptor | null | undefined,
+  ): Promise<ToolContentRetention> {
+    if (!tool?.connectionId) return "summary";
+    return tool.contentRetention ?? connectionContentRetention(db, companyId, tool.connectionId);
+  }
   const secrets = secretService(db);
   // Authentication produces a new session object for every operation. Keep
   // credential acquisition scoped to that object and out of persisted inputs.
@@ -1399,6 +1442,7 @@ export function createToolGatewayService(
           catalogEntryId: catalogEntry.id,
           upstreamToolName: catalogEntry.toolName,
           providerMetadata,
+          contentRetention: resolveConnectionContentRetention(connection.config),
         };
       },
     );
@@ -1659,7 +1703,30 @@ export function createToolGatewayService(
     actorId?: string;
     action: string;
     details: Record<string, unknown>;
+    /**
+     * Retention of the call's connection. Looked up from `details.connectionId`
+     * when omitted; a summary already marked as not retained forces "none".
+     */
+    contentRetention?: ToolContentRetention;
   }) {
+    const auditConnectionId =
+      typeof input.details.connectionId === "string" &&
+      uuidPattern.test(input.details.connectionId)
+        ? input.details.connectionId
+        : null;
+    const contentRetention = strictestToolContentRetention(
+      input.contentRetention ??
+        (auditConnectionId
+          ? await connectionContentRetention(db, input.companyId, auditConnectionId)
+          : null),
+      isUnretainedSummary(input.details.argumentsSummary) ||
+        isUnretainedSummary(input.details.resultSummary)
+        ? "none"
+        : null,
+    );
+    // The same details go to the audit table, the activity log, the live event
+    // stream and plugin event subscribers, so retention is applied once here.
+    const details = retainToolAuditDetails(input.details, contentRetention);
     const dedicatedAuditAction =
       input.action === "tool_gateway.discovery"
         ? "discovery"
@@ -1752,7 +1819,7 @@ export function createToolGatewayService(
           gatewayPublicId: input.session?.gatewayPublicId ?? null,
           gatewayName: input.session?.gatewayName ?? null,
           gatewayTokenId: input.session?.gatewayTokenId ?? null,
-          ...input.details,
+          ...details,
         },
       });
     } catch (error) {
@@ -1795,7 +1862,7 @@ export function createToolGatewayService(
         issueId: input.issueId,
         projectId: input.session?.projectId ?? null,
         runId: input.runId,
-        ...input.details,
+        ...details,
       },
     });
   }
@@ -2044,12 +2111,27 @@ export function createToolGatewayService(
     policyDecision?:
       "allow" | "deny" | "require_approval" | "defer_runtime" | null;
     reasonCode?: string | null;
-    argumentsSummary?: ReturnType<typeof summarizeToolValue> | null;
-    resultSummary?: ReturnType<typeof summarizeToolValue> | null;
+    argumentsSummary?: ToolRedactedValueSummary | null;
+    resultSummary?: ToolRedactedValueSummary | null;
     metadata?: Record<string, unknown> | null;
     tool?: ToolGatewayDescriptor | null;
   }) {
     const metadata = input.tool ? toolAuditMetadata(input.tool) : {};
+    const contentRetention = strictestToolContentRetention(
+      await toolContentRetention(input.session.companyId, input.tool),
+      isUnretainedSummary(input.argumentsSummary) ||
+        isUnretainedSummary(input.resultSummary)
+        ? "none"
+        : null,
+    );
+    const argumentsSummary = retainToolContentSummary(
+      input.argumentsSummary,
+      contentRetention,
+    );
+    const resultSummary = retainToolContentSummary(
+      input.resultSummary,
+      contentRetention,
+    );
     await db.insert(toolCallEvents).values({
       companyId: input.session.companyId,
       invocationId: input.invocationId ?? null,
@@ -2073,11 +2155,11 @@ export function createToolGatewayService(
       decision: input.policyDecision ?? null,
       reasonCode: input.reasonCode ?? null,
       matchedPolicyIds: [],
-      requestHash: input.argumentsSummary?.sha256 ?? null,
-      requestSummary: input.argumentsSummary ?? null,
-      resultHash: input.resultSummary?.sha256 ?? null,
-      resultSummary: input.resultSummary ?? null,
-      resultSizeBytes: input.resultSummary?.sizeBytes ?? null,
+      requestHash: argumentsSummary?.sha256 ?? null,
+      requestSummary: argumentsSummary ?? null,
+      resultHash: resultSummary?.sha256 ?? null,
+      resultSummary: resultSummary ?? null,
+      resultSizeBytes: resultSummary?.sizeBytes ?? null,
       metadata:
         Object.keys(metadata).length > 0 ||
         input.metadata ||
@@ -2108,16 +2190,33 @@ export function createToolGatewayService(
     errorMessage?: string | null;
     resultSummary?: string | null;
   }): Promise<void> {
+    if (["executed", "failed", "expired", "cancelled"].includes(input.status)) {
+      // Settled: the signed arguments will not be read again.
+      await purgeSettledUnretainedActionArguments(db, {
+        actionRequestId: input.actionRequestId,
+      });
+    }
     const [linked] = await db
       .select({
         companyId: toolActionRequests.companyId,
         interactionId: toolActionRequests.interactionId,
         issueId: toolActionRequests.issueId,
+        canonicalArgumentsSummary: toolActionRequests.canonicalArgumentsSummary,
       })
       .from(toolActionRequests)
       .where(eq(toolActionRequests.id, input.actionRequestId))
       .limit(1);
     if (!linked?.interactionId) return;
+    // The card's recorded outcome is stored with the issue thread. For a call
+    // that keeps no content it records the status and error code only; only a
+    // failed execution can carry the provider's own words.
+    const unretained = isUnretainedSummary(linked.canonicalArgumentsSummary);
+    const retainedResultSummary = unretained ? null : input.resultSummary ?? null;
+    const retainedErrorMessage = retainToolErrorMessage(
+      input.errorMessage ?? null,
+      input.errorCode ?? null,
+      unretained && input.status === "failed" ? "none" : "summary",
+    );
 
     const interactionId = linked.interactionId;
     const changed = await db.transaction(async (tx) => {
@@ -2176,8 +2275,9 @@ export function createToolGatewayService(
               version: 1,
               status: input.status === "cancelled" ? "expired" : input.status,
               errorCode: input.errorCode ?? null,
-              errorMessage: input.errorMessage ?? null,
-              resultSummary: input.resultSummary ?? null,
+              errorMessage: retainedErrorMessage,
+              resultSummary: retainedResultSummary,
+              ...(unretained ? { contentRetention: "none" } : {}),
               updatedAt: now.toISOString(),
             },
           } as unknown as NonNullable<
@@ -2255,11 +2355,22 @@ export function createToolGatewayService(
     session: ToolGatewaySession;
     tool: ToolGatewayDescriptor;
     parameters: unknown;
-    argumentsSummary: ReturnType<typeof summarizeToolValue>;
+    argumentsSummary: ToolRedactedValueSummary;
     policyDecision: ToolAccessDecision;
   }): Promise<never> {
     const canonicalArguments = canonicalToolArguments(input.parameters);
     const canonicalArgumentsHash = input.argumentsSummary.sha256 ?? "";
+    // Everything below is stored (request row, approval card, call event,
+    // audit). The signed arguments are the one exception: execution needs them,
+    // and they are dropped once the request settles.
+    const contentRetention = strictestToolContentRetention(
+      await toolContentRetention(input.session.companyId, input.tool),
+      isUnretainedSummary(input.argumentsSummary) ? "none" : null,
+    );
+    const argumentsSummary = retainToolContentSummary(
+      input.argumentsSummary,
+      contentRetention,
+    );
     const approvalSnapshot = await connectedRemoteApprovalSnapshot(
       input.session,
       input.tool,
@@ -2291,7 +2402,7 @@ export function createToolGatewayService(
         toolName: input.tool.name,
         policyDecision: "deny",
         reasonCode: "approval_path_missing",
-        argumentsSummary: input.argumentsSummary,
+        argumentsSummary,
         tool: input.tool,
       });
       throw new ToolGatewayHttpError(
@@ -2387,11 +2498,19 @@ export function createToolGatewayService(
       `Tool: \`${input.tool.name}\``,
       `Risk: \`${input.tool.risk}\``,
       "",
-      "Arguments reviewed for execution:",
-      "",
-      "```json",
-      input.argumentsSummary.summary,
-      "```",
+      ...(contentRetention === "none"
+        ? [
+            "This connection does not store call content, so the arguments are not shown here.",
+            "",
+            `Arguments SHA-256: \`${canonicalArgumentsHash}\` (${argumentsSummary.sizeBytes ?? 0} bytes)`,
+          ]
+        : [
+            "Arguments reviewed for execution:",
+            "",
+            "```json",
+            argumentsSummary.summary,
+            "```",
+          ]),
     ].join("\n");
 
     // Prosumer-facing card preview (M5/M7/M9). Respect an already-set custom preview
@@ -2400,7 +2519,7 @@ export function createToolGatewayService(
       actionRequest.previewMarkdown?.trim() ||
       buildHumanizedActionPreview({
         tool: input.tool,
-        argumentsSummary: input.argumentsSummary,
+        argumentsSummary,
       });
 
     let formalApprovalId: string | null = null;
@@ -2489,7 +2608,7 @@ export function createToolGatewayService(
                 }
               : {}),
             previewMarkdown,
-            argumentsSummaryJson: input.argumentsSummary.summary,
+            argumentsSummaryJson: argumentsSummary.summary,
             argumentsHash: canonicalArgumentsHash,
             expiresAt: expiresAt.toISOString(),
           },
@@ -2509,7 +2628,7 @@ export function createToolGatewayService(
       .set({
         interactionId: interaction.id,
         canonicalArgumentsHash,
-        canonicalArgumentsSummary: input.argumentsSummary,
+        canonicalArgumentsSummary: argumentsSummary,
         signedArguments,
         previewMarkdown,
         approvalId: formalApprovalId,
@@ -2570,7 +2689,7 @@ export function createToolGatewayService(
       toolName: input.tool.name,
       policyDecision: "require_approval",
       reasonCode: "requires_approval_policy",
-      argumentsSummary: input.argumentsSummary,
+      argumentsSummary,
       metadata: {
         actionRequestId: actionRequest.id,
         interactionId: interaction.id,
@@ -2581,6 +2700,7 @@ export function createToolGatewayService(
 
     await writeAudit({
       session: input.session,
+      contentRetention,
       companyId: input.session.companyId,
       agentId: input.session.agentId,
       runId: input.session.runId,
@@ -2596,7 +2716,7 @@ export function createToolGatewayService(
         matchedPolicyIds: input.policyDecision.matchedPolicyIds,
         tool: input.tool.name,
         ...toolAuditMetadata(input.tool),
-        argumentsSummary: input.argumentsSummary,
+        argumentsSummary,
       },
     });
 
@@ -5828,6 +5948,10 @@ export function createToolGatewayService(
       { agentId: input.session.agentId },
     );
     const now = new Date();
+    const contentRetention = await toolContentRetention(
+      input.session.companyId,
+      input.tool,
+    );
     await db
       .update(toolInvocations)
       .set({
@@ -5848,15 +5972,22 @@ export function createToolGatewayService(
       reasonCode: "elicitation_required",
       metadata: {
         interactionId: interaction.id,
-        elicitation: {
-          message: input.request.message,
-          requestedSchema: input.request.requestedSchema,
-        },
+        // The question itself lives on the interaction the human answers; the
+        // call event keeps a copy only when the connection keeps content.
+        ...(contentRetention === "none"
+          ? { contentRetention }
+          : {
+              elicitation: {
+                message: input.request.message,
+                requestedSchema: input.request.requestedSchema,
+              },
+            }),
       },
       tool: input.tool,
     });
     await writeAudit({
       session: input.session,
+      contentRetention,
       companyId: input.session.companyId,
       agentId: input.session.agentId,
       runId: input.session.runId,
@@ -5943,6 +6074,10 @@ export function createToolGatewayService(
     const { entry, connection } = await resolveConnectedRemoteTool(
       session,
       tool,
+    );
+    const contentRetention = strictestToolContentRetention(
+      tool.contentRetention,
+      resolveConnectionContentRetention(connection.config),
     );
     // Recheck immediately before dispatch, including previously approved calls
     // and connections whose stored grant/catalog predates scope reduction.
@@ -6183,7 +6318,7 @@ export function createToolGatewayService(
             onRequest: async (message) => {
               const pending = extractRemoteMcpPending(message);
               if (pending) {
-                await retainUpstreamHandoff(invocationId, pending);
+                await retainUpstreamHandoff(invocationId, pending, contentRetention);
                 // Defer this interaction to the user. Do not claim that consent
                 // was granted or repeat a potentially state-changing tool call.
                 await dispatchRemote(endpoint, {
@@ -6254,7 +6389,7 @@ export function createToolGatewayService(
       if (!payloadRecord) throw malformedRemoteMcpResponse();
       const upstreamPending = extractRemoteMcpPending(payloadRecord, String(connection.config.sourceTemplateKey ?? ""), entry.toolName);
       if (upstreamPending) {
-        await retainUpstreamHandoff(invocationId, upstreamPending);
+        await retainUpstreamHandoff(invocationId, upstreamPending, contentRetention);
         throw new ToolGatewayHttpError(409, "Complete the provider's authorization or approval before continuing. The original call has not been replayed.", "provider_interaction_required", { upstreamPending, invocationId });
       }
       const topLevelElicitation = extractMcpElicitationRequest(payloadRecord);
@@ -7175,7 +7310,7 @@ export function createToolGatewayService(
     companyId: string;
     agentId: string;
     userId: string;
-    argumentsSummary: ReturnType<typeof summarizeToolValue>;
+    argumentsSummary: ToolRedactedValueSummary;
     reasonCode: string;
     matchedPolicyIds: string[];
     timeoutMs?: number;
@@ -7187,6 +7322,14 @@ export function createToolGatewayService(
         error: { message: string; reasonCode: string };
       }
   > {
+    const contentRetention = strictestToolContentRetention(
+      await toolContentRetention(args.companyId, args.tool),
+      isUnretainedSummary(args.argumentsSummary) ? "none" : null,
+    );
+    const argumentsSummary = retainToolContentSummary(
+      args.argumentsSummary,
+      contentRetention,
+    );
     await db
       .update(toolInvocations)
       .set({
@@ -7197,6 +7340,7 @@ export function createToolGatewayService(
       .where(eq(toolInvocations.id, args.invocationId));
     await writeAudit({
       session: args.session,
+      contentRetention,
       companyId: args.companyId,
       agentId: args.agentId,
       runId: null,
@@ -7212,7 +7356,7 @@ export function createToolGatewayService(
         matchedPolicyIds: args.matchedPolicyIds,
         tool: args.tool.name,
         ...toolAuditMetadata(args.tool),
-        argumentsSummary: args.argumentsSummary,
+        argumentsSummary,
       },
     });
 
@@ -7254,6 +7398,10 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "block",
       });
+      const retainedResultSummary = retainToolContentSummary(
+        resultValidation.summary,
+        contentRetention,
+      );
       const providerResult = asRecord(resultValidation.value);
       if (providerResult?.error) {
         throw new ToolGatewayHttpError(502, String(providerResult.content || providerResult.error),
@@ -7263,9 +7411,9 @@ export function createToolGatewayService(
         .update(toolInvocations)
         .set({
           status: "succeeded",
-          resultHash: resultValidation.summary.sha256 ?? null,
-          resultSummary: resultValidation.summary,
-          resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
+          resultHash: retainedResultSummary.sha256 ?? null,
+          resultSummary: retainedResultSummary,
+          resultSizeBytes: retainedResultSummary.sizeBytes ?? null,
           completedAt: new Date(),
           updatedAt: new Date(),
         })
@@ -7278,8 +7426,8 @@ export function createToolGatewayService(
         toolName: args.tool.name,
         policyDecision: "allow",
         reasonCode: "tool_completed",
-        argumentsSummary: args.argumentsSummary,
-        resultSummary: resultValidation.summary,
+        argumentsSummary,
+        resultSummary: retainedResultSummary,
         metadata: {
           source: "test",
           headerSummary: connectedMcpExecution.headerSummary ?? undefined,
@@ -7289,6 +7437,7 @@ export function createToolGatewayService(
       });
       await writeAudit({
         session: args.session,
+        contentRetention,
         companyId: args.companyId,
         agentId: args.agentId,
         runId: null,
@@ -7304,9 +7453,9 @@ export function createToolGatewayService(
           tool: args.tool.name,
           ...toolAuditMetadata(args.tool),
           durationMs: Date.now() - startedAt,
-          argumentsSummary: args.argumentsSummary,
+          argumentsSummary,
           result: summarizeResult(resultValidation.value),
-          resultSummary: resultValidation.summary,
+          resultSummary: retainedResultSummary,
           headerSummary: connectedMcpExecution.headerSummary ?? undefined,
           execution: connectedMcpExecution.execution,
         },
@@ -7329,6 +7478,11 @@ export function createToolGatewayService(
             ? err.reasonCode
             : "tool_execution_failed";
       const message = err instanceof Error ? err.message : String(err);
+      const storedMessage = retainToolErrorMessage(
+        message,
+        reasonCode,
+        contentRetention,
+      );
       await db
         .update(toolInvocations)
         .set({
@@ -7339,7 +7493,7 @@ export function createToolGatewayService(
                 ? "rate_limited"
                 : "failed",
           errorCode: reasonCode,
-          errorMessage: message,
+          errorMessage: storedMessage,
           completedAt: new Date(),
           updatedAt: new Date(),
         })
@@ -7353,7 +7507,7 @@ export function createToolGatewayService(
         toolName: args.tool.name,
         policyDecision: status === 504 ? "defer_runtime" : "deny",
         reasonCode,
-        argumentsSummary: args.argumentsSummary,
+        argumentsSummary,
         metadata: {
           source: "test",
           ...(err instanceof ToolContentValidationError
@@ -7367,6 +7521,7 @@ export function createToolGatewayService(
       });
       await writeAudit({
         session: args.session,
+        contentRetention,
         companyId: args.companyId,
         agentId: args.agentId,
         runId: null,
@@ -7384,9 +7539,9 @@ export function createToolGatewayService(
           reasonCode,
           tool: args.tool.name,
           ...toolAuditMetadata(args.tool),
-          argumentsSummary: args.argumentsSummary,
+          argumentsSummary,
           durationMs: Date.now() - startedAt,
-          error: message,
+          error: storedMessage,
           ...(executionAuditFromError(err)
             ? { execution: executionAuditFromError(err) }
             : {}),
@@ -7492,7 +7647,11 @@ export function createToolGatewayService(
         status: "executed",
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = retainToolErrorMessage(
+        err instanceof Error ? err.message : String(err),
+        "tool_execution_failed",
+        await toolContentRetention(invocation.companyId, tool),
+      );
       await db
         .update(toolInvocations)
         .set({
@@ -7565,6 +7724,16 @@ export function createToolGatewayService(
   function storedInvocationResult(
     invocation: typeof toolInvocations.$inferSelect,
   ): unknown {
+    if (isUnretainedSummary(invocation.resultSummary)) {
+      // Nothing to replay: say so instead of returning an empty result.
+      return {
+        contentRetained: false,
+        resultSha256: invocation.resultSummary?.sha256 ?? null,
+        resultSizeBytes: invocation.resultSummary?.sizeBytes ?? null,
+        message:
+          "This call already ran and was not repeated. Its connection does not store call content, so the earlier result is not available; read the current state with a read-only call if you need it.",
+      };
+    }
     const summary = invocation.resultSummary?.summary;
     if (typeof summary !== "string") return null;
     try {
@@ -7591,6 +7760,9 @@ export function createToolGatewayService(
       ...actionRequest,
       resultSummary: invocation?.resultSummary?.summary ?? null,
       error: invocation?.errorMessage ?? null,
+      ...(isUnretainedSummary(actionRequest.canonicalArgumentsSummary)
+        ? { contentRetention: "none" as const }
+        : {}),
     };
   }
 
@@ -7600,6 +7772,8 @@ export function createToolGatewayService(
     claimUpdatedAt: Date;
     expectedInvocationStatus: "awaiting_approval" | "executing";
     error: unknown;
+    /** Retention of the call's connection; the reviewed request's own marker also applies. */
+    contentRetention?: ToolContentRetention;
   }) {
     const reasonCode =
       input.error instanceof ToolGatewayHttpError
@@ -7607,6 +7781,7 @@ export function createToolGatewayService(
         : "tool_execution_failed";
     const message =
       input.error instanceof Error ? input.error.message : String(input.error);
+    let storedMessage = message;
     const now = new Date();
     const settled = await db.transaction(async (tx) => {
       // Lock in the same invocation -> request order used by the normal
@@ -7626,6 +7801,7 @@ export function createToolGatewayService(
         .select({
           status: toolActionRequests.status,
           updatedAt: toolActionRequests.updatedAt,
+          canonicalArgumentsSummary: toolActionRequests.canonicalArgumentsSummary,
         })
         .from(toolActionRequests)
         .where(eq(toolActionRequests.id, input.actionRequestId))
@@ -7637,6 +7813,17 @@ export function createToolGatewayService(
       ) {
         return false;
       }
+      storedMessage =
+        retainToolErrorMessage(
+          message,
+          reasonCode,
+          strictestToolContentRetention(
+            input.contentRetention,
+            isUnretainedSummary(actionRequest.canonicalArgumentsSummary)
+              ? "none"
+              : null,
+          ),
+        ) ?? message;
 
       await tx
         .update(toolInvocations)
@@ -7644,7 +7831,7 @@ export function createToolGatewayService(
           status: "failed",
           idempotencyKey: null,
           errorCode: reasonCode,
-          errorMessage: message,
+          errorMessage: storedMessage,
           completedAt: now,
           updatedAt: now,
         })
@@ -7676,7 +7863,7 @@ export function createToolGatewayService(
       actionRequestId: input.actionRequestId,
       status: "failed",
       errorCode: reasonCode,
-      errorMessage: message,
+      errorMessage: storedMessage,
     });
     return { reasonCode, message, settled: true };
   }
@@ -8030,12 +8217,21 @@ export function createToolGatewayService(
       });
     }
 
-    const argumentsSummary = validateToolContent({
-      value: parameters,
-      direction: "arguments",
-      sensitiveMode: "redact",
-      promptInjectionMode: "ignore",
-    }).summary;
+    // The retention the call was reviewed under, or the connection's current
+    // one if that is stricter.
+    const contentRetention = strictestToolContentRetention(
+      await toolContentRetention(session.companyId, tool),
+      isUnretainedSummary(claimed.canonicalArgumentsSummary) ? "none" : null,
+    );
+    const argumentsSummary = retainToolContentSummary(
+      validateToolContent({
+        value: parameters,
+        direction: "arguments",
+        sensitiveMode: "redact",
+        promptInjectionMode: "ignore",
+      }).summary,
+      contentRetention,
+    );
     // Final recheck at the last DB write before dispatch: tool and snapshot
     // resolution above involve network calls, so re-verify the issue is still
     // open now that only the provider call remains. A close that commits after
@@ -8110,14 +8306,18 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "block",
       });
+      const retainedResultSummary = retainToolContentSummary(
+        resultValidation.summary,
+        contentRetention,
+      );
       const now = new Date();
       await db
         .update(toolInvocations)
         .set({
           status: "succeeded",
-          resultHash: resultValidation.summary.sha256 ?? null,
-          resultSummary: resultValidation.summary,
-          resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
+          resultHash: retainedResultSummary.sha256 ?? null,
+          resultSummary: retainedResultSummary,
+          resultSizeBytes: retainedResultSummary.sizeBytes ?? null,
           completedAt: now,
           updatedAt: now,
         })
@@ -8130,7 +8330,7 @@ export function createToolGatewayService(
       await reflectToolActionInteractionLifecycle({
         actionRequestId: claimed.id,
         status: "executed",
-        resultSummary: resultValidation.summary.summary,
+        resultSummary: contentRetention === "none" ? null : retainedResultSummary.summary,
       });
       await writeToolCallEvent({
         invocationId: invocation.id,
@@ -8142,7 +8342,7 @@ export function createToolGatewayService(
         policyDecision: "allow",
         reasonCode: "approved_action_executed",
         argumentsSummary,
-        resultSummary: resultValidation.summary,
+        resultSummary: retainedResultSummary,
         metadata: {
           durationMs: Date.now() - startedAt,
           timeoutMs: executionTimeoutMs,
@@ -8157,6 +8357,7 @@ export function createToolGatewayService(
         claimUpdatedAt: claimed.updatedAt,
         expectedInvocationStatus: "executing",
         error,
+        contentRetention,
       });
       await writeToolCallEvent({
         invocationId: invocation.id,
@@ -8371,14 +8572,17 @@ export function createToolGatewayService(
     }
 
     // Recover a redacted, structured snapshot of the parameters for the
-    // "Where" row — the test-call response never echoes them back.
+    // "Where" row — the test-call response never echoes them back. A
+    // connection that keeps no content shows none.
     let parameters: Record<string, unknown> | null = null;
-    const signed = readSignedToolArgumentsPayload({
-      signedArguments: actionRequest.signedArguments,
-      invocationId: invocation.id,
-      toolName: invocation.toolName,
-      signingSecret: options.toolActionSigningSecret,
-    });
+    const signed = isUnretainedSummary(actionRequest.canonicalArgumentsSummary)
+      ? null
+      : readSignedToolArgumentsPayload({
+          signedArguments: actionRequest.signedArguments,
+          invocationId: invocation.id,
+          toolName: invocation.toolName,
+          signingSecret: options.toolActionSigningSecret,
+        });
     if (
       signed &&
       signed.arguments &&
@@ -8404,16 +8608,7 @@ export function createToolGatewayService(
     let error: ToolConnectionTestCallStatus["error"];
     if (phase === "done") {
       if (invocation.status === "succeeded") {
-        const summary = invocation.resultSummary?.summary;
-        if (typeof summary === "string") {
-          try {
-            result = JSON.parse(summary);
-          } catch {
-            result = summary;
-          }
-        } else {
-          result = null;
-        }
+        result = storedInvocationResult(invocation);
       } else {
         error = {
           message: invocation.errorMessage ?? "The call didn't complete.",
@@ -9118,6 +9313,11 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "ignore",
       });
+      const contentRetention = await toolContentRetention(input.companyId, tool);
+      const argumentsSummary = retainToolContentSummary(
+        argumentValidation.summary,
+        contentRetention,
+      );
       const decisionInput = policyInputForAgentTool({
         companyId: input.companyId,
         agentId: input.agentId,
@@ -9207,13 +9407,13 @@ export function createToolGatewayService(
         }
         const previewMarkdown = buildHumanizedActionPreview({
           tool,
-          argumentsSummary: argumentValidation.summary,
+          argumentsSummary,
         });
         await db
           .update(toolActionRequests)
           .set({
             canonicalArgumentsHash,
-            canonicalArgumentsSummary: argumentValidation.summary,
+            canonicalArgumentsSummary: argumentsSummary,
             signedArguments,
             previewMarkdown,
             expiresAt: new Date(Date.now() + 60 * 60 * 1000),
@@ -9229,7 +9429,7 @@ export function createToolGatewayService(
           toolName: tool.name,
           policyDecision: "require_approval",
           reasonCode: accessDecision.reasonCode,
-          argumentsSummary: argumentValidation.summary,
+          argumentsSummary,
           metadata: {
             source: "test",
             actionRequestId: recorded.actionRequest.id,
@@ -9238,6 +9438,7 @@ export function createToolGatewayService(
         });
         await writeAudit({
           session,
+          contentRetention,
           companyId: input.companyId,
           agentId: input.agentId,
           runId: null,
@@ -9254,7 +9455,7 @@ export function createToolGatewayService(
             matchedPolicyIds: accessDecision.matchedPolicyIds,
             tool: tool.name,
             ...toolAuditMetadata(tool),
-            argumentsSummary: argumentValidation.summary,
+            argumentsSummary,
           },
         });
         return {
@@ -9270,6 +9471,7 @@ export function createToolGatewayService(
         void emitConnectionInvoked(db, invocationId);
         await writeAudit({
           session,
+          contentRetention,
           companyId: input.companyId,
           agentId: input.agentId,
           runId: null,
@@ -9285,7 +9487,7 @@ export function createToolGatewayService(
             matchedPolicyIds: accessDecision.matchedPolicyIds,
             tool: tool.name,
             ...toolAuditMetadata(tool),
-            argumentsSummary: argumentValidation.summary,
+            argumentsSummary,
             rateLimitState: accessDecision.rateLimitState ?? null,
           },
         });
@@ -9307,7 +9509,7 @@ export function createToolGatewayService(
         companyId: input.companyId,
         agentId: input.agentId,
         userId: input.userId,
-        argumentsSummary: argumentValidation.summary,
+        argumentsSummary,
         reasonCode: accessDecision.reasonCode,
         matchedPolicyIds: accessDecision.matchedPolicyIds,
         timeoutMs: input.timeoutMs,
@@ -9430,7 +9632,16 @@ export function createToolGatewayService(
               actor: { userId: row.decidedByUserId ?? row.resolvedByUserId },
             }).catch((error) =>
               logger.warn(
-                { err: error, actionRequestId: row.id },
+                // An execution error can quote the upstream tool's output.
+                isUnretainedSummary(row.canonicalArgumentsSummary)
+                  ? {
+                      reasonCode:
+                        error instanceof ToolGatewayHttpError
+                          ? error.reasonCode
+                          : "tool_execution_failed",
+                      actionRequestId: row.id,
+                    }
+                  : { err: error, actionRequestId: row.id },
                 "Could not recover approved tool action",
               ),
             );
@@ -9479,6 +9690,10 @@ export function createToolGatewayService(
         if (rows.length < 100) break;
         cursor = rows[rows.length - 1].id;
       }
+      // Requests can settle outside the gateway (a withdrawn card, an issue
+      // closing). Drop the signed arguments of any settled request whose call
+      // keeps no content.
+      await purgeSettledUnretainedActionArguments(db);
       return { scanned };
     },
 
@@ -9768,6 +9983,9 @@ export function createToolGatewayService(
         ...input,
         decision: "rejected",
       });
+      await purgeSettledUnretainedActionArguments(db, {
+        actionRequestId: updated.id,
+      });
       await options
         .onToolActionSettled?.(updated.id)
         .catch((error) =>
@@ -9996,7 +10214,11 @@ export function createToolGatewayService(
         promptInjectionMode: "ignore",
       });
       let effectiveParameters: unknown = requestedParameters;
-      let effectiveArgumentsSummary = argumentValidation.summary;
+      // What may be stored about this call. The agent always receives the full
+      // result; only persisted summaries and error text follow this setting.
+      let contentRetention = await toolContentRetention(session.companyId, tool);
+      let effectiveArgumentsSummary: ToolRedactedValueSummary =
+        retainToolContentSummary(argumentValidation.summary, contentRetention);
 
       if (!input.approvedActionRequestId) {
         const replay = await replayMatchingAgentAction({
@@ -10366,7 +10588,15 @@ export function createToolGatewayService(
         });
         invocationId = storedInvocation.id as typeof invocationId;
         effectiveParameters = storedParameters;
-        effectiveArgumentsSummary = storedArgumentValidation.summary;
+        // Keep the retention the call was reviewed under if it was stricter.
+        contentRetention = strictestToolContentRetention(
+          contentRetention,
+          isUnretainedSummary(claimed.canonicalArgumentsSummary) ? "none" : null,
+        );
+        effectiveArgumentsSummary = retainToolContentSummary(
+          storedArgumentValidation.summary,
+          contentRetention,
+        );
         await db
           .update(toolInvocations)
           .set({
@@ -10400,6 +10630,7 @@ export function createToolGatewayService(
         if (recorded.replayed && !retryingSlackRateLimit) {
           await writeAudit({
             session,
+            contentRetention,
             companyId: session.companyId,
             agentId: session.agentId,
             runId: session.runId,
@@ -10428,7 +10659,7 @@ export function createToolGatewayService(
             session,
             tool,
             parameters: effectiveParameters,
-            argumentsSummary: argumentValidation.summary,
+            argumentsSummary: effectiveArgumentsSummary,
             policyDecision: accessDecision,
           });
         }
@@ -10438,6 +10669,7 @@ export function createToolGatewayService(
           void emitConnectionInvoked(db, invocationId);
           await writeAudit({
             session,
+            contentRetention,
             companyId: session.companyId,
             agentId: session.agentId,
             runId: session.runId,
@@ -10481,6 +10713,7 @@ export function createToolGatewayService(
 
       await writeAudit({
         session,
+        contentRetention,
         companyId: session.companyId,
         agentId: session.agentId,
         runId: session.runId,
@@ -10558,6 +10791,10 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block",
         });
+        const retainedResultSummary = retainToolContentSummary(
+          resultValidation.summary,
+          contentRetention,
+        );
         const completedAt = new Date();
         const validatedMcpResult = connectedMcpExecution
           ? asRecord(resultValidation.value)
@@ -10574,9 +10811,9 @@ export function createToolGatewayService(
           .update(toolInvocations)
           .set({
             status: "succeeded",
-            resultHash: resultValidation.summary.sha256 ?? null,
-            resultSummary: resultValidation.summary,
-            resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
+            resultHash: retainedResultSummary.sha256 ?? null,
+            resultSummary: retainedResultSummary,
+            resultSizeBytes: retainedResultSummary.sizeBytes ?? null,
             completedAt,
             updatedAt: completedAt,
           })
@@ -10613,7 +10850,7 @@ export function createToolGatewayService(
           policyDecision: input.approvedActionRequestId ? "allow" : "allow",
           reasonCode: "tool_completed",
           argumentsSummary: effectiveArgumentsSummary,
-          resultSummary: resultValidation.summary,
+          resultSummary: retainedResultSummary,
           metadata: {
             ...(virtualToolName
               ? { virtualToolName, targetToolName: tool.name }
@@ -10633,6 +10870,7 @@ export function createToolGatewayService(
 
         await writeAudit({
           session,
+          contentRetention,
           companyId: session.companyId,
           agentId: session.agentId,
           runId: session.runId,
@@ -10649,7 +10887,7 @@ export function createToolGatewayService(
             durationMs: Date.now() - startedAt,
             argumentsSummary: effectiveArgumentsSummary,
             result: summarizeResult(resultValidation.value),
-            resultSummary: resultValidation.summary,
+            resultSummary: retainedResultSummary,
             headerSummary: connectedMcpExecution?.headerSummary ?? undefined,
             execution: connectedMcpExecution?.execution ?? undefined,
           },
@@ -10698,6 +10936,13 @@ export function createToolGatewayService(
         if (reasonCode === "elicitation_required") {
           throw normalizedError;
         }
+        // The thrown error keeps the full message for the caller; what is stored
+        // follows the connection's content retention.
+        const storedMessage = retainToolErrorMessage(
+          message,
+          reasonCode,
+          contentRetention,
+        );
         const completedAt = new Date();
         await db
           .update(toolInvocations)
@@ -10709,7 +10954,7 @@ export function createToolGatewayService(
                   ? "rate_limited"
                   : "failed",
             errorCode: reasonCode,
-            errorMessage: message,
+            errorMessage: storedMessage,
             completedAt,
             updatedAt: completedAt,
           })
@@ -10735,7 +10980,7 @@ export function createToolGatewayService(
               actionRequestId: failedRequest.id,
               status: "failed",
               errorCode: reasonCode,
-              errorMessage: message,
+              errorMessage: storedMessage,
             });
           }
         }
@@ -10764,6 +11009,7 @@ export function createToolGatewayService(
         });
         await writeAudit({
           session,
+          contentRetention,
           companyId: session.companyId,
           agentId: session.agentId,
           runId: session.runId,
@@ -10781,7 +11027,7 @@ export function createToolGatewayService(
             ...toolAuditMetadata(tool),
             argumentsSummary: effectiveArgumentsSummary,
             durationMs: Date.now() - startedAt,
-            error: message,
+            error: storedMessage,
             ...(executionAuditFromError(normalizedError)
               ? { execution: executionAuditFromError(normalizedError) }
               : {}),

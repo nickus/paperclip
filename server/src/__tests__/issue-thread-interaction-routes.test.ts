@@ -1235,6 +1235,50 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
+  it("tells the agent an approved action ran when its connection keeps no call content", async () => {
+    const approveToolActionRequest = vi.fn().mockResolvedValue({
+      status: "executed",
+      resultSummary: "",
+      contentRetention: "none",
+    });
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-tool-action",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee",
+        payload: {
+          version: 1,
+          prompt: "Approve the action?",
+          toolAction: {
+            version: 1,
+            actionRequestId: "action-request-1",
+            toolName: "notes_update",
+          },
+        },
+        result: { version: 1, outcome: "accepted" },
+      },
+      createdIssues: [],
+    });
+    const app = await createApp(undefined, { approveToolActionRequest });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-tool-action/accept")
+      .send({});
+
+    expect(res.status).toBe(200);
+    const payload = mockHeartbeatService.wakeup.mock.calls[0]?.[1]?.payload;
+    expect(payload.toolAction).toEqual({
+      toolName: "notes_update",
+      actionRequestId: "action-request-1",
+      decision: "accepted",
+      executionStatus: "executed",
+      instructions: "the approved notes_update action already ran — do not call the tool again; its connection does not store call content, so the result is not recorded here. Read the current state with a read-only call if you need it.",
+    });
+  });
+
   it("wakes with failure instructions after an accepted tool action fails", async () => {
     const approveToolActionRequest = vi.fn().mockResolvedValue({
       status: "failed",
