@@ -1124,6 +1124,10 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           issueStatus: issueRow?.status ?? "",
           hasAssigneeUser: Boolean(issueRow?.assigneeUserId),
           assigneeAgentMatchesRunAgent: issueRow?.assigneeAgentId === run.agentId,
+          // Only the release after the run's hold closed lifts this gate. A
+          // drain after the executor settled (afterOwnerSettled) does not:
+          // wakes behind a run awaiting reconciliation stay parked for that
+          // afterExecutionHold release.
           legacyExecutionNeedsReconciliation: legacyExecutionNeedsReconciliation(run) && !heldRunReleased,
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it

@@ -386,6 +386,33 @@ describeEmbeddedPostgres("deferred wakes after a run hands its task to another a
     expect(await runsFor(seeded.builderId, seeded.issueId)).toHaveLength(0);
   });
 
+  it("leaves wakes parked behind a settled run whose outcome still needs reconciliation", async () => {
+    const seeded = await seed();
+    await reassignFromOwnRun({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      fromAgentId: seeded.reviewerId,
+      fromRunId: seeded.reviewerRunId,
+      toAgentId: seeded.builderId,
+    });
+    // The previous owner's run ended without proof that its provider actions
+    // settled. Its queue waits for the release after that outcome's hold,
+    // not for the drain after the executor settled.
+    await db.update(heartbeatRuns).set({
+      status: "failed",
+      errorCode: "adapter_failed",
+      resultJson: {},
+    }).where(eq(heartbeatRuns.id, seeded.reviewerRunId));
+    await settleLease(seeded.leaseId);
+
+    expect(await heartbeatService(db).promoteDeferredWakesAfterRunSettled(seeded.reviewerRunId)).toBe(true);
+    await heartbeatService(db).resumeQueuedRuns();
+
+    const [wake] = await wakesFor(seeded.builderId, seeded.issueId);
+    expect(wake!.status).toBe("deferred_issue_execution");
+    expect(await runsFor(seeded.builderId, seeded.issueId)).toHaveLength(0);
+  });
+
   it("leaves queued work parked after a Stop that did not hand the task over", async () => {
     const seeded = await seed();
     // The task belongs to the builder; the reviewer's run is only a participant.

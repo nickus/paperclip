@@ -206,7 +206,9 @@ describe("releaseIssueExecution", () => {
     expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
   });
 
-  it("cancels an assignment wake whose agent lost the task, then promotes the assignee's wake", async () => {
+  // A queue with an assignment wake for an agent that no longer owns the
+  // task, ahead of the current assignee's parked assignment wake.
+  function reassignedAssignmentQueue() {
     const stale = wakeCandidate({
       id: "wake-stale-assignment", agentId: "previous-assignee",
       reason: "issue_assigned", wakeReason: "issue_assigned", preservesIndependentContinuation: true,
@@ -221,12 +223,28 @@ describe("releaseIssueExecution", () => {
       issueLock: createFakeIssueLock(createFakeHost(), transaction, { ...ISSUE, assigneeAgentId: "new-agent" }),
       recovery: createFakeRecovery(),
     });
-    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+    return { stale, current, transaction, release };
+  }
+
+  it("cancels an assignment wake whose agent lost the task, then promotes the assignee's wake, after the executor settled", async () => {
+    const { stale, current, transaction, release } = reassignedAssignmentQueue();
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date(), afterOwnerSettled: true });
     expect(result.outcome.kind).toBe("promoted");
     expect(transaction.cancelDeferredWake).toHaveBeenCalledTimes(1);
     expect(transaction.cancelDeferredWake).toHaveBeenCalledWith(expect.objectContaining({ wakeId: stale.id }));
     expect(transaction.claimDeferredWakeForPromotion).toHaveBeenCalledTimes(1);
     expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({ wakeId: current.id }));
+  });
+
+  it("leaves assignment wakes to the ordinary drain on a run's own release", async () => {
+    const { stale, transaction, release } = reassignedAssignmentQueue();
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+    // The run's own release keeps its existing FIFO handling: nothing is
+    // cancelled for belonging to a former assignee.
+    expect(result.outcome.kind).toBe("promoted");
+    expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledTimes(1);
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({ wakeId: stale.id }));
   });
 
   it("leaves recovery to the run's own release when draining after its executor settled", async () => {

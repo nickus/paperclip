@@ -212,9 +212,13 @@ async function runReleaseDrain(
     }
 
     // An assignment wake only ever addresses the task's assignee. If the task
-    // was handed to someone else while the wake waited, it no longer applies:
-    // promoting it would start a run for an agent that does not own the task.
+    // was handed to someone else while the wake waited behind a run whose
+    // executor has since settled, it no longer applies: promoting it would
+    // start a run for an agent that does not own the task. Only the drain
+    // after the executor settled applies this; a run's own release keeps its
+    // existing queue handling.
     if (
+      input.afterOwnerSettled &&
       (candidate.wakeReason ?? candidate.reason) === "issue_assigned" &&
       candidate.agentId !== issue.assigneeAgentId
     ) {

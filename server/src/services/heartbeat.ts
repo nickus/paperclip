@@ -27114,7 +27114,14 @@ export function heartbeatService(
    * hold, or the lock, and after a Stop that did not hand the task over (that
    * queued work waits for the next explicit wake, as before). The drain claims
    * each wake under the issue lock, so concurrent callers promote it once.
-   * Returns whether it ran the drain.
+   *
+   * It is not a complete backstop: it never overrides a legacy run whose
+   * outcome needs reconciliation (legacyExecutionNeedsReconciliation, e.g. a
+   * failed or stopped run with no proof that its provider actions settled).
+   * The drain stands down for such a run even after its recovery hold is
+   * closed, and the wakes stay parked until the existing afterExecutionHold
+   * release (promoteDeferredWakesAfterExecutionHold) drains the queue.
+   * Returns whether it ran the drain, not whether the drain promoted a wake.
    */
   async function promoteDeferredWakesAfterRunSettled(runId: string) {
     const run = await getRun(runId);
