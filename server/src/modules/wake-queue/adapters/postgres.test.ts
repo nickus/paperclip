@@ -25,6 +25,7 @@ import {
 } from "./postgres.js";
 import type { WakeQueuePostgresAdapterDeps } from "./postgres.js";
 import { createReleaseIssueExecution } from "../application/use-cases.js";
+import { terminalizeLegacyExecution } from "../../../services/legacy-execution-recovery.js";
 import type { TransactionScope } from "../application/ports.js";
 
 // Proves the atomicity and company-scope properties the security review
@@ -521,6 +522,65 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, queuedId));
     await release();
     expect(drainCalls).toBe(1);
+  });
+
+  // A failed legacy run whose outcome needs reconciliation parks the queue
+  // behind it until its hold is released. Terminalization records that hold
+  // only while the run's agent still owns the open task and the run is not a
+  // superseded conversation turn; when it records none, the run's own release
+  // must drain, or the wakes behind it wait for a hold that never comes.
+  it.each([
+    { scenario: "owner", holdRecorded: true },
+    { scenario: "handed_off", holdRecorded: false },
+    { scenario: "done", holdRecorded: false },
+    { scenario: "cancelled", holdRecorded: false },
+    { scenario: "superseded_conversation", holdRecorded: false },
+  ])("stands a failed legacy run's release down only when its hold was recorded ($scenario)", async ({ scenario, holdRecorded }) => {
+    const settings = instanceSettingsService(db);
+    const original = (await settings.getExperimental()).enableAgentChat;
+    // Conversation work drains only while Agent Chat is enabled.
+    await settings.updateExperimental({ enableAgentChat: true });
+    try {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const successorId = await seedAgent({ companyId, name: "Successor" });
+      const conversation = scenario === "superseded_conversation";
+      const ownerId = scenario === "handed_off" ? successorId : agentId;
+      const issueId = await seedIssue({
+        companyId,
+        assigneeAgentId: ownerId,
+        status: scenario === "done" || scenario === "cancelled" ? scenario : "in_progress",
+      });
+      const runId = await seedRun({
+        companyId, agentId, status: "running",
+        contextSnapshot: { issueId, ...(conversation ? { conversationSessionGeneration: 1 } : {}) },
+      });
+      await db.update(issues).set({
+        executionRunId: runId,
+        executionLockedAt: new Date(),
+        // The conversation was reset while the run's turn was still live.
+        ...(conversation ? {
+          conversationAgentId: agentId, conversationUserId: "responsible-user",
+          conversationState: "active" as const, conversationSessionGeneration: 2,
+        } : {}),
+      }).where(eq(issues.id, issueId));
+      await seedDeferredWake({ companyId, agentId: ownerId, issueId });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      // The adapter failed without evidence that its provider actions settled.
+      expect(await terminalizeLegacyExecution({ db, run: run!, status: "failed", patch: { errorCode: "adapter_failed" } }))
+        .toMatchObject({ status: "failed" });
+      const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(holds).toHaveLength(holdRecorded ? 1 : 0);
+
+      let drainCalls = 0;
+      await createPostgresWakeQueueAdapter(db, stubDeps).withIssueExecutionLock({ companyId, runId, now: new Date() }, async () => {
+        drainCalls++;
+        return { outcome: { kind: "released" as const }, postCommitEffects: [] };
+      });
+      expect(drainCalls).toBe(holdRecorded ? 0 : 1);
+    } finally {
+      await settings.updateExperimental({ enableAgentChat: original });
+    }
   });
 
   // Review test (a): a foreign-company agent id produces the current failed
