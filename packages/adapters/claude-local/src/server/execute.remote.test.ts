@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -233,6 +233,98 @@ describe("claude remote execution", () => {
       localDir: workspaceDir,
       remoteDir: managedRemoteWorkspace,
     }));
+  });
+
+  it("addresses the run's managed MCP servers through the callback bridge on an SSH target", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-mcp-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    const managedRemoteWorkspace = "/remote/workspace/.paperclip-runtime/runs/run-1/workspace";
+    const remoteConfigPath = `${managedRemoteWorkspace}/.paperclip-runtime/claude/mcp-config/mcp-config.json`;
+    const servers = [
+      { name: "Paperclip projects", url: "https://paperclip.example.test/api/mcp/project-tools", token: "run-jwt-canary", connectionId: "paperclip-project-tools" },
+      { name: "paperclip-assigned", url: "https://paperclip.example.test/mcp/gateways/gw_1", token: "gateway-token-canary", connectionId: "assignment:abc" },
+    ];
+    startAdapterExecutionTargetPaperclipBridge.mockImplementationOnce((async (input: {
+      runtimeMcpServers?: typeof servers;
+    }) => ({
+      env: {
+        PAPERCLIP_API_URL: "http://127.0.0.1:4310",
+        PAPERCLIP_API_KEY: "bridge-token",
+        PAPERCLIP_API_BRIDGE_MODE: "queue_v1",
+      },
+      runtimeMcpServers: (input.runtimeMcpServers ?? []).map((server) => ({
+        ...server,
+        url: `http://127.0.0.1:4310${new URL(server.url).pathname}`,
+        token: "bridge-token",
+      })),
+      stop: async () => {},
+    })) as never);
+    const staged: string[] = [];
+    syncDirectoryToSsh.mockImplementation((async (input: { localDir: string; remoteDir: string }) => {
+      if (input.remoteDir.endsWith("/mcp-config")) {
+        staged.push(await readFile(path.join(input.localDir, "mcp-config.json"), "utf8"));
+      }
+    }) as never);
+    const logs: string[] = [];
+
+    try {
+      await execute({
+        runId: "run-1",
+        agent: { id: "agent-1", companyId: "company-1", name: "Claude Coder", adapterType: "claude_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { engine: "cli", command: "claude" },
+        context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+        executionTransport: {
+          remoteExecution: {
+            host: "127.0.0.1",
+            port: 2222,
+            username: "fixture",
+            remoteWorkspacePath: "/remote/workspace",
+            remoteCwd: "/remote/workspace",
+            privateKey: "PRIVATE KEY",
+            knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+            strictHostKeyChecking: true,
+          },
+        },
+        runtimeMcp: { getServers: () => servers.map((server) => ({ ...server })) },
+        authToken: "run-jwt-canary",
+        onLog: async (_stream, chunk) => { logs.push(chunk); },
+      });
+    } finally {
+      syncDirectoryToSsh.mockImplementation(async () => undefined);
+    }
+
+    expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledWith(expect.objectContaining({
+      runtimeMcpServers: servers,
+    }));
+    // Nothing with a server token is staged before the bridge is up.
+    expect(staged).toEqual([JSON.stringify({ mcpServers: {} })]);
+    const writes = runSshCommand.mock.calls.filter((entry) =>
+      String((entry as unknown[])[1]).includes(remoteConfigPath)) as unknown as Array<
+      [unknown, string, { stdin?: string; env?: Record<string, string> }]
+    >;
+    expect(writes).toHaveLength(1);
+    const delivered = JSON.parse(writes[0]![2].stdin ?? "{}") as {
+      mcpServers: Record<string, { url: string; headers: Record<string, string> }>;
+    };
+    expect(delivered.mcpServers["Paperclip projects"]).toMatchObject({
+      type: "http",
+      url: "http://127.0.0.1:4310/api/mcp/project-tools",
+      headers: { Authorization: "Bearer bridge-token" },
+    });
+    expect(delivered.mcpServers["paperclip-assigned"]).toMatchObject({
+      url: "http://127.0.0.1:4310/mcp/gateways/gw_1",
+      headers: { Authorization: "Bearer bridge-token" },
+    });
+    const call = runChildProcess.mock.calls.find((entry) => (entry[2] as string[]).includes("--mcp-config")) as unknown as
+      | [string, string, string[], { env: Record<string, string> }]
+      | undefined;
+    expect(call?.[2]).toEqual(expect.arrayContaining(["--mcp-config", remoteConfigPath, "--strict-mcp-config"]));
+    const everything = JSON.stringify([runSshCommand.mock.calls, call?.[2], staged, logs]);
+    expect(everything).not.toContain("gateway-token-canary");
+    expect(JSON.stringify([writes, staged])).not.toContain("run-jwt-canary");
   });
 
   it("does not resume saved Claude sessions for remote SSH execution without a matching remote identity", async () => {
