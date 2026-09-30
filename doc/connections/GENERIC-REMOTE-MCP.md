@@ -222,6 +222,14 @@ that cannot reach the server at all (connection refused, DNS or TLS failure,
 HTTP 502/503/504) mark the connection `error` until a health check or a
 successful call restores it.
 
+### Tool names and descriptions agents see
+
+`config.toolOverrides` presents an upstream tool to agents under another name
+and description, keyed by the upstream tool name, and `config.agentDisplayName`
+/ `config.agentDescription` change how the connection itself is shown to them.
+Access, review and audit keep following the generated gateway name. See
+[Presenting connected tools under other names](./TOOL-NAME-OVERRIDES.md).
+
 ## Curated definitions remain optional
 
 A curated definition matching a pasted endpoint is offered as a branded

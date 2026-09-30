@@ -174,6 +174,9 @@ not own durable tokens.
 - [Connecting any remote MCP server](./GENERIC-REMOTE-MCP.md) is the baseline:
   how an operator connects a standards-compliant remote MCP endpoint with no
   Paperclip code change, and how sign-in resolves a client.
+- [Presenting connected tools under other names](./TOOL-NAME-OVERRIDES.md)
+  covers per-tool exposed names and descriptions, and the connection name and
+  description agents see.
 - [Connection authoring runbook](./CONNECTOR-PLAYBOOK.md) is the one
   end-to-end, agent-executable guide for adding a vendor as a catalog entry on
   Apps v2: research, connection-type selection, OAuth/API-key/generated-URL
