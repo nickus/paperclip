@@ -42,6 +42,8 @@ export type PromoteScheduledRetryOutcome =
       reason: string;
       errorCode: ScheduledRetryGateErrorCode;
     }
+  /** The retry's agent is paused; the retry stays scheduled until it is resumed. */
+  | { outcome: "held_for_paused_agent"; reason: string }
   | { outcome: "not_promoted" };
 
 export type CancelStaleQueuedRunOutcome =

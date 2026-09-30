@@ -322,7 +322,10 @@ export function createPostgresRunDispatchAdapter(
     facts.agentInvokabilityInvalidOrgChain = agentInvokability.invokable
       ? false
       : agentInvokability.invalidOrgChain;
-    if (!facts.agentInvokable) return { agentFound: true, facts };
+    // A paused agent's retry waits instead, so read on: any other rule may
+    // still suppress it.
+    facts.agentPaused = !agentInvokability.invokable && agentInvokability.reason === "paused";
+    if (!facts.agentInvokable && !facts.agentPaused) return { agentFound: true, facts };
 
     facts.heartbeatWakeOnDemandEnabled = isHeartbeatWakeOnDemandEnabled(agent);
     if (!facts.heartbeatWakeOnDemandEnabled) return { agentFound: true, facts };
@@ -488,6 +491,12 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.status, "scheduled_retry"),
           lte(heartbeatRuns.scheduledRetryAt, input.now),
           input.cutoff ? gte(heartbeatRuns.createdAt, input.cutoff) : undefined,
+          // A paused agent's retries wait for the agent to be resumed; leave
+          // them out so they never crowd other due retries out of a sweep.
+          sql`not exists (
+            select 1 from ${agents}
+            where ${agents.id} = ${heartbeatRuns.agentId} and ${agents.status} = 'paused'
+          )`,
         ),
       )
       .orderBy(
@@ -821,6 +830,18 @@ export function createPostgresRunDispatchAdapter(
               telemetryRun: cancelled.run,
             }
           : { outcome: { outcome: "not_promoted" as const }, telemetryRun: null };
+      }
+
+      // A paused agent's retry stays scheduled. The first sweep after the
+      // agent is resumed promotes it, or suppresses it under the rules above.
+      if (factsResult.facts.agentPaused) {
+        return {
+          outcome: {
+            outcome: "held_for_paused_agent" as const,
+            reason: "Scheduled retry waits until the agent is resumed",
+          },
+          telemetryRun: null,
+        };
       }
 
       const promoted = await promoteDueRetryInTx(tx as unknown as Db, {

@@ -87,6 +87,12 @@ export type ScheduledRetryFacts = {
   agentInvokable: boolean;
   agentInvokabilityDetails: Record<string, unknown>;
   agentInvokabilityInvalidOrgChain: boolean;
+  /**
+   * The agent is not invokable only because it is paused. A pause is
+   * temporary, so it never suppresses the retry; the caller holds its
+   * promotion until the agent is resumed.
+   */
+  agentPaused?: boolean;
 
   heartbeatWakeOnDemandEnabled: boolean;
 
@@ -254,7 +260,8 @@ function decideReviewParticipant(
 /**
  * Decides whether a due scheduled retry may promote to a queued run. The
  * caller passes now for signature symmetry with future clock-dependent
- * rules; today's rules need no clock read.
+ * rules; today's rules need no clock read. A paused agent does not suppress
+ * the retry (see `agentPaused`); every other rule still applies to it.
  */
 export function decideScheduledRetryGate(
   facts: ScheduledRetryFacts,
@@ -273,7 +280,7 @@ export function decideScheduledRetryGate(
     };
   }
 
-  if (!facts.agentInvokable) {
+  if (!facts.agentInvokable && !facts.agentPaused) {
     return {
       allowed: false,
       reason: "Scheduled retry suppressed because the agent is not invokable",

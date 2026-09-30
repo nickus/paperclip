@@ -244,7 +244,7 @@ export interface WakeQueueTransaction {
  */
 export interface IssueLockWriter {
   withIssueExecutionLock(
-    input: { companyId: string; runId: string; now: Date; afterExecutionHold?: boolean; afterOwnerSettled?: boolean },
+    input: { companyId: string; runId: string; now: Date; afterExecutionHold?: boolean; afterOwnerSettled?: boolean; afterAgentResumed?: boolean },
     fn: (
       locked: LockedIssueExecution,
       ports: { host: WakeQueueHost; transaction: WakeQueueTransaction },

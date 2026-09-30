@@ -399,6 +399,23 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       });
     });
 
+    it("does not block a scheduled retry because its agent is paused", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date() }).where(eq(agents.id, agentId));
+      const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId } });
+
+      const result = await createPostgresRunDispatchAdapter(db).evaluateScheduledRetryGate({
+        runId,
+        companyId,
+        retryReasonOverride: "other",
+        now: new Date(),
+      });
+
+      expect(result).toEqual({ allowed: true });
+    });
+
     it("maps an active subtree pause hold into a blocked scheduled-retry gate decision", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const issueId = randomUUID();
@@ -735,6 +752,49 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       expect(outcome.outcome).toBe("promoted");
       const [row] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       expect(row?.status).toBe("queued");
+    });
+
+    it("holds a paused agent's due retry, and promotes it once the agent is resumed", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      await seedScheduledRetryRun({ runId, companyId, agentId, issueId, now });
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+      await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: now }).where(eq(agents.id, agentId));
+      const adapter = createPostgresRunDispatchAdapter(db);
+
+      expect(await adapter.listDueRetries({ now, cutoff: null, limit: 50 })).toEqual([]);
+      const held = await adapter.promoteOrCancelDueRetry({ runId, companyId, now });
+
+      expect(held.outcome).toBe("held_for_paused_agent");
+      const [heldRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(heldRow).toMatchObject({ status: "scheduled_retry", error: null, errorCode: null });
+
+      await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null }).where(eq(agents.id, agentId));
+      expect(await adapter.listDueRetries({ now, cutoff: null, limit: 50 })).toEqual([{ runId, companyId }]);
+      const resumed = await adapter.promoteOrCancelDueRetry({ runId, companyId, now });
+
+      expect(resumed.outcome).toBe("promoted");
+      const [promotedRow] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(promotedRow?.status).toBe("queued");
+    });
+
+    it("still cancels a paused agent's due retry that another rule suppresses", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date();
+      await seedIssue({ companyId, issueId, status: "cancelled", assigneeAgentId: agentId });
+      await seedScheduledRetryRun({ runId, companyId, agentId, issueId, now });
+      await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: now }).where(eq(agents.id, agentId));
+
+      const outcome = await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ runId, companyId, now });
+
+      expect(outcome).toMatchObject({ outcome: "gate_suppressed", errorCode: "issue_cancelled" });
+      const [row] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(row?.status).toBe("cancelled");
     });
 
     it("cancels a due retry a pause hold blocks", async () => {

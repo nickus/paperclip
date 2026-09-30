@@ -4497,6 +4497,17 @@ export function recoveryService(
         agent && agent.companyId === issue.companyId
           ? await isAgentInvokable(agent)
           : false;
+      // A paused agent's live, queued or scheduled run, or a wake held for
+      // it, is work waiting for the agent to be resumed; the task is not
+      // stranded, so it is not escalated for the pause alone.
+      if (
+        agent?.status === "paused" &&
+        agent.companyId === issue.companyId &&
+        (await hasActiveExecutionPath(issue.companyId, issue.id, agentId))
+      ) {
+        result.skipped += 1;
+        continue;
+      }
       if (
         agent?.status === "paused" &&
         agent.companyId === issue.companyId &&

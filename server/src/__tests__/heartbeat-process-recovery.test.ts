@@ -8920,6 +8920,43 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakes).toHaveLength(0);
   });
 
+  it.each(["running", "queued"] as const)(
+    "leaves a paused agent's task alone while its %s run waits for the agent",
+    async (runStatus) => {
+      const { issueId } = await seedRunFixture({ agentStatus: "paused", runStatus });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.escalated).toBe(0);
+      expect(result.issueIds).not.toContain(issueId);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue?.status).toBe("in_progress");
+      expect(
+        await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)),
+      ).toHaveLength(0);
+    },
+  );
+
+  it("leaves a paused agent's task alone while a wake is held for the agent", async () => {
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture({ agentStatus: "paused" });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      reason: "issue_commented",
+      status: "deferred_issue_execution",
+      payload: { issueId },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue?.status).toBe("todo");
+  });
+
   it("re-enqueues assigned todo work when the last issue run died and no wake remains", async () => {
     const { companyId, agentId, issueId, runId } =
       await seedStrandedIssueFixture({

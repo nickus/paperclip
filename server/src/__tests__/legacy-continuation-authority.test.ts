@@ -102,7 +102,8 @@ describe("legacy continuation persisted authority", () => {
     if (gate === "reassigned") await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, f.issueId));
     expect(await f.createRecovery().legacyRepairDispatchBlock(second.id)).not.toBeNull();
     expect((await heartbeatService(db).promoteDueScheduledRetries(new Date(second.scheduledRetryAt!.getTime() + 1))).runIds).not.toContain(second.id);
-    expect((await f.runs()).find(r => r.id === second.id)?.status).toBe("cancelled");
+    // A paused agent's repair waits for the agent to be resumed; every other gate suppresses it.
+    expect((await f.runs()).find(r => r.id === second.id)?.status).toBe(gate === "pause" ? "scheduled_retry" : "cancelled");
     await f.createRecovery().reconcileLegacyContinuation(first.id);
     expect(await f.runs()).toHaveLength(3);
     expect((await f.actions())[0].attemptCount).toBe(2);
