@@ -16,6 +16,23 @@ interface JsonPayloadOptions extends CompanyOptions {
   payloadJson?: string;
 }
 
+interface TaskDrainStartOptions extends BaseClientOptions {
+  ttlMs?: string;
+  persistAcrossRestart?: boolean;
+}
+
+interface TaskDrainWaitOptions extends BaseClientOptions {
+  timeoutSec?: string;
+  intervalSec?: string;
+}
+
+type TaskDrainStatus = {
+  draining?: boolean;
+  quiescent?: boolean;
+  activeRuns?: number;
+  pendingWakes?: number;
+};
+
 interface QueryOptions extends CompanyOptions {
   query?: string;
   status?: string;
@@ -268,6 +285,7 @@ export function registerAccessCommands(program: Command): void {
   addJsonPatch(instance, "settings:general:update", "Update general instance settings", "/api/instance/settings/general");
   addSimpleGet(instance, "settings:experimental", "Get experimental instance settings", "/api/instance/settings/experimental");
   addJsonPatch(instance, "settings:experimental:update", "Update experimental instance settings", "/api/instance/settings/experimental");
+  addTaskDrainCommands(instance);
   addCommonClientOptions(
     instance
       .command("database-backup")
@@ -383,6 +401,93 @@ function addWhoamiCommand(parent: Command): void {
 function normalizeJoinStatus(status: string | undefined): string | undefined {
   if (status === "pending") return "pending_approval";
   return status;
+}
+
+function parsePositiveNumber(value: string, flag: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${flag} must be a positive number`);
+  return parsed;
+}
+
+// A task drain holds new run admission in the server process: running runs
+// finish, and new wakes and queued runs wait until the drain ends. Before a
+// restart: start a drain, wait until the process is quiescent, restart, and
+// stop the drain (a restart ends a drain unless it persists across restarts).
+function addTaskDrainCommands(instance: Command): void {
+  addSimpleGet(
+    instance,
+    "task-drain",
+    "Get the task-drain status: active runs and pending wakes in this server process",
+    "/api/instance/task-drain",
+  );
+  addCommonClientOptions(
+    instance
+      .command("task-drain:start")
+      .description("Start a task drain: hold new run admission while running runs finish")
+      .option("--ttl-ms <ms>", "End the drain automatically after this many milliseconds")
+      .option("--persist-across-restart", "Keep holding run admission after a server restart, until the drain is stopped")
+      .action(async (opts: TaskDrainStartOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const body: Record<string, unknown> = {};
+          if (opts.ttlMs !== undefined) {
+            const ttlMs = parsePositiveNumber(opts.ttlMs, "--ttl-ms");
+            if (!Number.isInteger(ttlMs)) throw new Error("--ttl-ms must be a whole number of milliseconds");
+            body.ttlMs = ttlMs;
+          }
+          if (opts.persistAcrossRestart) body.persistAcrossRestart = true;
+          printOutput(await ctx.api.post("/api/instance/task-drain", body), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+  addCommonClientOptions(
+    instance
+      .command("task-drain:wait")
+      .description("Wait until the draining server process has no active run or pending wake")
+      .option("--timeout-sec <seconds>", "Fail after this many seconds", "1800")
+      .option("--interval-sec <seconds>", "Seconds between status checks", "5")
+      .action(async (opts: TaskDrainWaitOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const timeoutMs = parsePositiveNumber(opts.timeoutSec ?? "1800", "--timeout-sec") * 1000;
+          const intervalMs = parsePositiveNumber(opts.intervalSec ?? "5", "--interval-sec") * 1000;
+          const deadline = Date.now() + timeoutMs;
+          for (;;) {
+            const status = await ctx.api.get<TaskDrainStatus>("/api/instance/task-drain");
+            // Without a drain, new runs can start at any moment, so an idle
+            // reading would not mean it is safe to restart.
+            if (!status?.draining) throw new Error("No task drain is active; start one with `instance task-drain:start`.");
+            if (status.quiescent) {
+              printOutput(status, { json: ctx.json });
+              return;
+            }
+            if (Date.now() + intervalMs > deadline) {
+              throw new Error(
+                `Timed out waiting for the task drain: ${status.activeRuns ?? "?"} active run(s), ${status.pendingWakes ?? "?"} pending wake(s).`,
+              );
+            }
+            await new Promise((resolve) => setTimeout(resolve, intervalMs));
+          }
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+  addCommonClientOptions(
+    instance
+      .command("task-drain:stop")
+      .description("Stop the task drain and restore run admission")
+      .action(async (opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          printOutput(await ctx.api.delete("/api/instance/task-drain"), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
 }
 
 function addSimpleGet(parent: Command, name: string, description: string, path: string): void {

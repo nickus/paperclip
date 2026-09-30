@@ -15,7 +15,17 @@ Every control-plane restart hard-kills any heartbeat run in flight at that momen
    SELECT count(*) FROM heartbeat_runs WHERE status = 'running';
    ```
 
-3. **Drain before restart (upcoming).** Graceful SIGTERM drain — stop accepting new runs, let in-flight runs finish or checkpoint, then exit — is being added in PAP-12930. Once it lands, send SIGTERM and wait for drain instead of hard-restarting. Until then, rule 2 is your drain.
+3. **Drain before restart.** A task drain holds new run admission for the server process: running runs finish normally, while new wakes and queued runs stay queued and start once the drain ends. Nothing is cancelled, unlike pausing every agent. Start a drain, wait until the process is quiescent, then restart (instance-admin access):
+
+   ```sh
+   npx paperclipai instance task-drain:start
+   npx paperclipai instance task-drain:wait    # returns once no run or wake is active
+   # restart the server
+   ```
+
+   A drain lives in process memory, so the restart ends it and the new process resumes queued work at once. To keep admission held after the restart (for example, to check the upgrade first), start the drain with `--persist-across-restart` and end it with `npx paperclipai instance task-drain:stop` when ready. The same operations are `GET`, `POST` (body `{ "ttlMs"?, "persistAcrossRestart"? }`) and `DELETE` on `/api/instance/task-drain`.
+
+   To stop a single agent, pause it with `{ "afterCurrentRun": true }` (CLI: `agent pause <agent-id> --after-current-run`): its live run finishes, and its queued work waits for resume.
 4. **After any restart, glance at the damage.** See the detection queries below; confirm lost runs either retried successfully or get manual follow-up.
 
 ## How to spot a restart burst

@@ -133,6 +133,72 @@ describe("access parity commands", () => {
       ["GET", "http://localhost:3100/api/llms/agent-configuration/codex_local.txt"],
     ]);
   });
+
+  describe("instance task drain", () => {
+    const status = (overrides: Record<string, unknown>) => ({
+      draining: true,
+      startedAt: "2026-03-01T00:00:00.000Z",
+      expiresAt: null,
+      persistAcrossRestart: false,
+      activeRuns: 0,
+      pendingWakes: 0,
+      quiescent: true,
+      ...overrides,
+    });
+
+    it("reads, starts, and stops the drain", async () => {
+      const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await run(["instance", "task-drain"]);
+      await run(["instance", "task-drain:start"]);
+      await run(["instance", "task-drain:start", "--ttl-ms", "600000", "--persist-across-restart"]);
+      await run(["instance", "task-drain:stop"]);
+
+      expect(fetchMock.mock.calls.map((call) => [
+        call[1]?.method ?? "GET",
+        call[0],
+        call[1]?.body === undefined ? undefined : JSON.parse(String(call[1].body)),
+      ])).toEqual([
+        ["GET", "http://localhost:3100/api/instance/task-drain", undefined],
+        ["POST", "http://localhost:3100/api/instance/task-drain", {}],
+        ["POST", "http://localhost:3100/api/instance/task-drain", { ttlMs: 600000, persistAcrossRestart: true }],
+        ["DELETE", "http://localhost:3100/api/instance/task-drain", undefined],
+      ]);
+    });
+
+    it("waits until the draining process is quiescent", async () => {
+      const readings = [
+        status({ activeRuns: 2, quiescent: false }),
+        status({ activeRuns: 1, pendingWakes: 1, quiescent: false }),
+        status({}),
+      ];
+      const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(readings.shift())));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await run(["instance", "task-drain:wait", "--interval-sec", "0.01"]);
+
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(readings).toEqual([]);
+    });
+
+    it.each([
+      ["no drain is active", status({ draining: false }), "No task drain is active"],
+      ["the timeout passes", status({ activeRuns: 1, quiescent: false }), "Timed out waiting for the task drain: 1 active run(s)"],
+    ])("fails when %s", async (_label, reading, message) => {
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(reading))));
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+        throw new Error(`exit ${code}`);
+      }) as typeof process.exit);
+
+      await expect(
+        run(["instance", "task-drain:wait", "--timeout-sec", "0.05", "--interval-sec", "0.01"]),
+      ).rejects.toThrow("exit 1");
+      expect(exitSpy).toHaveBeenCalledWith(1);
+      expect(String(errorSpy.mock.calls[0]?.[0])).toContain(message);
+    });
+  });
 });
 
 function jsonResponse(body: unknown = { ok: true }, init: ResponseInit = { status: 200 }): Response {
