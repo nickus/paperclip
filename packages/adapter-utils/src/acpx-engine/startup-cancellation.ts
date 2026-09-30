@@ -8,9 +8,10 @@ export function cancellableSandboxStartup(ctx: AdapterExecutionContext) {
   const signal = ctx.signal;
   const stop = ctx.stopRemoteStartup;
   if (!signal || !stop || target?.kind !== "remote" || target.transport !== "sandbox" || !target.runner) {
-    return { context: ctx, stopAcknowledged: () => false, finish: async () => {} };
+    return { context: ctx, stopAcknowledged: () => false, handOff: () => {}, finish: async () => {} };
   }
   let armed = true;
+  let handedOff = false;
   let stopping: Promise<void> | undefined;
   let stopAcknowledged = false;
   const inFlight = new Set<Promise<unknown>>();
@@ -83,11 +84,19 @@ export function cancellableSandboxStartup(ctx: AdapterExecutionContext) {
   return {
     context: { ...ctx, executionTarget: { ...target, runner } },
     stopAcknowledged: () => stopAcknowledged,
+    /** The wrapped code took over cancellation itself: later aborts are its
+     * own to handle. A stop that already started keeps ownership of the
+     * calls it abandoned, and `finish` still waits for it. */
+    handOff() {
+      signal.removeEventListener("abort", onAbort);
+      armed = false;
+      handedOff = true;
+    },
     async finish() {
       signal.removeEventListener("abort", onAbort);
       armed = false;
       if (stopping) await joinStop();
-      signal.throwIfAborted();
+      if (!handedOff) signal.throwIfAborted();
     },
   };
 }
