@@ -17,7 +17,11 @@ describe("legacy continuation persisted authority", () => {
     await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer", status: "idle", adapterType: "codex_local", runtimeConfig: { heartbeat: { wakeOnDemand: true } } });
     await db.insert(issues).values({ id: issueId, companyId, title: "Implement export", status: "in_progress", assigneeAgentId: agentId, responsibleUserId: "fixture-owner" });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", status: "succeeded", runtimeMode: "legacy", continuationAttempt, contextSnapshot: { issueId, ...context }, livenessState: "blocked", resultJson: { summary: "All done. Need approval. I will continue." } });
-    const createRecovery = (afterEnqueue?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>) => recoveryService(db, {
+    const createRecovery = (
+      afterEnqueue?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>,
+      seams: Pick<Parameters<typeof recoveryService>[1], "beforeReturnToRestWrite"> = {},
+    ) => recoveryService(db, {
+      ...seams,
       enqueueWakeup: async (targetAgentId, opts) => db.transaction(async tx => {
         const [wake] = await tx.insert(agentWakeupRequests).values({ companyId, agentId: targetAgentId, source: "automation", reason: opts?.reason, payload: opts?.payload, idempotencyKey: opts?.idempotencyKey, status: "queued" }).returning();
         const [run] = await tx.insert(heartbeatRuns).values({ companyId, agentId: targetAgentId, invocationSource: "automation", status: "queued", runtimeMode: "legacy", wakeupRequestId: wake.id, contextSnapshot: opts?.contextSnapshot }).returning();
@@ -341,6 +345,26 @@ describe("legacy continuation persisted authority", () => {
       expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("skipped");
       expect(await issueStatus(f.issueId)).toBe("in_progress");
       expect(await restActivity(f.companyId)).toHaveLength(0);
+    });
+
+    it.each(["monitor", "conversation", "status"])("keeps the issue in place when a %s write lands between the decision and the rest write", async change => {
+      const f = await harnessCheckedOutFixture();
+      const recovery = f.createRecovery(undefined, {
+        beforeReturnToRestWrite: async issueId => {
+          // A past-due check is not a durable path for the source-state scan,
+          // so only the row-gate recheck under the lock can see it.
+          if (change === "monitor") await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() - 1_000) }).where(eq(issues.id, issueId));
+          if (change === "conversation") await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "fixture-owner", conversationState: "active" }).where(eq(issues.id, issueId));
+          if (change === "status") {
+            await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+            await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+          }
+        },
+      });
+      expect(await recovery.reconcileLegacyContinuation(f.runId)).toBe("skipped");
+      expect(await issueStatus(f.issueId)).toBe("in_progress");
+      expect(await restActivity(f.companyId)).toHaveLength(0);
+      expect(await repairWakes(f.companyId)).toHaveLength(0);
     });
 
     it("resolves the agent's open repair action as covered and lets a reserved repair run", async () => {

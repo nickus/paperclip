@@ -929,6 +929,8 @@ export function recoveryService(
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    /** Test seam: runs after a rest decision, before the locked rest write. */
+    beforeReturnToRestWrite?: (issueId: string) => Promise<void>;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -3717,6 +3719,19 @@ export function recoveryService(
     return HARNESS_REST_STATUSES.find((status) => status === fromStatus) ?? null;
   }
 
+  /**
+   * The continuation gates stored on the issue row itself. Every writer of
+   * these columns updates the row, so a check made while holding the row lock
+   * sees the committed value (see returnIssueToRest).
+   */
+  function issueRowContinuationGates(issue: typeof issues.$inferSelect) {
+    return {
+      pendingWait: parseIssueExecutionState(issue.executionState)?.status === "pending" || Boolean(issue.monitorNextCheckAt),
+      ownedLifecycle: isPluginManagedIssueLifecycle(issue),
+      conversation: Boolean(issue.conversationAgentId) || isWaitingConversation(issue),
+    };
+  }
+
   async function decidePersistedLegacyContinuation(
     issue: typeof issues.$inferSelect,
     runId: string,
@@ -3746,18 +3761,19 @@ export function recoveryService(
       harnessCheckoutRestStatus(issue, run.agentId),
     ]);
     const ownsRepair = active?.kind === "deliberate_wait_without_target" && active.ownerType === "agent";
+    const rowGates = issueRowContinuationGates(issue);
     return decideLegacyContinuation({
       run, issue, agent, episode, restStatus,
       gates: {
         stopped: stop.kind !== "clear" || isOperatorCancelledRun(run, run.agentId),
         paused: pause, budgetBlocked: budget,
-        pendingWait: state.hasDurableWaitingPath || durableWait || parseIssueExecutionState(issue.executionState)?.status === "pending" || Boolean(issue.monitorNextCheckAt),
+        pendingWait: state.hasDurableWaitingPath || durableWait || rowGates.pendingWait,
         activeExecution: state.hasActiveExecutionPath || latest?.id !== (dispatchRunId ?? run.id),
         ownedLifecycle: run.issueCommentStatus === "retry_queued" || run.issueCommentStatus === "retry_exhausted" ||
           Boolean(readNonEmptyString(context.goalControlRequestId)) || context.resumeSessionGoalHeartbeat === true ||
-          isPluginManagedIssueLifecycle(issue) || routine.length > 0 || workspaceChildren.length > 0 ||
+          rowGates.ownedLifecycle || routine.length > 0 || workspaceChildren.length > 0 ||
           Boolean(goal[0]?.status && goal[0].status !== "complete") || Boolean(active && !ownsRepair),
-        conversation: Boolean(issue.conversationAgentId) || isWaitingConversation(issue),
+        conversation: rowGates.conversation,
         agentInvokable: Boolean(agent && await isAgentInvokable(agent) && isHeartbeatWakeOnDemandEnabled(agent)),
       },
     });
@@ -3942,14 +3958,28 @@ export function recoveryService(
 
   /**
    * Return an issue the harness checked out of a resting status back to it.
-   * Rechecked under the issue lock: a status, owner, run or wait committed
-   * since the decision keeps the issue where it is.
+   *
+   * Rechecked under the issue row lock: a status or owner change, a live run
+   * or queued wake, a durable wait, or any gate stored on the issue row
+   * (monitor, pending execution stage, conversation) committed since the
+   * decision keeps the issue where it is.
+   *
+   * The gates kept in other tables (stop, pause hold, budget, agent
+   * invokability, routine/goal/child lifecycles) are evaluated once, by the
+   * decision just before this call, and are not re-derived here. Their
+   * writers do not take this row lock, so re-reading them would narrow the
+   * window without closing it. In this decision each of them only holds back
+   * a repair wake, and resting wakes no one: it restores the status the
+   * harness checkout moved the issue out of. The repair path rechecks the
+   * same gates again at dispatch because a repair can sit queued, or wait out
+   * a retry backoff, before it runs; resting has no such gap.
    */
   async function returnIssueToRest(
     issue: typeof issues.$inferSelect,
     latestRun: NonNullable<LatestIssueRun>,
     status: HarnessRestStatus,
   ): Promise<"rested" | "skipped"> {
+    await deps.beforeReturnToRestWrite?.(issue.id);
     const publications: ActivityPublication[] = [];
     const postCommitActions: IssuePostCommitAction[] = [];
     const rested = await db.transaction(async (tx) => {
@@ -3968,6 +3998,8 @@ export function recoveryService(
         locked.assigneeUserId
       )
         return false;
+      const rowGates = issueRowContinuationGates(locked);
+      if (rowGates.pendingWait || rowGates.ownedLifecycle || rowGates.conversation) return false;
       const paths = await collectDispositionRepairSourceState(tx as unknown as Db, { issue: locked });
       if (paths.hasActiveExecutionPath || paths.hasDurableWaitingPath) return false;
       const updated = await issuesSvc.update(locked.id, { status }, tx, publications, postCommitActions);
