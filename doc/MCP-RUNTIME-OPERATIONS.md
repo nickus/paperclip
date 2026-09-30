@@ -6,6 +6,8 @@ Do not print raw bearer tokens, gateway session tokens, credential headers, envi
 
 Tool action approvals require `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` to be set independently from auth/JWT secrets. `paperclipai onboard` generates it for local instances, and worktree setup propagates or generates an independent value in the worktree `.env`; operator-managed deployments must set it explicitly. Rotate it deliberately: changing it invalidates outstanding signed tool-action approvals, so drain or reject pending approvals before rotation.
 
+Set `PAPERCLIP_TOOL_CONTENT_RETENTION_DEFAULT=none` to keep tool-call records free of argument and result text for every connection that does not choose for itself with `config.contentRetention`; see [Content retention](./connections/GENERIC-REMOTE-MCP.md#content-retention). Unset, calls keep redacted summaries.
+
 ## Support Matrix
 
 | Transport | Local trusted | Hosted cloud / public authenticated | Notes |
