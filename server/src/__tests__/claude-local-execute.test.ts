@@ -1670,6 +1670,87 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
     }
   });
 
+  it("waits for the prompt's turn when a resumed session first answers stale task notifications with a zero-turn result", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-stale-task-notifications-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    // The stream shape of a resumed session whose previous process exited
+    // while background tasks were running: the CLI reports those tasks as
+    // stopped, prints an empty zero-turn result for them, then starts the turn
+    // for the prompt. That turn starts a background task that keeps the CLI
+    // running after its result.
+    await fs.writeFile(
+      commandPath,
+      `#!/usr/bin/env node
+const sessionId = "abababab-abab-4bab-8bab-abababababab";
+const emit = (event) => process.stdout.write(JSON.stringify({ session_id: sessionId, ...event }) + "\\n");
+require("node:fs").readFileSync(0, "utf8");
+emit({ type: "system", subtype: "task_notification", task_id: "task-1", status: "stopped", summary: "Orphaned by a previous Claude Code process exit." });
+emit({ type: "system", subtype: "init", model: "claude-sonnet" });
+emit({ type: "result", subtype: "success", is_error: false, num_turns: 0, result: "" });
+emit({ type: "system", subtype: "init", model: "claude-sonnet" });
+setTimeout(() => {
+  emit({ type: "assistant", message: { content: [{ type: "text", text: "Handled the prompt." }] } });
+  emit({ type: "result", subtype: "success", is_error: false, num_turns: 2, result: "Handled the prompt.", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } });
+  setInterval(() => {}, 1000);
+}, 500);
+`,
+      "utf8",
+    );
+    await fs.chmod(commandPath, 0o755);
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-claude-stale-task-notifications",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+          terminalResultCleanupGraceMs: 50,
+          graceSec: 1,
+          timeoutSec: 20,
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.timedOut).toBe(false);
+      expect(result.errorMessage).toBeNull();
+      expect(result.summary).toBe("Handled the prompt.");
+      expect(result.resultJson).toMatchObject({
+        num_turns: 2,
+        unmanagedBackgroundTask: {
+          kind: "terminal_result_cleanup",
+          stopped: true,
+          terminalResultSeen: true,
+        },
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("classifies rate-limit / overloaded failures without reset metadata as transient", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-rate-limit-"));
     const workspace = path.join(root, "workspace");

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   claudeModelUsageTotals,
+  hasClaudeTerminalResult,
+  isClaudeNoopTurnResult,
   parseClaudeStreamJson,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -565,5 +567,65 @@ describe("parseClaudeStreamJson usage extraction", () => {
       cachedInputTokens: 20,
     });
     expect(parsed.usageBasis).toBe("per_run");
+  });
+});
+
+describe("hasClaudeTerminalResult", () => {
+  const line = (event: Record<string, unknown>) => `${JSON.stringify(event)}\n`;
+  const staleTaskNotification = line({
+    type: "system",
+    subtype: "task_notification",
+    task_id: "task-1",
+    status: "stopped",
+    summary: "Orphaned by a previous Claude Code process exit.",
+  });
+  const init = line({ type: "system", subtype: "init", session_id: "sess-1" });
+  const zeroTurnResult = line({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    num_turns: 0,
+    result: "",
+    session_id: "sess-1",
+  });
+
+  it("does not treat the zero-turn result for stale task notifications as the end of the turn", () => {
+    const stdout = staleTaskNotification + init + zeroTurnResult + init;
+    expect(hasClaudeTerminalResult(stdout)).toBe(false);
+    // The run's final result is still read from the full stream, so a run that
+    // never gets further keeps reporting what the CLI printed.
+    expect(parseClaudeStreamJson(stdout).resultJson).toMatchObject({ num_turns: 0 });
+  });
+
+  it("detects the prompt's result that follows the zero-turn result", () => {
+    const stdout =
+      staleTaskNotification +
+      init +
+      zeroTurnResult +
+      init +
+      line({ type: "assistant", session_id: "sess-1", message: { content: [{ type: "text", text: "done" }] } }) +
+      line({ type: "result", subtype: "success", is_error: false, num_turns: 3, result: "done", session_id: "sess-1" });
+    expect(hasClaudeTerminalResult(stdout)).toBe(true);
+  });
+
+  it("treats results that ran a turn, failed, or carry no turn count as terminal", () => {
+    expect(hasClaudeTerminalResult(line({ type: "result", subtype: "success", num_turns: 1, result: "ok" }))).toBe(true);
+    expect(hasClaudeTerminalResult(line({ type: "result", subtype: "success", result: "ok" }))).toBe(true);
+    expect(
+      hasClaudeTerminalResult(line({ type: "result", subtype: "error_during_execution", is_error: true, num_turns: 0 })),
+    ).toBe(true);
+    expect(hasClaudeTerminalResult(line({ type: "result", subtype: "success", is_error: true, num_turns: 0 }))).toBe(true);
+  });
+
+  it("ignores output without a result event", () => {
+    expect(hasClaudeTerminalResult(staleTaskNotification + init)).toBe(false);
+    expect(hasClaudeTerminalResult("not json\n")).toBe(false);
+  });
+
+  it("identifies only successful zero-turn results as no-op turns", () => {
+    expect(isClaudeNoopTurnResult({ type: "result", subtype: "success", is_error: false, num_turns: 0 })).toBe(true);
+    expect(isClaudeNoopTurnResult({ type: "result", subtype: "success", num_turns: 2 })).toBe(false);
+    expect(isClaudeNoopTurnResult({ type: "result", subtype: "error_max_turns", num_turns: 0 })).toBe(false);
+    expect(isClaudeNoopTurnResult({ type: "assistant", num_turns: 0 })).toBe(false);
   });
 });
