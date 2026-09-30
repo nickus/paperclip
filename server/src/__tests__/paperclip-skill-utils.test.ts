@@ -539,6 +539,27 @@ describe("paperclip skill utils", () => {
     // paperclip-issue-update-helper.test.ts against a live local server.
   });
 
+  it("ships every helper script the Paperclip skill tells agents to run", async () => {
+    const skillRoot = path.resolve("skills/paperclip");
+    const referenceFiles = (await fs.readdir(path.join(skillRoot, "references")))
+      .filter((name) => name.endsWith(".md"))
+      .map((name) => path.join("references", name));
+    const referenced = new Set<string>();
+    for (const file of ["SKILL.md", ...referenceFiles]) {
+      const body = await fs.readFile(path.join(skillRoot, file), "utf8");
+      for (const match of body.matchAll(/\bscripts\/([A-Za-z0-9._-]+\.sh)\b/g)) referenced.add(match[1]!);
+    }
+
+    expect([...referenced]).toEqual(
+      expect.arrayContaining(["paperclip-issue-update.sh", "paperclip-upload-artifact.sh"]),
+    );
+    // Relative helper paths in the skill resolve against the installed skill
+    // directory, which only carries what lives under skills/paperclip.
+    for (const name of referenced) {
+      await expect(fs.access(path.join(skillRoot, "scripts", name)), name).resolves.toBeUndefined();
+    }
+  });
+
   it("keeps the create-issue-interaction-ui guide as a maintainer-only skill", async () => {
     const skillPath = path.resolve(".agents/skills/create-issue-interaction-ui/SKILL.md");
     const skillBody = await fs.readFile(skillPath, "utf8");
