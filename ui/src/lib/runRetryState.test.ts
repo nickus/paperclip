@@ -25,6 +25,23 @@ describe("runRetryState", () => {
     });
   });
 
+  it("describes time-cap continuations as continuations", () => {
+    expect(formatRetryReason("time_cap_continuation")).toBe("Time-cap continuation");
+    expect(
+      describeRunRetryState({
+        status: "scheduled_retry",
+        retryOfRunId: "run-time-cap",
+        scheduledRetryAttempt: 1,
+        scheduledRetryReason: "time_cap_continuation",
+        scheduledRetryAt: "2026-04-18T20:15:00.000Z",
+      }),
+    ).toMatchObject({
+      kind: "scheduled",
+      badgeLabel: "Continuation scheduled",
+      detail: "Attempt 1 · Time-cap continuation",
+    });
+  });
+
   it("describes max-turn continuation retries distinctly", () => {
     expect(
       describeRunRetryState({

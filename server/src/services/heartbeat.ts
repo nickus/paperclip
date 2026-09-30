@@ -365,6 +365,23 @@ import {
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
 import {
+  DEFAULT_RUN_IDLE_TIMEOUT_SEC,
+  RUN_IDLE_TIMEOUT_ERROR_CODE,
+  RUN_TIME_CAP_CHECKPOINT_ERROR_CODE,
+  TIME_CAP_CONTINUATION_WAKE_REASON,
+  buildTimeCapContinuationInstruction,
+  classifyTimeCapStop,
+  createRunActivityWatchdog,
+  formatRunIdleTimeoutMessage,
+  formatRunIdleTimeoutUnenforcedMessage,
+  formatTimeCapCheckpointMessage,
+  isPlatformOnlyLogChunk,
+  resolveRunIdleTimeoutPolicy,
+  resolveTimeCapContinuationPolicy,
+  type RunActivityWatchdog,
+  type RunIdleTimeoutPolicy,
+} from "./run-activity-timeouts.js";
+import {
   CHAT_CONTROL_RECOVERY_ADMISSION_KEY,
   CHAT_CONTROL_RECOVERY_STOP_CODE,
   CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
@@ -546,6 +563,8 @@ import {
   createRunDispatch,
   type PostCommitEffect,
   MAX_TURN_CONTINUATION_RETRY_REASON,
+  TIME_CAP_CONTINUATION_RETRY_REASON,
+  isProductiveContinuationRetryReason,
   WORKSPACE_BUSY_RETRY_REASON,
   AI_CONNECTION_BUSY_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
@@ -928,7 +947,7 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "opencode_local",
   "pi_local",
 ]);
-export { MAX_TURN_CONTINUATION_RETRY_REASON };
+export { MAX_TURN_CONTINUATION_RETRY_REASON, TIME_CAP_CONTINUATION_RETRY_REASON };
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
 const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
@@ -7765,6 +7784,28 @@ export async function attachExecutionContinuationToWakePayload(input: {
   return fitPaperclipWakePayloadToHardCap({ ...wake, executionContinuation });
 }
 
+/**
+ * The continuation note of a run queued after a time-cap checkpoint. It rides
+ * the generic continuation section of the wake payload. The context key is
+ * copied forward into later retries, so only the continuation itself shows it.
+ */
+function buildTimeCapContinuationWake(contextSnapshot: Record<string, unknown>) {
+  if (contextSnapshot.retryReason !== TIME_CAP_CONTINUATION_RETRY_REASON) {
+    return null;
+  }
+  const continuation = parseObject(contextSnapshot.timeCapContinuation);
+  const reachedAt = readNonEmptyString(continuation.reachedAt);
+  if (!reachedAt) return null;
+  return {
+    attempt: continuation.attempt,
+    maxAttempts: continuation.maxAttempts,
+    sourceRunId: readNonEmptyString(continuation.sourceRunId),
+    state: "time_cap_checkpoint",
+    reason: "The previous run reached its hard time cap while it was still working.",
+    instruction: buildTimeCapContinuationInstruction(reachedAt),
+  };
+}
+
 export async function buildPaperclipWakePayload(input: {
   db: Db;
   companyId: string;
@@ -8341,7 +8382,7 @@ export async function buildPaperclipWakePayload(input: {
               input.contextSnapshot.livenessContinuationInstruction,
             ),
           }
-        : null,
+        : buildTimeCapContinuationWake(input.contextSnapshot),
     interactionKind,
     interactionStatus,
     interactionId,
@@ -15595,11 +15636,19 @@ export function heartbeatService(
       wakeReason?: string;
       maxAttempts?: number;
       delayMs?: number;
+      /** Extra context for the continuation run, merged into its snapshot. */
+      continuationContext?: Record<string, unknown>;
     },
   ) {
     const now = opts?.now ?? new Date();
     const retryReason =
       opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
+    const productiveContinuation =
+      isProductiveContinuationRetryReason(retryReason);
+    const productiveContinuationLabel =
+      retryReason === TIME_CAP_CONTINUATION_RETRY_REASON
+        ? "time-cap continuation"
+        : "max-turn continuation";
     const wakeReason =
       opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
     const maxAttempts = Math.max(
@@ -15692,7 +15741,7 @@ export function heartbeatService(
         issueId: readNonEmptyString(run.contextSnapshot?.issueId),
       };
     }
-    if (retryReason !== MAX_TURN_CONTINUATION_RETRY_REASON) {
+    if (!productiveContinuation) {
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
         await appendRunEvent(run, {
@@ -15737,7 +15786,7 @@ export function heartbeatService(
       isTransientWorkspaceGitScanCode(run.errorCode) ||
       hasConversationContinuationPolicy(run.resultJson) ||
       retryReason === AI_CONNECTION_BUSY_RETRY_REASON ||
-      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+      productiveContinuation ||
       retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON;
     if (requiresIssueGate) {
       const gate = await runDispatch.evaluateScheduledRetryGate({
@@ -15800,6 +15849,7 @@ export function heartbeatService(
         retryOfRunId: run.id,
         wakeReason,
         retryReason,
+        ...(opts?.continuationContext ?? {}),
         ...(retryReason === WORKSPACE_BUSY_RETRY_REASON
           ? {
               failureRetriesBeforeWorkspaceWait:
@@ -15852,9 +15902,11 @@ export function heartbeatService(
     const continuationRetryIdempotencyKey =
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
         ? `max-turn-continuation:${run.companyId}:${issueId ?? "no-issue"}:${run.id}:${schedule.attempt}`
-        : retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON
-          ? `interaction-continuation:${run.companyId}:${issueId ?? "no-issue"}:${run.id}:${schedule.attempt}`
-          : null;
+        : retryReason === TIME_CAP_CONTINUATION_RETRY_REASON
+          ? `time-cap-continuation:${run.companyId}:${issueId ?? "no-issue"}:${run.id}:${schedule.attempt}`
+          : retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON
+            ? `interaction-continuation:${run.companyId}:${issueId ?? "no-issue"}:${run.id}:${schedule.attempt}`
+            : null;
 
     type ScheduledRetryTransactionResult =
       | {
@@ -15881,7 +15933,7 @@ export function heartbeatService(
         // All automatic failure paths share the same predecessor claim. A
         // duplicate monitor, restart sweep or wake must reuse its successor.
         if (
-          retryReason !== MAX_TURN_CONTINUATION_RETRY_REASON &&
+          !productiveContinuation &&
           retryReason !== INTERACTION_CONTINUATION_INFRA_RETRY_REASON
         ) {
           if (issueId)
@@ -15975,7 +16027,7 @@ export function heartbeatService(
           }
         }
 
-        if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
+        if (productiveContinuation) {
           if (issueId) {
             await tx.execute(
               sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
@@ -16061,8 +16113,7 @@ export function heartbeatService(
             if (!lockedIssue) {
               return {
                 outcome: "not_scheduled",
-                reason:
-                  "Scheduled max-turn continuation suppressed because the target issue no longer exists",
+                reason: `Scheduled ${productiveContinuationLabel} suppressed because the target issue no longer exists`,
                 errorCode: "issue_not_found",
                 issueId,
                 details: { issueId },
@@ -16072,8 +16123,7 @@ export function heartbeatService(
             if (lockedIssue.assigneeAgentId !== run.agentId) {
               return {
                 outcome: "not_scheduled",
-                reason:
-                  "Scheduled max-turn continuation suppressed because issue ownership changed",
+                reason: `Scheduled ${productiveContinuationLabel} suppressed because issue ownership changed`,
                 errorCode: "issue_reassigned",
                 issueId,
                 details: {
@@ -16090,7 +16140,7 @@ export function heartbeatService(
             ) {
               return {
                 outcome: "not_scheduled",
-                reason: `Scheduled max-turn continuation suppressed because issue reached terminal status (${lockedIssue.status})`,
+                reason: `Scheduled ${productiveContinuationLabel} suppressed because issue reached terminal status (${lockedIssue.status})`,
                 errorCode:
                   lockedIssue.status === "cancelled"
                     ? "issue_cancelled"
@@ -16103,7 +16153,7 @@ export function heartbeatService(
             if (lockedIssue.status !== "in_progress") {
               return {
                 outcome: "not_scheduled",
-                reason: `Scheduled max-turn continuation suppressed because issue is no longer in_progress (current status: ${lockedIssue.status})`,
+                reason: `Scheduled ${productiveContinuationLabel} suppressed because issue is no longer in_progress (current status: ${lockedIssue.status})`,
                 errorCode: "issue_not_in_progress",
                 issueId,
                 details: {
@@ -16117,8 +16167,7 @@ export function heartbeatService(
             if (lockedIssue.executionRunId !== run.id) {
               return {
                 outcome: "not_scheduled",
-                reason:
-                  "Scheduled max-turn continuation suppressed because the issue execution lock belongs to a different run",
+                reason: `Scheduled ${productiveContinuationLabel} suppressed because the issue execution lock belongs to a different run`,
                 errorCode: "issue_execution_lock_changed",
                 issueId,
                 details: {
@@ -18390,7 +18439,8 @@ export function heartbeatService(
         : outcome === "succeeded" ||
             outcome === "interrupted" ||
             outcome === "cancelled" ||
-            (outcome === "failed" && options?.keepIdleOnFailure)
+            ((outcome === "failed" || outcome === "timed_out") &&
+              options?.keepIdleOnFailure)
           ? "idle"
           : "error";
 
@@ -20762,6 +20812,20 @@ export function heartbeatService(
     activeRunExecutions.add(run.id);
     const executionControl = createAdapterExecutionControl();
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
+    // Inactivity tracking for the adapter call (see run-activity-timeouts.ts).
+    // Armed when the adapter is dispatched, fed by every log chunk, adapter
+    // event and runtime progress report, and stopped when the adapter returns.
+    // Callbacks assign these, so the declarations widen past the null start.
+    let runActivityWatchdog = null as RunActivityWatchdog | null;
+    let runIdleStop = null as {
+      policy: RunIdleTimeoutPolicy;
+      firedAt: string;
+      lastActivityAt: string;
+      // False when the run had no process or cancellation handle to stop.
+      enforced: boolean;
+    } | null;
+    // When the adapter call returned; a hard-cap stop is classified against it.
+    let adapterReturnedAtMs = null as number | null;
     let runScratch: HeartbeatRunScratch | null = null;
     let remoteRunScratch: SshRunScratch | null = null;
     // Env entries that point the run at remoteRunScratch.
@@ -23561,6 +23625,9 @@ export function heartbeatService(
         const currentUserRedactionOptions =
           await getCurrentUserRedactionOptions();
         const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+          runActivityWatchdog?.recordActivity(
+            isPlatformOnlyLogChunk(chunk) ? "platform" : "provider",
+          );
           const sanitizedChunk = compactRunLogChunk(
             redactCurrentUserText(chunk, currentUserRedactionOptions),
           );
@@ -23742,6 +23809,7 @@ export function heartbeatService(
         const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
           const eventType = event.eventType.trim();
           if (!eventType) return;
+          runActivityWatchdog?.recordActivity("provider");
           await appendRunEvent(currentRun, {
             eventType: eventType.slice(0, 120),
             stream: event.stream,
@@ -25096,10 +25164,90 @@ export function heartbeatService(
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
             }
+            const idleTimeoutPolicy = resolveRunIdleTimeoutPolicy(agent.adapterType, runtimeConfig);
+            let idleStopUnavailableReported = false;
+            // Stop a run that went quiet, through the same handles as an
+            // operator Stop: the adapter's cancellation signal when it opted
+            // in, and the local or SSH client process the platform spawned.
+            // Returns false when neither exists yet, so the watchdog keeps
+            // watching and a process started later can still be stopped.
+            const stopRunForIdleTimeout = (
+              snapshot: ReturnType<RunActivityWatchdog["snapshot"]>,
+            ): boolean => {
+              const running = runningProcesses.get(run.id);
+              const control =
+                adapterExecutionControls.get(run.id) === executionControl
+                  ? executionControl
+                  : null;
+              const enforced = Boolean(running || control);
+              const lastActivityAt = new Date(snapshot.lastActivityAt).toISOString();
+              if (!enforced) {
+                if (!idleStopUnavailableReported) {
+                  idleStopUnavailableReported = true;
+                  void appendRunEvent(run, {
+                    eventType: "lifecycle",
+                    stream: "system",
+                    level: "warn",
+                    message: formatRunIdleTimeoutUnenforcedMessage(idleTimeoutPolicy),
+                    payload: {
+                      idleTimeoutSec: idleTimeoutPolicy.idleTimeoutSec,
+                      idleTimeoutSource: idleTimeoutPolicy.source,
+                      lastActivityAt,
+                      enforced: false,
+                    },
+                  }).catch(() => undefined);
+                }
+                return false;
+              }
+              runIdleStop = {
+                policy: idleTimeoutPolicy,
+                firedAt: new Date(snapshot.idleFiredAt ?? Date.now()).toISOString(),
+                lastActivityAt,
+                enforced: true,
+              };
+              const message = formatRunIdleTimeoutMessage(idleTimeoutPolicy);
+              void (async () => {
+                await onLog("stderr", `[paperclip] ${message}\n`).catch(() => undefined);
+                await appendRunEvent(run, {
+                  eventType: "lifecycle",
+                  stream: "system",
+                  level: "warn",
+                  message,
+                  payload: {
+                    idleTimeoutSec: idleTimeoutPolicy.idleTimeoutSec,
+                    idleTimeoutSource: idleTimeoutPolicy.source,
+                    lastActivityAt,
+                    enforced: true,
+                  },
+                }).catch(() => undefined);
+                // The adapter may have finished while the notes were written.
+                if (adapterReturnedAtMs !== null) return;
+                if (control) control.controller.abort(new Error(message));
+                if (running) {
+                  await terminateHeartbeatRunProcess({
+                    pid: running.child.pid,
+                    processGroupId: running.processGroupId,
+                    // Same signal choice as an operator Stop (see cancelRunInternal).
+                    signal: !control && agent.adapterType === "codex_local" ? "SIGINT" : undefined,
+                    graceMs: Math.max(1, running.graceSec) * 1000,
+                  });
+                }
+              })().catch((err) => {
+                logger.warn(
+                  { err, runId: run.id },
+                  "failed to stop a run after its inactivity timeout",
+                );
+              });
+              return true;
+            };
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
                   legacyAdapterEntered = true;
+                  runActivityWatchdog = createRunActivityWatchdog({
+                    idleTimeoutMs: idleTimeoutPolicy.idleTimeoutSec * 1000,
+                    onIdle: stopRunForIdleTimeout,
+                  });
                   return adapter.execute({
                     runId: run.id,
                     agent,
@@ -25125,6 +25273,7 @@ export function heartbeatService(
                     onEvent: onAdapterEvent,
                     startupTraceContext: getStartupTraceContext(),
                     onRuntimeProgress: async (progress) => {
+                      runActivityWatchdog?.recordActivity("platform");
                       await recordCurrentHeartbeatRunRuntimeProgress(
                         run,
                         progress,
@@ -25178,6 +25327,8 @@ export function heartbeatService(
               );
             if (!guardedDispatch.dispatched) return;
             adapterResult = await guardedDispatch.resultPromise;
+            adapterReturnedAtMs = Date.now();
+            runActivityWatchdog?.stop();
           }
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
           // A returned result can include a failed restore. Keep the workspace
@@ -25507,8 +25658,20 @@ export function heartbeatService(
         await processCancellation?.settled;
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
+        // The inactivity timeout stopped this run, unless the adapter still
+        // finished cleanly in the same moment.
+        const idleStopEnforced =
+          runIdleStop?.enforced === true &&
+          !(
+            !adapterResult.timedOut &&
+            (adapterResult.exitCode ?? 0) === 0 &&
+            !adapterResult.errorMessage &&
+            !adapterResult.signal
+          );
         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
           outcome = latestRun.status;
+        } else if (idleStopEnforced) {
+          outcome = "timed_out";
         } else if (executionControl.controller.signal.aborted) {
           outcome = "cancelled";
         } else if (adapterResult.nativeFinalization) {
@@ -25531,6 +25694,76 @@ export function heartbeatService(
           outcome = "succeeded";
         } else {
           outcome = "failed";
+        }
+        const idleTimedOut = outcome === "timed_out" && idleStopEnforced;
+        // A hard time cap that stopped a run while it was still producing
+        // output is a checkpoint: the task continues in a bounded
+        // continuation instead of waiting for manual reconciliation.
+        let timeCapCheckpoint: {
+          reachedAt: string;
+          attempt: number;
+          maxAttempts: number;
+          delayMs: number;
+          windowSec: number;
+          runDurationMs: number;
+          providerSilenceMs: number | null;
+        } | null = null;
+        if (
+          outcome === "timed_out" &&
+          adapterResult.timedOut &&
+          !idleTimedOut &&
+          legacyAdapterEntered &&
+          runActivityWatchdog &&
+          adapterReturnedAtMs !== null &&
+          issueId &&
+          !isConversation(issueContext) &&
+          !hasWorkspaceRestoreFailure(adapterResult.resultJson)
+        ) {
+          const idlePolicy = resolveRunIdleTimeoutPolicy(agent.adapterType, runtimeConfig);
+          const windowSec =
+            idlePolicy.idleTimeoutSec > 0
+              ? idlePolicy.idleTimeoutSec
+              : DEFAULT_RUN_IDLE_TIMEOUT_SEC;
+          const classification = classifyTimeCapStop({
+            snapshot: runActivityWatchdog.snapshot(),
+            stoppedAt: adapterReturnedAtMs,
+            windowSec,
+          });
+          const continuationPolicy = resolveTimeCapContinuationPolicy(
+            agent.runtimeConfig,
+          );
+          const consumedContinuations = executionRetryAttemptCount(
+            run,
+            TIME_CAP_CONTINUATION_RETRY_REASON,
+          );
+          if (
+            classification.productive &&
+            continuationPolicy.enabled &&
+            consumedContinuations < continuationPolicy.maxAttempts
+          ) {
+            timeCapCheckpoint = {
+              reachedAt: new Date(adapterReturnedAtMs).toISOString(),
+              attempt: consumedContinuations + 1,
+              maxAttempts: continuationPolicy.maxAttempts,
+              delayMs: continuationPolicy.delayMs,
+              windowSec,
+              runDurationMs: classification.runDurationMs,
+              providerSilenceMs: classification.providerSilenceMs,
+            };
+          } else if (classification.productive) {
+            await appendRunEvent(run, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message:
+                "Run reached its hard time cap while still making progress, but no automatic continuation is left for this task",
+              payload: {
+                retryReason: TIME_CAP_CONTINUATION_RETRY_REASON,
+                consumedContinuations,
+                policy: continuationPolicy,
+              },
+            });
+          }
         }
 
         const nextSessionState = resolveNextSessionState({
@@ -25558,15 +25791,27 @@ export function heartbeatService(
             : outcome === "succeeded"
               ? null
               : redactCurrentUserText(
-                  adapterResult.errorMessage ??
-                    (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+                  timeCapCheckpoint
+                    ? formatTimeCapCheckpointMessage({
+                        attempt: timeCapCheckpoint.attempt,
+                        maxAttempts: timeCapCheckpoint.maxAttempts,
+                        adapterMessage: adapterResult.errorMessage,
+                      })
+                    : idleTimedOut && runIdleStop
+                      ? formatRunIdleTimeoutMessage(runIdleStop.policy)
+                      : adapterResult.errorMessage ??
+                        (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
                   currentUserRedactionOptions,
                 );
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
         const runErrorCode =
           outcome === "timed_out"
-            ? "timeout"
+            ? timeCapCheckpoint
+              ? RUN_TIME_CAP_CHECKPOINT_ERROR_CODE
+              : idleTimedOut
+                ? RUN_IDLE_TIMEOUT_ERROR_CODE
+                : "timeout"
             : outcome === "cancelled"
               ? (latestRun?.errorCode ?? "cancelled")
               : outcome === "failed"
@@ -25708,6 +25953,34 @@ export function heartbeatService(
                 ...parseObject(adapterResult.resultJson),
                 ...(adapterResult.executionRecovery
                   ? { executionRecovery: adapterResult.executionRecovery }
+                  : {}),
+                ...(timeCapCheckpoint
+                  ? {
+                      // The platform, not the agent, ended this process. The
+                      // workspace stays with the task for the continuation.
+                      timeCapCheckpoint: {
+                        stoppedBy: "platform",
+                        reason: "hard_time_cap",
+                        reachedAt: timeCapCheckpoint.reachedAt,
+                        runDurationMs: timeCapCheckpoint.runDurationMs,
+                        providerSilenceMs: timeCapCheckpoint.providerSilenceMs,
+                        activityWindowSec: timeCapCheckpoint.windowSec,
+                        continuationAttempt: timeCapCheckpoint.attempt,
+                        continuationMaxAttempts: timeCapCheckpoint.maxAttempts,
+                        adapterMessage: adapterResult.errorMessage ?? null,
+                      },
+                    }
+                  : {}),
+                ...(idleTimedOut && runIdleStop
+                  ? {
+                      idleTimeout: {
+                        stoppedBy: "platform",
+                        idleTimeoutSec: runIdleStop.policy.idleTimeoutSec,
+                        source: runIdleStop.policy.source,
+                        firedAt: runIdleStop.firedAt,
+                        lastActivityAt: runIdleStop.lastActivityAt,
+                      },
+                    }
                   : {}),
                 configFreshness: configFreshnessResultMetadata,
                 metrics: runOrientationMetrics,
@@ -26033,7 +26306,36 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
-          if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+          if (timeCapCheckpoint) {
+            await appendRunEvent(livenessRun, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "info",
+              message:
+                "Run reached its hard time cap while still making progress; the platform stopped it as a checkpoint",
+              payload: {
+                stoppedBy: "platform",
+                reachedAt: timeCapCheckpoint.reachedAt,
+                providerSilenceMs: timeCapCheckpoint.providerSilenceMs,
+                continuationAttempt: timeCapCheckpoint.attempt,
+                continuationMaxAttempts: timeCapCheckpoint.maxAttempts,
+              },
+            });
+            await scheduleBoundedRetryForRun(livenessRun, agent, {
+              retryReason: TIME_CAP_CONTINUATION_RETRY_REASON,
+              wakeReason: TIME_CAP_CONTINUATION_WAKE_REASON,
+              maxAttempts: timeCapCheckpoint.maxAttempts,
+              delayMs: timeCapCheckpoint.delayMs,
+              continuationContext: {
+                timeCapContinuation: {
+                  sourceRunId: livenessRun.id,
+                  reachedAt: timeCapCheckpoint.reachedAt,
+                  attempt: timeCapCheckpoint.attempt,
+                  maxAttempts: timeCapCheckpoint.maxAttempts,
+                },
+              },
+            });
+          } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
               await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -26176,14 +26478,17 @@ export function heartbeatService(
         }
         await finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
           keepIdleOnFailure:
-            outcome === "failed" &&
-            ((finalizedRun
-              ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
-              : runErrorCode === "provider_quota") ||
-              isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
+            // A checkpoint is not an agent error; its continuation is queued.
+            timeCapCheckpoint !== null ||
+            (outcome === "failed" &&
+              ((finalizedRun
+                ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
+                : runErrorCode === "provider_quota") ||
+                isWorkspaceSyncConflictFailure(adapterResult.errorMessage))),
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
       } catch (err) {
+        runActivityWatchdog?.stop();
         if (err instanceof NativeControllerDetachedForRestartError) {
           nativeSessionResumeScheduled = true;
           return;
@@ -26378,16 +26683,31 @@ export function heartbeatService(
           );
         });
 
-        const stoppedDuringFailure = executionControl.controller.signal.aborted;
+        // An adapter can throw once the inactivity timeout aborted it; that
+        // stop is a timeout, not an operator cancellation.
+        const idleStoppedDuringFailure = runIdleStop?.enforced === true;
+        const stoppedDuringFailure =
+          !idleStoppedDuringFailure && executionControl.controller.signal.aborted;
         const stopSnapshot = stoppedDuringFailure ? await getRun(run.id) : null;
-        const failureOutcome = stoppedDuringFailure ? "cancelled" : "failed";
+        const failureOutcome = idleStoppedDuringFailure
+          ? "timed_out"
+          : stoppedDuringFailure
+            ? "cancelled"
+            : "failed";
+        const failureRunErrorCode = idleStoppedDuringFailure
+          ? RUN_IDLE_TIMEOUT_ERROR_CODE
+          : failureErrorCode;
+        const failureRunErrorMessage =
+          idleStoppedDuringFailure && runIdleStop
+            ? formatRunIdleTimeoutMessage(runIdleStop.policy)
+            : message;
         const failedRunWrite = await setRunStatusIfRunning(run.id, failureOutcome, {
-          error: message,
-          errorCode: stopSnapshot?.errorCode ?? failureErrorCode,
+          error: failureRunErrorMessage,
+          errorCode: stopSnapshot?.errorCode ?? failureRunErrorCode,
           finishedAt: new Date(),
           resultJson: mergeRunStopMetadataForAgent(agent, failureOutcome, {
-            errorCode: failureErrorCode,
-            errorMessage: message,
+            errorCode: failureRunErrorCode,
+            errorMessage: failureRunErrorMessage,
             resultJson: {
               ...parseObject(stopSnapshot?.resultJson),
               ...(workspaceValidationFailure?.resultJson ??
@@ -26986,6 +27306,7 @@ export function heartbeatService(
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
         }
       } finally {
+        runActivityWatchdog?.stop();
         sshWorkspaceReuseClaim?.release();
         sshWorkspaceReuseClaim = null;
         controllerLease.stop();

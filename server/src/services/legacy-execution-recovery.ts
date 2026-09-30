@@ -1,5 +1,5 @@
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
-import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
+import { isTimeCapCheckpointStopReason, normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
@@ -33,6 +33,10 @@ export function legacyExecutionNeedsReconciliation(
   if (hasConversationContinuationPolicy(run.resultJson)) return false;
   // Productive turn-budget continuation is not a failed provider session.
   if (normalizeMaxTurnStopReason(run.resultJson?.stopReason) ?? normalizeMaxTurnStopReason(run.errorCode)) return false;
+  // A hard time cap that stopped a run while it was still producing output is
+  // a checkpoint: the adapter finished its own teardown and the task
+  // continues in a bounded continuation from the workspace state.
+  if (isTimeCapCheckpointStopReason(run.resultJson?.stopReason)) return false;
   const evidence = run.resultJson?.executionRecovery as
     Record<string, unknown> | undefined;
   if (run.status === "cancelled" && evidence?.kind === "interrupted"

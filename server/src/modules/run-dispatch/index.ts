@@ -11,6 +11,8 @@ import type { RunDispatchWriter, ScheduledRetryReader } from "./application/port
 
 export {
   MAX_TURN_CONTINUATION_RETRY_REASON,
+  TIME_CAP_CONTINUATION_RETRY_REASON,
+  isProductiveContinuationRetryReason,
   WORKSPACE_BUSY_RETRY_REASON,
   AI_CONNECTION_BUSY_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
