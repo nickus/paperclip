@@ -26,6 +26,7 @@ import {
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  writeAdapterExecutionTargetTextFile,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -64,6 +65,7 @@ import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/se
 import {
   buildPruneManagedOpenCodeHomesCommand,
   prepareOpenCodeRuntimeConfig,
+  renderOpenCodeRuntimeConfigWithMcpServers,
   prepareManagedOpenCodeRemoteHomes,
 } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -339,7 +341,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeMcpIdentity = JSON.stringify(
     runtimeMcpServers.map(({ name, url, connectionId }) => ({ name, url, connectionId })),
   );
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config, runtimeMcpServers });
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
+    env,
+    config,
+    runtimeMcpServers,
+    // A remote target gets its servers once the callback bridge is up (see
+    // below): it addresses them through the bridge, so no server token is
+    // staged into the environment.
+    deferRuntimeMcpServers: executionTargetIsRemote,
+  });
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
@@ -391,6 +401,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
     let localSkillsDir: string | null = null;
     let remoteRuntimeRootDir: string | null = null;
+    let remoteRuntimeConfigDir: string | null = null;
     let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
 
     if (executionTarget?.kind === "remote") {
@@ -446,6 +457,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
       if (localRuntimeConfigHome && preparedExecutionTargetRuntime.assetDirs.xdgConfig) {
         preparedRuntimeConfig.env.XDG_CONFIG_HOME = preparedExecutionTargetRuntime.assetDirs.xdgConfig;
+        remoteRuntimeConfigDir = preparedExecutionTargetRuntime.assetDirs.xdgConfig;
       }
       const managedRemoteHome = prepareManagedOpenCodeRemoteHomes({
         env: preparedRuntimeConfig.env,
@@ -506,6 +518,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         adapterKey: "opencode",
         timeoutSec,
         hostApiToken: preparedRuntimeConfig.env.PAPERCLIP_API_KEY,
+        runtimeMcpServers,
         onLog,
       });
       if (paperclipBridge) {
@@ -519,6 +532,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           includeRuntimeKeys: ["HOME"],
           resolvedCommand,
         });
+      }
+    }
+
+    if (executionTargetIsRemote && runtimeMcpServers.length > 0 && localRuntimeConfigHome && remoteRuntimeConfigDir) {
+      // The servers as this target reaches them: through the bridge when it
+      // relays them, otherwise at the address the host handed over.
+      try {
+        const localConfigPath = path.join(localRuntimeConfigHome, "opencode", "opencode.json");
+        const rendered = renderOpenCodeRuntimeConfigWithMcpServers(
+          await fs.readFile(localConfigPath, "utf8"),
+          paperclipBridge?.runtimeMcpServers ?? runtimeMcpServers,
+        );
+        await writeAdapterExecutionTargetTextFile(
+          runId,
+          runtimeExecutionTarget,
+          path.posix.join(remoteRuntimeConfigDir, "opencode", "opencode.json"),
+          rendered.text,
+          { timeoutSec: 60 },
+        );
+        for (const note of rendered.notes) await onLog("stdout", `[paperclip] ${note}\n`);
+      } catch (error) {
+        await paperclipBridge?.stop().catch(() => undefined);
+        throw error;
       }
     }
 

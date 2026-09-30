@@ -8,6 +8,7 @@ import {
   buildPruneManagedOpenCodeHomesCommand,
   prepareManagedOpenCodeRemoteHomes,
   prepareOpenCodeRuntimeConfig,
+  renderOpenCodeRuntimeConfigWithMcpServers,
 } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
@@ -423,6 +424,48 @@ describe("prepareOpenCodeRuntimeConfig", () => {
       expect(contents).toMatchObject({ permission: { bash: "ask" }, theme: "system" });
       expect(Object.keys(contents.mcp as Record<string, unknown>)).toEqual(["paperclip-assigned"]);
       expect(prepared.notes).toHaveLength(1);
+      await prepared.cleanup();
+    });
+
+    it("can leave them out for a remote run and add them once the bridge is up", async () => {
+      const configHome = await makeConfigHome({
+        permission: { bash: "ask" },
+        mcp: { "Paperclip projects": { type: "remote", url: "https://stale.example.test/mcp" } },
+      });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: { dangerouslySkipPermissions: false },
+        runtimeMcpServers: [server("Paperclip projects", "project-tools", "secret-gateway-token")],
+        deferRuntimeMcpServers: true,
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      // The config home exists (so it ships), without any server token.
+      expect(prepared.env.XDG_CONFIG_HOME).not.toBe(configHome);
+      const configPath = path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json");
+      const staged = await fs.readFile(configPath, "utf8");
+      expect(staged).not.toContain("secret-gateway-token");
+      expect(prepared.notes).toEqual([
+        "Prepared the runtime OpenCode config for 1 Paperclip-managed MCP server(s); they are added once the callback bridge is up.",
+      ]);
+
+      const rendered = renderOpenCodeRuntimeConfigWithMcpServers(staged, [
+        { ...server("Paperclip projects", "project-tools"), url: "http://127.0.0.1:4310/api/mcp/project-tools", token: "bridge-token" },
+      ]);
+      expect(JSON.parse(rendered.text)).toEqual({
+        permission: { bash: "ask" },
+        mcp: {
+          Paperclip_projects: {
+            type: "remote",
+            url: "http://127.0.0.1:4310/api/mcp/project-tools",
+            headers: { Authorization: "Bearer bridge-token" },
+            oauth: false,
+            enabled: true,
+            timeout: 330_000,
+          },
+        },
+      });
+      expect(rendered.notes.join("\n")).toContain("replace the OpenCode MCP server(s) of the same name");
       await prepared.cleanup();
     });
 
