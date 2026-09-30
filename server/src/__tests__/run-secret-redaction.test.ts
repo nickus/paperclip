@@ -235,6 +235,37 @@ describe("live run secret redaction", () => {
     }
   });
 
+  it("re-reads a retained run's registry once its copy is older than the max age", async () => {
+    // A registration served by another server process writes the stored
+    // registry without reaching this process's cache.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const { registry, row, where } = liveFixture([{ fingerprintSha256: "one", material: { value: secret } }]);
+    const release = registry.retainLiveRun("company", "run-live-5");
+    try {
+      expect(await registry.valuesForLiveRun("company", "run-live-5")).toEqual([secret]);
+      (row.contextSnapshot.paperclipSecretRedactions as Registry).push({
+        fingerprintSha256: "remote",
+        material: { value: "remote-secret-value" },
+      });
+
+      vi.advanceTimersByTime(1_999);
+      expect(await registry.valuesForLiveRun("company", "run-live-5")).toEqual([secret]);
+      expect(where).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(1);
+      expect(await registry.valuesForLiveRun("company", "run-live-5"))
+        .toEqual(expect.arrayContaining([secret, "remote-secret-value"]));
+      expect(where).toHaveBeenCalledTimes(2);
+
+      // Served from memory again until the next expiry.
+      await registry.valuesForLiveRun("company", "run-live-5");
+      expect(where).toHaveBeenCalledTimes(2);
+    } finally {
+      release();
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects when a value cannot be decrypted and retries on the next call", async () => {
     const { registry } = liveFixture([{ fingerprintSha256: "one", material: { value: secret } }]);
     const release = registry.retainLiveRun("company", "run-live-4");

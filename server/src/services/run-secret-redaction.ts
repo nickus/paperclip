@@ -94,13 +94,28 @@ export function contextSnapshotKeepingRedactionRegistry(context: Record<string, 
 
 // Resolved values for runs that this process is executing, so that live
 // run-log and run-event publishing can redact every chunk without a database
-// round trip. An entry exists only while a run holds it (retainLiveRun), and a
-// registration marks it stale so the next redaction reloads the registry.
+// round trip. An entry exists only while a run holds it (retainLiveRun).
+//
+// This cache is local to the server process, like the live-event bus that
+// the redacted payloads are published on. A registration served by this
+// process marks the run's entry stale (register), so the next payload is
+// redacted with the new value. A registration served by another server
+// process that shares the database cannot reach this map, so a retained entry
+// is also re-read once it is older than LIVE_RUN_REGISTRY_MAX_AGE_MS. That
+// bounds, but does not close, the window in which such a value can reach live
+// payloads and stored output unredacted; the read routes always apply the
+// stored registry. A deployment that runs several server processes against
+// one database and needs a registration to apply to the very next chunk must
+// route a run's agent API calls to the process that executes the run.
+const LIVE_RUN_REGISTRY_MAX_AGE_MS = 2_000;
+
 type LiveRunRedactionEntry = {
   companyId: string;
   holders: number;
   generation: number;
   loadedGeneration: number;
+  // Date.now() when the registry behind loadedGeneration was read.
+  loadedAt: number;
   // fingerprint -> plaintext. Only grows while the entry lives: a value that
   // was registered for the run stays redacted even if the stored registry is
   // later rewritten without it.
@@ -150,6 +165,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
     // Settle loads in the order they were started, so a caller that waited on a
     // newer registry never resumes before one that waited on an older one.
     await previous?.catch(() => undefined);
+    const readAt = Date.now();
     const rows = await selectRunRegistry(entry.companyId, runId);
     const pending = rows
       .flatMap((row) => registryEntries(row.contextSnapshot))
@@ -160,6 +176,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
     }));
     entry.values = redactionValues(entry.resolved.values());
     entry.loadedGeneration = Math.max(entry.loadedGeneration, generation);
+    entry.loadedAt = Math.max(entry.loadedAt, readAt);
     return entry.values;
   }
 
@@ -167,6 +184,13 @@ export function createRunSecretRedactionRegistry(db: Db) {
     const entry = liveRunRedactions.get(runId);
     // Not executing in this process: read the registry for this call only.
     if (!entry || entry.companyId !== companyId) return valuesForRun(companyId, runId);
+    if (
+      entry.loadedGeneration === entry.generation &&
+      Date.now() - entry.loadedAt >= LIVE_RUN_REGISTRY_MAX_AGE_MS
+    ) {
+      // Pick up registrations served by other server processes.
+      entry.generation += 1;
+    }
     if (entry.loadedGeneration === entry.generation) return entry.values;
     if (entry.inflight?.generation !== entry.generation) {
       const generation = entry.generation;
@@ -222,7 +246,8 @@ export function createRunSecretRedactionRegistry(db: Db) {
         added = true;
       });
       // The caller hands the value out only after this returns, so any output
-      // that can contain it is redacted with the reloaded registry.
+      // that can contain it is redacted with the reloaded registry when this
+      // process executes the run (see LIVE_RUN_REGISTRY_MAX_AGE_MS otherwise).
       if (added) markLiveRunRegistryStale(runId);
     },
     redactForRuns: async <T extends { id: string }>(companyId: string, runs: T[]): Promise<T[]> => {
@@ -263,6 +288,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
           holders: 0,
           generation: 0,
           loadedGeneration: -1,
+          loadedAt: 0,
           resolved: new Map(),
           values: [],
           inflight: null,
@@ -284,8 +310,10 @@ export function createRunSecretRedactionRegistry(db: Db) {
     /**
      * The values redactForRun applies, for payloads persisted or published
      * while the run is live (use with redactRegisteredSecretValues). Served
-     * from memory while the run is retained in this process. Rejects when the
-     * registry cannot be read or decrypted, like redactForRun.
+     * from memory while the run is retained in this process, re-read after a
+     * registration in this process or once the copy is older than
+     * LIVE_RUN_REGISTRY_MAX_AGE_MS. Rejects when the registry cannot be read
+     * or decrypted, like redactForRun.
      */
     valuesForLiveRun,
   };
