@@ -225,6 +225,7 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
     holderActivityAt?: Date;
     issueWorkspaceSettings?: Record<string, unknown> | null;
     projectWorkspacePolicy?: Record<string, unknown>;
+    companyExecutionWorkspaceDefaults?: Record<string, unknown>;
     agentEnvironmentDriver?: "local" | "ssh" | "sandbox";
     // The project has no workspace: both issues run in its managed directory.
     withoutProjectWorkspace?: boolean;
@@ -256,6 +257,9 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
+      ...(input?.companyExecutionWorkspaceDefaults
+        ? { executionWorkspaceDefaults: input.companyExecutionWorkspaceDefaults }
+        : {}),
     });
 
     await db.insert(projects).values({
@@ -542,6 +546,94 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.scheduledRetryReason, WORKSPACE_BUSY_RETRY_REASON));
     expect(retryRuns).toHaveLength(0);
+  });
+
+  async function invokeAgainstLiveHolder(fixture: WorkspaceFixture) {
+    const run = await heartbeat.invoke(
+      fixture.agentId,
+      "assignment",
+      { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+      "system",
+    );
+    expect(run).not.toBeNull();
+    return await waitForRunToLeaveActiveStates(run!.id);
+  }
+
+  it.each([
+    { label: "no company default", companyDefaults: undefined, dispatched: false },
+    { label: "a company allow default", companyDefaults: { sharedWorkspaceConcurrency: "allow" }, dispatched: true },
+  ])("a project without a policy follows $label on a sandbox", async ({ companyDefaults, dispatched }) => {
+    const fixture = await seedWorkspaceFixture({
+      issueWorkspaceSettings: null,
+      agentEnvironmentDriver: "sandbox",
+      companyExecutionWorkspaceDefaults: companyDefaults,
+    });
+
+    const finishedRun = await invokeAgainstLiveHolder(fixture);
+    if (dispatched) {
+      expect(finishedRun?.status).toBe("succeeded");
+      expect(executedRunIds).toContain(finishedRun!.id);
+      expect((finishedRun?.contextSnapshot as Record<string, unknown>)?.paperclipTaskMarkdown).toContain(
+        `shared workspace is concurrently held by run ${fixture.holderRunId}`,
+      );
+      const retryRuns = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(
+        and(eq(heartbeatRuns.companyId, fixture.companyId), eq(heartbeatRuns.scheduledRetryReason, WORKSPACE_BUSY_RETRY_REASON)),
+      );
+      expect(retryRuns).toHaveLength(0);
+    } else {
+      expect(finishedRun?.errorCode).toBe(WORKSPACE_BUSY_ERROR_CODE);
+      expect(executedRunIds).not.toContain(finishedRun!.id);
+    }
+  });
+
+  it("applies the company default while isolated workspaces are disabled", async () => {
+    const fixture = await seedWorkspaceFixture({
+      issueWorkspaceSettings: null,
+      agentEnvironmentDriver: "sandbox",
+      companyExecutionWorkspaceDefaults: { sharedWorkspaceConcurrency: "allow" },
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+
+    const finishedRun = await invokeAgainstLiveHolder(fixture);
+    expect(finishedRun?.errorCode).not.toBe(WORKSPACE_BUSY_ERROR_CODE);
+    expect(executedRunIds).toContain(finishedRun!.id);
+  });
+
+  it("lets a project serialize policy override a company allow default", async () => {
+    const fixture = await seedWorkspaceFixture({
+      issueWorkspaceSettings: null,
+      agentEnvironmentDriver: "sandbox",
+      projectWorkspacePolicy: { enabled: true, defaultMode: "shared_workspace", sharedWorkspaceConcurrency: "serialize" },
+      companyExecutionWorkspaceDefaults: { sharedWorkspaceConcurrency: "allow" },
+    });
+
+    const finishedRun = await invokeAgainstLiveHolder(fixture);
+    expect(finishedRun?.errorCode).toBe(WORKSPACE_BUSY_ERROR_CODE);
+    expect(executedRunIds).not.toContain(finishedRun!.id);
+  });
+
+  it("lets an issue serialize setting override project and company allow", async () => {
+    const serialized = await seedWorkspaceFixture({
+      issueWorkspaceSettings: { sharedWorkspaceConcurrency: "serialize" },
+      agentEnvironmentDriver: "sandbox",
+      projectWorkspacePolicy: { enabled: true, defaultMode: "shared_workspace", sharedWorkspaceConcurrency: "allow" },
+      companyExecutionWorkspaceDefaults: { sharedWorkspaceConcurrency: "allow" },
+    });
+    const serializedRun = await invokeAgainstLiveHolder(serialized);
+    expect(serializedRun?.errorCode).toBe(WORKSPACE_BUSY_ERROR_CODE);
+    expect(executedRunIds).not.toContain(serializedRun!.id);
+  });
+
+  it("lets an issue allow setting override project and company serialize", async () => {
+    const allowed = await seedWorkspaceFixture({
+      issueWorkspaceSettings: { sharedWorkspaceConcurrency: "allow" },
+      agentEnvironmentDriver: "sandbox",
+      projectWorkspacePolicy: { enabled: true, defaultMode: "shared_workspace", sharedWorkspaceConcurrency: "serialize" },
+      companyExecutionWorkspaceDefaults: { sharedWorkspaceConcurrency: "serialize" },
+    });
+    const allowedRun = await invokeAgainstLiveHolder(allowed);
+    expect(allowedRun?.errorCode).not.toBe(WORKSPACE_BUSY_ERROR_CODE);
+    expect(executedRunIds).toContain(allowedRun!.id);
   });
 
   it("defers a sandbox run while another issue of its project runs in the project's managed directory", async () => {

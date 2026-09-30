@@ -19,6 +19,7 @@ export type {
 } from "./connection-intent.js";
 export type {
   Company,
+  CompanyExecutionWorkspaceDefaults,
   InteractionResolverGovernance,
   InteractionResolverKindGovernance,
 } from "./company.js";

@@ -1,4 +1,5 @@
 import type {
+  CompanyExecutionWorkspaceDefaults,
   ExecutionWorkspaceMode,
   ExecutionWorkspaceStrategy,
   IssueExecutionWorkspaceSettings,
@@ -391,12 +392,27 @@ function parseSharedWorkspaceConcurrency(raw: unknown): SharedWorkspaceConcurren
   return raw === "auto" || raw === "serialize" || raw === "allow" ? raw : undefined;
 }
 
+// Reads the company's stored execution workspace defaults. Values that are not
+// recognized are dropped, so a malformed row falls back to the built-in default
+// instead of failing the run.
+export function parseCompanyExecutionWorkspaceDefaults(raw: unknown): CompanyExecutionWorkspaceDefaults {
+  const parsed = parseObject(raw);
+  const sharedWorkspaceConcurrency = parseSharedWorkspaceConcurrency(parsed.sharedWorkspaceConcurrency);
+  return {
+    ...(sharedWorkspaceConcurrency ? { sharedWorkspaceConcurrency } : {}),
+  };
+}
+
+// Resolution order, first defined value wins:
+//   issue settings -> enabled project policy -> company default -> "auto"
 export function resolveSharedWorkspaceConcurrency(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;
+  companyDefaults?: CompanyExecutionWorkspaceDefaults | null;
 }): SharedWorkspaceConcurrency {
   return input.issueSettings?.sharedWorkspaceConcurrency
     ?? (input.projectPolicy?.enabled ? input.projectPolicy.sharedWorkspaceConcurrency : undefined)
+    ?? input.companyDefaults?.sharedWorkspaceConcurrency
     ?? "auto";
 }
 
