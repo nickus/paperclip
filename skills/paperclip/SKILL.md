@@ -682,6 +682,8 @@ Results are ranked by relevance: title matches first, then identifier, descripti
 
 For detailed API tables, JSON response schemas, worked examples (IC and Manager heartbeats), governance/approvals, cross-team delegation rules, error codes, issue lifecycle diagram, and the common mistakes table, read: `skills/paperclip/references/api-reference.md`
 
+Connected tools (MCP tool connections and other gateway tools) that your harness does not offer as native tools: call them over REST with the recipe in `skills/paperclip/references/connected-tools.md`.
+
 **Asking a free-text question.**
 
 For an open answer, use a text field, not invented choices. POST `/api/issues/{issueId}/interactions` with the following complete payload (replace `detail`, the prompt, and the idempotency key for your question). `questionSet` controls presentation; the matching `questions` entry is required storage compatibility and must not be sent alone.
