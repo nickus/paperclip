@@ -1441,4 +1441,128 @@ describe("ssh env-lab fixture", () => {
     },
     SSH_FIXTURE_TEST_TIMEOUT_MS,
   );
+
+  // What an agent does when it clones a repository into its remote workspace:
+  // a new directory with its own `.git` and a committed file.
+  function remoteCheckoutCommand(checkoutDir: string): string {
+    return (
+      `mkdir -p ${JSON.stringify(checkoutDir)} && cd ${JSON.stringify(checkoutDir)} && git init -q && ` +
+      `printf "checked out remotely\\n" > app.txt && git add app.txt && ` +
+      `git -c user.name="Paperclip SSH" -c user.email="ssh@paperclip.dev" commit -qm "remote checkout"`
+    );
+  }
+
+  async function initLocalGitWorkspace(localRepo: string, files: Record<string, string>): Promise<void> {
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["checkout", "-b", "main"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    for (const [relative, content] of Object.entries(files)) {
+      await mkdir(path.dirname(path.join(localRepo, relative)), { recursive: true });
+      await writeFile(path.join(localRepo, relative), content, "utf8");
+      await git(localRepo, ["add", relative]);
+    }
+    await git(localRepo, ["commit", "-m", "initial"]);
+  }
+
+  it("does not restore a Git checkout created in a Git-backed SSH workspace without its history", async (ctx) => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+    await initLocalGitWorkspace(localRepo, { "tracked.txt": "base\n" });
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH nested checkout restore test", ctx);
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { ...config, remoteCwd: started.workspaceDir },
+      runId: "run-nested-checkout",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localRepo,
+    });
+
+    await runSshCommand(
+      config,
+      `${remoteCheckoutCommand(path.posix.join(prepared.workspaceRemoteDir, "deps", "api"))} && ` +
+        `printf "edited remotely\\n" > ${JSON.stringify(path.posix.join(prepared.workspaceRemoteDir, "tracked.txt"))}`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+    const lines: string[] = [];
+    await prepared.restoreWorkspace((line) => {
+      lines.push(line);
+    });
+
+    // Ordinary changes come back as before.
+    await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("edited remotely\n");
+    // The restore leaves every nested `.git` behind, so the checkout's working
+    // tree stays behind too instead of landing on the host as a stale copy
+    // that is not a Git repository.
+    await expect(stat(path.join(localRepo, "deps", "api"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await git(localRepo, ["status", "--porcelain", "--untracked-files=all"])).toBe("M tracked.txt");
+    const notice = lines.find((line) => line.includes("Git checkouts created in the remote workspace"));
+    expect(notice).toContain("\"deps/api\"");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps restoring a host directory that became a Git repository in a Git-backed SSH workspace", async (ctx) => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+    await initLocalGitWorkspace(localRepo, { "docs/guide.md": "host\n" });
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH staged directory restore test", ctx);
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { ...config, remoteCwd: started.workspaceDir },
+      runId: "run-staged-dir",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localRepo,
+    });
+
+    // The host staged `docs/`, so the run's edits in it are host work even
+    // after the agent turned the directory into a repository.
+    const docsDir = path.posix.join(prepared.workspaceRemoteDir, "docs");
+    await runSshCommand(
+      config,
+      `cd ${JSON.stringify(docsDir)} && git init -q && printf "edited remotely\\n" > guide.md && printf "added remotely\\n" > new.md`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+    await prepared.restoreWorkspace();
+
+    await expect(readFile(path.join(localRepo, "docs", "guide.md"), "utf8")).resolves.toBe("edited remotely\n");
+    await expect(readFile(path.join(localRepo, "docs", "new.md"), "utf8")).resolves.toBe("added remotely\n");
+    await expect(stat(path.join(localRepo, "docs", ".git"))).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("restores a Git checkout created in a plain SSH workspace with its history", async (ctx) => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localDir = path.join(rootDir, "local-workspace");
+    await mkdir(localDir, { recursive: true });
+    await writeFile(path.join(localDir, "notes.md"), "host\n", "utf8");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH plain workspace checkout restore test", ctx);
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { ...config, remoteCwd: started.workspaceDir },
+      runId: "run-plain-checkout",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localDir,
+    });
+
+    await runSshCommand(
+      config,
+      remoteCheckoutCommand(path.posix.join(prepared.workspaceRemoteDir, "service")),
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+    const lines: string[] = [];
+    await prepared.restoreWorkspace((line) => {
+      lines.push(line);
+    });
+
+    // A plain workspace's restore keeps nested `.git` entries, so the checkout
+    // comes back whole, as a repository later runs can use.
+    await expect(readFile(path.join(localDir, "service", "app.txt"), "utf8")).resolves.toBe("checked out remotely\n");
+    expect(await git(path.join(localDir, "service"), ["log", "-1", "--pretty=%s"])).toBe("remote checkout");
+    expect(lines.some((line) => line.includes("Git checkouts created in the remote workspace"))).toBe(false);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 });

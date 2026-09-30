@@ -692,6 +692,8 @@ Sandbox staging, including Daytona, transfers each repository's Git history and 
 
 A Git checkout that the agent creates inside the sandbox workspace itself, for example with `git clone`, is not restored to the task workspace. Its `.git` never leaves the sandbox, and its working files alone would give later runs a stale copy that is not a Git repository. The run log names each checkout that was left out. Push work from such a checkout to a remote, or add the repository to the project so every run gets a checkout. A directory that was staged from the task workspace is still restored when the run turns it into a repository.
 
+SSH execution does the same when the task workspace is a Git repository, because that restore also leaves nested `.git` directories on the remote host. When the task workspace is not a Git repository, the SSH restore brings a checkout the agent created back whole, with its history.
+
 Staging preserves relative symlink targets in secondary repositories, including skill links such as `.claude/skills/demo -> ../../skills/demo`. It does not rewrite them to host temporary paths or copy their target contents in place of the link. Daytona still rejects outbound archives with absolute or escaping link targets before extraction.
 
 If a repository is detached or its source configuration changes, its previous task copy is retained under `.paperclip-runtime/detached-repositories/` and excluded from future sandbox transfers. Referenced projects continue to use the separate read-only multi-project workspace behavior.

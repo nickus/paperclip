@@ -21,6 +21,14 @@ import {
   type RuntimeProgressPhase,
   type RuntimeProgressSink,
 } from "./runtime-progress.js";
+import {
+  buildListNestedGitCheckoutsCommand,
+  describeUnrestoredGitCheckouts,
+  NESTED_GIT_CHECKOUT_LIST_MAX_BYTES,
+  parseNestedGitCheckoutList,
+  restoreExcludesNestedGit,
+  selectRemoteOnlyGitCheckouts,
+} from "./nested-git-checkouts.js";
 
 export interface SshConnectionConfig {
   host: string;
@@ -1684,6 +1692,35 @@ export async function prepareWorkspaceForSshExecution(input: {
   return { gitBacked: false };
 }
 
+// The Git checkouts the run created in the remote workspace (an agent's
+// `git clone`) that a restore with `baseline` leaves out of the host merge (see
+// nested-git-checkouts.ts). Only a restore that drops nested `.git` entries, as
+// a Git-backed workspace's does, would split a checkout from its history; any
+// other restore brings a checkout back whole, so none is listed. The listing
+// only narrows the restore, so any failure to produce it restores everything
+// as before.
+async function listRemoteOnlyGitCheckoutsOnSsh(input: {
+  spec: SshRemoteExecutionSpec;
+  remoteDir: string;
+  baseline: DirectorySnapshot;
+}): Promise<string[]> {
+  if (!restoreExcludesNestedGit(input.baseline.exclude)) return [];
+  try {
+    const result = await runSshCommand(
+      input.spec,
+      buildListNestedGitCheckoutsCommand({ workspaceRemoteDir: input.remoteDir }),
+      { timeoutMs: 60_000, maxBuffer: NESTED_GIT_CHECKOUT_LIST_MAX_BYTES + 64 * 1024 },
+    );
+    return selectRemoteOnlyGitCheckouts(
+      parseNestedGitCheckoutList(result.stdout),
+      input.baseline,
+      input.baseline.exclude,
+    );
+  } catch {
+    return [];
+  }
+}
+
 export async function restoreWorkspaceFromSshExecution(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
@@ -1709,6 +1746,18 @@ export async function restoreWorkspaceFromSshExecution(input: {
           onProgress: input.onProgress,
         })
         : null;
+      const remoteOnlyCheckouts = await listRemoteOnlyGitCheckoutsOnSsh({
+        spec: input.spec,
+        remoteDir,
+        baseline: input.baselineSnapshot,
+      });
+      if (remoteOnlyCheckouts.length > 0) {
+        try {
+          await input.onProgress?.(describeUnrestoredGitCheckouts(remoteOnlyCheckouts, "remote workspace"));
+        } catch {
+          // A broken log sink must not fail the restore.
+        }
+      }
       await syncDirectoryFromSsh({
         spec: input.spec,
         remoteDir,
@@ -1718,7 +1767,15 @@ export async function restoreWorkspaceFromSshExecution(input: {
         progressLabel: "workspace",
       });
       await mergeDirectoryWithBaseline({
-        baseline: input.baselineSnapshot,
+        // The transfer above still carries the remote-only checkouts: tar
+        // excludes match at any depth, so a literal path there could also drop
+        // a same-named directory elsewhere that the host must receive.
+        baseline: remoteOnlyCheckouts.length > 0
+          ? {
+            ...input.baselineSnapshot,
+            exclude: [...new Set([...input.baselineSnapshot.exclude, ...remoteOnlyCheckouts])],
+          }
+          : input.baselineSnapshot,
         sourceDir: stagingDir,
         targetDir: input.localDir,
         // Git history advances via integrateImportedGitHead; the working tree
