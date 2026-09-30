@@ -457,6 +457,47 @@ describe("HTTP logger redaction", () => {
     expect(log.res.statusCode).toBe(status);
   });
 
+  it.each([
+    { path: "/api/tool-gateway/tools/call", body: { tool: "notes:update", parameters: { body: "private-note-canary" } } },
+    { path: "/mcp/gateways/gw-1", body: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "notes:update", arguments: { body: "private-note-canary" } } } },
+    { path: "/api/tool-connections/conn-1/test-calls", body: { toolName: "update", parameters: { body: "private-note-canary" } } },
+  ])("keeps tool-call arguments out of failed $path logs", async ({ path, body }) => {
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(express.json());
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    // An approval-gated call answers 409; a failed one 502. Neither may log
+    // the arguments, with or without an error-handler context.
+    app.post(path, (req, res) => {
+      if (req.body?.withContext) {
+        (res as any).__errorContext = {
+          error: { name: "Error", message: "gateway failure" },
+          reqBody: req.body,
+          reqParams: req.params,
+        };
+      }
+      res.status(req.body?.withContext ? 502 : 409).json({ reasonCode: "approval_required" });
+    });
+
+    await request(app).post(path).send(body).expect(409);
+    await request(app).post(path).send({ ...body, withContext: true }).expect(502);
+
+    const output = chunks.join("");
+    expect(output).not.toContain("private-note-canary");
+    const logs = output.trim().split("\n").map((line) => JSON.parse(line));
+    expect(logs).toHaveLength(2);
+    for (const log of logs) {
+      expect(log.reqBody).toBe("[REDACTED]");
+      expect(log.req.url).toBe(path);
+    }
+  });
+
   it.each([200, 403, 500])("redacts cloud credentials and assertions from HTTP %i logs", async (status) => {
     const headers = {
       "X-Paperclip-Cloud-Tenant-Token": "cloud-tenant-token-canary",

@@ -83,6 +83,31 @@ export function isSecretSensitiveHttpRequest(
   return SECRET_SENSITIVE_HTTP_PATHS.some((pattern) => pattern.test(pathname));
 }
 
+// Requests whose body is a tool call's arguments. The tool gateway records
+// every call under its connection's content retention, so an HTTP failure log
+// must not keep a second, unfiltered copy of those arguments.
+const TOOL_CALL_CONTENT_HTTP_PATHS = [
+  /^\/api\/tool-gateway\/tools\/call\/?$/i,
+  /^\/mcp\/gateways\/[^/]+\/?$/i,
+  /^\/api\/tool-connections\/[^/]+\/test-calls\/?$/i,
+];
+
+export function isToolCallContentHttpRequest(
+  method: string | undefined,
+  url: string | undefined,
+): boolean {
+  if (!method || !url || method.toUpperCase() !== "POST") return false;
+  let pathname = normalizePath(url);
+  if (/^https?:\/\//i.test(pathname)) {
+    try {
+      pathname = new URL(url).pathname;
+    } catch {
+      return false;
+    }
+  }
+  return TOOL_CALL_CONTENT_HTTP_PATHS.some((pattern) => pattern.test(pathname));
+}
+
 export function shouldSilenceHttpSuccessLog(
   method: string | undefined,
   url: string | undefined,

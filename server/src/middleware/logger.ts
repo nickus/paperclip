@@ -5,6 +5,7 @@ import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import {
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
+  isToolCallContentHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
 import {
@@ -172,6 +173,12 @@ export function createHttpLogger(baseLogger: Logger) {
               : {}),
           };
         }
+        // A failed tool call (including every call that waits for approval)
+        // would otherwise log its arguments; the gateway audit is the record.
+        const toolCallContentRoute = isToolCallContentHttpRequest(
+          req.method,
+          requestClassificationUrl(req),
+        );
         if (ctx) {
           const secretSensitiveRoute = isSecretSensitiveHttpRequest(
             req.method,
@@ -184,14 +191,16 @@ export function createHttpLogger(baseLogger: Logger) {
             errorContext: secretSensitiveRoute
               ? { name: "Error" }
               : redactSensitive(ctx.error),
-            reqBody: redactSensitive(ctx.reqBody),
+            reqBody: toolCallContentRoute
+              ? "[REDACTED]"
+              : redactSensitive(ctx.reqBody),
             reqParams: redactSensitive(ctx.reqParams),
           };
         }
         const props: Record<string, unknown> = {};
         const { body, params } = req as any;
         if (body && typeof body === "object" && Object.keys(body).length > 0) {
-          props.reqBody = redactSensitive(body);
+          props.reqBody = toolCallContentRoute ? "[REDACTED]" : redactSensitive(body);
         }
         if (
           params &&
