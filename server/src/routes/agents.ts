@@ -7442,15 +7442,17 @@ export function agentRoutes(
     if (!run) return;
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
 
-    if (req.query.format !== undefined) {
-      // Claude stream-json view of the same log, with the same access checks
-      // and the same read-time redaction as the raw content below.
-      if (req.query.format !== "claude-stream-json" || !isStreamJsonEnabled()) {
-        throw badRequest("Unsupported log format");
-      }
-      if (req.query.offset !== undefined) {
-        throw badRequest("offset cannot be combined with format; page with after, before or tail");
-      }
+    // Claude stream-json view of the same log, with the same access checks and
+    // the same read-time redaction as the raw content below. It is strictly
+    // opt-in: only format=claude-stream-json without the raw `offset` cursor
+    // selects it. Any other request, including an unknown format value or a
+    // format combined with `offset`, keeps the raw contract existing clients
+    // already page with, instead of failing with 400.
+    const wantsStreamJson =
+      req.query.format === "claude-stream-json" &&
+      req.query.offset === undefined &&
+      isStreamJsonEnabled();
+    if (wantsStreamJson) {
       const meta = await loadRunStreamJsonMeta(db, run.id);
       if (!meta || meta.companyId !== run.companyId) throw notFound("Heartbeat run not found");
       const page = await readRunStreamJsonPage(

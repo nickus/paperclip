@@ -1050,8 +1050,19 @@ describe("agent live run routes", () => {
     });
 
     it.each([
-      ["format=transcript", "Unsupported log format"],
-      ["format=claude-stream-json&offset=0", "offset cannot be combined with format"],
+      ["format=transcript"],
+      ["format=claude-stream-json&offset=0"],
+      ["format=claude-stream-json&offset=128&limitBytes=4096"],
+    ])("keeps the raw log contract for %s", async (query) => {
+      // Clients that already page the raw log (with offset) or send another
+      // format value must keep getting the raw content, not a 400.
+      const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl).get(`${logPath}?${query}`));
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockHeartbeatService.readLog).toHaveBeenCalled();
+      expect(mockRunStreamJson.readRunStreamJsonPage).not.toHaveBeenCalled();
+    });
+
+    it.each([
       ["format=claude-stream-json&tail=yes", "tail must be 1 or 0"],
       ["format=claude-stream-json&after=a&after=b", "after must be a single value"],
     ])("rejects %s with 400", async (query, message) => {
@@ -1061,12 +1072,13 @@ describe("agent live run routes", () => {
       expect(mockRunStreamJson.readRunStreamJsonPage).not.toHaveBeenCalled();
     });
 
-    it("rejects the format while the kill switch is set", async () => {
+    it("serves the raw log while the kill switch is set", async () => {
       mockRunStreamJson.isStreamJsonEnabled.mockReturnValue(false);
       const res = await requestApp(await createApp(), (baseUrl) =>
         request(baseUrl).get(`${logPath}?format=claude-stream-json`),
       );
-      expect(res.status).toBe(400);
+      expect(res.status).toBe(200);
+      expect(mockRunStreamJson.readRunStreamJsonPage).not.toHaveBeenCalled();
     });
 
     it("keeps missing and cross-company runs indistinguishable", async () => {
