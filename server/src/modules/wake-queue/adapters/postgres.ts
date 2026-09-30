@@ -2,9 +2,9 @@ import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
-import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { EXECUTION_RECONCILIATION_CAUSES, extractIssueReferenceIdentifiers } from "@paperclipai/shared";
+import { EXECUTION_RECONCILIATION_CAUSES, extractIssueReferenceIdentifiers, isUuidLike } from "@paperclipai/shared";
 import {
   activityLog,
   agentWakeupRequests,
@@ -38,9 +38,12 @@ import { readContinuationAttempt } from "../../../services/recovery/run-liveness
 import { withRecoveryContext } from "../../../services/recovery/status-only-context.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import {
+  queuedCommentIdsFromRunContext,
   queuedCommentIdsFromWakePayload,
+  withQueuedCommentIdsInRunContext,
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
+import { undeliveredLegacyUserCommentIds } from "../../../services/explicit-native-continuation.js";
 import { extractWakeCommentIds } from "../../run-dispatch/index.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
@@ -54,6 +57,7 @@ import {
 } from "../domain/values.js";
 import { requireTransactionScopeTx, TransactionScope } from "../application/ports.js";
 import type {
+  CarryHandoffQueuedCommentsInput,
   DeferredWakeCandidate,
   InvokableAgentSnapshot,
   IssueLockWriter,
@@ -169,6 +173,113 @@ function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): 
     deferredCommentIds,
     wakeReason,
   };
+}
+
+/**
+ * A task's previous owner can hand it to another agent from inside its own
+ * run (the issue update route with the run's own run id). That run keeps
+ * running, so task messages that arrived for its agent meanwhile are still
+ * queued as that agent's deferred wakes. This moves them into the run that
+ * the new owner's wake just queued, under the task lock: the ordinary saved
+ * task messages only (the same set the release drain leaves for a hand-off),
+ * and only the user comments the new owner has not received yet, as
+ * admission does for a hand-off that stopped the previous owner's run. The
+ * moved wakes become `coalesced` into the new run, so the previous owner
+ * never runs for them and a later caller finds nothing left to move. It
+ * moves nothing while the handing-off run is still open, whichever caller
+ * asks. Returns the comment ids added to the new run.
+ */
+export async function carryHandoffQueuedComments(tx: Db, input: CarryHandoffQueuedCommentsInput): Promise<string[]> {
+  if (!isUuidLike(input.sourceRunId)) return [];
+  // Only the exact run that handed this task over, from another agent, and
+  // only once it has finished. While it is still queued, running or waiting
+  // for a retry it still holds the task, so its agent's queued messages stay
+  // where they are and a later call (after its release) moves them.
+  const source = await tx
+    .select({ agentId: heartbeatRuns.agentId })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.id, input.sourceRunId),
+      eq(heartbeatRuns.companyId, input.companyId),
+      ne(heartbeatRuns.agentId, input.newOwnerAgentId),
+      notInArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
+      or(isNull(heartbeatRuns.nativeIssueId), eq(heartbeatRuns.nativeIssueId, input.issueId)),
+    ))
+    .then((rows) => rows[0] ?? null);
+  if (!source) return [];
+
+  const saved = (await tx
+    .select()
+    .from(agentWakeupRequests)
+    .where(and(
+      eq(agentWakeupRequests.companyId, input.companyId),
+      eq(agentWakeupRequests.agentId, source.agentId),
+      eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+      sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
+    ))
+    .orderBy(asc(agentWakeupRequests.requestedAt)))
+    .filter((row) => {
+      const wake = toDeferredWakeCandidate(row);
+      // Chat, interaction, and explicit-continuation wakes keep their own
+      // delivery contract; mentions address the agent, not the task owner.
+      return (
+        !row.idempotencyKey?.startsWith("chat-inbound:") &&
+        !Object.hasOwn(wake.deferredContextSeed, "chatFailedRunRetry") &&
+        wake.payload.mutation !== "interaction" &&
+        !wake.preservesIndependentContinuation &&
+        ["issue_commented", "issue_reopened_via_comment"].includes(wake.wakeReason ?? wake.reason ?? "") &&
+        wake.queuedCommentIds.length > 0
+      );
+    });
+  if (saved.length === 0) return [];
+
+  const newRun = await tx
+    .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)))
+    .then((rows) => rows[0] ?? null);
+  const newWake = await tx
+    .select({ payload: agentWakeupRequests.payload })
+    .from(agentWakeupRequests)
+    .where(and(eq(agentWakeupRequests.id, input.wakeId), eq(agentWakeupRequests.companyId, input.companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!newRun || !newWake) return [];
+
+  // Guarded by the deferred status, so a wake another writer already moved
+  // is neither retired twice nor delivered twice.
+  const moved = new Set((await tx
+    .update(agentWakeupRequests)
+    .set({ status: "coalesced", runId: input.runId, finishedAt: input.now, updatedAt: input.now })
+    .where(and(
+      eq(agentWakeupRequests.companyId, input.companyId),
+      inArray(agentWakeupRequests.id, saved.map((row) => row.id)),
+      eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+    ))
+    .returning({ id: agentWakeupRequests.id })).map((row) => row.id));
+  const carried = await undeliveredLegacyUserCommentIds(
+    tx, input.companyId, input.issueId, input.newOwnerAgentId,
+    [...new Set(saved.filter((row) => moved.has(row.id)).flatMap((row) => queuedCommentIdsFromWakePayload(row.payload)))],
+  );
+  if (carried.length === 0) return [];
+
+  // The carried messages come first; the new owner's own wake comments (for
+  // example the hand-off note) stay last, so they remain the wake's latest.
+  const context = parseObject(newRun.contextSnapshot);
+  const commentIds = [...new Set([...carried, ...queuedCommentIdsFromRunContext(context)])];
+  await tx
+    .update(heartbeatRuns)
+    .set({ contextSnapshot: withQueuedCommentIdsInRunContext(context, commentIds), updatedAt: input.now })
+    .where(and(
+      eq(heartbeatRuns.id, input.runId),
+      eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.status, "queued"),
+    ));
+  await tx
+    .update(agentWakeupRequests)
+    .set({ payload: withQueuedCommentIdsInWakePayload(newWake.payload, commentIds), updatedAt: input.now })
+    .where(and(eq(agentWakeupRequests.id, input.wakeId), eq(agentWakeupRequests.companyId, input.companyId)));
+  return carried;
 }
 
 export type WakeQueuePostgresAdapterDeps = {
@@ -529,6 +640,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         );
 
       return toRunSummary(newRun);
+    },
+
+    async carryHandoffQueuedComments(input) {
+      return carryHandoffQueuedComments(tx, input);
     },
 
     async hasExistingExecutionPath({ companyId, issueId, excludeRunId, agentId }) {

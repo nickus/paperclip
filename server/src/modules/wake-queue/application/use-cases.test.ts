@@ -119,6 +119,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     reopenIssue: vi.fn(async () => null),
     claimDeferredWakeForPromotion: vi.fn(async () => true),
     finalizePromotedWake: vi.fn(async (input) => runSummary(input.wakeId)),
+    carryHandoffQueuedComments: vi.fn(async () => []),
     hasExistingExecutionPath: vi.fn(async () => false),
     hasExplicitBlockerPath: vi.fn(async () => false),
     isAutomaticRecoverySuppressedByPauseHold: vi.fn(async () => false),
@@ -205,6 +206,65 @@ describe("releaseIssueExecution", () => {
     expect(result.outcome.kind).toBe("promoted");
     expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({ wakeId: current.id }));
     expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+  });
+
+  // The finishing run handed its own task to "new-agent" and kept running,
+  // so the new owner's assignment wake waited behind it with the source run.
+  function handOffQueue(options: { handoffSourceRunId?: string; assigneeAgentId?: string; conversation?: boolean } = {}) {
+    const saved = wakeCandidate({ agentId: RUN.agentId, queuedCommentIds: ["saved-user-direction"] });
+    const parked = wakeCandidate({
+      id: "wake-new-owner", agentId: "new-agent",
+      reason: "issue_execution_deferred", wakeReason: "issue_assigned", preservesIndependentContinuation: true,
+      deferredContextSeed: {
+        wakeReason: "issue_assigned",
+        ...(options.handoffSourceRunId ? { handoffSourceRunId: options.handoffSourceRunId } : {}),
+      },
+    });
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async (input: { companyId: string; issueId: string; excludedWakeIds?: string[] }) =>
+        input.excludedWakeIds?.includes(saved.id) ? parked : saved),
+      getQueuedCommentLiveness: vi.fn(async () => ({ liveNonSelfCommentIds: ["saved-user-direction"], containedSelfAuthoredComment: false })),
+    });
+    const issue: IssueSnapshot = {
+      ...ISSUE,
+      assigneeAgentId: options.assigneeAgentId ?? "new-agent",
+      ...(options.conversation ? { conversationAgentId: "new-agent", conversationUserId: "user-1" } : {}),
+    };
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, issue),
+      recovery: createFakeRecovery(),
+    });
+    return { saved, parked, transaction, release };
+  }
+
+  it("carries the previous owner's saved messages into the new owner's promoted wake after a hand-off", async () => {
+    const { saved, parked, transaction, release } = handOffQueue({ handoffSourceRunId: RUN.id });
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+    expect(result.outcome.kind).toBe("promoted");
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledTimes(1);
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({ wakeId: parked.id }));
+    expect(transaction.carryHandoffQueuedComments).toHaveBeenCalledTimes(1);
+    expect(transaction.carryHandoffQueuedComments).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: RUN.companyId,
+      issueId: ISSUE.id,
+      sourceRunId: RUN.id,
+      newOwnerAgentId: "new-agent",
+      wakeId: parked.id,
+      runId: parked.id,
+    }));
+    // The previous owner's saved wake is not promoted or dropped by the drain.
+    expect(transaction.claimDeferredWakeForPromotion).not.toHaveBeenCalledWith(expect.objectContaining({ wakeId: saved.id }));
+    expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the wake names no hand-off source", {}],
+    ["the task changed hands again", { handoffSourceRunId: RUN.id, assigneeAgentId: "third-agent" }],
+    ["the task is a conversation", { handoffSourceRunId: RUN.id, conversation: true }],
+  ])("carries nothing into a promoted wake when %s", async (_case, options) => {
+    const { transaction, release } = handOffQueue(options);
+    await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+    expect(transaction.carryHandoffQueuedComments).not.toHaveBeenCalled();
   });
 
   // A queue with an assignment wake for an agent that no longer owns the

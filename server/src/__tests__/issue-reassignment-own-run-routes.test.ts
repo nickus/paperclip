@@ -12,6 +12,7 @@ import {
   companyMemberships,
   createDb,
   heartbeatRuns,
+  issueComments,
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
@@ -27,7 +28,7 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 
-type AdapterContext = { runId: string; agent: { id: string } };
+type AdapterContext = { runId: string; agent: { id: string }; context?: Record<string, unknown> };
 type AdapterResult = {
   exitCode: number;
   signal: null;
@@ -371,6 +372,197 @@ describeEmbeddedPostgres("issue reassignment from the assignee's own run", () =>
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
   });
 
+  async function commentsOf(issueId: string) {
+    return db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+  }
+
+  function wakeCommentIdsOf(context: unknown) {
+    return (context as { wakeCommentIds?: unknown } | null)?.wakeCommentIds;
+  }
+
+  function renderedWakeCommentIds(context: Record<string, unknown> | undefined) {
+    const wake = context?.paperclipWake as { comments?: Array<{ id?: unknown }> } | undefined;
+    return (wake?.comments ?? []).map((comment) => comment.id);
+  }
+
+  it("carries a message queued for the previous owner during its hand-off run to the new owner once", async () => {
+    const seeded = await seed();
+    let queuedCommentId = "";
+    let handOffCommentId = "";
+    let reviewerContext: Record<string, unknown> | undefined;
+
+    const builderRunId = await runBuilderThatHandsOff(seeded, async (runId) => {
+      // A board user writes to the task while the builder is still working
+      // on it. The message waits for the builder's next turn.
+      const posted = await request(createApp(boardActor(seeded.companyId)))
+        .post(`/api/issues/${seeded.issueId}/comments`)
+        .send({ body: "Please also cover the empty-input case." });
+      expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+      queuedCommentId = posted.body.id;
+      await vi.waitFor(async () => {
+        const [queued] = await wakesFor(seeded.builderId, seeded.issueId).then((wakes) =>
+          wakes.filter((wake) => wake.status === "deferred_issue_execution"));
+        expect(queued).toBeDefined();
+      });
+
+      // The builder then hands the task over from the same run.
+      const res = await request(createApp(agentActor(seeded.companyId, seeded.builderId, runId)))
+        .patch(`/api/issues/${seeded.issueId}`)
+        .send({ assigneeAgentId: seeded.reviewerId, comment: "Implementation is done; please review." });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      await vi.waitFor(async () => {
+        const [parked] = await wakesFor(seeded.reviewerId, seeded.issueId);
+        expect(parked).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      });
+    }, async (ctx) => {
+      expect(ctx.agent.id).toBe(seeded.reviewerId);
+      reviewerContext = ctx.context;
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.issueId));
+    });
+
+    handOffCommentId = (await commentsOf(seeded.issueId)).find((comment) => comment.authorAgentId === seeded.builderId)!.id;
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, builderRunId));
+    expect(finished).toMatchObject({ status: "succeeded", errorCode: null });
+
+    // The new owner's single run receives the queued message ahead of the
+    // hand-off note, which stays the wake's latest comment.
+    const reviewerRuns = await runsFor(seeded.reviewerId, seeded.issueId);
+    expect(reviewerRuns).toHaveLength(1);
+    expect(reviewerRuns[0]).toMatchObject({ status: "succeeded" });
+    expect(wakeCommentIdsOf(reviewerRuns[0]!.contextSnapshot)).toEqual([queuedCommentId, handOffCommentId]);
+    expect(reviewerRuns[0]!.contextSnapshot).toMatchObject({ wakeCommentId: handOffCommentId });
+    expect(renderedWakeCommentIds(reviewerContext)).toEqual([queuedCommentId, handOffCommentId]);
+
+    // The previous owner does not run again for it: its queued wake now
+    // belongs to the new owner's run.
+    expect(await runsFor(seeded.builderId, seeded.issueId)).toHaveLength(1);
+    const builderWakes = await wakesFor(seeded.builderId, seeded.issueId);
+    const carried = builderWakes.filter((wake) => wake.id !== finished!.wakeupRequestId);
+    expect(carried).toHaveLength(1);
+    expect(carried[0]).toMatchObject({ status: "coalesced", runId: reviewerRuns[0]!.id });
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
+    expect(await recoveryActionsFor(seeded.issueId)).toHaveLength(0);
+  });
+
+  it("gives the new owner only its own hand-off note when nothing was queued for the previous owner", async () => {
+    const seeded = await seed();
+    let reviewerContext: Record<string, unknown> | undefined;
+
+    await runBuilderThatHandsOff(seeded, async (runId) => {
+      const res = await request(createApp(agentActor(seeded.companyId, seeded.builderId, runId)))
+        .patch(`/api/issues/${seeded.issueId}`)
+        .send({ assigneeAgentId: seeded.reviewerId, comment: "Implementation is done; please review." });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      await vi.waitFor(async () => {
+        const [parked] = await wakesFor(seeded.reviewerId, seeded.issueId);
+        expect(parked).toMatchObject({ status: "deferred_issue_execution" });
+      });
+    }, async (ctx) => {
+      reviewerContext = ctx.context;
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.issueId));
+    });
+
+    const handOffCommentId = (await commentsOf(seeded.issueId)).find((comment) => comment.authorAgentId === seeded.builderId)!.id;
+    const reviewerRuns = await runsFor(seeded.reviewerId, seeded.issueId);
+    expect(reviewerRuns).toHaveLength(1);
+    expect(wakeCommentIdsOf(reviewerRuns[0]!.contextSnapshot)).toEqual([handOffCommentId]);
+    expect(renderedWakeCommentIds(reviewerContext)).toEqual([handOffCommentId]);
+    expect((await wakesFor(seeded.builderId, seeded.issueId)).map((wake) => wake.status)).not.toContain("coalesced");
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
+  });
+
+  it("carries the previous owner's queued message when the new owner's wake arrives after the hand-off run released the task", async () => {
+    const seeded = await seed();
+    // The hand-off run has already finished and released the task, and the
+    // board user's message it did not read is still queued for its agent.
+    const builderRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: builderRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.builderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      runtimeMode: "legacy",
+      startedAt: new Date(Date.now() - 60_000),
+      finishedAt: new Date(),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId, wakeReason: "issue_assigned" },
+    });
+    await db.update(issues).set({ assigneeAgentId: seeded.reviewerId }).where(eq(issues.id, seeded.issueId));
+    const [queuedComment] = await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorType: "user",
+      authorUserId: BOARD_USER_ID,
+      body: "Please also cover the empty-input case.",
+    }).returning();
+    const [handOffComment] = await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorType: "agent",
+      authorAgentId: seeded.builderId,
+      createdByRunId: builderRunId,
+      body: "Implementation is done; please review.",
+    }).returning();
+    const [queuedWake] = await db.insert(agentWakeupRequests).values({
+      companyId: seeded.companyId,
+      agentId: seeded.builderId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      status: "deferred_issue_execution",
+      requestedByActorType: "user",
+      requestedByActorId: BOARD_USER_ID,
+      payload: {
+        issueId: seeded.issueId,
+        commentId: queuedComment!.id,
+        mutation: "comment",
+        _paperclipWakeContext: {
+          issueId: seeded.issueId,
+          taskId: seeded.issueId,
+          wakeReason: "issue_commented",
+          commentId: queuedComment!.id,
+          wakeCommentId: queuedComment!.id,
+          wakeCommentIds: [queuedComment!.id],
+        },
+      },
+    }).returning();
+
+    let reviewerContext: Record<string, unknown> | undefined;
+    mockAdapterExecute.mockImplementationOnce(async (ctx) => {
+      reviewerContext = ctx.context;
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.issueId));
+      return succeeded("Reviewed the task.");
+    });
+    // The new owner's wake, as the update route sends it for this hand-off.
+    const queued = await heartbeat.wakeup(seeded.reviewerId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: seeded.issueId, commentId: handOffComment!.id, mutation: "update", handoffSourceRunId: builderRunId },
+      requestedByActorType: "agent",
+      requestedByActorId: seeded.builderId,
+      contextSnapshot: {
+        issueId: seeded.issueId,
+        taskId: seeded.issueId,
+        commentId: handOffComment!.id,
+        wakeCommentId: handOffComment!.id,
+        source: "issue.update",
+        handoffSourceRunId: builderRunId,
+      },
+    });
+    expect(queued).not.toBeNull();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    const reviewerRuns = await runsFor(seeded.reviewerId, seeded.issueId);
+    expect(reviewerRuns).toHaveLength(1);
+    expect(wakeCommentIdsOf(reviewerRuns[0]!.contextSnapshot)).toEqual([queuedComment!.id, handOffComment!.id]);
+    expect(renderedWakeCommentIds(reviewerContext)).toEqual([queuedComment!.id, handOffComment!.id]);
+    const [carried] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queuedWake!.id));
+    expect(carried).toMatchObject({ status: "coalesced", runId: reviewerRuns[0]!.id });
+    expect(await runsFor(seeded.builderId, seeded.issueId)).toHaveLength(1);
+  });
+
   /** A live run of `agentId` on `issueId`, backed by a real process so Stop can terminate it. */
   async function seedLiveRun(input: { companyId: string; agentId: string; issueId: string }) {
     const runId = randomUUID();
@@ -411,6 +603,47 @@ describeEmbeddedPostgres("issue reassignment from the assignee's own run", () =>
     expect(stopped).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned" });
     const [task] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
     expect(task).toMatchObject({ assigneeAgentId: seeded.reviewerId });
+  });
+
+  it("still hands a message queued for the previous owner to the new owner when a board user reassigns the task", async () => {
+    const seeded = await seed();
+    const liveRunId = await seedLiveRun({
+      companyId: seeded.companyId,
+      agentId: seeded.builderId,
+      issueId: seeded.issueId,
+    });
+    await db.update(issues).set({ executionRunId: liveRunId, executionLockedAt: new Date() })
+      .where(eq(issues.id, seeded.issueId));
+    const board = createApp(boardActor(seeded.companyId));
+    const posted = await request(board)
+      .post(`/api/issues/${seeded.issueId}/comments`)
+      .send({ body: "Please also cover the empty-input case." });
+    expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+    await vi.waitFor(async () => {
+      const queued = (await wakesFor(seeded.builderId, seeded.issueId))
+        .filter((wake) => wake.status === "deferred_issue_execution");
+      expect(queued).toHaveLength(1);
+    });
+
+    const res = await request(board)
+      .patch(`/api/issues/${seeded.issueId}`)
+      .send({ assigneeAgentId: seeded.reviewerId, comment: "Moving this to the reviewer." });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, liveRunId));
+    expect(stopped).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned" });
+    await vi.waitFor(async () => {
+      expect(await runsFor(seeded.reviewerId, seeded.issueId)).toHaveLength(1);
+    });
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    const reassignCommentId = (await commentsOf(seeded.issueId))
+      .find((comment) => comment.body === "Moving this to the reviewer.")!.id;
+    const [reviewerRun] = await runsFor(seeded.reviewerId, seeded.issueId);
+    expect(wakeCommentIdsOf(reviewerRun!.contextSnapshot)).toEqual([posted.body.id, reassignCommentId]);
+    const [carried] = (await wakesFor(seeded.builderId, seeded.issueId))
+      .filter((wake) => wake.payload?.mutation === "comment");
+    expect(carried).toMatchObject({ status: "coalesced", runId: reviewerRun!.id });
+    expect(await runsFor(seeded.builderId, seeded.issueId)).toHaveLength(1);
   });
 
   it("still stops the task's live run when a different run of the same agent reassigns it", async () => {

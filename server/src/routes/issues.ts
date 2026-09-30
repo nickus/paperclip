@@ -13252,6 +13252,10 @@ export function issueRoutes(
         return;
       }
       let interruptedRunId: string | null = null;
+      // The caller's own run when it hands its task to another assignee and
+      // keeps running (see below). The new assignee's wake names it so the
+      // messages still queued for the previous assignee can follow the task.
+      let handoffSourceRunId: string | null = null;
       const closedExecutionWorkspace =
         await getClosedIssueExecutionWorkspace(existing);
       const isAgentWorkUpdate =
@@ -13687,6 +13691,7 @@ export function issueRoutes(
         const runToStopForReassignment = actorRunHandsOffItsOwnTask
           ? null
           : activeIssueRun;
+        handoffSourceRunId = actorRunHandsOffItsOwnTask ? activeIssueRun.id : null;
         if (runToStopForReassignment) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
@@ -14864,6 +14869,7 @@ export function issueRoutes(
                 ? { resumeIntent: true, followUpRequested: true }
                 : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
+              ...(handoffSourceRunId ? { handoffSourceRunId } : {}),
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
@@ -14881,6 +14887,7 @@ export function issueRoutes(
                 ? { resumeIntent: true, followUpRequested: true }
                 : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
+              ...(handoffSourceRunId ? { handoffSourceRunId } : {}),
             },
           });
         }
