@@ -82,8 +82,15 @@ export function runtimeConnectionIntentRoutes(db: Db) {
       });
       return;
     }
-    if (request.method === "notifications/initialized") {
+    // Notifications get no JSON-RPC response. The Streamable HTTP transport
+    // acknowledges an accepted one with 202 and no body, whether or not the
+    // server acts on it (for example `notifications/cancelled`).
+    if (typeof request.method === "string" && request.method.startsWith("notifications/")) {
       res.status(202).end();
+      return;
+    }
+    if (request.method === "ping") {
+      res.json({ jsonrpc: "2.0", id, result: {} });
       return;
     }
     if (request.method === "tools/list") {
@@ -113,14 +120,19 @@ export function runtimeConnectionIntentRoutes(db: Db) {
         res.json({ jsonrpc: "2.0", id, result: resultContent(result) });
         return;
       }
-      res.status(404).json({
+      // MCP reports an unknown tool as invalid params. Like every JSON-RPC
+      // error it travels in a 200 response: the HTTP request itself succeeded.
+      res.json({
         jsonrpc: "2.0",
         id,
-        error: { code: -32601, message: `Unknown tool: ${name || "missing"}` },
+        error: { code: -32602, message: `Unknown tool: ${name || "missing"}` },
       });
       return;
     }
-    res.status(404).json({
+    // An MCP client may probe optional methods this server does not declare
+    // (prompts/list, resources/list, ...). Answer with the JSON-RPC "method not
+    // found" error in a 200 response rather than an HTTP 404.
+    res.json({
       jsonrpc: "2.0",
       id,
       error: { code: -32601, message: `Unknown method: ${request.method ?? "missing"}` },
