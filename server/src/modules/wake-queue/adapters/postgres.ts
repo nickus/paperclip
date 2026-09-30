@@ -1105,6 +1105,17 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             sql`coalesce(${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay', '') <> 'blocked'`,
           )).limit(1)).length,
         );
+        // A confirmed reassignment stop hands the task to its next owner. The
+        // stop's own release keeps the queue for that successor; once the run
+        // has settled and the task no longer belongs to the stopped agent, the
+        // wakes left behind are not that run's queued work, so the
+        // acknowledged stop no longer stands the drain down.
+        const handedOffAfterSettling = Boolean(
+          input.afterOwnerSettled && issueRow && run.runtimeMode !== "native" &&
+          run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
+          parseObject(run.resultJson).reassignmentStopConfirmed === true &&
+          issueRow.assigneeAgentId !== run.agentId,
+        );
         const preDrainFacts: PreDrainFacts = {
           issueRowPresent: issueRow !== null,
           executionRunIdMatchesRun: !issueRow || !issueRow.executionRunId || issueRow.executionRunId === run.id,
@@ -1117,17 +1128,19 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.
-          executionCancellationAcknowledged:
+          executionCancellationAcknowledged: !handedOffAfterSettling && (
             isAcknowledgedNativeReassignmentStop(run) ||
             (run.status === "cancelled" &&
             (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
-            !interruptedQueue),
+            !interruptedQueue)),
         };
         const preDrain = decidePreDrain(preDrainFacts);
 
         // The run's own release already escalated a blocked outcome; a
-        // drain after its hold only promotes what is still queued.
-        if (preDrain.kind === "released" || (input.afterExecutionHold && preDrain.kind === "blocked")) {
+        // drain after its hold, or after its executor settled, only promotes
+        // what is still queued.
+        if (preDrain.kind === "released" ||
+            ((input.afterExecutionHold || input.afterOwnerSettled) && preDrain.kind === "blocked")) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
@@ -1140,12 +1153,12 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // queued successor still owns the next turn, including during a late
         // finalization/stranded-queue retry under this issue lock. Another
         // agent's review participation retains its separate recovery path.
-        // A drain run after a hold is not the release of a run that just
-        // finished: any live run on the issue, of any agent, owns the next
-        // turn, and its own release drains the queue.
+        // A drain run after a hold, or after the executor settled, is not the
+        // release of a run that just finished: any live run on the issue, of
+        // any agent, owns the next turn, and its own release drains the queue.
         const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, input.companyId),
-          input.afterExecutionHold ? undefined : eq(heartbeatRuns.agentId, run.agentId),
+          input.afterExecutionHold || input.afterOwnerSettled ? undefined : eq(heartbeatRuns.agentId, run.agentId),
           sql`${heartbeatRuns.id} <> ${run.id}`,
           or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
             sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
@@ -1194,7 +1207,9 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // The finishing conversation may still own its lease until finally cleanup.
         // Allow only bounded retry planning in that case; admission stays gated.
         const executionBlocker = await getExecutionBlocker(tx, issueRow.companyId, issueRow.id);
-        const recoveryOnly = Boolean(executionBlocker &&
+        // Recovery planning belongs to the run's own release; a drain after
+        // the executor settled never repeats it.
+        const recoveryOnly = Boolean(executionBlocker && !input.afterOwnerSettled &&
           executionBlocker.cause === "execution_owner_active" && executionBlocker.runId === run.id &&
           runSnapshot.conversationContinuation && ["failed", "timed_out", "interrupted"].includes(run.status));
         if (executionBlocker && !recoveryOnly) {
