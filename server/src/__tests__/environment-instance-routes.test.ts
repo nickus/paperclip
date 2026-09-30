@@ -97,10 +97,14 @@ vi.mock("../services/plugin-environment-driver.js", () => ({
   deletePluginEnvironmentTemplate: vi.fn(),
 }));
 
+// Environment ids are UUIDs: the routes reject
+// any other form with a 400 before they look the record up.
+const ENV_ID = "11111111-1111-4111-8111-111111111111";
+
 function createEnvironment(overrides: Record<string, unknown> = {}) {
   const now = new Date("2026-06-20T00:00:00.000Z");
   return {
-    id: "env-1",
+    id: ENV_ID,
     name: "Local",
     description: "Default execution environment",
     driver: "local",
@@ -267,13 +271,13 @@ describe("environment instance routes", () => {
       { db: expect.anything() },
     );
     expect(mockSecretService.replaceSecretRefsForInstanceTarget).toHaveBeenCalledWith(
-      { targetType: "environment", targetId: "env-1" },
+      { targetType: "environment", targetId: ENV_ID },
       [],
       { db: expect.anything() },
     );
     expect(mockSecretService.syncEnvBindingsForTarget).toHaveBeenCalledWith(
       "company-1",
-      { targetType: "environment", targetId: "env-1" },
+      { targetType: "environment", targetId: ENV_ID },
       {},
       { db: expect.anything() },
     );
@@ -316,7 +320,7 @@ describe("environment instance routes", () => {
     );
     expect(mockSecretService.syncEnvBindingsForTarget).toHaveBeenCalledWith(
       "company-1",
-      { targetType: "environment", targetId: "env-1" },
+      { targetType: "environment", targetId: ENV_ID },
       envVars,
       { db: expect.anything() },
     );
@@ -331,7 +335,7 @@ describe("environment instance routes", () => {
       isInstanceAdmin: true,
     });
 
-    const res = await request(app).get("/api/environments/env-1");
+    const res = await request(app).get(`/api/environments/${ENV_ID}`);
 
     expect(res.status).toBe(200);
     expect(res.body.config).toEqual({ shell: "zsh" });

@@ -957,6 +957,35 @@ describe("heartbeat run ID OpenAPI contract", () => {
   });
 });
 
+describe("environment path ID OpenAPI contract", () => {
+  it("publishes the UUID constraint and 400 response on environment, lease and setup session routes", async () => {
+    const response = await request(createApp()).get("/api/openapi.json");
+    expect(response.status).toBe(200);
+    let checked = 0;
+    for (const [path, operations] of Object.entries(response.body.paths)) {
+      const match = /^\/api\/(?:environments\/\{(id|environmentId)\}|environment-leases\/\{(leaseId)\}|environment-custom-image-setup-sessions\/\{(sessionId)\})/
+        .exec(path);
+      if (!match) continue;
+      const name = match[1] ?? match[2] ?? match[3];
+      for (const operation of Object.values(operations as Record<string, any>)) {
+        const parameter = operation.parameters.find((param: { name: string }) => param.name === name);
+        expect(parameter.schema.pattern, path).toEqual(expect.any(String));
+        const pattern = new RegExp(parameter.schema.pattern);
+        for (const id of [
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "AAAAAAAA-AAAA-7AAA-BAAA-AAAAAAAAAAAA",
+        ]) expect(pattern.test(id), id).toBe(true);
+        for (const id of ["undefined", "1a2b3c4d", " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]) {
+          expect(pattern.test(id), JSON.stringify(id)).toBe(false);
+        }
+        expect(operation.responses["400"], path).toBeDefined();
+        checked++;
+      }
+    }
+    expect(checked).toBe(17);
+  });
+});
+
 it("documents the account binding required for preference reads", () => {
   const operation = buildOpenApiSpec().paths["/api/auth/preferences"]?.get;
   expect(operation?.parameters).toEqual(expect.arrayContaining([
