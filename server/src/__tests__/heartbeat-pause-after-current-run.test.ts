@@ -14,14 +14,18 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import { agentService } from "../services/agents.ts";
-import { heartbeatService } from "../services/heartbeat.ts";
+import { heartbeatService, startTaskDrain, stopTaskDrain } from "../services/heartbeat.ts";
+
+const TRANSIENT_FAILURE_TEST_ADAPTER = "pause_after_run_transient_failure_test";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -48,6 +52,8 @@ describeEmbeddedPostgres("heartbeat pause after the current run", () => {
   }, 60_000);
 
   afterEach(async () => {
+    stopTaskDrain();
+    await db.delete(issueRecoveryActions);
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
@@ -60,6 +66,7 @@ describeEmbeddedPostgres("heartbeat pause after the current run", () => {
   });
 
   afterAll(async () => {
+    unregisterServerAdapter(TRANSIENT_FAILURE_TEST_ADAPTER);
     await tempDb?.cleanup();
     if (markerDir) rmSync(markerDir, { recursive: true, force: true });
   });
@@ -169,5 +176,71 @@ describeEmbeddedPostgres("heartbeat pause after the current run", () => {
     await heartbeat.resumeQueuedRuns();
     await heartbeat.drainActiveRunExecutions();
     expect(await runStatus(queuedRunId)).toBe("succeeded");
+  }, 60_000);
+
+  it("keeps the transient-failure retry of the last run until the agent is resumed", async () => {
+    let started = false;
+    let finishRun!: () => void;
+    const runMayFinish = new Promise<void>((resolve) => { finishRun = resolve; });
+    registerServerAdapter({
+      type: TRANSIENT_FAILURE_TEST_ADAPTER,
+      execute: async () => {
+        started = true;
+        await runMayFinish;
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: "upstream overloaded",
+          errorCode: "claude_transient_upstream",
+          errorFamily: "transient_upstream",
+          resultJson: {
+            executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+            errorFamily: "transient_upstream",
+          },
+        };
+      },
+      testEnvironment: async () => ({
+        adapterType: TRANSIENT_FAILURE_TEST_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
+    const fixture = await seed(path.join(markerDir, `${randomUUID()}.unused`));
+    await db.update(agents).set({ adapterType: TRANSIENT_FAILURE_TEST_ADAPTER, adapterConfig: {} }).where(eq(agents.id, fixture.agentId));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, fixture.issueId));
+    const heartbeat = heartbeatService(db);
+    const liveRunId = await insertQueuedRun(fixture);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitFor(() => started);
+    // Pause after the current run: nothing is cancelled, and the run then
+    // fails with a transient provider error.
+    await agentService(db).pause(fixture.agentId);
+    finishRun();
+    await heartbeat.drainActiveRunExecutions();
+    // Keep the promoted retry queued for inspection.
+    startTaskDrain();
+
+    expect(await runStatus(liveRunId)).toBe("failed");
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, liveRunId));
+    expect(retry).toMatchObject({ agentId: fixture.agentId, status: "scheduled_retry", scheduledRetryReason: "transient_failure" });
+    const [issueAfterRun] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(issueAfterRun).toMatchObject({ status: "in_progress", executionRunId: retry!.id });
+
+    // While the agent stays paused, the due retry is neither promoted nor
+    // cancelled, and recovery does not escalate the task that waits for it.
+    const afterDue = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    expect(await heartbeat.promoteDueScheduledRetries(afterDue)).toEqual({ promoted: 0, runIds: [] });
+    expect(await runStatus(retry!.id)).toBe("scheduled_retry");
+    expect((await heartbeat.reconcileStrandedAssignedIssues()).escalated).toBe(0);
+    const [issueWhilePaused] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(issueWhilePaused!.status).toBe("in_progress");
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId))).toEqual([]);
+
+    await agentService(db).resume(fixture.agentId);
+    expect(await heartbeat.promoteDueScheduledRetries(afterDue)).toEqual({ promoted: 1, runIds: [retry!.id] });
+    expect(await runStatus(retry!.id)).toBe("queued");
   }, 60_000);
 });
