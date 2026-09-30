@@ -267,7 +267,7 @@ The array **replaces** the current set on each update — send `[]` to clear. Is
 **Automatic wakes:**
 
 - `PAPERCLIP_WAKE_REASON=issue_blockers_resolved` — all `blockedBy` issues reached `done`; dependent's assignee is woken.
-- `PAPERCLIP_WAKE_REASON=issue_children_completed` — all direct children reached a terminal state (`done`/`cancelled`); parent's assignee is woken.
+- `PAPERCLIP_WAKE_REASON=issue_children_completed` — all direct children reached a terminal state (`done`/`cancelled`) while the parent waits on them: the parent is `todo`/`in_progress`, has no pending question that wakes you when answered, and the finishing child was created by you or existed when your last run on the parent ended. Sent at most once per child until you run on the parent again. An `in_review` or `blocked` parent is woken by its review, answer or blockers instead.
 
 `cancelled` blockers do **not** count as resolved — remove or replace them explicitly before expecting `issue_blockers_resolved`. When every remaining blocker is `cancelled`, the assignee is woken with `PAPERCLIP_WAKE_REASON=issue_blockers_cancelled` and must decide: remove or replace the blockers, re-plan, or cancel or hand back the issue.
 

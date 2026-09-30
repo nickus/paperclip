@@ -15167,14 +15167,21 @@ export function issueRoutes(
           await destroyReusableSandboxLeasesForTerminalIssue(issue);
         }
         if (becameTerminal && issue.parentId) {
+          // Null unless the parent is waiting on its children (see
+          // getWakeableParentAfterChildCompletion). A parent blocked on this
+          // child is woken by the dependency path instead (the wake above, or
+          // the dependency backstop keyed on that wake), so it gets no second
+          // wake here.
           const parent = await svc.getWakeableParentAfterChildCompletion(
             issue.parentId,
+            { issueId: issue.id },
           );
-          if (parent) {
+          if (parent && !parent.completedChildBlocksParent) {
             addWakeup(parent.assigneeAgentId, {
               source: "automation",
               triggerDetail: "system",
               reason: "issue_children_completed",
+              idempotencyKey: parent.idempotencyKey,
               payload: {
                 issueId: parent.id,
                 completedChildIssueId: issue.id,
@@ -18546,14 +18553,21 @@ export function issueRoutes(
           await destroyReusableSandboxLeasesForTerminalIssue(currentIssue);
         }
         if (becameTerminal && currentIssue.parentId) {
+          // Null unless the parent is waiting on its children (see
+          // getWakeableParentAfterChildCompletion). A parent blocked on this
+          // child is woken by the dependency path instead (the wake above, or
+          // the dependency backstop keyed on that wake), so it gets no second
+          // wake here.
           const parent = await svc.getWakeableParentAfterChildCompletion(
             currentIssue.parentId,
+            { issueId: currentIssue.id },
           );
-          if (parent) {
+          if (parent && !parent.completedChildBlocksParent) {
             addWakeup(parent.assigneeAgentId, {
               source: "automation",
               triggerDetail: "system",
               reason: "issue_children_completed",
+              idempotencyKey: parent.idempotencyKey,
               payload: {
                 issueId: parent.id,
                 completedChildIssueId: currentIssue.id,

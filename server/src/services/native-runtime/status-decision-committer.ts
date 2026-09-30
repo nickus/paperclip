@@ -1979,14 +1979,17 @@ export async function commitNativeStatusDecision(input: {
           },
         });
       }
-      if (parent && !parentIsDependent) {
+      // A parent blocked on this child that is not ready yet still waits on
+      // its other blockers, so it gets no wake until the dependency path
+      // sends one.
+      if (parent && !parentIsDependent && !parent.completedChildBlocksParent) {
         const wakeId = await enqueueWake({
           tx: tx as unknown as Db,
           companyId: input.companyId,
           issueId: parent.id,
           agentId: parent.assigneeAgentId,
           reason: "issue_children_completed",
-          idempotencyKey: `issue_children_completed:${parent.id}:${input.issueId}`,
+          idempotencyKey: parent.idempotencyKey,
           payload: {
             completedChildIssueId: input.issueId,
             childIssueIds: parent.childIssueIds,

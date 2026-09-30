@@ -4900,6 +4900,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         title: "Child A",
         status: "done",
         priority: "medium",
+        createdByAgentId: assigneeAgentId,
         // Give the children distinct, ordered issue numbers. The service
         // sorts direct children by issueNumber, then createdAt. A batched
         // insert gives every row in the statement the same defaultNow()
@@ -4915,15 +4916,16 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         title: "Child B",
         status: "blocked",
         priority: "medium",
+        createdByAgentId: assigneeAgentId,
         issueNumber: 2,
       },
     ]);
 
-    expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toBeNull();
+    expect(await svc.getWakeableParentAfterChildCompletion(parentId, { issueId: childA })).toBeNull();
 
     await svc.update(childB, { status: "cancelled" });
 
-    expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toMatchObject({
+    expect(await svc.getWakeableParentAfterChildCompletion(parentId, { issueId: childB })).toMatchObject({
       id: parentId,
       assigneeAgentId,
       childIssueIds: [childA, childB],
