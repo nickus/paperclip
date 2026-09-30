@@ -1320,6 +1320,11 @@ export interface RequestConfirmationToolActionResult {
   errorMessage?: string | null;
   resultSummary?: string | null;
   resultHref?: string | null;
+  /**
+   * "none" when the action's connection keeps no call content: the outcome is
+   * recorded without the result and without the provider's error text.
+   */
+  contentRetention?: "none";
   updatedAt: string;
 }
 

@@ -83,6 +83,62 @@ export function isSecretSensitiveHttpRequest(
   return SECRET_SENSITIVE_HTTP_PATHS.some((pattern) => pattern.test(pathname));
 }
 
+// Requests whose body is a tool call's arguments. The tool gateway records
+// every call under its connection's content retention, so an HTTP failure log
+// must not keep a second, unfiltered copy of those arguments.
+//
+// Two mechanisms cover these requests, because each one alone leaves a gap:
+// - the handlers that pass a request body to the gateway mark their response
+//   (markToolCallContentResponse), so every route that reuses such a handler
+//   is covered however it is mounted;
+// - this path list covers a request that fails before its handler runs (body
+//   parsing, authentication, validation middleware) and so is never marked.
+const TOOL_CALL_CONTENT_HTTP_PATHS = [
+  /^\/api\/tool-gateway\/tools\/call\/?$/i,
+  /^\/mcp\/gateways\/[^/]+\/?$/i,
+  /^\/api\/tool-gateway\/gateways\/[^/]+\/mcp\/?$/i,
+  /^\/api\/tool-connections\/[^/]+\/test-calls\/?$/i,
+];
+
+const toolCallContentResponses = new WeakSet<object>();
+
+/** Mark a response whose request body carries tool-call arguments. */
+export function markToolCallContentResponse(res: object): void {
+  toolCallContentResponses.add(res);
+}
+
+/** Route middleware form of markToolCallContentResponse; place it first. */
+export function toolCallContentRequest(
+  _req: unknown,
+  res: object,
+  next: () => void,
+): void {
+  markToolCallContentResponse(res);
+  next();
+}
+
+export function isToolCallContentResponse(res: unknown): boolean {
+  return (
+    typeof res === "object" && res !== null && toolCallContentResponses.has(res)
+  );
+}
+
+export function isToolCallContentHttpRequest(
+  method: string | undefined,
+  url: string | undefined,
+): boolean {
+  if (!method || !url || method.toUpperCase() !== "POST") return false;
+  let pathname = normalizePath(url);
+  if (/^https?:\/\//i.test(pathname)) {
+    try {
+      pathname = new URL(url).pathname;
+    } catch {
+      return false;
+    }
+  }
+  return TOOL_CALL_CONTENT_HTTP_PATHS.some((pattern) => pattern.test(pathname));
+}
+
 export function shouldSilenceHttpSuccessLog(
   method: string | undefined,
   url: string | undefined,

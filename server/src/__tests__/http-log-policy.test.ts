@@ -2,8 +2,36 @@ import { describe, expect, it } from "vitest";
 import {
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
+  isToolCallContentHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "../middleware/http-log-policy.js";
+
+describe("isToolCallContentHttpRequest", () => {
+  it("classifies the routes whose body is a tool call's arguments", () => {
+    for (const path of [
+      "/api/tool-gateway/tools/call",
+      "/api/tool-gateway/tools/call/",
+      "/mcp/gateways/gw-public-id",
+      "/api/tool-gateway/gateways/gw-1/mcp",
+      "/api/tool-gateway/gateways/gw-1/mcp/",
+      "/api/tool-connections/conn-1/test-calls",
+      "http://host.invalid/api/tool-gateway/tools/call?x=1",
+    ]) {
+      expect(isToolCallContentHttpRequest("POST", path)).toBe(true);
+    }
+    for (const [method, path] of [
+      ["GET", "/mcp/gateways/gw-public-id"],
+      ["GET", "/api/tool-gateway/gateways/gw-1/mcp"],
+      ["POST", "/api/tool-gateway/gateways/gw-1/tokens"],
+      ["GET", "/api/tool-connections/conn-1/test-calls/request-1"],
+      ["POST", "/api/tool-gateway/sessions"],
+      ["POST", "/api/tool-gateway/action-requests/request-1/approve"],
+      ["POST", "/api/issues/issue-1"],
+    ] as const) {
+      expect(isToolCallContentHttpRequest(method, path)).toBe(false);
+    }
+  });
+});
 
 describe("isPrivateWebhookHttpRequest", () => {
   it("protects the native webhook namespace, including rejected methods and query data", () => {

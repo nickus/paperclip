@@ -226,6 +226,74 @@ check due, so the periodic health sweep probes it with `tools/list` on its next
 pass: a server that still answers stays healthy, one that accepts connections
 but never answers is marked `error` and its tools stop being listed.
 
+### Content retention
+
+The gateway records every tool call. By default those records include a
+redacted summary of the call's arguments and of its result (truncated to 4000
+characters) next to their SHA-256 hashes and sizes. For a server that holds
+private material, such as a personal notes server, a mailbox or a document
+store, those summaries copy that material into Paperclip's database, where
+anyone who can read the audit log can see it. `contentRetention` in the
+connection's `config` chooses what is kept:
+
+| `config.contentRetention` | Stored for each call |
+| --- | --- |
+| `"summary"` (default) | Who, when, which tool, policy decision, outcome, latency, error code and message, plus redacted, truncated argument and result summaries with their SHA-256 hashes and sizes |
+| `"none"` | Who, when, which tool, policy decision, outcome, latency, error code, and the SHA-256 hashes and sizes of the arguments and the result. No argument text, result text or provider error text |
+
+Any other value is rejected on create and update. A stored config whose
+`contentRetention` is present but not one of these values (for example `null`,
+written before validation or directly to the database) is read as `"none"`.
+Keep content out of the database for a private notes server:
+
+```sh
+curl -fsS -X PATCH -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
+  "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID" \
+  -d '{ "config": { "url": "https://notes.example.com/mcp", "contentRetention": "none" } }'
+```
+
+As with `toolTimeoutMs`, send the connection's full config with the new key.
+
+The setting only changes what is stored; the agent that made a call still
+receives the full result. With `"none"`:
+
+- Tool invocations, the call event log, the gateway audit, the activity log,
+  and the live and plugin events that the activity log feeds carry hashes and
+  sizes only. Their summaries are empty and marked
+  `"contentRetention": "none"`, so a reader can tell "not kept" from "empty".
+- A failed call stores its error code and a fixed message instead of the
+  provider's error text. The caller still receives the original message.
+- An approval card and its action request show the action, its risk, and the
+  SHA-256 and size of the arguments, but not their values, so the approver
+  decides without seeing them. The signed arguments that execution needs stay
+  on the action request only until it settles (executed, failed, rejected,
+  expired or cancelled); then they are removed. The API never returns them,
+  for any connection: they are signed, not encrypted.
+- When Paperclip runs an action a human approved, the result is not stored, so
+  the agent's follow-up wake says the action ran without including its result.
+  A retry of the same call does not run it again and returns a note that the
+  result was not kept. If the agent needs the output, it reads the current
+  state with a read-only call.
+- A question the server asks during a call (MCP elicitation) still appears on
+  the task so a human can answer it; the call event does not keep a copy.
+- Records written before the setting changed are not rewritten. The setting
+  applies from the next call.
+- Changing `config` while an action waits for approval makes that approval
+  stale, as for any config change; the action needs a new review.
+
+`PAPERCLIP_TOOL_CONTENT_RETENTION_DEFAULT` (`summary` or `none`) sets the
+default for every connection whose config does not set `contentRetention`,
+including connections that already exist. Leave it unset to keep summaries.
+A connection that sets `"summary"` keeps summaries under a `none` default. The
+variable is read at call time; an unrecognized value is treated as `none`.
+
+Separately from this setting, the HTTP request log never records the body of a
+failed tool-call request (`POST /api/tool-gateway/tools/call`,
+`POST /mcp/gateways/:id`, `POST /api/tool-gateway/gateways/:id/mcp`,
+`POST /api/tool-connections/:id/test-calls`, and any other route served by the
+same handlers); an approval-gated call answers `409`, so these bodies used to
+reach the log.
+
 ## Curated definitions remain optional
 
 A curated definition matching a pasted endpoint is offered as a branded

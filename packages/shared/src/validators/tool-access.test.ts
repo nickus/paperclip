@@ -10,6 +10,10 @@ import {
   toolTransportConfigSchema,
   updateToolConnectionSchema,
 } from "./tool-access.js";
+import {
+  readConfiguredToolContentRetention,
+  strictestToolContentRetention,
+} from "../tool-content-retention.js";
 
 describe("tool access validators", () => {
   it("treats a gateway token owner note as optional", () => {
@@ -93,6 +97,58 @@ describe("tool access validators", () => {
     expect(create(600_000).success).toBe(false);
     expect(update(300_000)).toMatchObject({ success: true, data: { config: { toolTimeoutMs: 300_000 } } });
     expect(update(600_000).success).toBe(false);
+  });
+
+  it("accepts a content retention mode on connection config", () => {
+    for (const contentRetention of ["summary", "none"]) {
+      expect(toolTransportConfigSchema.safeParse({ url: "https://example.test/mcp", contentRetention }).success).toBe(true);
+    }
+    expect(createToolConnectionSchema.parse({
+      name: "Private notes",
+      transport: "mcp_remote",
+      config: { url: "https://example.test/mcp", contentRetention: "none" },
+    }).config).toEqual({ url: "https://example.test/mcp", contentRetention: "none" });
+    expect(updateToolConnectionSchema.parse({
+      config: { url: "https://example.test/mcp", contentRetention: "none" },
+    }).config?.contentRetention).toBe("none");
+  });
+
+  it("rejects unknown content retention modes", () => {
+    for (const contentRetention of ["full", "None", "", true, null, 0]) {
+      const parsed = toolTransportConfigSchema.safeParse({ url: "https://example.test/mcp", contentRetention });
+      expect(parsed.success).toBe(false);
+      if (!parsed.success) {
+        expect(parsed.error.issues[0]?.path).toEqual(["contentRetention"]);
+      }
+    }
+    expect(updateToolConnectionSchema.safeParse({
+      config: { url: "https://example.test/mcp", contentRetention: "off" },
+    }).success).toBe(false);
+  });
+
+  it("reads a connection's content retention and fails closed on unrecognized stored values", () => {
+    expect(readConfiguredToolContentRetention({ url: "https://example.test/mcp" })).toBeNull();
+    expect(readConfiguredToolContentRetention(null)).toBeNull();
+    expect(readConfiguredToolContentRetention({ contentRetention: "summary" })).toBe("summary");
+    expect(readConfiguredToolContentRetention({ contentRetention: "none" })).toBe("none");
+    // Written before validation or around the API: keep less, not more.
+    expect(readConfiguredToolContentRetention({ contentRetention: "off" })).toBe("none");
+    expect(readConfiguredToolContentRetention({ contentRetention: null })).toBe("none");
+    expect(readConfiguredToolContentRetention({ contentRetention: 0 })).toBe("none");
+    // An undefined value is how an absent key looks before it is serialized.
+    expect(readConfiguredToolContentRetention({ contentRetention: undefined })).toBeNull();
+    expect(strictestToolContentRetention("summary", null)).toBe("summary");
+    expect(strictestToolContentRetention("summary", "none")).toBe("none");
+  });
+
+  it("keeps the no-content marker on a redacted value summary", () => {
+    expect(toolRedactedValueSummarySchema.parse({
+      summary: "",
+      sizeBytes: 12,
+      sha256: "a".repeat(64),
+      contentRetention: "none",
+    })).toMatchObject({ summary: "", contentRetention: "none" });
+    expect(toolRedactedValueSummarySchema.safeParse({ summary: "", contentRetention: "summary" }).success).toBe(false);
   });
 
   it("keeps app method configuration separate from secrets", () => {

@@ -1868,7 +1868,7 @@ function toToolActionRequest(
     status: row.status,
     canonicalArgumentsHash: row.canonicalArgumentsHash,
     canonicalArgumentsSummary: row.canonicalArgumentsSummary,
-    signedArguments: row.signedArguments,
+    // signedArguments stays in the table: see ToolActionRequest.
     previewMarkdown: row.previewMarkdown,
     requestedByAgentId: row.requestedByAgentId,
     requestedByUserId: row.requestedByUserId,

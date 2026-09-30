@@ -112,6 +112,11 @@ export interface ToolRedactedValueSummary {
   sha256?: string | null;
   redactedFields?: string[];
   artifactId?: string | null;
+  /**
+   * Set to "none" when the value came from a call on a connection that keeps
+   * no content: `summary` is then empty and only the hash and size remain.
+   */
+  contentRetention?: "none";
 }
 
 export type VercelConnectPrincipalMode = "app" | "user";
@@ -1290,6 +1295,12 @@ export interface ToolInvocation {
   updatedAt: Date;
 }
 
+/**
+ * An action request as the API returns it. The signed argument envelope that
+ * execution replays after approval is not part of it: the envelope is signed,
+ * not encrypted, so it would return the call's full arguments (including
+ * values the argument summary redacts) to every reader of the request.
+ */
 export interface ToolActionRequest {
   id: string;
   companyId: string;
@@ -1300,7 +1311,6 @@ export interface ToolActionRequest {
   status: ToolActionRequestStatus;
   canonicalArgumentsHash: string;
   canonicalArgumentsSummary: ToolRedactedValueSummary;
-  signedArguments: string | null;
   previewMarkdown: string | null;
   requestedByAgentId: string | null;
   requestedByUserId: string | null;

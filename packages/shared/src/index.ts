@@ -2794,5 +2794,6 @@ export * from "./slack-tools.js";
 export { MEMORY_CONNECTOR_IDS, isMemoryConnectorId, type MemoryConnectorId } from "./memory-connectors.js";
 export * from "./connection-routing.js";
 export * from "./tool-call-timeouts.js";
+export * from "./tool-content-retention.js";
 
 export { WORKSPACE_RESTORE_FAILURE_CODES, hasWorkspaceRestoreFailure, safeWorkspaceRestorePath, isNativeWorkspaceExportRepairCause } from "./workspace-restore.js";

@@ -2503,13 +2503,17 @@ function readToolActionContinuationContext(interaction: {
   if (!executionStatus) return null;
 
   if (executionStatus === "executed") {
+    // A connection that keeps no call content records the outcome without the result.
+    const resultNotRetained = toolActionResult.contentRetention === "none";
     return {
       toolName,
       actionRequestId,
       decision: "accepted",
       executionStatus,
       ...(resultSummary ? { resultSummary } : {}),
-      instructions: `the approved ${toolName} action already ran — do not call the tool again; continue with this result.`,
+      instructions: resultNotRetained
+        ? `the approved ${toolName} action already ran — do not call the tool again; its connection does not store call content, so the result is not recorded here. Read the current state with a read-only call if you need it.`
+        : `the approved ${toolName} action already ran — do not call the tool again; continue with this result.`,
     };
   }
 
@@ -16302,6 +16306,9 @@ export function issueRoutes(
                 status: executionStatus,
                 errorMessage: readNonEmptyString(approval.error),
                 resultSummary: readNonEmptyString(approval.resultSummary),
+                ...(approval.contentRetention === "none"
+                  ? { contentRetention: "none" }
+                  : {}),
                 updatedAt: new Date().toISOString(),
               },
             } as typeof interaction.result,

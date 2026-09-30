@@ -1700,6 +1700,9 @@ export const requestConfirmationToolActionResultSchema = z.object({
   // connector returns a URL (PAP-13745 §5 Executed / Peak-End).
   resultSummary: z.string().trim().min(1).max(4000).nullable().optional(),
   resultHref: z.string().trim().url().max(2000).nullable().optional(),
+  // Set when the action's connection keeps no call content, so readers can
+  // tell a result that was not kept from one that was empty.
+  contentRetention: z.literal("none").optional(),
   updatedAt: z.string().datetime({ offset: true }),
 });
 

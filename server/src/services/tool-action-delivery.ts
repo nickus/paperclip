@@ -219,10 +219,21 @@ export function toolActionDeliveryService(
           ({ request, invocation, interaction }) => {
             const result = interaction.result as {
               reason?: string;
-              toolAction?: { resultSummary?: string; errorMessage?: string };
+              toolAction?: {
+                resultSummary?: string;
+                errorMessage?: string;
+                contentRetention?: string;
+              };
             } | null;
+            // A connection that keeps no call content has no stored result to
+            // hand over; tell the agent instead of implying an empty result.
+            const resultNotRetained =
+              result?.toolAction?.contentRetention === "none" ||
+              invocation.resultSummary?.contentRetention === "none";
             const instructions =
-              request.status === "executed"
+              request.status === "executed" && resultNotRetained
+                ? "The approved action already ran. Do not call it again. Its connection does not store call content, so the result is not included here; if you need it, read the current state with a read-only call, then answer the user in your own words."
+                : request.status === "executed"
                 ? "The approved action already ran. Do not call it again; continue with the recorded result. Process the result and answer the user in your own words. Do not paste the raw tool or transport JSON unless the user asks for it."
                 : request.status === "rejected"
                   ? "The human declined this action. Do not retry the same call. Adjust your approach or explain what is blocked."

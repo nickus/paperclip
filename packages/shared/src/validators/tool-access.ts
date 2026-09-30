@@ -43,6 +43,11 @@ import {
   MIN_CONFIGURED_TOOL_CALL_TIMEOUT_MS,
   REMOTE_MCP_TOOL_TIMEOUT_CONFIG_KEY,
 } from "../tool-call-timeouts.js";
+import {
+  CONNECTION_CONTENT_RETENTION_CONFIG_KEY,
+  isToolContentRetention,
+  TOOL_CONTENT_RETENTION_MODES,
+} from "../tool-content-retention.js";
 import { jsonSchemaSchema } from "./plugin.js";
 import { objectWithoutDefaults } from "./partial.js";
 
@@ -166,9 +171,23 @@ function validateToolCallTimeoutConfig(value: Record<string, unknown>, ctx: z.Re
   }
 }
 
+// What the tool gateway stores about this connection's calls: "summary" keeps
+// redacted argument and result summaries, "none" keeps metadata only.
+function validateContentRetentionConfig(value: Record<string, unknown>, ctx: z.RefinementCtx) {
+  if (!Object.prototype.hasOwnProperty.call(value, CONNECTION_CONTENT_RETENTION_CONFIG_KEY)) return;
+  if (!isToolContentRetention(value[CONNECTION_CONTENT_RETENTION_CONFIG_KEY])) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: [CONNECTION_CONTENT_RETENTION_CONFIG_KEY],
+      message: `${CONNECTION_CONTENT_RETENTION_CONFIG_KEY} must be one of: ${TOOL_CONTENT_RETENTION_MODES.map((mode) => `"${mode}"`).join(", ")}.`,
+    });
+  }
+}
+
 export const toolTransportConfigSchema = z.record(z.string(), z.unknown()).superRefine((value, ctx) => {
   rejectSensitiveConfigKeys(value, ctx);
   validateToolCallTimeoutConfig(value, ctx);
+  validateContentRetentionConfig(value, ctx);
 });
 
 export const toolRedactedValueSummarySchema = z.object({
@@ -177,6 +196,7 @@ export const toolRedactedValueSummarySchema = z.object({
   sha256: z.string().trim().regex(/^[a-f0-9]{64}$/i).optional().nullable(),
   redactedFields: z.array(z.string().trim().min(1).max(200)).default([]).optional(),
   artifactId: z.string().guid().optional().nullable(),
+  contentRetention: z.literal("none").optional(),
 });
 
 export const createToolApplicationSchema = z.object({
