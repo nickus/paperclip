@@ -260,6 +260,20 @@ describe("releaseIssueExecution", () => {
     expect(transaction.queueReviewParticipantRecoveryRun).not.toHaveBeenCalled();
   });
 
+  it("leaves recovery to the run's own release when replaying its drain after a paused agent resumed", async () => {
+    const transaction = createFakeTransaction();
+    const recovery = createFakeRecovery();
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction), recovery,
+    });
+    // A failed run of the assignee would queue an immediate recovery on its own release.
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date(), afterAgentResumed: true });
+    expect(result.outcome.kind).toBe("released");
+    expect(transaction.queueImmediateRecoveryRun).not.toHaveBeenCalled();
+    expect(transaction.queueReviewParticipantRecoveryRun).not.toHaveBeenCalled();
+    expect(recovery.escalateStrandedAssignedIssue).not.toHaveBeenCalled();
+  });
+
   it.each(["done", "in_progress"])("does not promote a former assignee's saved instruction after handoff (%s)", async (status) => {
     const queuedCommentIds = ["saved-user-direction"];
     const queue = [wakeCandidate({

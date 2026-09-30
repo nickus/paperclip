@@ -589,6 +589,57 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect(promotedRun).toMatchObject({ agentId, status: "queued", wakeupRequestId: wakeId });
   });
 
+  it("replays only the drain of a failed native run's release once a paused agent resumes", async () => {
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent({ companyId, name: "Assignee" });
+    const nativeAgentId = await seedAgent({ companyId, name: "Reviewer" });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: pausedAgentId, status: "in_progress" });
+    const runId = await seedRun({ companyId, agentId: nativeAgentId, contextSnapshot: { issueId }, status: "failed" });
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const wakeId = await seedDeferredWake({ companyId, agentId: pausedAgentId, issueId });
+    await db.update(agentWakeupRequests).set({ reason: "issue_comment_mentioned" }).where(eq(agentWakeupRequests.id, wakeId));
+    await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date() }).where(eq(agents.id, pausedAgentId));
+
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: {
+        escalateStrandedAssignedIssue: async () => { throw new Error("unexpected escalation"); },
+        escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected escalation"); },
+      },
+    });
+    // The failed run is not the assignee's, so its release records no
+    // terminal recovery and reaches the drain, which holds the paused wake.
+    const held = await release({ companyId, runId, now: new Date() });
+    expect(held.outcome.kind).toBe("released");
+    const [heldWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(heldWake!.status).toBe("deferred_issue_execution");
+    expect(heldWake!.payload).toMatchObject({ heldForPausedAgent: { runId } });
+
+    // While the agent was paused the task was handed to the failed run's
+    // agent. Replaying the whole release now would record that run's
+    // terminal recovery after the fact and block the task.
+    await db.update(issues).set({ assigneeAgentId: nativeAgentId }).where(eq(issues.id, issueId));
+    await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null }).where(eq(agents.id, pausedAgentId));
+    const resumed = await release({
+      companyId,
+      runId,
+      now: new Date(),
+      suppressImmediateRecovery: true,
+      afterExecutionHold: true,
+      afterAgentResumed: true,
+    });
+
+    expect(resumed.outcome.kind).toBe("promoted");
+    const [promotedWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(promotedWake!.status).not.toBe("deferred_issue_execution");
+    const [promotedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, promotedWake!.runId!));
+    expect(promotedRun).toMatchObject({ agentId: pausedAgentId, status: "queued", wakeupRequestId: wakeId });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue!.status).toBe("in_progress");
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toEqual([]);
+  });
+
   it("fails a deferred wake whose agent belongs to a different company, without creating a run", async () => {
     const companyId = await seedCompany();
     const otherCompanyId = await seedCompany();

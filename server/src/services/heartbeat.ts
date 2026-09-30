@@ -20081,12 +20081,15 @@ export function heartbeatService(
   // `deferred_issue_execution` and stamps it with the finishing run whose
   // release reached it (HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY). With the issue's
   // execution lock released, no later run is guaranteed to drain that queue
-  // again, so once the agent is no longer paused, run that same release
-  // again: every admission gate (terminal issue, reassignment, pause hold,
-  // an agent that is still not invokable) applies to the wake as usual.
+  // again, so once the agent is no longer paused, run that same release's
+  // drain again: every admission gate (terminal issue, reassignment, pause
+  // hold, an agent that is still not invokable) applies to the wake as usual.
   // The drain runs with the rules of a drain after an execution hold: a
   // live run on the issue, of any agent, owns the next turn, and a blocked
   // outcome that the original release already escalated is not repeated.
+  // Only the drain is replayed: the stamp is written from the original
+  // release's drain, so that release already recorded its recovery (a
+  // native run's terminal recovery included), and the replay never does.
   async function releaseDeferredWakesHeldForPausedAgents() {
     const cutoff = await getWorktreeExecutionCutoff();
     const held = await db
@@ -20131,19 +20134,20 @@ export function heartbeatService(
       if (!wake.runId || releasedRunIds.has(wake.runId)) continue;
       const run = await getRun(wake.runId);
       // Only the terminal run whose release held this wake, on the same
-      // issue and company, may drain it again. An unsuccessful native run's
-      // release can record its own recovery, so it is never run twice; its
-      // queue drains with the next run on the issue.
+      // issue and company, may drain it again.
       if (
         !run ||
         run.companyId !== wake.companyId ||
         !isHeartbeatRunTerminalStatus(run.status) ||
-        (run.runtimeMode === "native" && run.status !== "succeeded") ||
         (run.nativeIssueId ?? readNonEmptyString(parseObject(run.contextSnapshot).issueId)) !== wake.issueId
       ) continue;
       releasedRunIds.add(run.id);
       try {
-        await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true, afterExecutionHold: true });
+        await releaseIssueExecutionAndPromote(run, {
+          suppressImmediateRecovery: true,
+          afterExecutionHold: true,
+          afterAgentResumed: true,
+        });
         released += 1;
       } catch (err) {
         logger.warn({ err, runId: run.id, wakeupRequestId: wake.wakeId }, "failed to release a deferred wake held while its agent was paused");
@@ -27282,7 +27286,7 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean; afterExecutionHold?: boolean; afterOwnerSettled?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; afterExecutionHold?: boolean; afterOwnerSettled?: boolean; afterAgentResumed?: boolean } = {},
   ) {
     try {
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
@@ -27292,6 +27296,7 @@ export function heartbeatService(
         suppressImmediateRecovery: options.suppressImmediateRecovery,
         ...(options.afterExecutionHold ? { afterExecutionHold: true } : {}),
         ...(options.afterOwnerSettled ? { afterOwnerSettled: true } : {}),
+        ...(options.afterAgentResumed ? { afterAgentResumed: true } : {}),
       });
       await applyWakeQueuePostCommitEffects(postCommitEffects);
       const completed = await getRun(run.id);

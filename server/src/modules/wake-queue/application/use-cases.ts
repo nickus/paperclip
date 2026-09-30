@@ -136,6 +136,14 @@ export type ReleaseIssueExecutionInput = {
    * queue once the task belongs to another agent.
    */
   afterOwnerSettled?: boolean;
+  /**
+   * Replays the drain of a release that held a paused agent's wake, now that
+   * the agent is no longer paused. That release wrote its marker from its
+   * drain, in its own transaction, so every step before the drain (a native
+   * run's terminal recovery included) already ran, and it decided its own
+   * recovery after the drain. The replay only promotes what is still queued.
+   */
+  afterAgentResumed?: boolean;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -364,8 +372,9 @@ async function runReleaseDrain(
   }
 
   // The run's own release already decided its recovery. A drain after the
-  // executor settled only promotes what others left queued.
-  if (input.afterOwnerSettled) return { outcome: { kind: "released" }, postCommitEffects };
+  // executor settled, or after a paused agent resumed, only promotes what is
+  // still queued.
+  if (input.afterOwnerSettled || input.afterAgentResumed) return { outcome: { kind: "released" }, postCommitEffects };
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
 
@@ -1021,6 +1030,7 @@ export function createReleaseIssueExecution(deps: {
         now: input.now,
         ...(input.afterExecutionHold ? { afterExecutionHold: true } : {}),
         ...(input.afterOwnerSettled ? { afterOwnerSettled: true } : {}),
+        ...(input.afterAgentResumed ? { afterAgentResumed: true } : {}),
       },
       (locked, ports) => runReleaseDrain(locked, ports, input),
     );

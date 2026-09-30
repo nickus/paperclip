@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import {
@@ -199,6 +200,62 @@ describeEmbeddedPostgres("heartbeat deferred wakes held for a paused agent", () 
     const wake = await readWake(wakeId);
     expect(wake.status).toBe("deferred_issue_execution");
     expect(wake.runId).toBeNull();
+  });
+
+  it("promotes a wake held by a failed native run's release exactly once, without recording that run's recovery again", async () => {
+    const { companyId, agentId, issueId, wakeId } = await seedHeldWake();
+    // The wake was held by the release of another agent's native run that
+    // failed; that run's agent owns the task now. Its release reached the
+    // drain, so any terminal recovery it needed was already settled then.
+    const ownerId = randomUUID();
+    await db.insert(agents).values({
+      id: ownerId,
+      companyId,
+      name: "Reviewer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    const nativeRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nativeRunId,
+      companyId,
+      agentId: ownerId,
+      invocationSource: "on_demand",
+      status: "failed",
+      runtimeMode: "native",
+      nativeIssueId: issueId,
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ assigneeAgentId: ownerId }).where(eq(issues.id, issueId));
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        reason: "issue_comment_mentioned",
+        payload: { issueId, heldForPausedAgent: { runId: nativeRunId, heldAt: new Date().toISOString() } },
+      })
+      .where(eq(agentWakeupRequests.id, wakeId));
+    await resume(agentId);
+    startTaskDrain();
+
+    const first = await heartbeat.releaseDeferredWakesHeldForPausedAgents();
+    const second = await heartbeat.releaseDeferredWakesHeldForPausedAgents();
+
+    expect(first).toEqual({ checked: 1, released: 1 });
+    expect(second).toEqual({ checked: 0, released: 0 });
+    const wake = await readWake(wakeId);
+    expect(wake.status).not.toBe("deferred_issue_execution");
+    const promoted = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(promoted.filter((run) => run.wakeupRequestId === wakeId)).toHaveLength(1);
+    expect(promoted.find((run) => run.wakeupRequestId === wakeId)).toMatchObject({ status: "queued" });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue!.status).toBe("in_progress");
+    expect(
+      await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)),
+    ).toEqual([]);
   });
 
   it("strips the marker from a wake caller's payload", async () => {

@@ -1231,7 +1231,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           };
         }
 
-        if (await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now)) {
+        // A replay after a paused agent resumed only drains the queue. The
+        // release it replays reached its drain, so it already settled the
+        // run's terminal recovery; recording it here would act on the same
+        // failure twice.
+        if (!input.afterAgentResumed && await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now)) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
@@ -1240,8 +1244,9 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // Allow only bounded retry planning in that case; admission stays gated.
         const executionBlocker = await getExecutionBlocker(tx, issueRow.companyId, issueRow.id);
         // Recovery planning belongs to the run's own release; a drain after
-        // the executor settled never repeats it.
-        const recoveryOnly = Boolean(executionBlocker && !input.afterOwnerSettled &&
+        // the executor settled, or after a paused agent resumed, never
+        // repeats it.
+        const recoveryOnly = Boolean(executionBlocker && !input.afterOwnerSettled && !input.afterAgentResumed &&
           executionBlocker.cause === "execution_owner_active" && executionBlocker.runId === run.id &&
           runSnapshot.conversationContinuation && ["failed", "timed_out", "interrupted"].includes(run.status));
         if (executionBlocker && !recoveryOnly) {
