@@ -552,6 +552,25 @@ describe("issue update comment wakeups", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("rejects a multipart body on the JSON-only update route before any read, mutation or wake", async () => {
+    // Callers (and proxies that pass multipart uploads through untouched) can
+    // send form data to a route that only takes JSON. The JSON parser skips
+    // such a body, so the route must fail validation instead of applying an
+    // empty patch.
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+    mockIssueService.getById.mockResolvedValue(existing);
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .field("status", "done")
+      .field("comment", "closing");
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Validation error");
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it("wakes the assignee on comment-only issue updates", async () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
