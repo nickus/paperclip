@@ -113,6 +113,10 @@ describe("tool access validators", () => {
     expect(readConfiguredToolContentRetention({ contentRetention: "none" })).toBe("none");
     // Written before validation or around the API: keep less, not more.
     expect(readConfiguredToolContentRetention({ contentRetention: "off" })).toBe("none");
+    expect(readConfiguredToolContentRetention({ contentRetention: null })).toBe("none");
+    expect(readConfiguredToolContentRetention({ contentRetention: 0 })).toBe("none");
+    // An undefined value is how an absent key looks before it is serialized.
+    expect(readConfiguredToolContentRetention({ contentRetention: undefined })).toBeNull();
     expect(strictestToolContentRetention("summary", null)).toBe("summary");
     expect(strictestToolContentRetention("summary", "none")).toBe("none");
   });

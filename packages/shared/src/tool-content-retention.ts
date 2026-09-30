@@ -36,17 +36,20 @@ export function isToolContentRetention(value: unknown): value is ToolContentRete
 
 /**
  * Read the retention a connection config selects, or null when it selects
- * none. The key is validated on create and update, so an unrecognized value
- * can only come from a config stored before validation or written around the
- * API. Such a value fails closed to "none": someone tried to change what is
- * kept, and keeping less is the safe reading of an unclear intent.
+ * none. Only a config without the key selects none. The key is validated on
+ * create and update, so any other value that is not a mode (an unrecognized
+ * string, `null`, a number) can only come from a config stored before
+ * validation or written around the API. Such a value fails closed to "none":
+ * someone tried to change what is kept, and keeping less is the safe reading of
+ * an unclear intent.
  */
 export function readConfiguredToolContentRetention(config: unknown): ToolContentRetention | null {
   if (!config || typeof config !== "object" || Array.isArray(config)) return null;
   const record = config as Record<string, unknown>;
-  if (!Object.prototype.hasOwnProperty.call(record, CONNECTION_CONTENT_RETENTION_CONFIG_KEY)) return null;
+  // An `undefined` value is the in-memory form of an absent key: JSON storage
+  // drops it, so reading it as "not set" keeps both forms of one config equal.
   const value = record[CONNECTION_CONTENT_RETENTION_CONFIG_KEY];
-  if (value === undefined || value === null) return null;
+  if (value === undefined) return null;
   return isToolContentRetention(value) ? value : "none";
 }
 

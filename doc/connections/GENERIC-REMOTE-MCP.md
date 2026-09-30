@@ -237,8 +237,10 @@ connection's `config` chooses what is kept:
 | `"summary"` (default) | Who, when, which tool, policy decision, outcome, latency, error code and message, plus redacted, truncated argument and result summaries with their SHA-256 hashes and sizes |
 | `"none"` | Who, when, which tool, policy decision, outcome, latency, error code, and the SHA-256 hashes and sizes of the arguments and the result. No argument text, result text or provider error text |
 
-Any other value is rejected on create and update. Keep content out of the
-database for a private notes server:
+Any other value is rejected on create and update. A stored config whose
+`contentRetention` is present but not one of these values (for example `null`,
+written before validation or directly to the database) is read as `"none"`.
+Keep content out of the database for a private notes server:
 
 ```sh
 curl -fsS -X PATCH -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
