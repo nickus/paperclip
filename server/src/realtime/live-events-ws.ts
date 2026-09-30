@@ -65,6 +65,16 @@ function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
 
+/**
+ * Returns the request target without its query string or fragment. Clients may
+ * send an API key as `?token=`, so the raw `req.url` must never be logged.
+ */
+function pathForLog(rawUrl: string | undefined) {
+  if (!rawUrl) return rawUrl;
+  const queryStart = rawUrl.search(/[?#]/);
+  return queryStart === -1 ? rawUrl : rawUrl.slice(0, queryStart);
+}
+
 function isWritableUpgradeSocket(socket: Duplex) {
   const maybeWritableState = socket as Duplex & { writable?: boolean; writableEnded?: boolean; writableDestroyed?: boolean };
   return !socket.destroyed && maybeWritableState.writable !== false && !maybeWritableState.writableEnded && !maybeWritableState.writableDestroyed;
@@ -336,7 +346,7 @@ export function setupLiveEventsWebSocketServer(
     }
 
     const onRawSocketError = (err: Error) => {
-      logger.warn({ err, path: req.url }, "live websocket upgrade socket error");
+      logger.warn({ err, path: pathForLog(req.url) }, "live websocket upgrade socket error");
     };
     const cleanupRawSocketListeners = () => {
       socket.off("error", onRawSocketError);
@@ -384,7 +394,7 @@ export function setupLiveEventsWebSocketServer(
         });
       })
       .catch((err) => {
-        logger.error({ err, path: req.url }, "failed websocket upgrade authorization");
+        logger.error({ err, path: pathForLog(req.url) }, "failed websocket upgrade authorization");
         rejectUpgrade(socket, "500 Internal Server Error", "upgrade failed");
       });
   });

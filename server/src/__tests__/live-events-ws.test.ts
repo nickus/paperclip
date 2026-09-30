@@ -173,6 +173,58 @@ describe("setupLiveEventsWebSocketServer", () => {
     expect(socket.destroyed).toBe(true);
   });
 
+  describe("with an API key in the token query parameter", () => {
+    const queryToken = "query-token-that-must-stay-out-of-logs";
+    const requestWithQueryToken = () =>
+      createUpgradeRequest({ url: `/api/companies/company-1/events/ws?token=${queryToken}` });
+    // Key lookups fail, as they would while the database is unreachable.
+    const unavailableDb = {
+      select() {
+        throw new Error("database unavailable");
+      },
+    };
+
+    function expectTokenNotLogged() {
+      const logged = JSON.stringify([
+        vi.mocked(logger.warn).mock.calls,
+        vi.mocked(logger.error).mock.calls,
+      ]);
+      expect(logged).not.toContain(queryToken);
+    }
+
+    it("logs only the path when the raw upgrade socket errors", async () => {
+      const server = new EventEmitter();
+      setupLiveEventsWebSocketServer(server as never, unavailableDb as never, { deploymentMode: "authenticated" });
+      const socket = new FakeUpgradeSocket();
+
+      server.emit("upgrade", requestWithQueryToken(), socket as unknown as Duplex, Buffer.alloc(0));
+      socket.emitSocketError(new Error("read ECONNRESET"));
+      await flushPromises();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error), path: "/api/companies/company-1/events/ws" }),
+        "live websocket upgrade socket error",
+      );
+      expectTokenNotLogged();
+    });
+
+    it("logs only the path when authorization throws", async () => {
+      const server = new EventEmitter();
+      setupLiveEventsWebSocketServer(server as never, unavailableDb as never, { deploymentMode: "authenticated" });
+      const socket = new FakeUpgradeSocket();
+
+      server.emit("upgrade", requestWithQueryToken(), socket as unknown as Duplex, Buffer.alloc(0));
+      await flushPromises();
+
+      expect(socket.endedChunks[0]).toContain("500 Internal Server Error");
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error), path: "/api/companies/company-1/events/ws" }),
+        "failed websocket upgrade authorization",
+      );
+      expectTokenNotLogged();
+    });
+  });
+
   it("destroys and cleans up listeners after flushing a rejection response", async () => {
     const server = new EventEmitter();
     setupLiveEventsWebSocketServer(server as never, {} as never, { deploymentMode: "authenticated" });
