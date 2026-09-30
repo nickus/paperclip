@@ -107,6 +107,7 @@ import {
   testEnvironment as openCodeTestEnvironment,
   sessionCodec as openCodeSessionCodec,
   listOpenCodeModels,
+  openCodeStreamJsonTranslator,
 } from "@paperclipai/adapter-opencode-local/server";
 import {
   agentConfigurationDoc as openCodeAgentConfigurationDoc,
@@ -819,6 +820,7 @@ const openCodeLocalAdapter: ServerAdapterModule = {
   requiresMaterializedRuntimeSkills: true,
   getRuntimeCommandSpec: (config) => buildNpmRuntimeCommandSpec(config, "opencode", "opencode-ai"),
   agentConfigurationDoc: openCodeAgentConfigurationDoc,
+  streamJsonTranslator: openCodeStreamJsonTranslator,
 };
 
 const piLocalAdapter: ServerAdapterModule = {
