@@ -2819,11 +2819,24 @@ async function runFileGateway() {
 
       const url = new URL(req.url || "/", "http://127.0.0.1");
       const contentType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
-      const multipartAttachment = req.method === "POST"
-        && /^\\/api\\/companies\\/[^/]+\\/issues\\/[^/]+\\/attachments$/.test(url.pathname)
-        && /^multipart\\/form-data(?:;|$)/i.test(contentType);
-      if (req.method && req.method !== "GET" && req.method !== "HEAD" && !/json/i.test(contentType) && !multipartAttachment) {
-        writeJsonResponse(res, 415, { error: "Bridge only accepts JSON request bodies." });
+      // Multipart bodies travel as raw bytes, so a file upload reaches the
+      // host byte for byte. Which routes accept one is the host policy's and
+      // the API's decision, not this gateway's.
+      const multipart = /^multipart\\/form-data(?:;|$)/i.test(contentType);
+      // A request with neither Content-Length nor Transfer-Encoding has no
+      // body (RFC 9112, section 6.3), and neither has one with Content-Length
+      // 0. Such a request (a bare DELETE, or a POST action with no payload)
+      // needs no content type, so it goes on to the route policy and the API
+      // instead of failing here.
+      const declaresBody = req.headers["transfer-encoding"] !== undefined
+        || Number(req.headers["content-length"] || 0) > 0;
+      if (
+        req.method && req.method !== "GET" && req.method !== "HEAD"
+        && declaresBody && !/json/i.test(contentType) && !multipart
+      ) {
+        writeJsonResponse(res, 415, {
+          error: "Bridge only accepts JSON request bodies, or multipart/form-data for file uploads.",
+        });
         return;
       }
       const requestId = randomUUID();
@@ -2840,7 +2853,7 @@ async function runFileGateway() {
         path: url.pathname,
         query: url.search,
         headers: normalizeHeaders(req.headers),
-        ...encodeSandboxBridgeBody(multipartAttachment ? requestBody : requestBody.toString("utf8"), maxBodyBytes),
+        ...encodeSandboxBridgeBody(multipart ? requestBody : requestBody.toString("utf8"), maxBodyBytes),
         createdAt: new Date().toISOString(),
       };
       const requestPath = path.posix.join(requestsDir, \`\${requestId}.json\`);
