@@ -565,6 +565,140 @@ async function continueAfterAgentPause(
   return true;
 }
 
+/** Error code of a resume that a reconciliation hold blocks; see `reconcileExecutionHoldForResume`. */
+export const RESUME_RECONCILIATION_REQUIRED_CODE = "execution_reconciliation_required";
+
+/** What a board operator confirms when a resume continues held work. */
+export const RESUME_RECONCILIATION_CONFIRMATION =
+  "The stopped run's process has exited. Work it recorded before it stopped (comments, documents and other " +
+  "actions) stands and is not undone; an action whose result was not recorded may or may not have happened. " +
+  "Continuing starts a new run that reviews the recorded work and continues the task.";
+
+/** A hold a board operator can reconcile from the resume flow instead of the recovery API. */
+export function isResumeReconcilableBlocker(
+  blocker: { recoveryActionId: string | null; cause: string } | null,
+): blocker is { recoveryActionId: string; cause: string } {
+  return Boolean(blocker?.recoveryActionId && blocker.cause === LEGACY_RECOVERY_CAUSE);
+}
+
+/**
+ * Reconcile the legacy execution hold that blocks a task a board operator is
+ * resuming, after the operator confirmed `RESUME_RECONCILIATION_CONFIRMATION`.
+ * Records the same decision as an operator reconciliation through the recovery
+ * API (`providerStopped: true`, `actionOutcome: "mixed"`) with the same checks:
+ * the task owner, a stopped process, no coordinator and released execution
+ * environments. The continuation is delivered like any reconciled one. A
+ * refusal throws and records nothing.
+ */
+export async function reconcileExecutionHoldForResume(
+  db: Db,
+  input: { companyId: string; issueId: string; recoveryActionId: string; actorId: string },
+) {
+  const stale = () =>
+    conflict("This task's recovery changed while it was being resumed. Refresh the task and try again.");
+  return db.transaction(async (tx) => {
+    await tx.execute(
+      sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
+    );
+    const [candidate] = await tx
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.id, input.recoveryActionId),
+        eq(issueRecoveryActions.sourceIssueId, input.issueId),
+      ));
+    const runId = candidate?.evidence.runId;
+    if (typeof runId !== "string") throw stale();
+    // Same issue -> coordinator -> run -> action lock order as the disposition.
+    const [task] = await tx
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)))
+      .for("update");
+    await tx
+      .select({ runId: nativeRunFinalizations.runId })
+      .from(nativeRunFinalizations)
+      .where(and(eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, runId)))
+      .for("update");
+    const [run] = await tx
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, runId)))
+      .for("update");
+    const [action] = await tx
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, candidate!.id))
+      .for("update");
+    if (
+      !task ||
+      !run ||
+      !action ||
+      action.evidence.runId !== run.id ||
+      action.cause !== LEGACY_RECOVERY_CAUSE ||
+      action.kind !== "active_run_watchdog" ||
+      !(["active", "escalated"].includes(action.status) || isSettledNoReplayHold(action))
+    )
+      throw stale();
+    if (!action.returnOwnerAgentId || task.assigneeAgentId !== action.returnOwnerAgentId)
+      throw conflict("The task changed hands since its run stopped. Inspect the task before resuming it.");
+    const decision: ExecutionReconciliation = {
+      runId: run.id,
+      providerStopped: true,
+      actionOutcome: "mixed",
+      outcomeEvidence: `Confirmed by a board operator while resuming the task: ${RESUME_RECONCILIATION_CONFIRMATION}`,
+    };
+    await validateExecutionReconciliation({
+      db: tx as unknown as Db,
+      companyId: task.companyId,
+      issueId: task.id,
+      agentId: task.assigneeAgentId,
+      sourceRunId: run.id,
+      decision,
+    });
+    await markExecutionReconciliation(tx as unknown as Db, action, decision, input.actorId);
+    const now = new Date();
+    const note =
+      "Reconciled by a board operator while resuming the task. Recorded work stands; the task continues in a new run.";
+    await tx
+      .update(issueRecoveryActions)
+      .set({
+        status: "resolved",
+        outcome: "restored",
+        resolvedAt: now,
+        updatedAt: now,
+        nextAction: note,
+        resolutionNote: note,
+        wakePolicy: null,
+        monitorPolicy: null,
+      })
+      .where(eq(issueRecoveryActions.id, action.id));
+    await persistActivity(tx as unknown as Db, {
+      companyId: task.companyId,
+      actorType: "user",
+      actorId: input.actorId,
+      action: "issue.recovery_action_resolved",
+      entityType: "issue",
+      entityId: task.id,
+      details: {
+        identifier: task.identifier,
+        recoveryActionId: action.id,
+        outcome: "restored",
+        source: "tree_resume",
+        sourceRunId: run.id,
+        actionOutcome: decision.actionOutcome,
+        resolutionNote: note,
+      },
+    });
+    await tx
+      .update(heartbeatRuns)
+      .set({ executionStatusDeliveryId: randomUUID() })
+      .where(eq(heartbeatRuns.id, run.id));
+    return { recoveryActionId: action.id, runId: run.id };
+  });
+}
+
 /**
  * Failed execution is a system responsibility, not a user questionnaire. After
  * automatic recovery is ruled out, preserve evidence and stop without replay.

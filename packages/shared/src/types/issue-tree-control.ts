@@ -114,7 +114,12 @@ export interface IssueTreeHold {
   members?: IssueTreeHoldMember[];
 }
 
-/** A completed release can include best-effort wake failures. */
+/**
+ * A completed release can include best-effort wake failures, and the tasks
+ * whose reconciliation hold the release reconciled (their continuation is
+ * delivered by recovery instead of a resume wake).
+ */
 export interface ReleaseIssueTreeHoldResponse extends IssueTreeHold {
   wakeFailures?: Array<{ issueId: string; message: string }>;
+  reconciledIssueIds?: string[];
 }

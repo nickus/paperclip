@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -15,6 +17,8 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueTreeHoldMembers,
+  issueTreeHolds,
   issues,
 } from "@paperclipai/db";
 import {
@@ -28,14 +32,19 @@ vi.mock("../telemetry.ts", () => ({
 
 import { runningProcesses } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { issueTreeControlService } from "../services/issue-tree-control.js";
 import {
   AGENT_PAUSE_RESUME_POLICY,
   AGENT_PAUSE_STOP_SETTLE_GRACE_MS,
   deliverReconciledExecutions,
+  RESUME_RECONCILIATION_CONFIRMATION,
+  RESUME_RECONCILIATION_REQUIRED_CODE,
   settleUnrecoverableExecutions,
 } from "../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { LEGACY_RECOVERY_CAUSE, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
+import { errorHandler } from "../middleware/index.js";
+import { issueTreeControlRoutes } from "../routes/issue-tree-control.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -66,6 +75,8 @@ describeEmbeddedPostgres("agent pause keeps its task resumable", () => {
     children.clear();
     runningProcesses.clear();
     await heartbeatService(db).drainActiveRunExecutions();
+    await db.delete(issueTreeHoldMembers);
+    await db.delete(issueTreeHolds);
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
     await db.delete(environmentLeases);
@@ -355,5 +366,107 @@ describeEmbeddedPostgres("agent pause keeps its task resumable", () => {
     const hold = await legacyHold(issueId);
     expect(hold).toMatchObject({ status: "resolved", evidence: { automaticRecovery: { replay: "blocked" } } });
     expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: hold.id });
+  });
+
+  describe("resuming held work from the task", () => {
+    function app(companyId: string, userId: string) {
+      const server = express();
+      server.use(express.json());
+      server.use((req, _res, next) => {
+        (req as any).actor = { type: "board", userId, companyIds: [companyId], source: "session", isInstanceAdmin: false };
+        next();
+      });
+      server.use("/api", issueTreeControlRoutes(db));
+      server.use(errorHandler);
+      return server;
+    }
+
+    /** A task held by a settled no-replay disposition, then paused and moved back to work by the board. */
+    async function seedHeldTask() {
+      const seeded = await seedWorkingRun({ adapterType: "process" });
+      await pauseAgent(seeded.agentId);
+      await settleUnrecoverableExecutions(db, new Date());
+      const hold = await legacyHold(seeded.issueId);
+      expect(hold.evidence).toMatchObject({ automaticRecovery: { replay: "blocked" } });
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, seeded.agentId));
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.issueId));
+      const userId = randomUUID();
+      const { hold: pauseHold } = await issueTreeControlService(db).createHold(seeded.companyId, seeded.issueId, {
+        mode: "pause",
+        releasePolicy: { strategy: "manual", note: "leaf_pause" },
+        actor: { actorType: "user", actorId: userId, userId },
+      });
+      return { ...seeded, hold, pauseHoldId: pauseHold.id, userId };
+    }
+
+    it("offers the reconciliation instead of failing, and keeps the task paused until confirmed", async () => {
+      const { companyId, issueId, hold, pauseHoldId, userId, runId } = await seedHeldTask();
+      const response = await request(app(companyId, userId))
+        .post(`/api/issues/${issueId}/tree-holds/${pauseHoldId}/release`)
+        .send({ metadata: { wakeAgents: true } });
+      expect(response.status).toBe(409);
+      expect(response.body).toMatchObject({
+        code: RESUME_RECONCILIATION_REQUIRED_CODE,
+        details: {
+          confirmation: RESUME_RECONCILIATION_CONFIRMATION,
+          tasks: [{ issueId, recoveryActionId: hold.id, runId }],
+        },
+      });
+      const [pauseHold] = await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, pauseHoldId));
+      expect(pauseHold!.status).toBe("active");
+      expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: hold.id });
+    });
+
+    it("reconciles the hold for a board operator who confirms, and continues the task", async () => {
+      const { companyId, agentId, issueId, hold, pauseHoldId, userId, runId } = await seedHeldTask();
+      const response = await request(app(companyId, userId))
+        .post(`/api/issues/${issueId}/tree-holds/${pauseHoldId}/release`)
+        .send({ metadata: { wakeAgents: true, reconcileExecutionHolds: true } });
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ status: "released", reconciledIssueIds: [issueId] });
+      expect(response.body.wakeFailures).toBeUndefined();
+
+      const [reconciled] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold.id));
+      expect(reconciled).toMatchObject({
+        status: "resolved",
+        outcome: "restored",
+        evidence: {
+          continuationDelivery: "pending",
+          executionReconciliation: { runId, providerStopped: true, actionOutcome: "mixed", actorId: userId },
+        },
+      });
+      expect(reconciled!.evidence).not.toHaveProperty("automaticRecovery");
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+      const [resolvedActivity] = await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.recovery_action_resolved"),
+      ));
+      expect(resolvedActivity).toMatchObject({ actorType: "user", actorId: userId });
+
+      // The reconciled continuation, not a second resume wake, starts the task.
+      await resumeAgent(agentId);
+      await deliverReconciledExecutions(db, heartbeatService(db, { runtimeEnv: {} }).wakeup);
+      const continuation = await continuationFor(hold.id);
+      expect(continuation?.run).toMatchObject({ status: "queued", retryOfRunId: runId });
+      expect(await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "issue_tree_resumed"),
+      ))).toHaveLength(0);
+    });
+
+    it("refuses to reconcile while the stopped run's provider is still running", async () => {
+      const { companyId, issueId, hold, pauseHoldId, userId, runId } = await seedHeldTask();
+      // Another live process now owns the pid the run recorded.
+      const survivor = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      children.add(survivor);
+      await db.update(heartbeatRuns).set({ processPid: survivor.pid! }).where(eq(heartbeatRuns.id, runId));
+      const response = await request(app(companyId, userId))
+        .post(`/api/issues/${issueId}/tree-holds/${pauseHoldId}/release`)
+        .send({ metadata: { wakeAgents: true, reconcileExecutionHolds: true } });
+      expect(response.status).toBe(409);
+      expect(response.body.error).toContain("still running");
+      const [unchanged] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold.id));
+      expect(unchanged!.evidence).not.toHaveProperty("executionReconciliation");
+      const [pauseHold] = await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, pauseHoldId));
+      expect(pauseHold!.status).toBe("active");
+    });
   });
 });
