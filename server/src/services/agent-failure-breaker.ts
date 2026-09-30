@@ -1,6 +1,6 @@
-import { and, desc, eq, gt, gte, inArray, max } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, max } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentConfigRevisions, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
+import { agentConfigRevisions, heartbeatRuns } from "@paperclipai/db";
 
 /**
  * Retry breaker for agents whose runs keep failing the same way.
@@ -134,30 +134,6 @@ export async function readAgentFailureBreaker(
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
     .limit(threshold);
   return evaluateAgentFailureBreaker(recentRuns, threshold);
-}
-
-/**
- * Whether an automatic wake has already been held for this streak, so the
- * notice is recorded once per trip rather than once per skipped wake.
- */
-export async function hasHeldWakeForAgentFailureBreaker(
-  db: Db,
-  agent: { id: string; companyId: string },
-  trip: AgentFailureBreakerTrip,
-): Promise<boolean> {
-  const [held] = await db
-    .select({ id: agentWakeupRequests.id })
-    .from(agentWakeupRequests)
-    .where(
-      and(
-        eq(agentWakeupRequests.agentId, agent.id),
-        eq(agentWakeupRequests.companyId, agent.companyId),
-        eq(agentWakeupRequests.reason, AGENT_FAILURE_BREAKER_SKIP_REASON),
-        gte(agentWakeupRequests.requestedAt, trip.latestFailureAt),
-      ),
-    )
-    .limit(1);
-  return Boolean(held);
 }
 
 /** The operator-facing explanation stored on the agent and the skipped wake. */

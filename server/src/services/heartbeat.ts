@@ -33,7 +33,6 @@ import {
   AGENT_FAILURE_BREAKER_SKIP_REASON,
   AGENT_FAILURE_BREAKER_THRESHOLD,
   describeAgentFailureBreaker,
-  hasHeldWakeForAgentFailureBreaker,
   readAgentFailureBreaker,
   type AgentFailureBreakerTrip,
 } from "./agent-failure-breaker.js";
@@ -18380,16 +18379,35 @@ export function heartbeatService(
    * The one board-visible notice for a tripped failure breaker: the agent's
    * error reason (shown on the agent page and in the attention feed) says why
    * automatic wakes stopped, and the activity log records the decision.
+   *
+   * Recorded at most once per streak, even when several automatic wakes for
+   * the agent are admitted concurrently. Every finished run rewrites the
+   * agent's error reason, so it still holds this notice only if an earlier
+   * held wake of the same streak already recorded it. The conditional update
+   * below is the claim: concurrent updates of the agent row serialize on its
+   * row lock and re-check the condition against the committed row, so exactly
+   * one caller gets the row back and logs the activity entry.
    */
   async function recordAgentFailureBreakerNotice(
     agent: typeof agents.$inferSelect,
     trip: AgentFailureBreakerTrip,
     notice: string,
   ) {
-    await db
+    const errorReason = truncateAgentErrorReason(notice) ?? notice;
+    const claimed = await db
       .update(agents)
-      .set({ errorReason: truncateAgentErrorReason(notice), updatedAt: new Date() })
-      .where(and(eq(agents.id, agent.id), eq(agents.status, "error")));
+      .set({ errorReason, updatedAt: new Date() })
+      .where(
+        and(
+          eq(agents.id, agent.id),
+          // A person who cleared the error in the meantime gets no notice.
+          eq(agents.status, "error"),
+          // Already showing this notice: another wake of this streak won.
+          or(isNull(agents.errorReason), ne(agents.errorReason, errorReason)),
+        ),
+      )
+      .returning({ id: agents.id });
+    if (claimed.length === 0) return;
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: "system",
@@ -27638,9 +27656,9 @@ export function heartbeatService(
       const failureBreaker = await readAgentFailureBreaker(db, agent);
       if (failureBreaker) {
         const notice = describeAgentFailureBreaker(failureBreaker);
-        const alreadyNoticed = await hasHeldWakeForAgentFailureBreaker(db, agent, failureBreaker);
         await writeSkippedRequest(AGENT_FAILURE_BREAKER_SKIP_REASON, { error: notice });
-        if (!alreadyNoticed) await recordAgentFailureBreakerNotice(agent, failureBreaker, notice);
+        // Records the notice only for the first held wake of the streak.
+        await recordAgentFailureBreakerNotice(agent, failureBreaker, notice);
         return null;
       }
     }
