@@ -483,6 +483,20 @@ export interface ServerAdapterModule {
   listSkills?: (ctx: AdapterSkillContext) => Promise<AdapterSkillSnapshot>;
   syncSkills?: (ctx: AdapterSkillContext, desiredSkills: string[]) => Promise<AdapterSkillSnapshot>;
   sessionCodec?: AdapterSessionCodec;
+  /**
+   * Adapter resumes its provider session on the next run (it persists the
+   * session through `sessionCodec`), so a resumed run takes a new turn of the
+   * same conversation. Paperclip may then continue a task after a run that
+   * stopped or was lost, for example after an agent pause that verified the
+   * run's process stopped, instead of holding the task for reconciliation: the
+   * new turn sees the recorded work and decides what remains, and nothing the
+   * stopped run did is replayed. Leave it unset for an adapter whose retry
+   * re-runs a command or re-sends a request (process or webhook adapters).
+   * When undefined, the server falls back to its built-in list of
+   * conversation adapters, so external plugins must opt in; `false` opts a
+   * type out.
+   */
+  supportsConversationContinuation?: boolean;
   sessionManagement?: import("./session-compaction.js").AdapterSessionManagement;
   supportsLocalAgentJwt?: boolean;
   /** How this adapter receives Paperclip's run-scoped control tools. */

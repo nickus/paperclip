@@ -203,6 +203,10 @@ export const sessionCodec: AdapterSessionCodec = {
 };
 ```
 
+4. Set `supportsConversationContinuation: true` on the module when a resumed run takes a new turn of the same conversation
+
+With it, a task whose run was stopped or lost continues as a new conversation turn instead of being held for reconciliation: for example after an agent pause that verified the run's process stopped, once the agent is resumed, or after a graceful server restart. The new turn sees the work the stopped run recorded and decides what remains; nothing the stopped run did is replayed. Leave it unset when a retry would re-run a command or re-send a request (as the `process` and `http` adapters do); such runs keep the reconciliation hold. Built-in conversation adapters keep their behavior when the flag is absent, and `false` opts a type out.
+
 ## Capability Flags
 
 Adapters can declare what "local" capabilities they support by setting optional fields on the `ServerAdapterModule`. The server and UI use these flags to decide which features to enable for agents using the adapter (instructions bundle editor, skills sync, JWT auth, etc.).

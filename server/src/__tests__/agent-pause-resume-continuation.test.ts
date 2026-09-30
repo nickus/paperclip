@@ -30,7 +30,12 @@ vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
 }));
 
-import { runningProcesses } from "../adapters/index.js";
+import {
+  registerServerAdapter,
+  runningProcesses,
+  unregisterServerAdapter,
+  type ServerAdapterModule,
+} from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
 import {
@@ -59,6 +64,29 @@ function exited(child: ChildProcess) {
   return child.exitCode !== null || child.signalCode !== null;
 }
 
+/** An adapter from an external plugin: its type is in no built-in list. */
+const EXTERNAL_ADAPTER_TYPE = "external_session_test";
+
+function externalAdapter(capabilities: Partial<ServerAdapterModule> = {}): ServerAdapterModule {
+  return {
+    type: EXTERNAL_ADAPTER_TYPE,
+    execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+    testEnvironment: async () => ({
+      adapterType: EXTERNAL_ADAPTER_TYPE,
+      status: "pass",
+      checks: [],
+      testedAt: new Date(0).toISOString(),
+    }),
+    // The plugin persists its provider session and resumes it on the next run.
+    sessionCodec: {
+      deserialize: (raw) => (raw && typeof raw === "object" ? (raw as Record<string, unknown>) : null),
+      serialize: (params) => params,
+      getDisplayId: (params) => (typeof params?.sessionId === "string" ? params.sessionId : null),
+    },
+    ...capabilities,
+  };
+}
+
 describeEmbeddedPostgres("agent pause keeps its task resumable", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
@@ -71,6 +99,7 @@ describeEmbeddedPostgres("agent pause keeps its task resumable", () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    unregisterServerAdapter(EXTERNAL_ADAPTER_TYPE);
     for (const child of children) if (!exited(child)) child.kill("SIGKILL");
     children.clear();
     runningProcesses.clear();
@@ -366,6 +395,89 @@ describeEmbeddedPostgres("agent pause keeps its task resumable", () => {
     const hold = await legacyHold(issueId);
     expect(hold).toMatchObject({ status: "resolved", evidence: { automaticRecovery: { replay: "blocked" } } });
     expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: hold.id });
+  });
+
+  // An adapter plugin cannot be added to the server's built-in list of
+  // conversation adapters; it declares the capability on its module instead.
+  describe("an adapter from an external plugin", () => {
+    it("continues the task after a pause when the adapter declares conversation continuation", async () => {
+      registerServerAdapter(externalAdapter({ supportsConversationContinuation: true }));
+      const { companyId, agentId, issueId, runId, child } = await seedWorkingRun({ adapterType: EXTERNAL_ADAPTER_TYPE });
+
+      await pauseAgent(agentId);
+      expect(exited(child!)).toBe(true);
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(stopped!.resultJson).toMatchObject({
+        providerStop: { initiator: "agent_pause", processTerminated: true },
+      });
+
+      await settleUnrecoverableExecutions(db, new Date());
+      const hold = await legacyHold(issueId);
+      expect(hold).toMatchObject({
+        status: "resolved",
+        outcome: "restored",
+        evidence: {
+          continuationDelivery: "pending",
+          executionReconciliation: { runId, providerStopped: true, actionOutcome: "mixed" },
+        },
+      });
+      expect(hold.evidence).not.toHaveProperty("automaticRecovery");
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+
+      await resumeAgent(agentId);
+      await deliverReconciledExecutions(db, heartbeatService(db, { runtimeEnv: {} }).wakeup);
+      const continuation = await continuationFor(hold.id);
+      expect(continuation?.run).toMatchObject({
+        agentId,
+        status: "queued",
+        retryOfRunId: runId,
+        contextSnapshot: expect.objectContaining({ issueId, previousRunId: runId, source: "execution.reconciled" }),
+      });
+    });
+
+    it.each([
+      ["leaves the capability unset", {}],
+      ["declares that it does not continue a conversation", { supportsConversationContinuation: false }],
+    ] as const)("keeps the hold of a paused run when the adapter %s", async (_label, capabilities) => {
+      registerServerAdapter(externalAdapter(capabilities));
+      const { companyId, agentId, issueId, child } = await seedWorkingRun({ adapterType: EXTERNAL_ADAPTER_TYPE });
+
+      await pauseAgent(agentId);
+      expect(exited(child!)).toBe(true);
+
+      await settleUnrecoverableExecutions(db, new Date());
+      const hold = await legacyHold(issueId);
+      expect(hold).toMatchObject({ status: "resolved", outcome: "blocked", evidence: { automaticRecovery: { replay: "blocked" } } });
+      expect(hold.evidence).not.toHaveProperty("executionReconciliation");
+      expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: hold.id });
+      await resumeAgent(agentId);
+      await deliverReconciledExecutions(db, heartbeatService(db, { runtimeEnv: {} }).wakeup);
+      expect(await continuationFor(hold.id)).toBeNull();
+    });
+
+    it("continues the task after an instance restart stops its run when the adapter declares the capability", async () => {
+      registerServerAdapter(externalAdapter({ supportsConversationContinuation: true }));
+      const { companyId, issueId, runId } = await seedWorkingRun({ adapterType: EXTERNAL_ADAPTER_TYPE });
+      const responsibleUserId = randomUUID();
+      await db.insert(authUsers).values({
+        id: responsibleUserId, name: "Operator", email: `${responsibleUserId}@example.test`,
+        emailVerified: true, createdAt: new Date(), updatedAt: new Date(),
+      });
+      await db.update(companies).set({ defaultResponsibleUserId: responsibleUserId })
+        .where(eq(companies.id, companyId));
+
+      const drained = await heartbeatService(db, { runtimeEnv: {} }).drainRunningRunsForShutdown("SIGTERM");
+      expect(drained.interruptedRunIds).toEqual([runId]);
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(stopped!.resultJson).toMatchObject({ conversationContinuation: "continue_conversation_v1" });
+
+      await settleUnrecoverableExecutions(db, new Date());
+      expect(await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+        eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+      ))).toHaveLength(0);
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    });
   });
 
   // The agent pause is not the only operator action that stops a run's

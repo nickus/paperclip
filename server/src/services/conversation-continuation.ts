@@ -1,16 +1,40 @@
 import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
+import { findActiveServerAdapter, listServerAdapters } from "../adapters/registry.js";
 import { readProcessStartedAt } from "./hot-restart.js";
 
-// These adapters accept a conversation turn. Retrying a process or webhook can
-// replay the action itself, so those adapters retain their recovery contract.
+// These built-in adapters accept a conversation turn. Retrying a process or
+// webhook can replay the action itself, so those adapters retain their
+// recovery contract.
 export const CONVERSATION_ADAPTER_TYPES = [
   "claude_local", "codex_local", "cursor", "gemini_local", "opencode_local",
   "pi_local", "grok_local", "kimi_local", "hermes_local",
 ] as const;
 
+/**
+ * Whether a run of this adapter type continues as a new conversation turn,
+ * that is whether the adapter resumes its provider session. A registered
+ * adapter module can declare it (`supportsConversationContinuation`), which is
+ * how an external adapter plugin opts in; when the module leaves it undefined
+ * the built-in list above decides. The active module is read, so a paused
+ * external override resolves to the built-in it replaced, and a type that is
+ * no longer registered falls back to the built-in list.
+ */
 export function isConversationAdapter(adapterType: string): boolean {
+  const declared = findActiveServerAdapter(adapterType)?.supportsConversationContinuation;
+  if (typeof declared === "boolean") return declared;
   return (CONVERSATION_ADAPTER_TYPES as readonly string[]).includes(adapterType);
+}
+
+/**
+ * Every adapter type `isConversationAdapter` accepts right now: the built-in
+ * list plus each registered adapter that declares the capability. SQL
+ * predicates use it so they select the same runs as the in-process check.
+ */
+export function conversationAdapterTypes(): string[] {
+  const types = new Set<string>(CONVERSATION_ADAPTER_TYPES);
+  for (const adapter of listServerAdapters()) types.add(adapter.type);
+  return [...types].filter(isConversationAdapter);
 }
 
 export const CONVERSATION_CONTINUATION_POLICY = "continue_conversation_v1";
@@ -26,15 +50,16 @@ export function claimedAdapterType(run: Pick<typeof heartbeatRuns.$inferSelect, 
 }
 
 function conversationRunPredicate() {
+  const adapterTypes = conversationAdapterTypes();
   return or(
-    inArray(sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`, [...CONVERSATION_ADAPTER_TYPES]),
+    inArray(sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`, adapterTypes),
     sql`${heartbeatRuns.resultJson}->>'conversationContinuation' = ${CONVERSATION_CONTINUATION_POLICY}`,
     sql`exists (
       select 1 from ${heartbeatRunEvents}
       where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId}
         and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
         and ${heartbeatRunEvents.eventType} = 'adapter.invoke'
-        and ${inArray(sql`${heartbeatRunEvents.payload}->>'adapterType'`, [...CONVERSATION_ADAPTER_TYPES])}
+        and ${inArray(sql`${heartbeatRunEvents.payload}->>'adapterType'`, adapterTypes)}
     )`,
   );
 }
