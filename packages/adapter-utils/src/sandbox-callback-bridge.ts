@@ -676,10 +676,10 @@ export const STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRou
 
 /**
  * The writes the `steward` policy forwards on top of the `agent` allow rules,
- * and nothing more: replacing another agent's instructions bundle settings or
- * one of its instruction files, creating a company skill, and editing a
- * company skill file. Assigning skills to an agent (`skills/sync`) is already
- * on the `agent` list. Deleting instruction files, skill imports, catalog
+ * and nothing more: replacing another agent's instructions bundle settings,
+ * writing or deleting one of its instruction files, creating a company skill,
+ * and editing or deleting a company skill file. Assigning skills to an agent
+ * (`skills/sync`) is already on the `agent` list. Skill imports, catalog
  * installs, skill deletes and skill metadata or sharing changes stay refused.
  *
  * The policy is meant for the environment of one dedicated reviewer agent.
@@ -691,9 +691,9 @@ export const STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRou
  */
 export const STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRouteRule[] = [
   { methods: ["PATCH"], path: /^\/api\/agents\/[^/]+\/instructions-bundle$/ },
-  { methods: ["PUT"], path: /^\/api\/agents\/[^/]+\/instructions-bundle\/file$/ },
+  { methods: ["PUT", "DELETE"], path: /^\/api\/agents\/[^/]+\/instructions-bundle\/file$/ },
   { methods: ["POST"], path: new RegExp(`${COMPANY}\\/skills$`) },
-  { methods: ["PATCH"], path: new RegExp(`${COMPANY}\\/skills\\/[^/]+\\/files$`) },
+  { methods: ["PATCH", "DELETE"], path: new RegExp(`${COMPANY}\\/skills\\/[^/]+\\/files$`) },
 ];
 
 function agentPolicyRouteMatches(rules: readonly AgentBridgeRouteRule[], method: string, path: string): boolean {

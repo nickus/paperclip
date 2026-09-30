@@ -3705,6 +3705,36 @@ describe("sandbox callback bridge", () => {
     expect(handled).toHaveBeenCalledTimes(2);
   });
 
+  it("forwards the steward policy's file deletes through the queue gateway", async () => {
+    const handled = vi.fn(async (_request: { method: string; path: string; query: string; body: string | Buffer }) => ({
+      status: 200, headers: { "content-type": "application/json" }, body: JSON.stringify({ ok: true }),
+    }));
+    const gateway = await startQueueGatewayForFileTest({
+      maxBodyBytes: 1024,
+      handleRequest: handled,
+      authorizeRequest: createSandboxCallbackBridgeAuthorizer({ policy: "steward", companyId: "co-1" }),
+    });
+    const authorization = `Bearer ${gateway.bridgeToken}`;
+
+    // The instruction file delete names its file in the query and has no body.
+    const instructionDelete = await fetch(
+      `${gateway.baseUrl}/api/agents/agent-2/instructions-bundle/file?path=notes.md`,
+      { method: "DELETE", headers: { authorization } },
+    );
+    expect(instructionDelete.status).toBe(200);
+    // The skill file delete names its file in a JSON body.
+    const skillDelete = await fetch(`${gateway.baseUrl}/api/companies/co-1/skills/skill-1/files`, {
+      method: "DELETE",
+      headers: { authorization, "content-type": "application/json" },
+      body: JSON.stringify({ path: "references/old.md" }),
+    });
+    expect(skillDelete.status).toBe(200);
+    expect(handled.mock.calls.map(([request]) => [request.method, request.path, request.query, request.body])).toEqual([
+      ["DELETE", "/api/agents/agent-2/instructions-bundle/file", "?path=notes.md", ""],
+      ["DELETE", "/api/companies/co-1/skills/skill-1/files", "", JSON.stringify({ path: "references/old.md" })],
+    ]);
+  });
+
   it("carries multipart bodies to any route on the queue path and lets the route policy decide", async () => {
     const handled = vi.fn(async (request: { body?: string | Buffer }) => ({
       status: 201, headers: { "content-type": "application/octet-stream" }, body: Buffer.from(request.body ?? ""),

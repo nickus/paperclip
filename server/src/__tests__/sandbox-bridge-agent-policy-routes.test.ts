@@ -293,11 +293,13 @@ describe("agent bridge policy route inventory", () => {
 describe("steward bridge policy route inventory", () => {
   const { routes } = listServerRoutes();
 
-  it("differs from the agent policy only by instruction-bundle writes, company skill create and file edits, and hires", () => {
+  it("differs from the agent policy only by instruction-bundle writes, company skill create and file writes, and hires", () => {
     const changed = [...new Set(routes
       .filter((route) => classify(route, "steward") !== classify(route, "agent"))
       .map((route) => `${classify(route, "steward")} ${route.method} ${route.path}`))].sort();
     expect(changed).toEqual([
+      "ALLOW DELETE /api/agents/:id/instructions-bundle/file",
+      "ALLOW DELETE /api/companies/:companyId/skills/:skillId/files",
       "ALLOW PATCH /api/agents/:id/instructions-bundle",
       "ALLOW PATCH /api/companies/:companyId/skills/:skillId/files",
       "ALLOW POST /api/companies/:companyId/skills",
@@ -318,7 +320,6 @@ describe("steward bridge policy route inventory", () => {
         (route.method !== "GET" &&
           /^\/api\/agents\/:[a-z]+\/(?:config-revisions|pause|resume|approve|terminate|clear-error|claude-login|heartbeat|runtime-state)(?:\/|$)/
             .test(path)) ||
-        (route.method === "DELETE" && /^\/api\/agents\/:[a-z]+\/instructions-bundle(?:\/|$)/.test(path)) ||
         (route.method !== "GET" && /^\/api\/companies\/:companyid\/(?:agents|agent-hires)(?:\/|$)/.test(path)) ||
         /^\/api\/(?:companies\/:companyid\/)?environments?(?:\/|$)/.test(path)
       );
