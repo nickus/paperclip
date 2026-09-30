@@ -130,6 +130,40 @@ export function parseClaudeStreamJson(stdout: string) {
   };
 }
 
+/**
+ * A successful result event for which Claude ran no model turn. A resumed
+ * session emits one when the CLI first reports background tasks that a
+ * previous process left behind (`task_notification` events): it answers those
+ * notifications with an empty zero-turn result and only then starts the turn
+ * for the prompt. Such a result does not end the invocation.
+ */
+export function isClaudeNoopTurnResult(event: Record<string, unknown>): boolean {
+  return (
+    asString(event.type, "") === "result" &&
+    asString(event.subtype, "").trim().toLowerCase() === "success" &&
+    !asBoolean(event.is_error, false) &&
+    event.num_turns === 0
+  );
+}
+
+/**
+ * Whether the stream-json output contains the result that ends the prompt's
+ * turn. Used to decide when a Claude process that keeps running (for example
+ * because a background task it started is still alive) can be cleaned up.
+ * A zero-turn result (see isClaudeNoopTurnResult) does not count: the prompt's
+ * turn is still to come.
+ */
+export function hasClaudeTerminalResult(stdout: string): boolean {
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const event = parseJson(line);
+    if (!event || asString(event.type, "") !== "result") continue;
+    if (!isClaudeNoopTurnResult(event)) return true;
+  }
+  return false;
+}
+
 function extractClaudeErrorMessages(parsed: Record<string, unknown>): string[] {
   const raw = Array.isArray(parsed.errors) ? parsed.errors : [];
   const messages: string[] = [];

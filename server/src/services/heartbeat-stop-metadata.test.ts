@@ -3,6 +3,7 @@ import {
   buildHeartbeatRunStopMetadata,
   mergeHeartbeatRunStopMetadata,
   resolveHeartbeatRunTimeoutPolicy,
+  wasStoppedAfterTerminalResult,
 } from "./heartbeat-stop-metadata.js";
 
 describe("heartbeat stop metadata", () => {
@@ -128,5 +129,27 @@ describe("heartbeat stop metadata", () => {
       timeoutSource: "default",
       timeoutFired: false,
     });
+  });
+
+  it("recognizes only a terminal-result cleanup stop that followed the final result", () => {
+    const evidence = {
+      kind: "terminal_result_cleanup",
+      stopped: true,
+      stopReason: "unmanaged_background_task_stopped",
+      terminalResultSeen: true,
+      signal: "SIGTERM",
+    };
+    expect(wasStoppedAfterTerminalResult({ unmanagedBackgroundTask: evidence })).toBe(true);
+    expect(
+      wasStoppedAfterTerminalResult({ unmanagedBackgroundTask: { ...evidence, terminalResultSeen: false } }),
+    ).toBe(false);
+    // A process-group sweep after a lost process is not a clean end of the turn.
+    expect(
+      wasStoppedAfterTerminalResult({
+        unmanagedBackgroundTask: { ...evidence, kind: "orphaned_process_group_cleanup" },
+      }),
+    ).toBe(false);
+    expect(wasStoppedAfterTerminalResult({ stopReason: "unmanaged_background_task_stopped" })).toBe(false);
+    expect(wasStoppedAfterTerminalResult(null)).toBe(false);
   });
 });
