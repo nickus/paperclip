@@ -368,6 +368,122 @@ describeEmbeddedPostgres("agent pause keeps its task resumable", () => {
     expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: hold.id });
   });
 
+  // The agent pause is not the only operator action that stops a run's
+  // provider process. An instance restart and a board Stop record their
+  // verified stop differently (an interrupted run, an acknowledged
+  // cancellation), and conversation continuation already accepts both. These
+  // cases pin that every such stop leaves the task resumable, and that a stop
+  // nobody verified keeps the conservative hold.
+  describe("other operator stops of a conversation turn", () => {
+    function boardApp(companyId: string, userId: string) {
+      const server = express();
+      server.use(express.json());
+      server.use((req, _res, next) => {
+        (req as any).actor = { type: "board", userId, companyIds: [companyId], source: "session", isInstanceAdmin: false };
+        next();
+      });
+      server.use("/api", issueTreeControlRoutes(db));
+      server.use(errorHandler);
+      return server;
+    }
+
+    /** "Resume work" on the task: pause it, then release the pause and wake its agent. */
+    async function resumeWork(companyId: string, issueId: string, userId: string) {
+      const { hold } = await issueTreeControlService(db).createHold(companyId, issueId, {
+        mode: "pause",
+        releasePolicy: { strategy: "manual", note: "leaf_pause" },
+        actor: { actorType: "user", actorId: userId, userId },
+      });
+      return request(boardApp(companyId, userId))
+        .post(`/api/issues/${issueId}/tree-holds/${hold.id}/release`)
+        .send({ metadata: { wakeAgents: true } });
+    }
+
+    it("continues the task after an instance restart stops its run", async () => {
+      const { companyId, issueId, runId, child } = await seedWorkingRun();
+      // The retry run is attributed to the company's responsible user.
+      const responsibleUserId = randomUUID();
+      await db.insert(authUsers).values({
+        id: responsibleUserId, name: "Operator", email: `${responsibleUserId}@example.test`,
+        emailVerified: true, createdAt: new Date(), updatedAt: new Date(),
+      });
+      await db.update(companies).set({ defaultResponsibleUserId: responsibleUserId })
+        .where(eq(companies.id, companyId));
+
+      // A graceful restart (or a drain before one) stops the owned process
+      // before it records the interruption.
+      const drained = await heartbeatService(db, { runtimeEnv: {} }).drainRunningRunsForShutdown("SIGTERM");
+      expect(drained.interruptedRunIds).toEqual([runId]);
+      expect(exited(child!)).toBe(true);
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(stopped).toMatchObject({ status: "interrupted", errorCode: "server_shutdown_interrupted" });
+      expect(stopped!.resultJson).toHaveProperty("conversationContinuation");
+
+      // No no-replay disposition: the next turn continues from the recorded work.
+      await settleUnrecoverableExecutions(db, new Date());
+      expect(await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+        eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+      ))).toHaveLength(0);
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+      expect(drained.retryRunIds).toHaveLength(1);
+      const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, drained.retryRunIds[0]!));
+      expect(retry).toMatchObject({ retryOfRunId: runId, contextSnapshot: expect.objectContaining({ issueId }) });
+    });
+
+    it("resumes the task after a board Stop that verified its process stopped", async () => {
+      const { companyId, agentId, issueId, runId, child } = await seedWorkingRun();
+      const userId = randomUUID();
+      await heartbeatService(db, { runtimeEnv: {} }).cancelRun(runId, "Cancelled by a board operator", {
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: userId },
+      });
+      expect(exited(child!)).toBe(true);
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(stopped).toMatchObject({
+        status: "cancelled",
+        resultJson: { cancelledByActorType: "user", executionCancellation: { state: "acknowledged" } },
+      });
+
+      // The Stop is the operator's decision: nothing wakes the task by itself,
+      // and nothing blocks it once the operator resumes it.
+      await settleUnrecoverableExecutions(db, new Date());
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+      await resumeAgent(agentId);
+      const response = await resumeWork(companyId, issueId, userId);
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ status: "released" });
+      expect(response.body.wakeFailures).toBeUndefined();
+      expect(response.body.reconciledIssueIds).toBeUndefined();
+      expect(await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "issue_tree_resumed"),
+      ))).toHaveLength(1);
+    });
+
+    it("keeps the hold of a board Stop that could not verify its process stopped", async () => {
+      // The server does not own the process, so the Stop cannot confirm it
+      // ended; the task keeps the no-replay disposition until reconciled.
+      const { companyId, issueId, runId } = await seedWorkingRun({ ownedProcess: false });
+      const userId = randomUUID();
+      await heartbeatService(db, { runtimeEnv: {} }).cancelRun(runId, "Cancelled by a board operator", {
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: userId },
+      });
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(stopped!.status).toBe("cancelled");
+      expect(stopped!.resultJson).not.toHaveProperty("executionCancellation");
+      await settleUnrecoverableExecutions(db, new Date());
+      const hold = await legacyHold(issueId);
+      expect(hold).toMatchObject({ status: "resolved", outcome: "blocked", evidence: { automaticRecovery: { replay: "blocked" } } });
+      expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: hold.id });
+
+      // Moved back to work, "Resume work" offers the board reconciliation
+      // instead of failing.
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+      const response = await resumeWork(companyId, issueId, userId);
+      expect(response.status).toBe(409);
+      expect(response.body).toMatchObject({ code: RESUME_RECONCILIATION_REQUIRED_CODE });
+    });
+  });
+
   describe("resuming held work from the task", () => {
     function app(companyId: string, userId: string) {
       const server = express();

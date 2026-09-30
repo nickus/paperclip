@@ -38,8 +38,15 @@ export function buildProviderStop(stop: { initiator: "agent_pause"; requestedAt:
  * A legacy run that an agent pause stopped, with the stop of its provider
  * process verified. Resuming the agent is the operator's decision to continue
  * the task: the run's recorded work stands, and a new turn decides what
- * remains. Any other stop, including one whose termination was not verified,
- * keeps the regular reconciliation hold.
+ * remains. A pause stop whose termination was not verified keeps the regular
+ * reconciliation hold.
+ *
+ * Other operator stops need no such record. A restart or drain records an
+ * interrupted run, a board Stop records an acknowledged cancellation once
+ * termination returns, and conversation continuation accepts both without a
+ * hold; a stop that verified nothing keeps the hold. The pause marks its runs
+ * cancelled before it stops their processes, so it records the verified stop
+ * separately.
  */
 export function isVerifiedAgentPauseStop(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson">,
