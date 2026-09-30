@@ -226,9 +226,19 @@ const MAX_REMOTE_MCP_RESPONSE_BYTES = 1_000_000;
 // be a blip, and marking the connection unhealthy hides every one of its tools
 // until the next health check, so the gateway only does that after this many
 // consecutive transport failures with no reachable answer in between. Per-call
-// errors from a server that answered (timeouts, JSON-RPC errors, rejected
-// arguments) never count.
+// errors from a server that answered (JSON-RPC errors, rejected arguments, an
+// unusable body) never count.
 const REMOTE_MCP_CONSECUTIVE_TRANSPORT_FAILURES_BEFORE_ERROR = 3;
+// A tools/call that outlives its deadline says nothing certain about the
+// connection: the tool may just be slow for this input, and hiding the
+// connection's other tools for that is the wrong outcome. A server that accepts
+// connections and then never answers looks the same from one call, though. So
+// after this many consecutive timed-out calls with no answered call in between,
+// the gateway marks the connection's health check as due instead of changing
+// its health. The next health sweep then probes it with tools/list under the
+// transport's short response deadline: a responsive server stays healthy and
+// keeps its tools listed, a wedged one is marked `error`.
+const REMOTE_MCP_CONSECUTIVE_TIMEOUTS_BEFORE_HEALTH_CHECK = 3;
 const REMOTE_MCP_TRANSPORT_FAILURE_TRACKING_LIMIT = 10_000;
 const REMOTE_MCP_UNREACHABLE_HTTP_STATUSES = new Set([502, 503, 504]);
 const REMOTE_MCP_UNREACHABLE_REASON_CODES = new Set([
@@ -3555,32 +3565,77 @@ export function createToolGatewayService(
     return { headers, summary };
   }
 
-  // Consecutive tools/call transport failures per connection, in this process.
-  const remoteTransportFailureCounts = new Map<string, number>();
+  // Consecutive unanswered tools/call outcomes per connection, in this process:
+  // calls that could not reach the server, and calls that timed out. Any call
+  // the server answered clears both streaks.
+  type RemoteCallStreaks = { unreachable: number; timedOut: number };
+  const remoteCallStreaks = new Map<string, RemoteCallStreaks>();
 
+  function bumpRemoteCallStreak(
+    connectionId: string,
+    kind: keyof RemoteCallStreaks,
+  ): number {
+    const streaks = remoteCallStreaks.get(connectionId) ?? { unreachable: 0, timedOut: 0 };
+    streaks[kind] += 1;
+    // Re-insert, so the Map's insertion order follows the latest failure.
+    remoteCallStreaks.delete(connectionId);
+    if (remoteCallStreaks.size >= REMOTE_MCP_TRANSPORT_FAILURE_TRACKING_LIMIT) {
+      // Drop the least recently failing connection; Map keeps insertion order.
+      const oldest = remoteCallStreaks.keys().next().value;
+      if (oldest !== undefined) remoteCallStreaks.delete(oldest);
+    }
+    remoteCallStreaks.set(connectionId, streaks);
+    return streaks[kind];
+  }
+
+  /** The server answered a tools/call, whatever the answer said. */
   function recordRemoteTransportSuccess(
     connection: typeof toolConnections.$inferSelect,
   ) {
-    remoteTransportFailureCounts.delete(connection.id);
+    remoteCallStreaks.delete(connection.id);
   }
 
   async function recordRemoteTransportFailure(
     connection: typeof toolConnections.$inferSelect,
     message: string,
   ) {
-    const failures = (remoteTransportFailureCounts.get(connection.id) ?? 0) + 1;
-    remoteTransportFailureCounts.delete(connection.id);
-    if (remoteTransportFailureCounts.size >= REMOTE_MCP_TRANSPORT_FAILURE_TRACKING_LIMIT) {
-      // Drop the least recently failing connection; Map keeps insertion order.
-      const oldest = remoteTransportFailureCounts.keys().next().value;
-      if (oldest !== undefined) remoteTransportFailureCounts.delete(oldest);
-    }
-    remoteTransportFailureCounts.set(connection.id, failures);
+    const failures = bumpRemoteCallStreak(connection.id, "unreachable");
     if (failures >= REMOTE_MCP_CONSECUTIVE_TRANSPORT_FAILURES_BEFORE_ERROR) {
       await markRemoteConnectionHealth(
         connection,
         "error",
         `${message} ${failures} consecutive tool calls could not reach the server.`,
+      );
+    }
+  }
+
+  /**
+   * A tools/call outlived its deadline. It leaves the connection's health
+   * alone; a run of them asks the health sweep to probe the connection soon
+   * (see REMOTE_MCP_CONSECUTIVE_TIMEOUTS_BEFORE_HEALTH_CHECK).
+   */
+  async function recordRemoteToolCallTimeout(
+    connection: typeof toolConnections.$inferSelect,
+  ) {
+    const timeouts = bumpRemoteCallStreak(connection.id, "timedOut");
+    if (timeouts < REMOTE_MCP_CONSECUTIVE_TIMEOUTS_BEFORE_HEALTH_CHECK) return;
+    // Start a new streak, so a server the probe finds responsive is probed
+    // again only after another run of timeouts, not on every later one.
+    const streaks = remoteCallStreaks.get(connection.id);
+    if (streaks) streaks.timedOut = 0;
+    try {
+      // The health sweep checks connections without a recorded check first.
+      // The health status itself is left as it is until that check runs.
+      await db
+        .update(toolConnections)
+        .set({ healthCheckedAt: null })
+        .where(eq(toolConnections.id, connection.id));
+    } catch (error) {
+      // Best effort: the caller's answer is the tool_timeout error, and the
+      // regular sweep still probes the connection once its check goes stale.
+      logger.warn(
+        { err: error, connectionId: connection.id },
+        "Could not request a health check after repeated tool-call timeouts",
       );
     }
   }
@@ -6330,6 +6385,10 @@ export function createToolGatewayService(
       if (error instanceof ToolGatewayHttpError) {
         if (REMOTE_MCP_UNREACHABLE_REASON_CODES.has(error.reasonCode)) {
           await recordRemoteTransportFailure(connection, error.message);
+        } else if (error.reasonCode === "remote_http_response_timeout") {
+          // The transport's own response deadline (it matches this call's
+          // deadline) passed first: the same signal as the timeout below.
+          await recordRemoteToolCallTimeout(connection);
         }
         throw new ToolGatewayHttpError(
           error.status,
@@ -6342,10 +6401,11 @@ export function createToolGatewayService(
         );
       }
       if (error instanceof Error && error.name === "AbortError") {
-        // The call outlived its own deadline. That says nothing about the
-        // connection's health: the provider may simply be slow for this input.
-        // Leave the health indicator alone so the connection's other tools stay
-        // listed.
+        // The call outlived its own deadline. That alone says nothing about
+        // the connection's health: the provider may simply be slow for this
+        // input. Leave the health indicator alone so the connection's other
+        // tools stay listed; a run of timeouts only asks for a health check.
+        await recordRemoteToolCallTimeout(connection);
         throw new ToolGatewayHttpError(
           504,
           "Remote MCP tool call timed out",
