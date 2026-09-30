@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, routines } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -251,5 +251,111 @@ describe("legacy continuation persisted authority", () => {
     expect(await f.runs()).toHaveLength(2);
     const repair = (await f.runs()).find(r => r.id !== f.runId)!;
     expect(repair.contextSnapshot).toMatchObject({ legacyDispositionEpisode: { id: f.runId, attempt: 1 } });
+  });
+
+  describe("return to rest", () => {
+    // The issue rested in backlog and the harness checkout for the source run
+    // moved it to in_progress, recording that origin in the run context.
+    async function harnessCheckedOutFixture() {
+      const f = await fixture();
+      await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, f.issueId));
+      const [checkedOut] = await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId)).returning();
+      await recordCheckout(f.runId, f.issueId, checkedOut.statusVersion);
+      return f;
+    }
+    async function recordCheckout(runId: string, issueId: string, statusVersion: number) {
+      await db.update(heartbeatRuns).set({ contextSnapshot: {
+        issueId, paperclipHarnessCheckedOut: true,
+        paperclipHarnessCheckoutFromStatus: "backlog", paperclipHarnessCheckoutStatusVersion: statusVersion,
+      } }).where(eq(heartbeatRuns.id, runId));
+    }
+    const issueStatus = async (issueId: string) => (await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status;
+    const repairWakes = async (companyId: string) => (await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId))).filter(w => w.reason === "issue_disposition_repair");
+    const restActivity = async (companyId: string) => (await db.select().from(activityLog)
+      .where(eq(activityLog.companyId, companyId))).filter(a => a.action === "issue.returned_to_rest");
+
+    it("returns the issue to backlog instead of waking the agent for a disposition repair", async () => {
+      const f = await harnessCheckedOutFixture();
+      expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("rested");
+      expect(await issueStatus(f.issueId)).toBe("backlog");
+      expect(await f.runs()).toHaveLength(1);
+      expect(await repairWakes(f.companyId)).toHaveLength(0);
+      expect(await f.actions()).toHaveLength(0);
+      expect(await restActivity(f.companyId)).toEqual([expect.objectContaining({
+        entityId: f.issueId, runId: f.runId,
+        details: expect.objectContaining({ status: "backlog", previousStatus: "in_progress" }),
+      })]);
+      // Backlog is not a stranded-work candidate: a later sweep leaves it alone.
+      await f.createRecovery().reconcileStrandedAssignedIssues();
+      expect(await issueStatus(f.issueId)).toBe("backlog");
+      expect(await f.runs()).toHaveLength(1);
+    });
+
+    it("rests after a follow-up run when nothing recorded a status since the checkout", async () => {
+      const f = await harnessCheckedOutFixture();
+      const [followUp] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "automation",
+        status: "succeeded", runtimeMode: "legacy", contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented" } }).returning();
+      expect(await f.createRecovery().reconcileLegacyContinuation(followUp.id)).toBe("rested");
+      expect(await issueStatus(f.issueId)).toBe("backlog");
+      expect(await repairWakes(f.companyId)).toHaveLength(0);
+    });
+
+    it("the periodic sweep returns the issue to rest too", async () => {
+      const f = await harnessCheckedOutFixture();
+      const result = await f.createRecovery().reconcileStrandedAssignedIssues();
+      expect(result).toMatchObject({ returnedToRest: 1, dispositionRepairRequeued: 0, issueIds: [f.issueId] });
+      expect(await issueStatus(f.issueId)).toBe("backlog");
+      expect(await f.runs()).toHaveLength(1);
+    });
+
+    it.each(["todo", "in_progress"])("requests a repair once a status was recorded after the checkout (%s)", async recorded => {
+      const f = await harnessCheckedOutFixture();
+      // The agent recorded its own status during the run: back to todo, and
+      // for the in_progress case, in_progress again. Either bumps the version.
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+      if (recorded === "in_progress") await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
+      expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("queued");
+      expect(await issueStatus(f.issueId)).toBe(recorded);
+      expect(await repairWakes(f.companyId)).toHaveLength(1);
+      expect(await restActivity(f.companyId)).toHaveLength(0);
+    });
+
+    it("requests a repair after a reassignment away and back", async () => {
+      const f = await harnessCheckedOutFixture();
+      const otherAgentId = randomUUID();
+      await db.insert(agents).values({ id: otherAgentId, companyId: f.companyId, name: "Other", role: "engineer", status: "idle", adapterType: "codex_local" });
+      await db.update(issues).set({ assigneeAgentId: otherAgentId, statusVersion: sql`${issues.statusVersion} + 1` }).where(eq(issues.id, f.issueId));
+      await db.update(issues).set({ assigneeAgentId: f.agentId, statusVersion: sql`${issues.statusVersion} + 1` }).where(eq(issues.id, f.issueId));
+      expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("queued");
+      expect(await issueStatus(f.issueId)).toBe("in_progress");
+    });
+
+    it.each(["routine", "approval", "monitor", "paused-agent", "queued-wake"])("keeps the %s gate ahead of rest", async gate => {
+      const f = await harnessCheckedOutFixture();
+      if (gate === "routine") await db.insert(routines).values({ companyId: f.companyId, title: "Follow-up check", parentIssueId: f.issueId, assigneeAgentId: f.agentId, status: "active" });
+      if (gate === "approval") await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "request_confirmation", status: "pending", requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone", payload: { version: 1, prompt: "Approve?" } });
+      if (gate === "monitor") await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 3_600_000) }).where(eq(issues.id, f.issueId));
+      if (gate === "paused-agent") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+      if (gate === "queued-wake") await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "automation", status: "queued", runtimeMode: "legacy", contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented" } });
+      expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("skipped");
+      expect(await issueStatus(f.issueId)).toBe("in_progress");
+      expect(await restActivity(f.companyId)).toHaveLength(0);
+    });
+
+    it("resolves the agent's open repair action as covered and lets a reserved repair run", async () => {
+      const f = await fixture();
+      await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, f.issueId));
+      const [checkedOut] = await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId)).returning();
+      // A repair reserved before any rest evidence existed.
+      expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("queued");
+      const repair = (await f.runs()).find(r => r.id !== f.runId)!;
+      await recordCheckout(f.runId, f.issueId, checkedOut.statusVersion);
+      expect(await f.createRecovery().legacyRepairDispatchBlock(repair.id)).toBeNull();
+      await f.finish(repair);
+      expect(await f.createRecovery().reconcileLegacyContinuation(repair.id)).toBe("rested");
+      expect(await issueStatus(f.issueId)).toBe("backlog");
+      expect(await f.actions()).toEqual([expect.objectContaining({ kind: "deliberate_wait_without_target", status: "resolved", resolutionNote: "returned_to_rest" })]);
+    });
   });
 });

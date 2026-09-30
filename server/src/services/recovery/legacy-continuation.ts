@@ -16,6 +16,31 @@ export interface LegacyContinuationInput {
     conversation: boolean;
     agentInvokable: boolean;
   };
+  /**
+   * The resting status to restore when the harness checked the issue out of
+   * it for a wake and no status has been recorded since. Null otherwise.
+   */
+  restStatus?: HarnessRestStatus | null;
+}
+/** Run-context keys recording which status the harness checkout moved the issue out of. */
+export const HARNESS_CHECKOUT_FROM_STATUS_KEY = "paperclipHarnessCheckoutFromStatus";
+export const HARNESS_CHECKOUT_STATUS_VERSION_KEY = "paperclipHarnessCheckoutStatusVersion";
+/** Statuses an issue returns to when the harness checked it out of them for a wake. */
+export const HARNESS_REST_STATUSES = ["backlog"] as const;
+export type HarnessRestStatus = (typeof HARNESS_REST_STATUSES)[number];
+/**
+ * The checkout origin to record in the run context, or null when the checkout
+ * did not itself move the issue into in_progress. Every status change bumps
+ * `statusVersion` exactly once, so a single bump across the checkout proves no
+ * concurrent write changed the status between the read and the checkout.
+ */
+export function harnessCheckoutOrigin(
+  before: { status: string; statusVersion: number },
+  after: { status: string; statusVersion: number } | null | undefined,
+): { fromStatus: string; statusVersion: number } | null {
+  if (!after || after.status !== "in_progress" || before.status === "in_progress") return null;
+  if (after.statusVersion !== before.statusVersion + 1) return null;
+  return { fromStatus: before.status, statusVersion: after.statusVersion };
 }
 export interface LegacyDispositionEpisode {
   id: string;
@@ -62,6 +87,7 @@ export function legacyDispositionFingerprint(companyId: string, issueId: string,
 export function decideLegacyContinuation(input: LegacyContinuationInput):
   | { kind: "skip"; reason: string }
   | { kind: "exhausted"; attempt: number; maxAttempts: number }
+  | { kind: "rest"; status: HarnessRestStatus }
   | { kind: "enqueue"; nextAttempt: number; idempotencyKey: string; instruction: string } {
   const { run, issue, agent, gates, episode } = input;
   if (run.runtimeMode === "native") return { kind: "skip", reason: "native_finalization" };
@@ -76,6 +102,10 @@ export function decideLegacyContinuation(input: LegacyContinuationInput):
     [gates.conversation, "conversation"],
     [!gates.agentInvokable || ["paused", "terminated", "pending_approval"].includes(agent.status), "agent_not_invokable"],
   ] as const) if (blocked) return { kind: "skip", reason };
+  // The harness moved a resting issue into in_progress only to run a wake and
+  // nothing has recorded a status since, so the run left no disposition to
+  // repair: the issue goes back to where it was. Every gate above still wins.
+  if (input.restStatus && issue.status === "in_progress") return { kind: "rest", status: input.restStatus };
   if (episode.attempt >= episode.maxAttempts) return { kind: "exhausted", attempt: episode.attempt, maxAttempts: episode.maxAttempts };
   const nextAttempt = episode.attempt + 1;
   return {

@@ -161,4 +161,11 @@ describe("activity formatting", () => {
       "Run finished without a next step - recovery escalated",
     );
   });
+
+  it("says an issue went back to backlog after a run that recorded no status", () => {
+    expect(formatActivityVerb("issue.returned_to_rest")).toBe("returned to backlog");
+    expect(formatIssueActivityAction("issue.returned_to_rest")).toBe(
+      "Run finished without a status change - returned to backlog",
+    );
+  });
 });
