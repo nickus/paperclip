@@ -657,6 +657,33 @@ describe("paperclip skill utils", () => {
     expect(cookbook).toContain("sha256sum");
   });
 
+  it("documents the bare-array response shape of the issue sub-resource list routes", async () => {
+    const cookbook = await fs.readFile(path.resolve("skills/paperclip/references/payload-cookbook.md"), "utf8");
+    const issuesRouteSource = await fs.readFile(path.resolve("server/src/routes/issues.ts"), "utf8");
+
+    // These are the routes agents crashed on by assuming an object envelope
+    // (`'list' object has no attribute 'get'`); pin the documented shape...
+    expect(cookbook).toContain("| `GET /api/issues/{issueId}/documents` | bare array |");
+    expect(cookbook).toContain("| `GET /api/issues/{issueId}/comments[?after=…]` | bare array");
+    expect(cookbook).toContain("| `GET /api/issues/{issueId}/interactions` | bare array |");
+    expect(cookbook).toContain("| `GET /api/issues/{issueId}/attachments` | bare array |");
+
+    // ...and pin each route's actual response call, so a future change that wraps
+    // one of these in an object fails here instead of in an agent's run.
+    expect(issuesRouteSource).toMatch(
+      /router\.get\("\/issues\/:id\/documents", async \(req, res\) => \{[\s\S]{0,400}res\.json\(docs\);/,
+    );
+    expect(issuesRouteSource).toMatch(
+      /router\.get\("\/issues\/:id\/comments", async \(req, res\) => \{[\s\S]{0,2000}res\.json\(\s*await runRedactions\.redactForIssue\(issue\.companyId, issue\.id, comments\),?\s*\);/,
+    );
+    expect(issuesRouteSource).toMatch(
+      /router\.get\("\/issues\/:id\/interactions", async \(req, res\) => \{[\s\S]{0,400}res\.json\(interactions\);/,
+    );
+    expect(issuesRouteSource).toMatch(
+      /router\.get\("\/issues\/:id\/attachments", async \(req, res\) => \{[\s\S]{0,400}res\.json\(attachments\.map\(withContentPath\)\);/,
+    );
+  });
+
   it("keeps the create-issue-interaction-ui guide as a maintainer-only skill", async () => {
     const skillPath = path.resolve(".agents/skills/create-issue-interaction-ui/SKILL.md");
     const skillBody = await fs.readFile(skillPath, "utf8");
