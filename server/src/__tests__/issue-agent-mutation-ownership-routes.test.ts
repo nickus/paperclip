@@ -1718,7 +1718,183 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toBe("Agents may only name themselves as an unblock owner");
+    // The denial names the one owner the agent may use and the human-wait path.
+    expect(res.body.code).toBe("unblock_owner_not_allowed");
+    expect(res.body.remediation).toContain(`{"agentId":"${ownerAgentId}"}`);
+    expect(res.body.remediation).toContain(`POST /api/issues/${issueId}/interactions`);
+    expect(res.body.remediation).toContain('status "in_review"');
+    expect(res.body.details.examples).toContainEqual({
+      when: expect.any(String),
+      body: {
+        status: "blocked",
+        unblockDescriptor: {
+          owner: { agentId: ownerAgentId },
+          action: expect.any(String),
+        },
+      },
+    });
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  function withoutPendingApprovals<T extends ReturnType<typeof createRunContextDb>>(routeDb: T): T {
+    // The generic stub answers every unknown select with a row; the blocked
+    // wait-path check must see "no pending approval" to reach its 422.
+    const baseSelect = routeDb.select;
+    const emptyChain: Record<string, unknown> = {};
+    for (const method of ["innerJoin", "where", "limit", "orderBy"]) {
+      emptyChain[method] = vi.fn(() => emptyChain);
+    }
+    emptyChain.then = (resolve: (rows: unknown[]) => unknown) => resolve([]);
+    routeDb.select = vi.fn((selection: Record<string, unknown> = {}) => {
+      const query = baseSelect(selection);
+      return {
+        from: vi.fn((table: Parameters<typeof getTableName>[0]) =>
+          getTableName(table) === "issue_approvals" ? emptyChain : query.from(table)),
+      };
+    }) as T["select"];
+    return routeDb;
+  }
+
+  it("tells an agent which wait paths satisfy blocked status when none is present", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+
+    const res = await request(await createApp(
+      ownerActor(),
+      withoutPendingApprovals(createRunContextDb({}, ownerAgentId, ownerRunId)),
+    )).patch(`/api/issues/${issueId}`).send({ status: "blocked", comment: "Blocked on review" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toBe(
+      "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
+    );
+    expect(res.body.code).toBe("blocked_status_wait_path_required");
+    expect(res.body.remediation).toContain("blockedByIssueIds");
+    expect(res.body.remediation).toContain(`POST /api/issues/${issueId}/interactions`);
+    expect(res.body.remediation).toContain('status "in_review"');
+    expect(res.body.details.examples).toEqual([
+      {
+        when: expect.any(String),
+        body: { status: "blocked", blockedByIssueIds: ["<blocking-issue-id>"] },
+      },
+      {
+        when: expect.any(String),
+        body: {
+          status: "blocked",
+          unblockDescriptor: { owner: { agentId: ownerAgentId }, action: expect.any(String) },
+        },
+      },
+    ]);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("offers the board owner example to board actors missing a blocked wait path", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+
+    const res = await request(await createApp(
+      boardActor(),
+      withoutPendingApprovals(createRunContextDb({}, ownerAgentId, ownerRunId)),
+    )).patch(`/api/issues/${issueId}`).send({ status: "blocked" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("blocked_status_wait_path_required");
+    expect(res.body.details.examples).toContainEqual({
+      when: expect.any(String),
+      body: { status: "blocked", unblockDescriptor: { owner: "board", action: expect.any(String) } },
+    });
+  });
+
+  it("explains that an unblockDescriptor needs blocked status in the same request", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
+      unblockDescriptor: { owner: { agentId: ownerAgentId }, action: "Rerun the migration" },
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toBe("unblockDescriptor requires blocked status");
+    expect(res.body.code).toBe("unblock_descriptor_requires_blocked_status");
+    expect(res.body.remediation).toContain('"in_progress"');
+    expect(res.body.remediation).toContain('Send status "blocked" in the same request');
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("shows the unblockDescriptor object shape when a string is sent", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
+      status: "blocked",
+      unblockDescriptor: "Waiting for the board to approve the budget",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.details).toEqual([
+      expect.objectContaining({
+        path: ["unblockDescriptor"],
+        message: expect.stringContaining('{"owner":{"agentId":"<agent-id>"},"action":'),
+      }),
+    ]);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects a misnamed issue update field instead of returning success without applying it", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+    const blockerId = "33333333-3333-4333-8333-333333333333";
+
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
+      status: "blocked",
+      blockedBy: [blockerId],
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toBe(
+      "Unknown field in issue update: blockedBy (did you mean blockedByIssueIds?)",
+    );
+    expect(res.body.code).toBe("unknown_fields");
+    expect(res.body.details.acceptedFields).toEqual(
+      expect.arrayContaining(["blockedByIssueIds", "comment", "status", "unblockDescriptor"]),
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("points an issue update `body` at comment or description", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
+      status: "done",
+      body: "Shipped the fix",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.details.suggestions).toEqual({
+      body: "comment (adds a comment) or description (replaces the issue description)",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("accepts `comment` as the comment text on comment creation", async () => {
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ comment: "progress update" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "progress update",
+      expect.any(Object),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("rejects issue fields on comment creation and names the route that applies them", async () => {
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Done here", status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toContain("Unknown field in issue comment: status");
+    expect(res.body.details.suggestions.status).toContain(`PATCH /api/issues/{issueId}`);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
   it.each([

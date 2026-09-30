@@ -1010,14 +1010,25 @@ function assertSelectableProviderConfig(config: {
 export function secretService(db: Db | DbTransaction) {
   const authorization = authorizationService(db);
 
+  /**
+   * Reject secret references whose secret is not active (disabled or
+   * archived). Such a binding persists fine but fails every run at setup with
+   * "Secret is not active". Ids in `alreadyBoundSecretIds` are exempt, so a
+   * config that already carried the binding stays editable.
+   */
+  type RequireActiveSecretsOption = {
+    alreadyBoundSecretIds?: readonly string[];
+  };
   type NormalizeEnvOptions = {
     strictMode?: boolean;
     fieldPath?: string;
+    requireActiveSecrets?: RequireActiveSecretsOption;
   };
   type NormalizeAdapterConfigOptions = {
     strictMode?: boolean;
     adapterType?: string | null;
     actor?: { userId?: string | null; agentId?: string | null };
+    requireActiveSecrets?: RequireActiveSecretsOption;
   };
 
   async function getById(id: string, source: Pick<Db | DbTransaction, "select"> = db) {
@@ -2042,7 +2053,19 @@ export function secretService(db: Db | DbTransaction) {
         continue;
       }
 
-      await assertSecretInCompany(companyId, binding.secretId);
+      const secret = await assertSecretInCompany(companyId, binding.secretId);
+      if (
+        opts?.requireActiveSecrets &&
+        secret.status !== "active" &&
+        !opts.requireActiveSecrets.alreadyBoundSecretIds?.includes(secret.id)
+      ) {
+        const fieldPath = `${opts.fieldPath ?? "env"}.${key}`;
+        throw unprocessable(
+          `${fieldPath} references secret "${secret.name}", which is ${secret.status}. ` +
+            "Runs cannot resolve an inactive secret: re-enable it or bind an active secret.",
+          { code: "secret_inactive", field: fieldPath, secretId: secret.id, secretStatus: secret.status },
+        );
+      }
       normalized[key] = {
         type: "secret_ref",
         secretId: binding.secretId,

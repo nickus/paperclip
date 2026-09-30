@@ -94,6 +94,7 @@ import {
 } from "./workspace-command-authz.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
+import { assertAdapterModelValue, boundEnvSecretIds } from "./agent-adapter-config-checks.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { resolvePluginSandboxProviderDriverByKey } from "../services/plugin-environment-driver.js";
@@ -2489,13 +2490,25 @@ export function agentRoutes(
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    /**
+     * The agent's stored config when updating. Create, hire and update run
+     * the same checks; values the agent already had are not re-checked, so a
+     * stale stored value does not block unrelated edits.
+     */
+    previousAdapterConfig?: Record<string, unknown> | null;
   }): Promise<Record<string, unknown>> {
+    assertAdapterModelValue(input.adapterConfig, input.previousAdapterConfig);
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       input.companyId,
       input.adapterConfig,
       {
         strictMode: strictSecretsMode,
         adapterType: input.adapterType ?? null,
+        // A binding to a disabled or archived secret saves fine but fails
+        // every run at setup, so reject newly bound inactive secrets here.
+        requireActiveSecrets: {
+          alreadyBoundSecretIds: boundEnvSecretIds(input.previousAdapterConfig),
+        },
       },
     );
     await assertAdapterConfigConstraints(
@@ -5388,6 +5401,7 @@ export function agentRoutes(
         companyId: existing.companyId,
         adapterType: requestedAdapterType,
         adapterConfig: effectiveAdapterConfig,
+        previousAdapterConfig: existingAdapterConfig,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
       assertExternalInstructionsAdmin(req, {
@@ -5406,11 +5420,25 @@ export function agentRoutes(
     }
     if (requestedRuntimeConfig) patchData.runtimeConfig = requestedRuntimeConfig;
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
+      const nextDefaultEnvironmentId = Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")
+        ? (typeof patchData.defaultEnvironmentId === "string" ? patchData.defaultEnvironmentId : null)
+        : existing.defaultEnvironmentId;
+      // Create and hire also reject an archived environment. Apply that check
+      // when this update selects a different environment or moves the agent
+      // to another adapter; an unchanged binding stays editable.
+      if (
+        nextDefaultEnvironmentId !== existing.defaultEnvironmentId ||
+        requestedAdapterType !== existing.adapterType
+      ) {
+        await assertAgentEnvironmentSelection(
+          existing.companyId,
+          requestedAdapterType,
+          nextDefaultEnvironmentId,
+        );
+      }
       await assertAgentDefaultEnvironmentSelection(
         existing.companyId,
-        Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")
-          ? (typeof patchData.defaultEnvironmentId === "string" ? patchData.defaultEnvironmentId : null)
-          : existing.defaultEnvironmentId,
+        nextDefaultEnvironmentId,
         {
           allowedDrivers: allowedEnvironmentDriversForAgent(requestedAdapterType),
           allowedSandboxProviders: allowedSandboxProvidersForAgent(requestedAdapterType),

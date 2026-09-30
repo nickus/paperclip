@@ -28,6 +28,14 @@ import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
+import {
+  AGENT_FAILURE_BREAKER_ACTIVITY_ACTION,
+  AGENT_FAILURE_BREAKER_SKIP_REASON,
+  AGENT_FAILURE_BREAKER_THRESHOLD,
+  describeAgentFailureBreaker,
+  readAgentFailureBreaker,
+  type AgentFailureBreakerTrip,
+} from "./agent-failure-breaker.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
@@ -18378,6 +18386,55 @@ export function heartbeatService(
     return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
   }
 
+  /**
+   * The one board-visible notice for a tripped failure breaker: the agent's
+   * error reason (shown on the agent page and in the attention feed) says why
+   * automatic wakes stopped, and the activity log records the decision.
+   *
+   * Recorded at most once per streak, even when several automatic wakes for
+   * the agent are admitted concurrently. Every finished run rewrites the
+   * agent's error reason, so it still holds this notice only if an earlier
+   * held wake of the same streak already recorded it. The conditional update
+   * below is the claim: concurrent updates of the agent row serialize on its
+   * row lock and re-check the condition against the committed row, so exactly
+   * one caller gets the row back and logs the activity entry.
+   */
+  async function recordAgentFailureBreakerNotice(
+    agent: typeof agents.$inferSelect,
+    trip: AgentFailureBreakerTrip,
+    notice: string,
+  ) {
+    const errorReason = truncateAgentErrorReason(notice) ?? notice;
+    const claimed = await db
+      .update(agents)
+      .set({ errorReason, updatedAt: new Date() })
+      .where(
+        and(
+          eq(agents.id, agent.id),
+          // A person who cleared the error in the meantime gets no notice.
+          eq(agents.status, "error"),
+          // Already showing this notice: another wake of this streak won.
+          or(isNull(agents.errorReason), ne(agents.errorReason, errorReason)),
+        ),
+      )
+      .returning({ id: agents.id });
+    if (claimed.length === 0) return;
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      action: AGENT_FAILURE_BREAKER_ACTIVITY_ACTION,
+      entityType: "agent",
+      entityId: agent.id,
+      details: {
+        errorCode: trip.errorCode,
+        consecutiveFailures: AGENT_FAILURE_BREAKER_THRESHOLD,
+        failedRunIds: trip.runIds,
+        reason: notice,
+      },
+    });
+  }
+
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
@@ -27845,6 +27902,22 @@ export function heartbeatService(
     if (source !== "timer" && !policy.wakeOnDemand) {
       await writeSkippedRequest("heartbeat.wakeOnDemand.disabled", {}, { wakeOnDemand: false });
       return null;
+    }
+
+    // Runs that keep failing the same way (a disabled secret, a bad model id,
+    // an unreachable environment) fail every automatic wake the same way too.
+    // Hold automatic wakes until a person changes the configuration, clears
+    // the agent's error, or starts a run that succeeds; wakes a person
+    // requests are never held.
+    if (opts.requestedByActorType !== "user" && agent.status === "error") {
+      const failureBreaker = await readAgentFailureBreaker(db, agent);
+      if (failureBreaker) {
+        const notice = describeAgentFailureBreaker(failureBreaker);
+        await writeSkippedRequest(AGENT_FAILURE_BREAKER_SKIP_REASON, { error: notice });
+        // Records the notice only for the first held wake of the streak.
+        await recordAgentFailureBreakerNotice(agent, failureBreaker, notice);
+        return null;
+      }
     }
 
     const genericTimerWake =

@@ -149,6 +149,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
+import { rejectUnknownBodyFields } from "../middleware/unknown-body-fields.js";
 import * as serviceIndex from "../services/index.js";
 import {
   accessService,
@@ -226,6 +227,11 @@ import {
   unauthorized,
   unprocessable,
 } from "../errors.js";
+import {
+  blockedStatusWaitPathRequiredDetails,
+  unblockDescriptorRequiresBlockedDetails,
+  unblockOwnerNotAllowedDetails,
+} from "./issue-blocked-status-guidance.js";
 import { privateJsonEtag } from "../middleware/private-json-etag.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import {
@@ -353,6 +359,45 @@ import {
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
+});
+// Issue updates reject unknown keys instead of stripping them: a misnamed
+// field such as `blockedBy` used to return 200 without changing anything.
+// There is no alias here. `body` is ambiguous on an issue update (a comment,
+// or the description as in other trackers' issue APIs), so it gets a hint.
+const rejectUnknownIssueUpdateFields = rejectUnknownBodyFields({
+  payloadName: "issue update",
+  acceptedFields: Object.keys(updateIssueRouteSchema.shape),
+  hints: {
+    blockedBy: "blockedByIssueIds",
+    blockers: "blockedByIssueIds",
+    blockedByIds: "blockedByIssueIds",
+    assigneeId: "assigneeAgentId (agent) or assigneeUserId (user)",
+    assignee: "assigneeAgentId (agent) or assigneeUserId (user)",
+    body: "comment (adds a comment) or description (replaces the issue description)",
+    text: "comment",
+    message: "comment",
+    labels: "labelIds",
+    parentIssueId: "parentId",
+    state: "status",
+  },
+});
+// Comment creation accepts `comment` as an alias for `body`: the endpoint
+// only creates comments, and `comment` is the field name the issue update
+// uses for the same text, so the intent is unambiguous.
+const rejectUnknownIssueCommentFields = rejectUnknownBodyFields({
+  payloadName: "issue comment",
+  acceptedFields: Object.keys(addIssueCommentSchema.shape),
+  aliases: { comment: "body" },
+  hints: {
+    comment: "body (send the comment text once)",
+    text: "body",
+    message: "body",
+    content: "body",
+    status:
+      'PATCH /api/issues/{issueId} with {"status":"...","comment":"..."} to change status and comment together',
+    assigneeAgentId:
+      'PATCH /api/issues/{issueId} with {"assigneeAgentId":"...","comment":"..."} to reassign and comment together',
+  },
 });
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -12883,6 +12928,7 @@ export function issueRoutes(
 
   router.patch(
     "/issues/:id",
+    rejectUnknownIssueUpdateFields,
     validateIssueMutationBody(updateIssueRouteSchema),
     async (req, res) => {
       const id = req.params.id as string;
@@ -13327,7 +13373,16 @@ export function issueRoutes(
 
       const nextStatus = updateFields.status ?? existing.status;
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
-        throw unprocessable("unblockDescriptor requires blocked status");
+        throw unprocessable(
+          "unblockDescriptor requires blocked status",
+          unblockDescriptorRequiresBlockedDetails({
+            nextStatus,
+            actor: {
+              type: req.actor.type,
+              agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+            },
+          }),
+        );
       }
       const descriptor = updateFields.unblockDescriptor ?? null;
       if (descriptor && typeof descriptor === "object") {
@@ -13338,6 +13393,10 @@ export function issueRoutes(
         ) {
           throw forbidden(
             "Agents may only name themselves as an unblock owner",
+            unblockOwnerNotAllowedDetails({
+              issueId: existing.id,
+              agentId: req.actor.agentId,
+            }),
           );
         }
         if (owner !== "board" && "agentId" in owner) {
@@ -13362,6 +13421,10 @@ export function issueRoutes(
           ) {
             throw forbidden(
               "Agents may only name themselves as an unblock owner",
+              unblockOwnerNotAllowedDetails({
+                issueId: existing.id,
+                agentId: req.actor.agentId,
+              }),
             );
           }
         } else if (owner !== "board" && "userId" in owner) {
@@ -13439,11 +13502,18 @@ export function issueRoutes(
           !pendingApproval &&
           !descriptor
         ) {
-          res.status(422).json({
-            error:
-              "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
-          });
-          return;
+          // Name the accepted wait paths and hand back copyable bodies, so
+          // the caller can fix the request without a docs round trip.
+          throw unprocessable(
+            "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
+            blockedStatusWaitPathRequiredDetails({
+              issueId: existing.id,
+              actor: {
+                type: req.actor.type,
+                agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+              },
+            }),
+          );
         }
       }
       if (
@@ -17373,6 +17443,7 @@ export function issueRoutes(
 
   router.post(
     "/issues/:id/comments",
+    rejectUnknownIssueCommentFields,
     validate(addIssueCommentSchema),
     async (req, res) => {
       const id = req.params.id as string;
