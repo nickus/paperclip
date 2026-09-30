@@ -2694,6 +2694,8 @@ describe("sandbox adapter execution targets", () => {
       { name: "Paperclip connections", url: `${apiUrl}/mcp/runtime-tools`, token: "runtime-tools-token-canary", connectionId: "paperclip-runtime-tools" },
       { name: "paperclip-assigned", url: `${apiUrl}/mcp/gateways/gw_1`, token: "gateway-token-canary", connectionId: "assignment:abc" },
       { name: "external", url: "https://mcp.example.test/mcp", token: "external-token", connectionId: "external" },
+      // On the API origin but not relayable: the bridge picks the token by path.
+      { name: "duplicate", url: `${apiUrl}/mcp/gateways/gw_1`, token: "withheld-token-canary", connectionId: "duplicate" },
     ];
     const baseTarget: AdapterSandboxExecutionTarget = {
       kind: "remote",
@@ -2774,11 +2776,14 @@ describe("sandbox adapter execution targets", () => {
           "Relaying 3 Paperclip-managed MCP server(s) through the callback bridge: Paperclip projects, Paperclip connections, paperclip-assigned.",
         );
         expect(logText).toContain("Not relaying 1 managed MCP server(s) that are not on the Paperclip API origin: external.");
+        expect(logText).toContain(
+          "Withholding 1 managed MCP server(s) that the callback bridge cannot relay: duplicate (another server already uses its path with a different token).",
+        );
         // No server token reaches the target: not in what it is handed, not in
-        // the bridge's files or logs.
-        const handed = JSON.stringify(targetServers.slice(0, 3));
+        // the bridge's files or logs. The withheld server is not handed at all.
+        const handed = JSON.stringify(targetServers);
         const queued = await readRuntimeTextFiles(path.join(runtimeRootDir, "paperclip-bridge"));
-        for (const secret of ["real-run-jwt", "runtime-tools-token-canary", "gateway-token-canary"]) {
+        for (const secret of ["real-run-jwt", "runtime-tools-token-canary", "gateway-token-canary", "withheld-token-canary"]) {
           expect(handed).not.toContain(secret);
           expect(logText).not.toContain(secret);
           for (const content of queued) expect(content).not.toContain(secret);

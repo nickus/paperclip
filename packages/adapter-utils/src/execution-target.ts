@@ -368,7 +368,9 @@ export interface AdapterExecutionTargetPaperclipBridgeHandle {
    * {@link startAdapterExecutionTargetPaperclipBridge}) as the execution target
    * must address them: servers on the Paperclip API origin point at this
    * bridge and use the bridge token, which the bridge swaps for each server's
-   * own token on the host. Write the target's MCP client config from this list,
+   * own token on the host. A server on that origin the bridge cannot relay is
+   * left out (the run log says which and why); servers on other origins are
+   * listed unchanged. Write the target's MCP client config from this list,
    * not from the host-side one, once the bridge has started. Empty when the
    * bridge was started without servers.
    */
@@ -4716,10 +4718,18 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         `[paperclip] Relaying ${mcpRelay.relayedNames.length} Paperclip-managed MCP server(s) through the callback bridge: ${mcpRelay.relayedNames.join(", ")}.\n`,
       );
     }
-    if (mcpRelay.unrelayedNames.length > 0) {
+    if (mcpRelay.externalNames.length > 0) {
       await onLog(
         "stderr",
-        `[paperclip] Not relaying ${mcpRelay.unrelayedNames.length} managed MCP server(s) that are not on the Paperclip API origin: ${mcpRelay.unrelayedNames.join(", ")}. The environment must reach them at their own address.\n`,
+        `[paperclip] Not relaying ${mcpRelay.externalNames.length} managed MCP server(s) that are not on the Paperclip API origin: ${mcpRelay.externalNames.join(", ")}. The environment must reach them at their own address.\n`,
+      );
+    }
+    if (mcpRelay.withheld.length > 0) {
+      // Names and reasons only; a withheld server's URL or token is never logged.
+      const detail = mcpRelay.withheld.map((entry) => `${entry.name} (${entry.reason})`).join("; ");
+      await onLog(
+        "stderr",
+        `[paperclip] Withholding ${mcpRelay.withheld.length} managed MCP server(s) that the callback bridge cannot relay: ${detail}. They are not configured in this run's environment.\n`,
       );
     }
   };

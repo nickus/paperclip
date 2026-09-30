@@ -25,7 +25,8 @@ describe("sandbox callback bridge MCP relay", () => {
     });
 
     expect(relay.relayedNames).toEqual(["Paperclip projects", "Paperclip connections", "paperclip-assigned"]);
-    expect(relay.unrelayedNames).toEqual(["external"]);
+    expect(relay.externalNames).toEqual(["external"]);
+    expect(relay.withheld).toEqual([]);
     expect(relay.routeFor("/mcp/runtime-tools")).toEqual({
       name: "Paperclip connections",
       path: "/mcp/runtime-tools",
@@ -42,26 +43,52 @@ describe("sandbox callback bridge MCP relay", () => {
     ]);
   });
 
-  it("leaves a server at its own address when its path or credential cannot be relayed", () => {
+  it("withholds a server on the Paperclip API origin whose path or credential cannot be relayed", () => {
     const relay = createSandboxCallbackBridgeMcpRelay({
       servers: [
         server("first", `${API}/mcp/gateways/gw_1`, "first-token"),
-        // The same path with another credential: the bridge cannot tell them apart.
+        // The same path with another credential: the bridge picks the token by path alone.
         server("second", `${API}/mcp/gateways/gw_1`, "second-token"),
+        // The same path with the same credential shares the route.
+        server("first again", `${API}/mcp/gateways/gw_1?view=full`, "first-token"),
         server("tokenless", `${API}/mcp/gateways/gw_3`, ""),
         server("encoded", `${API}/mcp/gateways/gw%2F6`),
         server("userinfo", "http://user:pass@paperclip.example.test:3100/mcp/gateways/gw_4"),
-        server("other port", "http://paperclip.example.test:3200/mcp/gateways/gw_5"),
+        server("fragment", `${API}/mcp/gateways/gw_7#part`),
         server("not a url", "::"),
+        // Another port is another origin: not a Paperclip API server, left alone.
+        server("other port", "http://paperclip.example.test:3200/mcp/gateways/gw_5"),
       ],
       paperclipOrigins: [API],
     });
-    expect(relay.relayedNames).toEqual(["first"]);
-    expect(relay.routeFor("/mcp/gateways/gw_1")?.token).toBe("first-token");
-    const targetServers = relay.serversFor({ baseUrl: "http://127.0.0.1:4310", token: "bridge-token" });
-    expect(targetServers.slice(1).map((entry) => entry.token)).toEqual([
-      "second-token", "", "encoded-token", "userinfo-token", "other port-token", "not a url-token",
+    expect(relay.relayedNames).toEqual(["first", "first again"]);
+    expect(relay.externalNames).toEqual(["other port"]);
+    expect(relay.withheld).toEqual([
+      { name: "second", reason: "another server already uses its path with a different token" },
+      { name: "tokenless", reason: "it has no token to forward" },
+      {
+        name: "encoded",
+        reason: "its path is not canonical (percent-encoded dot, slash, backslash, or NUL in path)",
+      },
+      { name: "userinfo", reason: "its URL carries user info" },
+      { name: "fragment", reason: "its URL has a fragment" },
+      { name: "not a url", reason: "its URL does not parse" },
     ]);
+    expect(relay.routeFor("/mcp/gateways/gw_1")?.token).toBe("first-token");
+    expect(relay.routeFor("/mcp/gateways/gw_3")).toBeNull();
+
+    const targetServers = relay.serversFor({ baseUrl: "http://127.0.0.1:4310", token: "bridge-token" });
+    // Withheld servers are not handed to the target at all, so none of their
+    // tokens reach it; only the external server keeps its own address and token.
+    expect(targetServers).toEqual([
+      { ...server("first", "http://127.0.0.1:4310/mcp/gateways/gw_1"), token: "bridge-token" },
+      { ...server("first again", "http://127.0.0.1:4310/mcp/gateways/gw_1?view=full"), token: "bridge-token" },
+      server("other port", "http://paperclip.example.test:3200/mcp/gateways/gw_5"),
+    ]);
+    const handed = JSON.stringify(targetServers);
+    for (const token of ["first-token", "second-token", "encoded-token", "userinfo-token", "fragment-token"]) {
+      expect(handed).not.toContain(token);
+    }
   });
 
   it("relays nothing without servers", () => {
