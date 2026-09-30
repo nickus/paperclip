@@ -35,7 +35,7 @@ import {
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
-import { multilineTextSchema } from "./text.js";
+import { multilineTextSchema, normalizeEscapedLineBreaks } from "./text.js";
 import {
   lowTrustReviewPresetPolicySchema,
   trustAuthorizationPolicySchema,
@@ -684,24 +684,57 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(
   }, schema);
 }
 
+// Copyable shape for unblockDescriptor errors. Callers most often send a bare
+// string or a free-form owner; the messages below say exactly what to send.
+const UNBLOCK_DESCRIPTOR_EXAMPLE =
+  '{"owner":{"agentId":"<agent-id>"},"action":"<the exact step that unblocks this issue>"}';
+
+const unblockDescriptorSchema = z
+  .object(
+    {
+      owner: z.union(
+        [
+          z.object({ agentId: z.string().guid() }).strict(),
+          z.object({ userId: z.string().trim().min(1) }).strict(),
+          z.literal("board"),
+        ],
+        {
+          error:
+            'unblockDescriptor.owner must be {"agentId":"<agent-id>"}, {"userId":"<user-id>"}, or "board" (agents may only name themselves)',
+        },
+      ),
+      action: z
+        .string({
+          error:
+            "unblockDescriptor.action is required: a string naming the exact step that unblocks this issue",
+        })
+        .transform(normalizeEscapedLineBreaks)
+        .pipe(
+          z
+            .string()
+            .trim()
+            .min(1, "unblockDescriptor.action must not be empty")
+            .max(2_000),
+        ),
+    },
+    {
+      // Only the object's own type error gets the example; field errors keep
+      // their own messages above.
+      error: (issue) =>
+        issue.code === "invalid_type"
+          ? `unblockDescriptor must be an object like ${UNBLOCK_DESCRIPTOR_EXAMPLE}`
+          : undefined,
+    },
+  )
+  .strict();
+
 const createIssueBaseSchema = z.object({
   projectId: z.string().guid().optional().nullable(),
   projectWorkspaceId: z.string().guid().optional().nullable(),
   goalId: z.string().guid().optional().nullable(),
   parentId: z.string().guid().optional().nullable(),
   blockedByIssueIds: z.array(z.string().guid()).optional(),
-  unblockDescriptor: z
-    .object({
-      owner: z.union([
-        z.object({ agentId: z.string().guid() }).strict(),
-        z.object({ userId: z.string().trim().min(1) }).strict(),
-        z.literal("board"),
-      ]),
-      action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
-    })
-    .strict()
-    .optional()
-    .nullable(),
+  unblockDescriptor: unblockDescriptorSchema.optional().nullable(),
   inheritExecutionWorkspaceFromIssueId: z.string().guid().optional().nullable(),
   title: z.string().min(1),
   description: multilineTextSchema.optional().nullable(),
@@ -758,7 +791,8 @@ function requireBlockedStatusForUnblockDescriptor(
   ) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: "unblockDescriptor requires blocked status",
+      message:
+        'unblockDescriptor requires status "blocked" in the same request; omit unblockDescriptor for other statuses',
       path: ["unblockDescriptor"],
     });
   }

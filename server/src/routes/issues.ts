@@ -226,6 +226,11 @@ import {
   unauthorized,
   unprocessable,
 } from "../errors.js";
+import {
+  blockedStatusWaitPathRequiredDetails,
+  unblockDescriptorRequiresBlockedDetails,
+  unblockOwnerNotAllowedDetails,
+} from "./issue-blocked-status-guidance.js";
 import { privateJsonEtag } from "../middleware/private-json-etag.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import {
@@ -13327,7 +13332,16 @@ export function issueRoutes(
 
       const nextStatus = updateFields.status ?? existing.status;
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
-        throw unprocessable("unblockDescriptor requires blocked status");
+        throw unprocessable(
+          "unblockDescriptor requires blocked status",
+          unblockDescriptorRequiresBlockedDetails({
+            nextStatus,
+            actor: {
+              type: req.actor.type,
+              agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+            },
+          }),
+        );
       }
       const descriptor = updateFields.unblockDescriptor ?? null;
       if (descriptor && typeof descriptor === "object") {
@@ -13338,6 +13352,10 @@ export function issueRoutes(
         ) {
           throw forbidden(
             "Agents may only name themselves as an unblock owner",
+            unblockOwnerNotAllowedDetails({
+              issueId: existing.id,
+              agentId: req.actor.agentId,
+            }),
           );
         }
         if (owner !== "board" && "agentId" in owner) {
@@ -13362,6 +13380,10 @@ export function issueRoutes(
           ) {
             throw forbidden(
               "Agents may only name themselves as an unblock owner",
+              unblockOwnerNotAllowedDetails({
+                issueId: existing.id,
+                agentId: req.actor.agentId,
+              }),
             );
           }
         } else if (owner !== "board" && "userId" in owner) {
@@ -13439,11 +13461,18 @@ export function issueRoutes(
           !pendingApproval &&
           !descriptor
         ) {
-          res.status(422).json({
-            error:
-              "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
-          });
-          return;
+          // Name the accepted wait paths and hand back copyable bodies, so
+          // the caller can fix the request without a docs round trip.
+          throw unprocessable(
+            "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
+            blockedStatusWaitPathRequiredDetails({
+              issueId: existing.id,
+              actor: {
+                type: req.actor.type,
+                agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+              },
+            }),
+          );
         }
       }
       if (

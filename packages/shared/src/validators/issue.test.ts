@@ -189,6 +189,47 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
+  it("explains the expected unblockDescriptor shape when it is malformed", () => {
+    const messagesFor = (unblockDescriptor: unknown) => {
+      const result = updateIssueSchema.safeParse({ status: "blocked", unblockDescriptor });
+      expect(result.success).toBe(false);
+      return result.success
+        ? []
+        : result.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message }));
+    };
+
+    // A bare string is the most common mistake: show the object to send instead.
+    expect(messagesFor("Waiting for the board to review")).toEqual([
+      {
+        path: "unblockDescriptor",
+        message: expect.stringContaining('{"owner":{"agentId":"<agent-id>"},"action":'),
+      },
+    ]);
+    expect(messagesFor({ owner: "the product owner", action: "Review" })).toEqual([
+      {
+        path: "unblockDescriptor.owner",
+        message: expect.stringContaining('{"agentId":"<agent-id>"}, {"userId":"<user-id>"}, or "board"'),
+      },
+    ]);
+    expect(messagesFor({ owner: "board" })).toEqual([
+      {
+        path: "unblockDescriptor.action",
+        message: expect.stringContaining("unblockDescriptor.action is required"),
+      },
+    ]);
+    expect(messagesFor({ owner: "board", action: "   " })).toEqual([
+      { path: "unblockDescriptor.action", message: "unblockDescriptor.action must not be empty" },
+    ]);
+
+    const wrongStatus = createIssueSchema.safeParse({
+      title: "Descriptor on a todo issue",
+      status: "todo",
+      unblockDescriptor: { owner: "board", action: "Review" },
+    });
+    expect(wrongStatus.success).toBe(false);
+    expect(wrongStatus.error?.issues[0]?.message).toContain('requires status "blocked" in the same request');
+  });
+
   it("rejects invalid task-scoped network egress CIDRs", () => {
     expect(
       updateIssueSchema.safeParse({
