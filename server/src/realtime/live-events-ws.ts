@@ -8,6 +8,7 @@ import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipa
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
+import { boardAuthService } from "../services/board-auth.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 
 interface WsSocket {
@@ -52,6 +53,8 @@ export interface CloudUpgradeActor {
   /** Companies this actor may subscribe to (primary stack company + real memberships). */
   companyIds: string[];
 }
+
+type BoardAuthService = ReturnType<typeof boardAuthService>;
 
 interface IncomingMessageWithContext extends IncomingMessage {
   paperclipWebSocketHandled?: boolean;
@@ -121,6 +124,37 @@ function headersFromIncomingMessage(req: IncomingMessage): Headers {
   return headers;
 }
 
+/**
+ * Authorizes a bearer token as a board API key (issued by the CLI auth flow),
+ * mirroring the board-key branch of actorMiddleware. Company scope follows the
+ * session path: instance admins, or users with an active membership.
+ */
+async function authorizeBoardApiKeyUpgrade(
+  boardAuth: BoardAuthService,
+  token: string,
+  companyId: string,
+): Promise<UpgradeContext | null> {
+  // Only returns keys that are neither revoked nor expired.
+  const boardKey = await boardAuth.findBoardApiKeyByToken(token);
+  if (!boardKey) return null;
+
+  const access = await boardAuth.resolveBoardAccess(boardKey.userId);
+  // Like actorMiddleware, a key whose user no longer exists does not authenticate.
+  if (!access.user) return null;
+  if (!access.isInstanceAdmin && !access.companyIds.includes(companyId)) return null;
+
+  // Recording last use must not delay or fail the upgrade; never log the token.
+  void boardAuth.touchBoardApiKey(boardKey.id).catch((err) => {
+    logger.warn({ err, boardApiKeyId: boardKey.id }, "failed to record live websocket board API key use");
+  });
+
+  return {
+    companyId,
+    actorType: "board",
+    actorId: boardKey.userId,
+  };
+}
+
 async function authorizeUpgrade(
   db: Db,
   req: IncomingMessage,
@@ -128,6 +162,7 @@ async function authorizeUpgrade(
   url: URL,
   opts: {
     deploymentMode: DeploymentMode;
+    boardAuth: BoardAuthService;
     resolveSessionFromHeaders?: (headers: Headers) => Promise<BetterAuthSessionResult | null>;
     resolveCloudActor?: (req: IncomingMessage) => Promise<CloudUpgradeActor | null>;
   },
@@ -208,7 +243,13 @@ async function authorizeUpgrade(
     .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
     .then((rows) => rows[0] ?? null);
 
-  if (!key || key.companyId !== companyId) {
+  // Agent keys are checked first; a token that matches no active agent key may
+  // still be a board API key.
+  if (!key) {
+    return authorizeBoardApiKeyUpgrade(opts.boardAuth, token, companyId);
+  }
+
+  if (key.companyId !== companyId) {
     return null;
   }
 
@@ -239,6 +280,7 @@ export function setupLiveEventsWebSocketServer(
   },
 ) {
   const wss = new WebSocketServer({ noServer: true });
+  const boardAuth = boardAuthService(db);
   const cleanupByClient = new Map<WsSocket, () => void>();
   const aliveByClient = new Map<WsSocket, boolean>();
 
@@ -318,6 +360,7 @@ export function setupLiveEventsWebSocketServer(
 
     void authorizeUpgrade(db, req, companyId, url, {
       deploymentMode: opts.deploymentMode,
+      boardAuth,
       resolveSessionFromHeaders: opts.resolveSessionFromHeaders,
       resolveCloudActor: opts.resolveCloudActor,
     })
