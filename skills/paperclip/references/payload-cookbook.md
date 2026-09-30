@@ -108,6 +108,70 @@ What the errors mean:
 | `400` `Validation error`, path `blockedByIssueIds` | an identifier or other non-UUID in the list | send issue UUIDs |
 | `422` `Issue cannot be blocked by itself`, `Blocking relations cannot contain cycles`, `Blocked-by issues must belong to the same company` | as stated | fix the list |
 
+## Review transitions (`in_review`)
+
+An agent-authored `PATCH` that sets `status: "in_review"` is rejected with `422` `invalid_issue_disposition` unless the same request also leaves one of five review paths behind (the server enumerates them as `validReviewPaths`): `pending_issue_thread_interaction`, `linked_pending_approval`, `human_assignee_user_id`, `typed_execution_state_current_participant`, or `scheduled_issue_monitor` (a real `monitorNextCheckAt`; see `SKILL.md`'s monitor section). An `@mention` in a comment, or an `assigneeAgentId` with no execution-policy stage behind it, is not on that list and still gets `422`. The two most common agent-initiated paths are below; a human/board actor, or any status other than `in_review`, is never checked against this list.
+
+### Ask a colleague agent to review
+
+Name the reviewer in `executionPolicy.stages[]` and set `status` to `in_review` in the same request. Paperclip resolves `executionState.currentParticipant` from the stage's `participants[]` and reassigns the issue to that agent — the response's `assigneeAgentId` becomes the reviewer, not you:
+
+```bash
+jq -n --arg reviewer "$REVIEWER_AGENT_ID" --rawfile comment "$PAPERCLIP_RUN_SCRATCH_DIR/comment.md" \
+  '{
+    status: "in_review",
+    executionPolicy: {stages: [{type: "review", participants: [{type: "agent", agentId: $reviewer}]}]},
+    comment: $comment
+  }' > "$PAPERCLIP_RUN_SCRATCH_DIR/payload.json"
+```
+
+Check the response's `executionState.currentParticipant.agentId` equals `$REVIEWER_AGENT_ID`. If `executionPolicy` was already set on the issue earlier (e.g. when work started), a later `{"status": "in_review", "comment": "..."}` reuses it without resending `executionPolicy`. Naming only the issue's own current assignee as the stage's sole participant leaves no eligible reviewer once that assignee is excluded as its own return path, and the PATCH answers `422` ("No eligible review participant is configured for this issue"); name a different reviewer or add a second participant.
+
+### Ask a human to review
+
+Assign them directly:
+
+```bash
+jq -n --arg reviewerUserId "$REVIEWER_USER_ID" --rawfile comment "$PAPERCLIP_RUN_SCRATCH_DIR/comment.md" \
+  '{status: "in_review", assigneeAgentId: null, assigneeUserId: $reviewerUserId, comment: $comment}' \
+  > "$PAPERCLIP_RUN_SCRATCH_DIR/payload.json"
+```
+
+or, to let a policy-eligible agent submit the verdict later without opening authority to unrelated cards, create a pending interaction first (`POST /api/issues/{issueId}/interactions`; see `references/api-reference.md`, "Questions and waiting for human input") and bind its id in the same PATCH that enters review:
+
+```bash
+jq -n --arg interactionId "$INTERACTION_ID" --rawfile comment "$PAPERCLIP_RUN_SCRATCH_DIR/comment.md" \
+  '{status: "in_review", reviewInteractionId: $interactionId, comment: $comment}' \
+  > "$PAPERCLIP_RUN_SCRATCH_DIR/payload.json"
+```
+
+`reviewInteractionId` must name a `pending` `request_confirmation` or `request_checkbox_confirmation` that this run (or this user) created — not a tool-action or secret-proposal confirmation, and not someone else's card.
+
+### Handing a review back (approve / request changes)
+
+Only the agent or user named in `executionState.currentParticipant` may decide, and the decision comment must be in the *same* request as the status change — a comment posted earlier does not count, and the plain status change alone gets `422` twice before that becomes obvious:
+
+```bash
+# Approve — advances to the next stage, or to `done` if this was the last one
+jq -n --rawfile comment "$PAPERCLIP_RUN_SCRATCH_DIR/comment.md" '{status: "done", comment: $comment}' \
+  > "$PAPERCLIP_RUN_SCRATCH_DIR/payload.json"
+
+# Request changes — reassigns to `returnAssignee` and reopens the issue
+jq -n --rawfile comment "$PAPERCLIP_RUN_SCRATCH_DIR/comment.md" '{status: "in_progress", comment: $comment}' \
+  > "$PAPERCLIP_RUN_SCRATCH_DIR/payload.json"
+```
+
+What the errors mean:
+
+| Response | Cause | Fix |
+| --- | --- | --- |
+| `422` `invalid_issue_disposition` `Agent-authored updates that move an issue to in_review must include a real review path` | agent PATCH sets `status: "in_review"` with none of the five review paths present. Top-level `code` is `invalid_issue_disposition`; `details.missing` is `"review_path"`; `details.validReviewPaths` lists `pending_issue_thread_interaction`, `linked_pending_approval`, `human_assignee_user_id`, `typed_execution_state_current_participant`, `scheduled_issue_monitor` | add one of the five paths above in the same request |
+| `422` `invalid_review_interaction` `reviewInteractionId must identify a pending non-tool confirmation created by` `this agent run` (or `this user`) | `reviewInteractionId` pointed at someone else's interaction, a resolved/expired one, or a tool-action/secret-proposal confirmation | create your own `request_confirmation`/`request_checkbox_confirmation` first, or use a different review path |
+| `422` `Approving a review or approval stage requires a comment.` `Include the decision comment in the same PATCH request; prior comments are not considered.` | `{"status": "done"}` on an execution-policy stage without `comment` | resend with `comment` in the same body |
+| `422` `Requesting changes requires a comment.` `Include the decision comment in the same PATCH request; prior comments are not considered.` | any non-`in_review`, non-`done` `status` (typically `in_progress`) on a stage without `comment` — this is what the handoff above hits on a plain status change | resend with `comment` in the same body |
+| `422` `Only the active reviewer or approver can advance the current execution stage` | the actor is not the `executionState.currentParticipant` named on the issue | `GET /api/issues/{issueId}` to see who is, and have them decide |
+| `403` `review_policy_denied` | the issue's `reviewPolicy` restricts who may submit the verdict: `human_only` allows only an authenticated user; `not_creator` disallows the same actor who moved the issue into `in_review` | have a different writer (or a human, for `human_only`) submit the verdict |
+
 ## Document
 
 `PUT /api/issues/{issueId}/documents/{key}`; the key uses lowercase letters, digits, `_` and `-`. `format` is required and `"markdown"` is its only value:
