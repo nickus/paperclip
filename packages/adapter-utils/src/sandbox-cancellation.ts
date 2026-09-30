@@ -32,8 +32,12 @@ function isCancellableSandboxInvocation(ctx: AdapterExecutionContext): boolean {
  * An invocation that calls `onCancellationReady` itself takes over its own
  * cancellation from that point, for example to cancel a turn through its
  * agent protocol: the wrapper then stops guarding and never stops the sandbox
- * for it. `stopRemoteStartup` is shared, so a stop already in progress is
- * joined instead of being started a second time.
+ * for it. Opting in therefore removes this automatic stop. Only an invocation
+ * that independently stops its sandbox work when `signal` aborts (for example
+ * by calling `stopRemoteStartup`) may call it; one that does not leaves its
+ * commands running after the run is cancelled. `stopRemoteStartup` is shared,
+ * so a stop already in progress is joined instead of being started a second
+ * time.
  *
  * Invocations on other targets, or without a stop handle, run unchanged.
  */
