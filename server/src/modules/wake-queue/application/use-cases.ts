@@ -126,6 +126,15 @@ export type ReleaseIssueExecutionInput = {
    * other gate, including a new hold on the issue, still applies.
    */
   afterExecutionHold?: boolean;
+  /**
+   * The run's executor has settled (its process and environment lease are
+   * gone) after the run's own release, which could not drain the queue then.
+   * Drain it for wakes that others parked behind the run meanwhile: any live
+   * run on the issue owns the next turn, recovery was already planned by the
+   * run's own release, and a confirmed reassignment stop no longer holds the
+   * queue once the task belongs to another agent.
+   */
+  afterOwnerSettled?: boolean;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -197,6 +206,26 @@ async function runReleaseDrain(
         companyId: run.companyId,
         wakeId: candidate.id,
         reason: "Delegation closing note refers to completed child work",
+        now: input.now,
+      });
+      continue;
+    }
+
+    // An assignment wake only ever addresses the task's assignee. If the task
+    // was handed to someone else while the wake waited behind a run whose
+    // executor has since settled, it no longer applies: promoting it would
+    // start a run for an agent that does not own the task. Only the drain
+    // after the executor settled applies this; a run's own release keeps its
+    // existing queue handling.
+    if (
+      input.afterOwnerSettled &&
+      (candidate.wakeReason ?? candidate.reason) === "issue_assigned" &&
+      candidate.agentId !== issue.assigneeAgentId
+    ) {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId,
+        wakeId: candidate.id,
+        reason: "Deferred assignment wake no longer applies: the task was reassigned",
         now: input.now,
       });
       continue;
@@ -315,6 +344,9 @@ async function runReleaseDrain(
     return promoted;
   }
 
+  // The run's own release already decided its recovery. A drain after the
+  // executor settled only promotes what others left queued.
+  if (input.afterOwnerSettled) return { outcome: { kind: "released" }, postCommitEffects };
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
 
@@ -968,6 +1000,7 @@ export function createReleaseIssueExecution(deps: {
         runId: input.runId,
         now: input.now,
         ...(input.afterExecutionHold ? { afterExecutionHold: true } : {}),
+        ...(input.afterOwnerSettled ? { afterOwnerSettled: true } : {}),
       },
       (locked, ports) => runReleaseDrain(locked, ports, input),
     );

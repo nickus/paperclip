@@ -20052,6 +20052,12 @@ export function heartbeatService(
         logger.warn({ err, queueId: wake.id }, "failed to promote stranded legacy comments");
       });
     }
+    // The sweep above replays the release of the wake's own agent. A new
+    // assignee that never ran on the task has none; its wake waits behind the
+    // previous owner's settled run instead.
+    await promoteDeferredWakesBehindSettledRuns(cutoff).catch((err) => {
+      logger.error({ err }, "failed to promote wakes parked behind settled runs");
+    });
 
     // The cancellation marker is durable intent. Retry while its exact queue
     // is still deferred, including after a failed cleanup promotion or restart.
@@ -27006,6 +27012,11 @@ export function heartbeatService(
           : releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: true })).catch(err => {
           logger.error({ err, runId: run.id }, "failed to promote legacy comment queue after cleanup");
         });
+        // Wakes other agents parked behind this run, such as the new
+        // assignee's wake after a hand-off stop, were waiting for this cleanup.
+        await promoteDeferredWakesAfterRunSettled(run.id).catch(err => {
+          logger.error({ err, runId: run.id }, "failed to promote wakes parked behind a settled run");
+        });
       }
       if (
         !nativeSessionResumeScheduled &&
@@ -27029,7 +27040,7 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean; afterExecutionHold?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; afterExecutionHold?: boolean; afterOwnerSettled?: boolean } = {},
   ) {
     try {
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
@@ -27038,6 +27049,7 @@ export function heartbeatService(
         now: new Date(),
         suppressImmediateRecovery: options.suppressImmediateRecovery,
         ...(options.afterExecutionHold ? { afterExecutionHold: true } : {}),
+        ...(options.afterOwnerSettled ? { afterOwnerSettled: true } : {}),
       });
       await applyWakeQueuePostCommitEffects(postCommitEffects);
       const completed = await getRun(run.id);
@@ -27086,6 +27098,127 @@ export function heartbeatService(
       return false;
     await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true, afterExecutionHold: true });
     return true;
+  }
+
+  /**
+   * A run's own release can stand down before its executor has settled: a
+   * stopped or failed conversation run still owns the task through its
+   * process and environment lease until cleanup, and an acknowledged Stop
+   * does not drain the queue. Wakes that other agents queue on the task
+   * meanwhile are parked behind the run, for example the new assignee's wake
+   * when the run was stopped to hand the task over. The executor retries its
+   * own agent's queue after cleanup; this drains the rest once nothing holds
+   * the task any more.
+   *
+   * It stands down while the task has a newer run, a live run, an execution
+   * hold, or the lock, and after a Stop that did not hand the task over (that
+   * queued work waits for the next explicit wake, as before). The drain claims
+   * each wake under the issue lock, so concurrent callers promote it once.
+   *
+   * It is not a complete backstop: it never overrides a legacy run whose
+   * outcome needs reconciliation (legacyExecutionNeedsReconciliation, e.g. a
+   * failed or stopped run with no proof that its provider actions settled).
+   * The drain stands down for such a run even after its recovery hold is
+   * closed, and the wakes stay parked until the existing afterExecutionHold
+   * release (promoteDeferredWakesAfterExecutionHold) drains the queue.
+   * Returns whether it ran the drain, not whether the drain promoted a wake.
+   */
+  async function promoteDeferredWakesAfterRunSettled(runId: string) {
+    const run = await getRun(runId);
+    if (!run || run.runtimeMode !== "legacy" || !isHeartbeatRunTerminalStatus(run.status)) return false;
+    // An executor in this process is still cleaning up; its cleanup calls back.
+    if (activeRunExecutions.has(run.id) || adapterExecutionControls.has(run.id)) return false;
+    const issueId = readNonEmptyString(run.contextSnapshot?.issueId);
+    if (!issueId || !isUuidLike(issueId)) return false;
+    const resultJson = parseObject(run.resultJson);
+    const handOffStop = run.errorCode === "issue_reassigned" && resultJson.reassignmentStopConfirmed === true;
+    if (run.status === "cancelled" && parseObject(resultJson.executionCancellation).state === "acknowledged" &&
+        !handOffStop) return false;
+    // Most runs leave nothing parked behind them; check that first.
+    const [parked] = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, run.companyId),
+        ne(agentWakeupRequests.agentId, run.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+        sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+      ))
+      .limit(1);
+    if (!parked) return false;
+    const [task] = await db
+      .select({ status: issues.status, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)));
+    if (!task || task.executionRunId || task.status === "done" || task.status === "cancelled") return false;
+    // Only the task's most recent run speaks for it; a newer run's own
+    // release (or its Stop) decides what happens to the queue.
+    const [latest] = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, run.companyId),
+        or(eq(heartbeatRuns.nativeIssueId, issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
+      ))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1);
+    if (latest?.id !== run.id) return false;
+    if (await getExecutionBlocker(db, run.companyId, issueId)) return false;
+    await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true, afterOwnerSettled: true });
+    return true;
+  }
+
+  /**
+   * Backstop for promoteDeferredWakesAfterRunSettled: after a restart, or when
+   * a run's cleanup finished in another process, a wake of the task's
+   * assignee (or a stale assignment wake) can still be parked behind the
+   * task's latest run, which belongs to another agent and has ended.
+   */
+  async function promoteDeferredWakesBehindSettledRuns(cutoff: Date | null) {
+    const latestIssueRunId = sql`(
+      select r.id from ${heartbeatRuns} r
+      where r.company_id = ${issues.companyId}
+        and (r.native_issue_id = ${issues.id} or r.context_snapshot->>'issueId' = ${issues.id}::text)
+      order by r.created_at desc, r.id desc
+      limit 1
+    )`;
+    const settledRuns = await db
+      .selectDistinct({ runId: heartbeatRuns.id })
+      .from(agentWakeupRequests)
+      .innerJoin(issues, and(
+        eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        // The assignee's parked wakes, and assignment wakes that went stale
+        // because the task moved on while they waited.
+        or(
+          eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
+          sql`coalesce(${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'wakeReason', ${agentWakeupRequests.reason}) = 'issue_assigned'`,
+        ),
+      ))
+      .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
+      .innerJoin(heartbeatRuns, sql`${heartbeatRuns.id} = ${latestIssueRunId}`)
+      .where(and(
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+        isNull(issues.executionRunId),
+        notInArray(issues.status, ["done", "cancelled"]),
+        ne(heartbeatRuns.agentId, agentWakeupRequests.agentId),
+        eq(heartbeatRuns.runtimeMode, "legacy"),
+        inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        // A Stop that did not hand the task over keeps its queue parked.
+        sql`not (${heartbeatRuns.status} = 'cancelled'
+          and coalesce(${heartbeatRuns.resultJson}->'executionCancellation'->>'state', '') = 'acknowledged'
+          and not (coalesce(${heartbeatRuns.errorCode}, '') = 'issue_reassigned'
+            and coalesce(${heartbeatRuns.resultJson}->>'reassignmentStopConfirmed', '') = 'true'))`,
+        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined,
+      ))
+      .limit(50);
+    for (const { runId } of settledRuns) {
+      await promoteDeferredWakesAfterRunSettled(runId).catch((err) => {
+        logger.warn({ err, runId }, "failed to promote wakes parked behind a settled run");
+      });
+    }
   }
 
   // A dependency wake that admission does not dispatch leaves only a receipt;
@@ -30581,6 +30714,7 @@ export function heartbeatService(
 
     resumeQueuedRuns,
     finalizeDeferredWakesForTerminalIssues,
+    promoteDeferredWakesAfterRunSettled,
 
     scheduleBoundedRetry: async (
       runId: string,
