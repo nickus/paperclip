@@ -610,7 +610,12 @@ import {
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
-import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
+import {
+  contextSnapshotKeepingRedactionRegistry,
+  createRunSecretRedactionRegistry,
+  isRedactionRegistryKey,
+  redactRegisteredSecretValues,
+} from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
   resolvePaperclipRunnerIdleTimeoutMs,
@@ -3664,9 +3669,11 @@ function boundRunEventValue(
   value: unknown,
   depth: number,
   seen: WeakSet<object>,
+  redactString: (value: string) => string,
 ): unknown {
   if (typeof value === "string") {
-    return truncateRunEventString(value);
+    // Redact before truncating, so a cut never leaves part of a value behind.
+    return truncateRunEventString(redactString(value));
   }
   if (
     value === null ||
@@ -3688,7 +3695,7 @@ function boundRunEventValue(
     }
     const bounded = value
       .slice(0, MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS)
-      .map((entry) => boundRunEventValue(entry, depth + 1, seen));
+      .map((entry) => boundRunEventValue(entry, depth + 1, seen, redactString));
     if (value.length > MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS) {
       bounded.push({
         _truncated: true,
@@ -3704,12 +3711,17 @@ function boundRunEventValue(
     return "[Circular]";
   }
   seen.add(value);
-  const entries = Object.entries(value as Record<string, unknown>);
+  // Encrypted redaction registry material is dropped, as the run read routes
+  // drop it, so stored and published payloads match their responses.
+  const entries = Object.entries(value as Record<string, unknown>).filter(
+    ([key]) => !isRedactionRegistryKey(key),
+  );
   if (depth >= MAX_RUN_EVENT_PAYLOAD_DEPTH) {
     const bounded = {
       _truncated: true,
       type: "object",
-      keys: entries.map(([key]) => key).slice(0, 20),
+      // Listed keys become string values, so they are redacted like values.
+      keys: entries.slice(0, 20).map(([key]) => redactString(key)),
     };
     seen.delete(value);
     return bounded;
@@ -3720,7 +3732,7 @@ function boundRunEventValue(
     0,
     MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS,
   )) {
-    out[key] = boundRunEventValue(entryValue, depth + 1, seen);
+    out[key] = boundRunEventValue(entryValue, depth + 1, seen, redactString);
   }
   if (entries.length > MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS) {
     out._truncated = true;
@@ -3732,8 +3744,9 @@ function boundRunEventValue(
 
 export function boundHeartbeatRunEventPayloadForStorage(
   payload: Record<string, unknown>,
+  redactString: (value: string) => string = (value) => value,
 ): Record<string, unknown> {
-  const bounded = boundRunEventValue(payload, 0, new WeakSet());
+  const bounded = boundRunEventValue(payload, 0, new WeakSet(), redactString);
   return parseObject(bounded) ?? { _truncated: true };
 }
 
@@ -9709,6 +9722,7 @@ export function heartbeatService(
   };
 
   const runLogStore = getRunLogStore();
+  const runRedactions = createRunSecretRedactionRegistry(db);
   const traceStore = providerTraceStore(db);
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
@@ -9762,7 +9776,7 @@ export function heartbeatService(
   // best-effort basis, exactly as this service publishes them for every
   // other run write. A publish failure never rolls back the write that
   // already committed.
-  function applyRunDispatchPostCommitEffects(effects: PostCommitEffect[]) {
+  async function applyRunDispatchPostCommitEffects(effects: PostCommitEffect[]) {
     for (const effect of effects) {
       if (effect.kind === "run_queued") {
         publishLiveEvent({
@@ -9777,10 +9791,9 @@ export function heartbeatService(
           },
         });
       } else {
-        publishLiveEvent({
-          companyId: effect.companyId,
-          type: "heartbeat.run.status",
-          payload: buildHeartbeatRunStatusLiveEventPayload({
+        const statusPayload = await redactRegisteredRunSecrets(
+          { companyId: effect.companyId, id: effect.runId },
+          buildHeartbeatRunStatusLiveEventPayload({
             id: effect.runId,
             agentId: effect.agentId,
             status: effect.status,
@@ -9793,8 +9806,18 @@ export function heartbeatService(
             resultJson: effect.result,
             contextSnapshot: { source: effect.contextSource },
           }),
+        );
+        if (statusPayload) {
+          publishLiveEvent({
+            companyId: effect.companyId,
+            type: "heartbeat.run.status",
+            payload: statusPayload,
+          });
+        }
+        publishRunLifecyclePluginEventData({
+          ...effect,
+          error: statusPayload ? statusPayload.error : null,
         });
-        publishRunLifecyclePluginEventData(effect);
         if (
           isHeartbeatRunTerminalStatus(effect.status) &&
           effect.previousStatus !== effect.status
@@ -11002,7 +11025,15 @@ export function heartbeatService(
       return null;
     }
 
-    return recordHeartbeatRunRuntimeProgress(currentRun, update, issueId);
+    // The stored runtime status is republished on later output activity, so
+    // its text (message, tool name, assistant snippet) is redacted up front.
+    const redactedUpdate = await redactRegisteredRunSecrets(currentRun, update);
+    if (!redactedUpdate) return null;
+    return recordHeartbeatRunRuntimeProgress(
+      currentRun,
+      redactedUpdate,
+      issueId,
+    );
   }
 
   async function getRunLogAccess(runId: string) {
@@ -13167,12 +13198,7 @@ export function heartbeatService(
             .then((rows) => rows[0] ?? null);
 
     if (updated) {
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: buildHeartbeatRunStatusLiveEventPayload(updated),
-      });
-      publishRunLifecyclePluginEvent(updated);
+      await publishRunStatusChange(updated);
       emitTerminalAgentTaskRun(updated, previousStatus?.status ?? null);
     }
 
@@ -13260,12 +13286,7 @@ export function heartbeatService(
             .then((rows) => rows[0] ?? null);
 
     if (updated) {
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: buildHeartbeatRunStatusLiveEventPayload(updated),
-      });
-      publishRunLifecyclePluginEvent(updated);
+      await publishRunStatusChange(updated);
       emitTerminalAgentTaskRun(updated, previousStatus?.status ?? null);
       return { run: updated, updated: true as const };
     }
@@ -13362,6 +13383,57 @@ export function heartbeatService(
       });
     }
     return terminalRun ?? run;
+  }
+
+  // Values an agent reads through the secrets API are registered for redaction
+  // on its run. The run read routes (/log, /events, run detail) apply them to
+  // every response; payloads derived from run output get the same redaction
+  // before they are persisted or published live. Returns null when the
+  // registry cannot be read or decrypted, so the caller withholds the payload,
+  // as the read routes fail closed on the same error.
+  async function registeredRunSecretValues(run: {
+    companyId: string;
+    id: string;
+  }): Promise<string[] | null> {
+    try {
+      return await runRedactions.valuesForLiveRun(run.companyId, run.id);
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id },
+        "withholding live run payload: registered secret values could not be resolved",
+      );
+      return null;
+    }
+  }
+
+  async function redactRegisteredRunSecrets<T>(
+    run: { companyId: string; id: string },
+    value: T,
+  ): Promise<T | null> {
+    const values = await registeredRunSecretValues(run);
+    return values ? redactRegisteredSecretValues(value, values) : null;
+  }
+
+  // Status payloads carry run text (the error and, once terminal, the final
+  // summary), so they go through the run's redaction like its log and events.
+  async function publishRunStatusChange(
+    run: typeof heartbeatRuns.$inferSelect,
+    payload: Record<string, unknown> & {
+      error: string | null;
+    } = buildHeartbeatRunStatusLiveEventPayload(run),
+  ) {
+    const redacted = await redactRegisteredRunSecrets(run, payload);
+    if (redacted) {
+      publishLiveEvent({
+        companyId: run.companyId,
+        type: "heartbeat.run.status",
+        payload: redacted,
+      });
+    }
+    publishRunLifecyclePluginEvent({
+      ...run,
+      error: redacted ? redacted.error : null,
+    });
   }
 
   function publishRunLifecyclePluginEvent(
@@ -14137,13 +14209,27 @@ export function heartbeatService(
   ) {
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const sanitizedMessage = event.message
-      ? redactSensitiveText(
-          redactCurrentUserText(event.message, currentUserRedactionOptions),
-        )
+    // Registered run secrets are replaced first, on the raw text: the other
+    // sanitizers and the storage bound could otherwise alter or cut a value
+    // so that it no longer matches. The stored row and the live event carry
+    // the same redacted text.
+    const registeredSecrets = await registeredRunSecretValues(run);
+    const redactRegistered = (text: string) =>
+      registeredSecrets
+        ? redactRegisteredSecretValues(text, registeredSecrets)
+        : text;
+    const rawMessage = event.message
+      ? redactRegistered(event.message)
       : event.message;
+    const sanitizedMessage = rawMessage
+      ? redactSensitiveText(
+          redactCurrentUserText(rawMessage, currentUserRedactionOptions),
+        )
+      : rawMessage;
+    // The bound redacts every string it keeps before truncating it, so the
+    // bounded payload needs no second registered-secret pass.
     const boundedPayload = event.payload
-      ? boundHeartbeatRunEventPayloadForStorage(event.payload)
+      ? boundHeartbeatRunEventPayloadForStorage(event.payload, redactRegistered)
       : event.payload;
     const secretSanitizedPayload = boundedPayload
       ? redactEventPayload(boundedPayload)
@@ -14174,6 +14260,9 @@ export function heartbeatService(
       retryExhaustion: event.retryExhaustion,
     });
     if (persistedEvent.disposition === "duplicate") return;
+    // Without the registry the stored row keeps the unredacted text; the
+    // events route redacts it on read and fails closed. Nothing is published.
+    if (!registeredSecrets) return;
     const seq = persistedEvent.row.seq;
 
     publishLiveEvent({
@@ -16832,7 +16921,7 @@ export function heartbeatService(
       now,
       cutoff,
     });
-    applyRunDispatchPostCommitEffects(result.postCommitEffects);
+    await applyRunDispatchPostCommitEffects(result.postCommitEffects);
     return { promoted: result.promoted, runIds: result.runIds };
   }
 
@@ -17017,7 +17106,7 @@ export function heartbeatService(
       now,
     });
     if (promotion.outcome === "promoted") {
-      applyRunDispatchPostCommitEffects(promotion.postCommitEffects);
+      await applyRunDispatchPostCommitEffects(promotion.postCommitEffects);
     }
     const promotedRow = await getIssueRetryRun(issue.companyId, issue.id, [
       "queued",
@@ -17604,18 +17693,13 @@ export function heartbeatService(
         : await attempt();
       if (terminal) {
         const settled = terminal as typeof heartbeatRuns.$inferSelect;
-        publishLiveEvent({
-          companyId: settled.companyId,
-          type: "heartbeat.run.status",
-          payload: {
-            runId: settled.id,
-            agentId: settled.agentId,
-            status: settled.status,
-            errorCode: settled.errorCode,
-            error: settled.error,
-          },
+        await publishRunStatusChange(settled, {
+          runId: settled.id,
+          agentId: settled.agentId,
+          status: settled.status,
+          errorCode: settled.errorCode,
+          error: settled.error,
         });
-        publishRunLifecyclePluginEvent(settled);
         if (stage === "dispatch")
           await finalizeAgentStatus(settled.agentId, "cancelled");
       }
@@ -17777,7 +17861,7 @@ export function heartbeatService(
         expectedStatus: "queued",
       });
       if (staleness.outcome === "cancelled") {
-        applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        await applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
         logger.info(
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
@@ -18157,26 +18241,21 @@ export function heartbeatService(
           queuedCommentClaim.run.error ??
           "Queued messages were discarded before dispatch",
       });
-      publishLiveEvent({
-        companyId: queuedCommentClaim.run.companyId,
-        type: "heartbeat.run.status",
-        payload: {
-          runId: queuedCommentClaim.run.id,
-          agentId: queuedCommentClaim.run.agentId,
-          status: queuedCommentClaim.run.status,
-          invocationSource: queuedCommentClaim.run.invocationSource,
-          triggerDetail: queuedCommentClaim.run.triggerDetail,
-          error: queuedCommentClaim.run.error ?? null,
-          errorCode: queuedCommentClaim.run.errorCode ?? null,
-          startedAt: queuedCommentClaim.run.startedAt
-            ? new Date(queuedCommentClaim.run.startedAt).toISOString()
-            : null,
-          finishedAt: queuedCommentClaim.run.finishedAt
-            ? new Date(queuedCommentClaim.run.finishedAt).toISOString()
-            : null,
-        },
+      await publishRunStatusChange(queuedCommentClaim.run, {
+        runId: queuedCommentClaim.run.id,
+        agentId: queuedCommentClaim.run.agentId,
+        status: queuedCommentClaim.run.status,
+        invocationSource: queuedCommentClaim.run.invocationSource,
+        triggerDetail: queuedCommentClaim.run.triggerDetail,
+        error: queuedCommentClaim.run.error ?? null,
+        errorCode: queuedCommentClaim.run.errorCode ?? null,
+        startedAt: queuedCommentClaim.run.startedAt
+          ? new Date(queuedCommentClaim.run.startedAt).toISOString()
+          : null,
+        finishedAt: queuedCommentClaim.run.finishedAt
+          ? new Date(queuedCommentClaim.run.finishedAt).toISOString()
+          : null,
       });
-      publishRunLifecyclePluginEvent(queuedCommentClaim.run);
       // Fire-and-forget: nothing else in this path depends on the emission,
       // so it must not delay the return.
       void emitAgentTaskRun(db, queuedCommentClaim.run);
@@ -18211,26 +18290,21 @@ export function heartbeatService(
         });
     if (!claimed) return null;
 
-    publishLiveEvent({
-      companyId: claimed.companyId,
-      type: "heartbeat.run.status",
-      payload: {
-        runId: claimed.id,
-        agentId: claimed.agentId,
-        status: claimed.status,
-        invocationSource: claimed.invocationSource,
-        triggerDetail: claimed.triggerDetail,
-        error: claimed.error ?? null,
-        errorCode: claimed.errorCode ?? null,
-        startedAt: claimed.startedAt
-          ? new Date(claimed.startedAt).toISOString()
-          : null,
-        finishedAt: claimed.finishedAt
-          ? new Date(claimed.finishedAt).toISOString()
-          : null,
-      },
+    await publishRunStatusChange(claimed, {
+      runId: claimed.id,
+      agentId: claimed.agentId,
+      status: claimed.status,
+      invocationSource: claimed.invocationSource,
+      triggerDetail: claimed.triggerDetail,
+      error: claimed.error ?? null,
+      errorCode: claimed.errorCode ?? null,
+      startedAt: claimed.startedAt
+        ? new Date(claimed.startedAt).toISOString()
+        : null,
+      finishedAt: claimed.finishedAt
+        ? new Date(claimed.finishedAt).toISOString()
+        : null,
     });
-    publishRunLifecyclePluginEvent(claimed);
 
     if (!nativeReviewContext) {
       await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
@@ -20932,6 +21006,12 @@ export function heartbeatService(
     if (run.runtimeMode === "legacy" && run.controllerBootId &&
         run.controllerBootId !== legacyControllerBootId) return;
     activeRunExecutions.add(run.id);
+    // Keep the run's registered secret values in memory while it executes, so
+    // redacting each log chunk and event needs no database read.
+    const releaseLiveRunRedaction = runRedactions.retainLiveRun(
+      run.companyId,
+      run.id,
+    );
     const executionControl = createAdapterExecutionControl();
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
     let runScratch: HeartbeatRunScratch | null = null;
@@ -21115,7 +21195,7 @@ export function heartbeatService(
             expectedStatus: "running",
           });
           if (staleness.outcome === "cancelled") {
-            applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+            await applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
             return;
           }
           throw error;
@@ -23148,7 +23228,7 @@ export function heartbeatService(
 
         if (gate.dispatched) return gate;
         if (gate.cancellation.outcome === "cancelled") {
-          applyRunDispatchPostCommitEffects(
+          await applyRunDispatchPostCommitEffects(
             gate.cancellation.postCommitEffects,
           );
         }
@@ -23742,8 +23822,18 @@ export function heartbeatService(
         const currentUserRedactionOptions =
           await getCurrentUserRedactionOptions();
         const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+          // Registered run secrets are replaced on the raw chunk, before the
+          // other sanitizers and the size cap can alter or cut a value. The
+          // persisted log line, the run excerpts and the live event then carry
+          // the text the log route returns.
+          const registeredSecrets = await registeredRunSecretValues(run);
           const sanitizedChunk = compactRunLogChunk(
-            redactCurrentUserText(chunk, currentUserRedactionOptions),
+            redactCurrentUserText(
+              registeredSecrets
+                ? redactRegisteredSecretValues(chunk, registeredSecrets)
+                : chunk,
+              currentUserRedactionOptions,
+            ),
           );
           if (stream === "stdout")
             stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
@@ -23794,6 +23884,10 @@ export function heartbeatService(
               publishHeartbeatRunRuntimeProgress(touchedStatus);
           }
 
+          // Without the registry the persisted line keeps the unredacted text;
+          // the log route redacts it on read and fails closed. Nothing is
+          // published.
+          if (!registeredSecrets) return;
           const payloadChunk =
             sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES
               ? sanitizedChunk.slice(
@@ -25657,10 +25751,12 @@ export function heartbeatService(
             combinedRuntimeServices.find((service) =>
               readNonEmptyString(service.url),
             )?.url ?? null;
+          // The agent has run by now and may have registered secrets for
+          // redaction; this in-memory context predates those registrations.
           await db
             .update(heartbeatRuns)
             .set({
-              contextSnapshot: context,
+              contextSnapshot: contextSnapshotKeepingRedactionRegistry(context),
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));
@@ -27232,6 +27328,7 @@ export function heartbeatService(
         sshWorkspaceReuseClaim = null;
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
+        releaseLiveRunRedaction();
         // A failed owned Stop remains visible until this exact executor settles,
         // including a graceful exit result arriving after the cancellation error.
         // It is never retained beyond the active execution's cleanup.
