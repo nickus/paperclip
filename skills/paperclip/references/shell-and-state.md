@@ -14,6 +14,7 @@ Assume that every shell tool call starts a new shell, whatever your adapter:
 - Do not keep pointer files (`echo "$f" > /tmp/current`) or rely on `trap … EXIT` for work that spans calls.
 - Anything that must outlive the run belongs on the issue (comment, document, attachment, work product) or in the workspace, never in the scratch directory.
 - If `PAPERCLIP_RUN_SCRATCH_DIR` is empty, run `mktemp -d` once and type the absolute path it prints into later commands literally.
+- Never delete a wildcard path in a shared directory such as `/tmp` (`rm -rf /tmp/tmp.*`, `rm -rf /tmp/*`): other processes and parallel runs of the same user create their `mktemp` files there, and the glob removes theirs too. Delete only the exact paths you created, spelled out in full. Files under `"$PAPERCLIP_RUN_SCRATCH_DIR"` need no cleanup, because Paperclip deletes that directory after the run.
 
 A recipe split over two calls:
 

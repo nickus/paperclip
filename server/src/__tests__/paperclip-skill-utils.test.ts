@@ -576,6 +576,9 @@ describe("paperclip skill utils", () => {
     expect(normalizedReference).toContain("every shell tool call starts a new shell");
     expect(normalizedReference).toContain("Background processes (`cmd &`, `nohup cmd &`) may be killed");
     expect(normalizedReference).toContain("spell the variable out in every call");
+    // Wildcard cleanup of shared /tmp deletes other runs' mktemp files.
+    expect(normalizedReference).toContain("Never delete a wildcard path in a shared directory");
+    expect(normalizedReference).toContain("Delete only the exact paths you created");
     expect(reference).toContain('"$PAPERCLIP_RUN_SCRATCH_DIR/build.pid"');
     // The pkill -f self-match trap and its bracket-pattern fix.
     expect(normalizedReference).toContain("`pkill` then kills its own shell");
