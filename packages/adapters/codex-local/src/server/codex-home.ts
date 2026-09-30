@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
+import { TOOL_CALL_CLIENT_TIMEOUT_MS } from "@paperclipai/shared/tool-call-timeouts";
 import { isCodexAuthCachePath, readSubscriptionAccountId } from "./codex-auth-cache.js";
 
 const TRUTHY_ENV_RE = /^(1|true|yes|on)$/i;
@@ -317,6 +318,10 @@ function buildManagedMcpBlock(input: {
       `[mcp_servers.${tomlString(managedName)}]`,
       `url = ${tomlString(url)}`,
       `http_headers = { Authorization = ${tomlString(`Bearer ${gateway.bearerToken}`)} }`,
+      // Codex gives up on an MCP tool call after its own per-server timeout
+      // (60 s unless set). The gateway enforces each tool's deadline, up to
+      // five minutes, and reports `tool_timeout` itself; outlast it slightly.
+      `tool_timeout_sec = ${Math.ceil(TOOL_CALL_CLIENT_TIMEOUT_MS / 1000)}`,
     );
   });
   lines.push(MANAGED_MCP_BLOCK_END);

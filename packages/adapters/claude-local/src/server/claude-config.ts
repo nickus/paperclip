@@ -16,6 +16,7 @@ import {
   type AdapterExecutionTargetShellOptions,
 } from "@paperclipai/adapter-utils/execution-target";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
+import { TOOL_CALL_CLIENT_TIMEOUT_MS } from "@paperclipai/shared/tool-call-timeouts";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { classifyThrownErrorClass, logSandboxProbeDiagnostic } from "./probe-diagnostics.js";
 
@@ -176,6 +177,12 @@ export async function writePaperclipClaudeMcpConfig(input: {
       type: "http",
       url: server.url,
       headers: { Authorization: `Bearer ${server.token}` },
+      // Claude Code aborts an HTTP MCP request after 60 s unless the server
+      // entry (or MCP_TOOL_TIMEOUT) raises it. The Paperclip gateway enforces
+      // each tool's own deadline, up to five minutes, and answers with a
+      // `tool_timeout` error when it passes; give the client a little more so
+      // that answer arrives instead of a client-side abort.
+      timeout: TOOL_CALL_CLIENT_TIMEOUT_MS,
     };
   }
   await fs.mkdir(configDir, { recursive: true });
