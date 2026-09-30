@@ -10,6 +10,7 @@ import {
   environmentLeases,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import { runningProcesses } from "../adapters/index.js";
@@ -31,8 +32,10 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-// An agent hands its task to another agent from inside its own run. The route
-// stops that run first, then commits the new assignee and wakes it. The
+// A task is handed to another agent while a run of its previous owner is
+// live. The route stops that run first, then commits the new assignee and
+// wakes it. (A run that hands over its own task is not stopped; see
+// issue-reassignment-own-run-routes.test.ts.) The
 // stopped conversation run still owns its environment lease until its
 // executor finishes cleanup, so admission parks the new assignee's wake as a
 // `deferred_issue_execution` row. These tests cover what must happen once
@@ -162,7 +165,7 @@ describeEmbeddedPostgres("deferred wakes after a run hands its task to another a
     return { companyId, reviewerId, builderId, thirdAgentId, issueId, reviewerRunId, leaseId: lease!.id };
   }
 
-  /** The sequence the issue update route runs when an agent reassigns its own task. */
+  /** The stop, update and wake sequence of a hand-over while the previous owner's run is live. */
   async function reassignFromOwnRun(input: {
     companyId: string;
     issueId: string;
@@ -396,16 +399,30 @@ describeEmbeddedPostgres("deferred wakes after a run hands its task to another a
       toAgentId: seeded.builderId,
     });
     // The previous owner's run ended without proof that its provider actions
-    // settled. Its queue waits for the release after that outcome's hold,
-    // not for the drain after the executor settled.
+    // settled, and its hold was recorded while it still owned the task. Its
+    // queue waits for the release after that hold, not for the drain after
+    // the executor settled.
     await db.update(heartbeatRuns).set({
       status: "failed",
       errorCode: "adapter_failed",
       resultJson: {},
     }).where(eq(heartbeatRuns.id, seeded.reviewerRunId));
+    await db.insert(issueRecoveryActions).values({
+      companyId: seeded.companyId,
+      sourceIssueId: seeded.issueId,
+      kind: "active_run_watchdog",
+      status: "active",
+      ownerType: "board",
+      returnOwnerAgentId: seeded.reviewerId,
+      cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${seeded.reviewerRunId}`,
+      evidence: { runId: seeded.reviewerRunId, originalFailureCode: "adapter_failed" },
+      nextAction: "Reconcile the stopped run before continuing.",
+    });
     await settleLease(seeded.leaseId);
 
-    expect(await heartbeatService(db).promoteDeferredWakesAfterRunSettled(seeded.reviewerRunId)).toBe(true);
+    // The open hold is an execution blocker, so the settled-run drain stands down.
+    expect(await heartbeatService(db).promoteDeferredWakesAfterRunSettled(seeded.reviewerRunId)).toBe(false);
     await heartbeatService(db).resumeQueuedRuns();
 
     const [wake] = await wakesFor(seeded.builderId, seeded.issueId);

@@ -13611,7 +13611,7 @@ export function issueRoutes(
       }
 
       // Only this request may finish a mutation that intentionally stops its
-      // own run (for example handing work to a signoff reviewer).
+      // own run (for example a runner goal stop before terminalization).
       const issueMutationStopId = randomUUID();
       if (assigneeWillChange && existing.assigneeAgentId) {
         await stopRunnerGoalForOwnershipChange({
@@ -13619,7 +13619,23 @@ export function issueRoutes(
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
         });
-        const runToStopForReassignment = await resolveActiveIssueRun(existing);
+        const activeIssueRun = await resolveActiveIssueRun(existing);
+        // A run that hands its own task to someone else is finishing its
+        // turn, not being preempted: it keeps running and ends with its real
+        // outcome. The new owner's wake waits behind it on the issue
+        // execution lock and is promoted by the run's normal release. Any
+        // other live run on the task (another run of the same agent, or a
+        // run preempted by a board user or another agent) is still stopped.
+        const actorRunHandsOffItsOwnTask =
+          activeIssueRun !== null &&
+          actor.actorType === "agent" &&
+          !!actor.agentId &&
+          !!actor.runId &&
+          activeIssueRun.id === actor.runId &&
+          activeIssueRun.agentId === actor.agentId;
+        const runToStopForReassignment = actorRunHandsOffItsOwnTask
+          ? null
+          : activeIssueRun;
         if (runToStopForReassignment) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
