@@ -78,7 +78,7 @@ When a run reaches `timeoutSec` while it is still producing output, Paperclip tr
 - no reconciliation hold is created, and the agent does not go into an error state;
 - the same task gets a continuation run with the note "Your previous run reached the time cap at <time>; continue from the workspace state." The task keeps its execution workspace, and a reusable sandbox is resumed where the environment supports it.
 
-Continuations are bounded per continuation chain, together with max-turn continuations. Configure them in the agent runtime settings under `heartbeat.timeCapContinuation` (`enabled`, default `true`; `maxAttempts`, default `3`; `delayMs`, default `1000`). A cap hit after a long quiet spell, a cap shorter than `idleTimeoutSec`, and a cap hit with no continuation left keep the ordinary timeout behavior.
+Continuations are bounded per continuation chain, together with max-turn continuations. Configure them in the agent runtime settings under `heartbeat.timeCapContinuation` (`enabled`, default `true`; `maxAttempts`, default `3`; `delayMs`, default `1000`). A cap hit after a long quiet spell, a cap shorter than `idleTimeoutSec`, and a cap hit with no continuation left keep the ordinary timeout behavior. "Still producing output" means agent output within the last `idleTimeoutSec` (900 seconds when the inactivity timeout is off): adapter events and log lines other than Paperclip's own status lines. Status lines are recognized by the `[paperclip] ` prefix at the start of a line, so if an agent prints nothing but lines with that exact prefix for a whole window, the cap stop is treated as a quiet one.
 
 ## 3.4 Prompt templates
 

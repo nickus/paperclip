@@ -34,9 +34,9 @@ const TIME_CAP_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 3;
 const TIME_CAP_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
 const TIME_CAP_CONTINUATION_DEFAULT_DELAY_MS = 1_000;
 const TIME_CAP_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
-// Lines the platform itself writes into a run log carry this prefix. They are
-// not evidence that the provider is still working.
-const PLATFORM_LOG_LINE_PREFIX = "[paperclip]";
+// Lines the platform itself writes into a run log start with this prefix at
+// column 0. They are not evidence that the provider is still working.
+const PLATFORM_LOG_LINE_PREFIX = "[paperclip] ";
 // Adapters that run an arbitrary command or call a webhook rather than an
 // agent session. A long quiet spell is normal for them, so the idle timer is
 // off unless their config sets it.
@@ -148,13 +148,25 @@ export function resolveTimeCapContinuationPolicy(
 /**
  * True when a log chunk carries no provider output: every non-empty line is a
  * platform status line (or the chunk is blank).
+ *
+ * Platform lines share the log stream with provider output and are told
+ * apart only by their text, so this is a heuristic. The match is kept narrow
+ * (the exact prefix at the very start of the line, so indented, quoted or
+ * JSON-embedded copies count as provider output), but a provider that prints
+ * lines starting with that exact prefix is still read as platform output.
+ * The effect is limited: every chunk still resets the idle timer, so such a
+ * run is never stopped as idle. It only matters when a run reaches the hard
+ * time cap and every chunk it produced for a whole activity window looked
+ * like this; `classifyTimeCapStop` then sees no recent provider output and
+ * the stop keeps the ordinary timeout behavior instead of a checkpoint.
  */
 export function isPlatformOnlyLogChunk(chunk: string): boolean {
   // Fast path for ordinary output, which is most chunks.
   if (!chunk.includes(PLATFORM_LOG_LINE_PREFIX)) return chunk.trim().length === 0;
   for (const line of chunk.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed.length > 0 && !trimmed.startsWith(PLATFORM_LOG_LINE_PREFIX)) {
+    // No trimming before the prefix check: any leading character, including
+    // whitespace, makes the line provider output.
+    if (line.trim().length > 0 && !line.startsWith(PLATFORM_LOG_LINE_PREFIX)) {
       return false;
     }
   }
@@ -256,6 +268,11 @@ export interface TimeCapStopClassification {
  * as a request timeout, not a safety net) and its latest provider output
  * must be no older than that window when it stopped. An earlier quiet spell
  * does not matter; only the activity leading up to the stop does.
+ *
+ * This is a heuristic on the activity the watchdog saw. Provider output that
+ * looks like platform status lines (see `isPlatformOnlyLogChunk`) does not
+ * count, so a run whose only recent output was such lines is classified as
+ * not productive and keeps the ordinary timeout behavior.
  */
 export function classifyTimeCapStop(input: {
   snapshot: RunActivitySnapshot;

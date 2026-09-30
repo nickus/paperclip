@@ -49,12 +49,26 @@ describe("isPlatformOnlyLogChunk", () => {
   it("treats platform status lines and blank chunks as non-provider output", () => {
     expect(isPlatformOnlyLogChunk("[paperclip] Syncing workspace\n")).toBe(true);
     expect(isPlatformOnlyLogChunk("[paperclip] a\n  \n[paperclip] b\n")).toBe(true);
+    expect(isPlatformOnlyLogChunk("[paperclip] a\r\n[paperclip] b\r\n")).toBe(true);
     expect(isPlatformOnlyLogChunk("\n")).toBe(true);
   });
 
   it("treats any other line as provider output", () => {
     expect(isPlatformOnlyLogChunk('{"type":"tool_call"}\n')).toBe(false);
     expect(isPlatformOnlyLogChunk("[paperclip] note\nediting src/app.ts\n")).toBe(false);
+  });
+
+  it("does not take copies of platform lines inside provider output for platform lines", () => {
+    // Indented, as in a code block or a log dump.
+    expect(isPlatformOnlyLogChunk("    [paperclip] Syncing workspace\n")).toBe(false);
+    expect(isPlatformOnlyLogChunk("\t[paperclip] Syncing workspace\n")).toBe(false);
+    // Quoted or embedded in structured output.
+    expect(isPlatformOnlyLogChunk("> [paperclip] Syncing workspace\n")).toBe(false);
+    expect(
+      isPlatformOnlyLogChunk('{"type":"text","text":"[paperclip] Syncing workspace"}\n'),
+    ).toBe(false);
+    // Not the platform's line format.
+    expect(isPlatformOnlyLogChunk("[paperclip]Syncing workspace\n")).toBe(false);
   });
 });
 
