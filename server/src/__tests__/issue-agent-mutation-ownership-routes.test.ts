@@ -1871,6 +1871,24 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["monitor", { nextCheckAt: "2026-10-01T09:00:00.000Z" }, "executionPolicy.monitor, e.g."],
+    ["monitorNextCheckAt", "2026-10-01T09:00:00.000Z", "executionPolicy.monitor.nextCheckAt, e.g."],
+  ])("points a top-level `%s` at the execution policy monitor", async (field, value, hint) => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
+      [field]: value,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.code).toBe("unknown_fields");
+    expect(res.body.details.suggestions[field]).toContain(hint);
+    // The policy is replaced as a whole, so the hint says to resend the rest.
+    expect(res.body.details.suggestions[field]).toContain("replaces the whole policy");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("accepts `comment` as the comment text on comment creation", async () => {
     const res = await request(await createApp(ownerActor()))
       .post(`/api/issues/${issueId}/comments`)

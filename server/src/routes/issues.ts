@@ -381,6 +381,12 @@ const rejectUnknownIssueUpdateFields = rejectUnknownBodyFields({
     labels: "labelIds",
     parentIssueId: "parentId",
     state: "status",
+    // The monitor lives inside the execution policy, and a policy update
+    // replaces the whole policy, so the hint says to resend the rest of it.
+    monitor:
+      'executionPolicy.monitor, e.g. {"executionPolicy":{"monitor":{"nextCheckAt":"<ISO time>","notes":"..."}}}; executionPolicy replaces the whole policy, so resend its other current fields (such as stages) with it',
+    monitorNextCheckAt:
+      'executionPolicy.monitor.nextCheckAt, e.g. {"executionPolicy":{"monitor":{"nextCheckAt":"<ISO time>"}}}; executionPolicy replaces the whole policy, so resend its other current fields (such as stages) with it',
   },
 });
 // Comment creation accepts `comment` as an alias for `body`: the endpoint
