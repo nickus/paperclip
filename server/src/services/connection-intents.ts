@@ -141,8 +141,11 @@ export function connectionIntentService(db: Db) {
     }
   }
 
-  async function loadRunContext(claims: ConnectionRunClaims) {
-    let run = await db
+  // The token-to-run binding and the run's liveness: everything a runtime
+  // tools token needs to be usable at all. Connection requests additionally
+  // need the task preconditions that `loadRunContext` checks.
+  async function loadActiveRun(claims: ConnectionRunClaims) {
+    const run = await db
       .select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
@@ -162,6 +165,11 @@ export function connectionIntentService(db: Db) {
       || (!run.activeIdentityContextId && run.responsibleUserId !== claims.responsible_user_id)
     ) throw forbidden("Runtime tool token does not match its heartbeat run");
     if (run.status !== "running") throw forbidden("Runtime tool token is no longer active");
+    return run;
+  }
+
+  async function loadRunContext(claims: ConnectionRunClaims) {
+    let run = await loadActiveRun(claims);
     if (run.activeIdentityContextId) {
       const current = await captureRunIdentity(db, { companyId: run.companyId, agentId: run.agentId, runId: run.id });
       run = { ...run, responsibleUserId: current.run.responsibleUserId };
@@ -899,6 +907,15 @@ export function connectionIntentService(db: Db) {
 
   return {
     validate: loadRunContext,
+    /**
+     * Check only that the token belongs to a live run, without the task
+     * preconditions of a connection request. A run woken on a task it does
+     * not own (a mention, a review) or with no task at all still holds a valid
+     * token; the tool calls themselves report why a request cannot be made.
+     */
+    validateActiveRun: async (claims: ConnectionRunClaims) => {
+      await loadActiveRun(claims);
+    },
     usableConnectionForAgent,
     search,
     request,

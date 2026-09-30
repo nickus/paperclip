@@ -811,12 +811,47 @@ describeEmbeddedPostgres("connectionIntentService", () => {
     }
   });
 
+  it("accepts a live run's token when only the task preconditions fail", async () => {
+    // A run woken on a task another agent owns still holds a valid token; the
+    // MCP handshake checks only that, and connection requests keep the task
+    // checks.
+    const service = connectionIntentService(db);
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const issueId = (run!.contextSnapshot as { issueId: string }).issueId;
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId: claims.company_id,
+      name: "Owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({ assigneeAgentId: otherAgentId }).where(eq(issues.id, issueId));
+    try {
+      await expect(service.validate(claims)).rejects.toThrow("no longer owns this task");
+      await expect(service.validateActiveRun(claims)).resolves.toBeUndefined();
+      await expect(service.validateActiveRun({ ...claims, company_id: randomUUID() }))
+        .rejects.toThrow("does not match its heartbeat run");
+    } finally {
+      await db.update(issues).set({ assigneeAgentId: claims.sub }).where(eq(issues.id, issueId));
+    }
+  });
+
   it("rejects cross-company claims and tokens after the run ends", async () => {
     const service = connectionIntentService(db);
     await expect(service.search({ ...claims, company_id: randomUUID() }, "notion"))
       .rejects.toThrow("does not match its heartbeat run");
     await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
     await expect(service.search(claims, "notion"))
+      .rejects.toThrow("no longer active");
+    await expect(service.validateActiveRun(claims))
       .rejects.toThrow("no longer active");
   });
   it("keeps runtime authentication separate from obsolete Anthropic tool requests", async () => {
