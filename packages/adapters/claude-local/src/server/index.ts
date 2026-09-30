@@ -8,6 +8,7 @@ export {
   claudeCommandSupportsEffortFlag,
   resetClaudeCliCapabilitiesCacheForTests,
 } from "./cli-capabilities.js";
+export { claudeStreamJsonTranslator } from "./stream-json.js";
 export {
   parseClaudeStreamJson,
   describeClaudeFailure,
