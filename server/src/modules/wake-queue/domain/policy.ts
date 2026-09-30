@@ -216,6 +216,12 @@ export type ReleaseRecoverySharedFacts = {
   isStrandedRecoveryOrigin: boolean;
   recoveryAgentPresent: boolean;
   recoveryAgentInvokable: boolean;
+  /**
+   * True when the recovery agent is not invokable only because its own
+   * status is paused. A pause is temporary: the scheduler leaves a paused
+   * agent's queued runs queued until the agent is resumed.
+   */
+  recoveryAgentPaused: boolean;
 };
 
 export type ReleaseRecoveryReviewParticipantFacts = {
@@ -230,6 +236,8 @@ export type ReleaseRecoveryImmediateFacts = {
   applies: boolean;
   /** True when the finishing run itself carried the disposition-repair retry reason. */
   isDispositionRepairRetry: boolean;
+  /** True when the finishing run was cancelled, rather than failing or timing out on its own. */
+  finishingRunCancelled: boolean;
   hasExplicitBlockerPath: boolean;
   isWorkspaceValidationFailedRun: boolean;
   isConfigurationIncompleteFailedRun: boolean;
@@ -420,9 +428,19 @@ export function decideReleaseRecovery(facts: ReleaseRecoveryFacts): ReleaseRecov
   if (shared.suppressedByPauseHold) return { kind: "released" };
   if (shared.isStrandedRecoveryOrigin) return { kind: "blocked_recovery_in_place" };
 
+  // A run that failed after its agent was paused (for example the last run
+  // of a pause that let it finish) gets the same recovery run as for an
+  // agent that is not paused. The run stays queued until the agent is
+  // resumed, like a paused agent's retries and deferred wakes, instead of
+  // the task going to the board. A cancelled run keeps the outcome below:
+  // whoever stopped it, the pause itself included, decides what comes next.
+  const recoveryAgentAvailable =
+    shared.recoveryAgentInvokable ||
+    (shared.recoveryAgentPaused && !immediate.finishingRunCancelled);
+
   const shouldBlockImmediately =
     immediate.sourceRequiresExplicitRecovery === true ||
-    !shared.recoveryAgentInvokable ||
+    !recoveryAgentAvailable ||
     !shared.recoveryAgentPresent ||
     immediate.isWorkspaceValidationFailedRun ||
     immediate.isConfigurationIncompleteFailedRun ||

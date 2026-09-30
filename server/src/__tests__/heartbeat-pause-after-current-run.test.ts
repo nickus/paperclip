@@ -26,6 +26,7 @@ import { agentService } from "../services/agents.ts";
 import { heartbeatService, startTaskDrain, stopTaskDrain } from "../services/heartbeat.ts";
 
 const TRANSIENT_FAILURE_TEST_ADAPTER = "pause_after_run_transient_failure_test";
+const FAILURE_TEST_ADAPTER = "pause_after_run_failure_test";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -67,6 +68,7 @@ describeEmbeddedPostgres("heartbeat pause after the current run", () => {
 
   afterAll(async () => {
     unregisterServerAdapter(TRANSIENT_FAILURE_TEST_ADAPTER);
+    unregisterServerAdapter(FAILURE_TEST_ADAPTER);
     await tempDb?.cleanup();
     if (markerDir) rmSync(markerDir, { recursive: true, force: true });
   });
@@ -242,5 +244,147 @@ describeEmbeddedPostgres("heartbeat pause after the current run", () => {
     await agentService(db).resume(fixture.agentId);
     expect(await heartbeat.promoteDueScheduledRetries(afterDue)).toEqual({ promoted: 1, runIds: [retry!.id] });
     expect(await runStatus(retry!.id)).toBe("queued");
+  }, 60_000);
+
+  /**
+   * An adapter whose first run waits for the test, then fails for good (no
+   * retry applies and it never started provider work, so no reconciliation
+   * hold either). Every later run succeeds.
+   */
+  function registerFailingOnceAdapter() {
+    const state = { invocations: 0, finishFirstRun: () => {} };
+    const firstRunMayFinish = new Promise<void>((resolve) => { state.finishFirstRun = resolve; });
+    registerServerAdapter({
+      type: FAILURE_TEST_ADAPTER,
+      execute: async () => {
+        state.invocations += 1;
+        if (state.invocations > 1) return { exitCode: 0, signal: null, timedOut: false };
+        await firstRunMayFinish;
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: "adapter rejected its configuration",
+          errorCode: "adapter_failed",
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+        };
+      },
+      testEnvironment: async () => ({
+        adapterType: FAILURE_TEST_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
+    return state;
+  }
+
+  async function seedInProgress() {
+    const fixture = await seed(path.join(markerDir, `${randomUUID()}.unused`));
+    await db.update(agents).set({ adapterType: FAILURE_TEST_ADAPTER, adapterConfig: {} }).where(eq(agents.id, fixture.agentId));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, fixture.issueId));
+    return fixture;
+  }
+
+  async function recoveryRunsOf(runId: string) {
+    return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+  }
+
+  it("holds the recovery run of a last run that fails for good until the agent is resumed", async () => {
+    const adapter = registerFailingOnceAdapter();
+    const fixture = await seedInProgress();
+    const heartbeat = heartbeatService(db);
+    const liveRunId = await insertQueuedRun(fixture);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitFor(() => adapter.invocations === 1);
+    // Pause after the current run, which then fails without a retry.
+    await agentService(db).pause(fixture.agentId);
+    adapter.finishFirstRun();
+    await heartbeat.drainActiveRunExecutions();
+    expect(await runStatus(liveRunId)).toBe("failed");
+
+    // The task is not handed to the board. It gets the one recovery run an
+    // agent that is not paused gets, queued until the agent is resumed.
+    const [issueAfterRun] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(issueAfterRun!.status).toBe("in_progress");
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId))).toEqual([]);
+    const recoveryRuns = await recoveryRunsOf(liveRunId);
+    expect(recoveryRuns).toHaveLength(1);
+    const recovery = recoveryRuns[0]!;
+    expect(recovery).toMatchObject({
+      agentId: fixture.agentId,
+      status: "queued",
+      contextSnapshot: expect.objectContaining({ issueId: fixture.issueId, retryReason: "issue_continuation_needed" }),
+    });
+    expect(issueAfterRun!.executionRunId).toBe(recovery.id);
+
+    // While the agent stays paused the run does not start, and stranded-work
+    // recovery leaves the task that waits for it alone.
+    await heartbeat.resumeQueuedRuns();
+    expect(await runStatus(recovery.id)).toBe("queued");
+    expect((await heartbeat.reconcileStrandedAssignedIssues()).escalated).toBe(0);
+    const [issueWhilePaused] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(issueWhilePaused!.status).toBe("in_progress");
+
+    // Resuming the agent runs it once.
+    await agentService(db).resume(fixture.agentId);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect(await runStatus(recovery.id)).toBe("succeeded");
+    const continuationRuns = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, fixture.agentId)))
+      .filter((run) => run.contextSnapshot?.retryReason === "issue_continuation_needed");
+    expect(continuationRuns.map((run) => run.id)).toEqual([recovery.id]);
+  }, 60_000);
+
+  it("queues the same recovery run for an agent that is not paused", async () => {
+    const adapter = registerFailingOnceAdapter();
+    const fixture = await seedInProgress();
+    const heartbeat = heartbeatService(db);
+    const liveRunId = await insertQueuedRun(fixture);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitFor(() => adapter.invocations === 1);
+    // Keep the recovery run queued for inspection.
+    startTaskDrain();
+    adapter.finishFirstRun();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(await runStatus(liveRunId)).toBe("failed");
+    const recoveryRuns = await recoveryRunsOf(liveRunId);
+    expect(recoveryRuns).toHaveLength(1);
+    expect(recoveryRuns[0]).toMatchObject({
+      agentId: fixture.agentId,
+      status: "queued",
+      contextSnapshot: expect.objectContaining({ issueId: fixture.issueId, retryReason: "issue_continuation_needed" }),
+    });
+    const [issueAfterRun] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(issueAfterRun).toMatchObject({ status: "in_progress", executionRunId: recoveryRuns[0]!.id });
+  }, 60_000);
+
+  it("queues no recovery run for a run that an immediate pause stopped", async () => {
+    const fixture = await seedInProgress();
+    // A run the pause stops before its provider work started: its release
+    // reaches the same recovery decision as a failed run.
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      invocationSource: "assignment",
+      status: "running",
+      runtimeMode: "legacy",
+      startedAt: new Date(),
+      contextSnapshot: { issueId: fixture.issueId },
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+    });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, fixture.issueId));
+
+    // What the pause route does without afterCurrentRun.
+    await agentService(db).pause(fixture.agentId);
+    await heartbeatService(db).cancelActiveForAgent(fixture.agentId);
+
+    expect(await runStatus(runId)).toBe("cancelled");
+    expect(await recoveryRunsOf(runId)).toEqual([]);
   }, 60_000);
 });
