@@ -481,6 +481,11 @@ import {
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
 import {
+  cleanupSandboxRunScratch,
+  prepareSandboxRunScratch,
+  type SandboxRunScratch,
+} from "./sandbox-run-scratch.js";
+import {
   cleanupSshRunScratch,
   omitRemoteRunScratchEnv,
   prepareSshRunScratch,
@@ -20850,7 +20855,8 @@ export function heartbeatService(
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
     let runScratch: HeartbeatRunScratch | null = null;
     let remoteRunScratch: SshRunScratch | null = null;
-    // Env entries that point the run at remoteRunScratch.
+    let sandboxRunScratch: SandboxRunScratch | null = null;
+    // Env entries that point the run at remoteRunScratch or sandboxRunScratch.
     let remoteRunScratchEnv: Record<string, string> | null = null;
     let sshWorkspaceReuseClaim: SshWorkspaceReuseClaim | null = null;
     let githubLauncherLocation:
@@ -23108,23 +23114,30 @@ export function heartbeatService(
             "failed to prepare heartbeat run scratch directory; continuing without scratch env",
           );
         }
-      } else if (
-        executionTarget.kind === "remote" &&
-        executionTarget.transport === "ssh"
-      ) {
-        // The run scratch directory lives on the SSH host, next to the run's
-        // runtime files. Created before the adapter runs any remote command,
-        // since those already get TMPDIR pointed at it.
+      } else if (executionTarget.kind === "remote") {
+        // The run scratch directory lives on the SSH host or in the sandbox,
+        // next to the run's runtime files. Created before the adapter runs any
+        // remote command, since those already get TMPDIR pointed at it.
         delete context.paperclipScratch;
         try {
-          remoteRunScratch = await prepareSshRunScratch({
-            target: executionTarget,
-            runId: run.id,
-          });
+          let remoteScratchDir: string;
+          if (executionTarget.transport === "ssh") {
+            remoteRunScratch = await prepareSshRunScratch({
+              target: executionTarget,
+              runId: run.id,
+            });
+            remoteScratchDir = remoteRunScratch.dir;
+          } else {
+            sandboxRunScratch = await prepareSandboxRunScratch({
+              target: executionTarget,
+              runId: run.id,
+            });
+            remoteScratchDir = sandboxRunScratch.dir;
+          }
           const existingRuntimeEnv = parseObject(runtimeConfig.env);
           const scratchEnv = buildRunScratchEnvForDir(
             existingRuntimeEnv,
-            remoteRunScratch.dir,
+            remoteScratchDir,
           );
           runtimeConfig = {
             ...runtimeConfig,
@@ -23137,12 +23150,13 @@ export function heartbeatService(
           context.paperclipScratch = {
             type: "heartbeat_run",
             location: "remote",
-            dir: remoteRunScratch.dir,
+            dir: remoteScratchDir,
             cleanupPolicy: "terminal_run",
             tempKeysApplied: scratchEnv.tempKeysApplied,
           };
         } catch (scratchPrepareError) {
           remoteRunScratch = null;
+          sandboxRunScratch = null;
           remoteRunScratchEnv = null;
           delete context.paperclipScratch;
           logger.warn(
@@ -23771,7 +23785,7 @@ export function heartbeatService(
             null,
           config: hostExecutionWorkspaceConfig,
           // Runtime services run on this host; a scratch path on the SSH host
-          // means nothing to them.
+          // or in the sandbox means nothing to them.
           adapterEnv: omitRemoteRunScratchEnv(adapterEnv, remoteRunScratchEnv),
           onLog,
           recorder: workspaceOperationRecorder,
@@ -26968,6 +26982,29 @@ export function heartbeatService(
                 );
               },
             );
+          }
+          // A kept sandbox would carry the directory into later runs, so remove
+          // it while this run still holds the lease. Best effort: a sandbox that
+          // is not kept takes the directory with it.
+          if (
+            sandboxRunScratch &&
+            latestRun &&
+            isHeartbeatRunTerminalStatus(latestRun.status)
+          ) {
+            const sandboxScratchForCleanup = sandboxRunScratch;
+            sandboxRunScratch = null;
+            await cleanupSandboxRunScratch({
+              scratch: sandboxScratchForCleanup,
+            }).catch((sandboxScratchCleanupError) => {
+              logger.warn(
+                {
+                  err: sandboxScratchCleanupError,
+                  runId: run.id,
+                  scratchDir: sandboxScratchForCleanup.dir,
+                },
+                "failed to clean sandbox run scratch directory",
+              );
+            });
           }
           await releaseEnvironmentLeasesForRun({
             runId: run.id,

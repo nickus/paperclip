@@ -4,12 +4,14 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-// End-to-end coverage for scripts/paperclip-issue-update.sh: the helper must
-// only exit 0 when the server confirms the write by echoing the update, must
-// classify failures (retry connection-level faults and 5xx, never retry a
-// definitive 4xx), and must stop at two attempts total to honor the shared
-// bounded-write-retry rule.
-const HELPER_PATH = path.resolve("scripts/paperclip-issue-update.sh");
+// End-to-end coverage for the issue update helper that ships with the
+// Paperclip skill: the helper must only exit 0 when the server confirms the
+// write by echoing the update, must classify failures (retry connection-level
+// faults and 5xx, never retry a definitive 4xx), and must stop at two attempts
+// total to honor the shared bounded-write-retry rule.
+const HELPER_PATH = path.resolve("skills/paperclip/scripts/paperclip-issue-update.sh");
+// The repository path forwards to the bundled helper.
+const REPO_HELPER_PATH = path.resolve("scripts/paperclip-issue-update.sh");
 
 interface HelperResult {
   code: number | null;
@@ -66,9 +68,9 @@ describe("paperclip issue update helper", () => {
     return { baseUrl: `http://127.0.0.1:${port}`, requests };
   }
 
-  function runHelper(apiUrl: string, args: string[]): Promise<HelperResult> {
+  function runHelper(apiUrl: string, args: string[], helperPath = HELPER_PATH): Promise<HelperResult> {
     return new Promise((resolve, reject) => {
-      const child = spawn("bash", [HELPER_PATH, ...args], {
+      const child = spawn("bash", [helperPath, ...args], {
         env: {
           ...process.env,
           PAPERCLIP_API_URL: apiUrl,
@@ -106,6 +108,21 @@ describe("paperclip issue update helper", () => {
     expect(requests).toHaveLength(1);
     expect(requests[0]?.method).toBe("PATCH");
     expect(requests[0]?.url).toBe("/api/issues/issue-1");
+    expect(JSON.parse(requests[0]?.body ?? "{}")).toEqual({ status: "done", comment: "closing note" });
+  });
+
+  it("forwards the repository path to the helper bundled with the skill", async () => {
+    const { baseUrl, requests } = await startServer((request, _attempt, res) => {
+      const payload = JSON.parse(request.body) as { status?: string };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "issue-1", status: payload.status }));
+    });
+
+    const result = await runHelper(baseUrl, doneArgs, REPO_HELPER_PATH);
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ id: "issue-1", status: "done" });
+    expect(requests).toHaveLength(1);
     expect(JSON.parse(requests[0]?.body ?? "{}")).toEqual({ status: "done", comment: "closing note" });
   });
 

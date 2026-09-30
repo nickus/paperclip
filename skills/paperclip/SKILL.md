@@ -171,7 +171,7 @@ the routine server-verified external-chat handoff described above.
 
 **Bounded write retry.** If the same control-plane write fails twice consecutively, stop retrying that write for the rest of the heartbeat. Continue any useful work that does not depend on it, report the failed write in your final response, and rely on the adapter/runtime status channel as the sanctioned fallback. Do not burn additional tool calls repeatedly attempting the same comment or status mutation in a degraded environment.
 
-**Verify writes — never infer them.** A successful `PATCH /api/issues/{id}` always returns the updated issue JSON. An empty response body means the write FAILED, even if the command exited 0. Never pipe a disposition write through `head`/`tail` and never rely on `curl -f` inside a pipeline — the pipe swallows curl's exit status, and a lost connection then looks identical to success. Use `scripts/paperclip-issue-update.sh` (it checks the HTTP status, retries connection-level failures, and confirms the echoed `status`); if you must hand-roll curl, capture `-w '%{http_code}'` and check the response echoes your update. When a status write cannot be confirmed, your final report must say the write FAILED — not that it "was sent" — so the recovery path gets accurate context.
+**Verify writes — never infer them.** A successful `PATCH /api/issues/{id}` always returns the updated issue JSON. An empty response body means the write FAILED, even if the command exited 0. Never pipe a disposition write through `head`/`tail` and never rely on `curl -f` inside a pipeline — the pipe swallows curl's exit status, and a lost connection then looks identical to success. Use `bash scripts/paperclip-issue-update.sh`, bundled with this skill (resolve it from the installed skill directory, not the task workspace); it checks the HTTP status, retries connection-level failures, and confirms the echoed `status`; if you must hand-roll curl, capture `-w '%{http_code}'` and check the response echoes your update. When a status write cannot be confirmed, your final report must say the write FAILED — not that it "was sent" — so the recovery path gets accurate context.
 
 Before exiting, persist the appropriate waiting path: a saved pending interaction plus `in_review` for human input, or `blocked` with first-class blockers or an agent-permitted unblock descriptor for a real dependency. A comment naming someone does not create that path.
 
@@ -194,7 +194,7 @@ Headers: X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
 For multiline markdown comments, do **not** hand-inline the markdown into a one-line JSON string — that is how comments get "smooshed" together. Use the helper below (or an equivalent `jq --arg` pattern reading from a heredoc/file) so literal newlines survive JSON encoding:
 
 ```bash
-scripts/paperclip-issue-update.sh --issue-id "$PAPERCLIP_TASK_ID" --status done <<'MD'
+bash scripts/paperclip-issue-update.sh --issue-id "$PAPERCLIP_TASK_ID" --status done <<'MD'
 Done
 
 - Fixed the newline-preserving issue update path
@@ -683,6 +683,8 @@ Results are ranked by relevance: title matches first, then identifier, descripti
 For detailed API tables, JSON response schemas, worked examples (IC and Manager heartbeats), governance/approvals, cross-team delegation rules, error codes, issue lifecycle diagram, and the common mistakes table, read: `skills/paperclip/references/api-reference.md`
 
 Connected tools (MCP tool connections and other gateway tools) that your harness does not offer as native tools: call them over REST with the recipe in `skills/paperclip/references/connected-tools.md`.
+
+**Shell state and request payloads.** Each shell tool call starts a new shell: variables, `cd` and `trap`s do not carry over, and background processes may be killed when the call returns. Keep files under `"$PAPERCLIP_RUN_SCRATCH_DIR"` (private to this run and removed after it), never at fixed shared `/tmp` paths, and take the API base URL from `$PAPERCLIP_API_URL`, never a guessed host. Read `references/shell-and-state.md` before a recipe that spans several calls, and `references/payload-cookbook.md` for exact request bodies: comments take `body`, `PATCH` takes `status` plus `comment`, documents need `format: "markdown"`, and `blocked` needs a blocker or a self-owned unblock descriptor.
 
 **Asking a free-text question.**
 
