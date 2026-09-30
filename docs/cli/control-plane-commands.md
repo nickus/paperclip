@@ -73,6 +73,12 @@ command.
 ```sh
 npx paperclipai agent list
 npx paperclipai agent get <agent-id>
+
+# Pause; cancels the live and queued runs
+npx paperclipai agent pause <agent-id>
+# Pause, but let the live run finish; queued runs wait for resume
+npx paperclipai agent pause <agent-id> --after-current-run
+npx paperclipai agent resume <agent-id>
 ```
 
 ## Skills Commands

@@ -70,6 +70,19 @@ describe("agent lifecycle commands", () => {
     ]);
   });
 
+  it("pauses after the current run only when asked", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["agent", "pause", AGENT_ID]);
+    await run(["agent", "pause", AGENT_ID, "--after-current-run"]);
+
+    expect(fetchMock.mock.calls.map((call) => [call[0], JSON.parse(String(call[1]?.body))])).toEqual([
+      [`http://localhost:3100/api/agents/${AGENT_ID}/pause`, {}],
+      [`http://localhost:3100/api/agents/${AGENT_ID}/pause`, { afterCurrentRun: true }],
+    ]);
+  });
+
   it("wraps configuration, runtime, skills, and instructions endpoints", async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
     vi.stubGlobal("fetch", fetchMock);
