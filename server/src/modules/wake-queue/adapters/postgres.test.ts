@@ -546,6 +546,49 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect(preserved.runId).toBeNull();
   });
 
+  it("keeps a paused agent's deferred wake queued through a release, and promotes it once the agent resumes", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId, status: "in_progress" });
+    const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, status: "succeeded" });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
+    // Paused after the wake was deferred, while its run was still live.
+    await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date() }).where(eq(agents.id, agentId));
+
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: {
+        escalateStrandedAssignedIssue: async () => { throw new Error("unexpected escalation"); },
+        escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected escalation"); },
+      },
+    });
+    const heldAt = new Date("2026-03-01T00:00:00.000Z");
+    const held = await release({ companyId, runId, now: heldAt });
+
+    expect(held.outcome.kind).toBe("released");
+    const [heldWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(heldWake).toMatchObject({ status: "deferred_issue_execution", runId: null, error: null, finishedAt: null });
+    expect(heldWake!.payload).toEqual({
+      issueId,
+      heldForPausedAgent: { runId, heldAt: heldAt.toISOString() },
+    });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+    const [releasedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(releasedIssue!.executionRunId).toBeNull();
+
+    // The same release, run again after the agent resumes, promotes the wake.
+    await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null }).where(eq(agents.id, agentId));
+    const resumed = await release({ companyId, runId, now: new Date(), afterExecutionHold: true });
+
+    expect(resumed.outcome.kind).toBe("promoted");
+    const [promotedWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(promotedWake!.status).not.toBe("deferred_issue_execution");
+    expect(promotedWake!.runId).not.toBeNull();
+    const [promotedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, promotedWake!.runId!));
+    expect(promotedRun).toMatchObject({ agentId, status: "queued", wakeupRequestId: wakeId });
+  });
+
   it("fails a deferred wake whose agent belongs to a different company, without creating a run", async () => {
     const companyId = await seedCompany();
     const otherCompanyId = await seedCompany();

@@ -43,6 +43,7 @@ import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+  HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY,
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
   parseObject,
@@ -197,7 +198,13 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .then((rows) => rows[0] ?? null);
       if (!agent) return null;
       const invokability = await evaluateAgentInvokabilityFromDb(tx, agent);
-      return { id: agent.id, companyId: agent.companyId, name: agent.name, invokable: invokability.invokable };
+      return {
+        id: agent.id,
+        companyId: agent.companyId,
+        name: agent.name,
+        invokable: invokability.invokable,
+        paused: !invokability.invokable && invokability.reason === "paused",
+      };
     },
 
     async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
@@ -322,6 +329,27 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           status: "failed",
           finishedAt: now,
           error: "Deferred wake could not be promoted: agent is not invokable",
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, wakeId),
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      return rows.length > 0;
+    },
+
+    async holdDeferredWakeForPausedAgent({ companyId, wakeId, finishingRunId, now }) {
+      const rows = await tx
+        .update(agentWakeupRequests)
+        .set({
+          payload: sql`coalesce(${agentWakeupRequests.payload}, '{}'::jsonb) || jsonb_build_object(
+            ${HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY}::text,
+            jsonb_build_object('runId', ${finishingRunId}::text, 'heldAt', ${now.toISOString()}::text)
+          )`,
           updatedAt: now,
         })
         .where(

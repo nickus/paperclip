@@ -104,6 +104,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     cancelDeferredWake: vi.fn(async () => true),
     normalizeDeferredWakeCommentIds: vi.fn(async (input) => wakeCandidate({ id: input.wakeId, queuedCommentIds: input.liveCommentIds })),
     failDeferredWake: vi.fn(async () => true),
+    holdDeferredWakeForPausedAgent: vi.fn(async () => true),
     getPauseHoldFacts: vi.fn(async () => ({
       activePauseHold: false,
       treeHoldInteractionWake: false,
@@ -407,6 +408,75 @@ describe("releaseIssueExecution", () => {
     expect(transaction.normalizeDeferredWakeCommentIds).toHaveBeenCalledTimes(1);
     expect(findNextDeferredWake).toHaveBeenCalledTimes(3);
     expect(result.outcome.kind).toBe("promoted");
+  });
+
+  it("keeps a paused agent's wake deferred, skips it for the rest of the drain, and promotes the wake behind it", async () => {
+    const paused = wakeCandidate({ id: "wake-paused-agent", agentId: "paused-agent" });
+    const next = wakeCandidate({ id: "wake-next" });
+    const findNextDeferredWake = vi.fn(async (input: { excludedWakeIds?: string[] }) =>
+      input.excludedWakeIds?.includes(paused.id) ? next : paused,
+    );
+    const findInvokableAgent = vi.fn(async (input: { agentId: string }) =>
+      input.agentId === "paused-agent"
+        ? { id: "paused-agent", companyId: "company-1", name: "Paused Agent", invokable: false, paused: true }
+        : AGENT,
+    );
+    const transaction = createFakeTransaction({ findNextDeferredWake, findInvokableAgent });
+    const now = new Date("2026-03-01T00:00:00.000Z");
+    const releaseIssueExecution = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction),
+      recovery: createFakeRecovery(),
+    });
+
+    const result = await releaseIssueExecution({ companyId: "company-1", runId: RUN.id, now });
+
+    expect(transaction.holdDeferredWakeForPausedAgent).toHaveBeenCalledWith({
+      companyId: "company-1",
+      wakeId: paused.id,
+      finishingRunId: RUN.id,
+      now,
+    });
+    expect(transaction.failDeferredWake).not.toHaveBeenCalled();
+    expect(findNextDeferredWake).toHaveBeenLastCalledWith(expect.objectContaining({ excludedWakeIds: [paused.id] }));
+    expect(transaction.claimDeferredWakeForPromotion).toHaveBeenCalledTimes(1);
+    expect(transaction.claimDeferredWakeForPromotion).toHaveBeenCalledWith(expect.objectContaining({ wakeId: next.id }));
+    expect(result.outcome.kind).toBe("promoted");
+  });
+
+  it("still fails a deferred wake whose agent is not invokable for a reason other than a pause", async () => {
+    const queue = [wakeCandidate({ id: "wake-terminated-agent" })];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      findInvokableAgent: vi.fn(async () => ({ ...AGENT, invokable: false, paused: false })),
+    });
+    const releaseIssueExecution = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction),
+      recovery: createFakeRecovery(),
+    });
+
+    await releaseIssueExecution({ companyId: "company-1", runId: RUN.id, now: new Date() });
+
+    expect(transaction.failDeferredWake).toHaveBeenCalledTimes(1);
+    expect(transaction.holdDeferredWakeForPausedAgent).not.toHaveBeenCalled();
+  });
+
+  it("does not carry the paused-agent marker onto the run a formerly held wake promotes", async () => {
+    const finalizePromotedWake = vi.fn(async (input: PromoteDeferredWakeInput) => runSummary(input.wakeId));
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () =>
+        wakeCandidate({ payload: { issueId: ISSUE.id, heldForPausedAgent: { runId: "run-0", heldAt: "2026-03-01T00:00:00.000Z" } } }),
+      ),
+      finalizePromotedWake,
+    });
+    const releaseIssueExecution = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction),
+      recovery: createFakeRecovery(),
+    });
+
+    await releaseIssueExecution({ companyId: "company-1", runId: RUN.id, now: new Date() });
+
+    expect(finalizePromotedWake).toHaveBeenCalledTimes(1);
+    expect(finalizePromotedWake.mock.calls[0]![0].payload).toEqual({ issueId: ISSUE.id });
   });
 
   it("rejects with deferred_wake_not_advanced when the queue read returns the same wake id twice, instead of looping forever", async () => {

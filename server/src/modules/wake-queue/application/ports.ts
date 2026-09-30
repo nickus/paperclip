@@ -136,6 +136,18 @@ export interface WakeQueueTransaction {
   }): Promise<DeferredWakeCandidate | null>;
   /** Sets `status = 'failed'` guarded by the current `deferred_issue_execution` status. */
   failDeferredWake(input: { companyId: string; wakeId: string; now: Date }): Promise<boolean>;
+  /**
+   * Leaves the wake on `deferred_issue_execution` because its agent is paused,
+   * and records the finishing run whose release reached it, so the same
+   * release can run again once the agent resumes. Guarded by the current
+   * deferred status.
+   */
+  holdDeferredWakeForPausedAgent(input: {
+    companyId: string;
+    wakeId: string;
+    finishingRunId: string;
+    now: Date;
+  }): Promise<boolean>;
   getPauseHoldFacts(input: {
     companyId: string;
     issueId: string;
