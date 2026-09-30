@@ -4718,3 +4718,215 @@ describe("sandbox git-bundle export transport", () => {
     expect(restoreLines.some((line) => line.includes("(0.0/0.0 MB)"))).toBe(false);
   });
 });
+
+describe("sandbox managed runtime restore of Git checkouts created in the sandbox", () => {
+  const cleanupDirs: string[] = [];
+
+  afterEach(async () => {
+    while (cleanupDirs.length > 0) {
+      const dir = cleanupDirs.pop();
+      if (!dir) continue;
+      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  const spec = (remoteCwd: string) => ({
+    transport: "sandbox" as const,
+    provider: "test",
+    sandboxId: "sandbox-checkouts",
+    remoteCwd,
+    timeoutMs: 30_000,
+    apiKey: null,
+  });
+
+  async function makeDirs(prefix: string) {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), prefix));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    return { rootDir, localWorkspaceDir, remoteWorkspaceDir };
+  }
+
+  // What an agent does when it clones a repository into its workspace: a new
+  // directory with its own `.git` and a committed file.
+  async function cloneInSandbox(checkoutDir: string): Promise<void> {
+    await initGitRepo(checkoutDir);
+    await writeFile(path.join(checkoutDir, "app.txt"), "checked out in the sandbox\n", "utf8");
+    await git(checkoutDir, ["add", "app.txt"]);
+    await git(checkoutDir, ["commit", "-qm", "sandbox work"]);
+  }
+
+  // A client with a native `syncOut` for the workspace restore: it copies the
+  // remote directory as-is, the way a provider that ignores `exclude` would.
+  function makeNativeRestoreClient(): SandboxManagedRuntimeClient {
+    const client = makeFilesystemClient();
+    client.syncOut = async (operations) => {
+      for (const operation of operations) {
+        for (const mapping of operation.files) {
+          if (mapping.kind === "directory") {
+            await mirrorDirectory(mapping.sourcePath, mapping.targetPath);
+          } else {
+            await mkdir(path.dirname(mapping.targetPath), { recursive: true });
+            await writeFile(mapping.targetPath, await readFile(mapping.sourcePath));
+          }
+        }
+      }
+      return {
+        operations: operations.map((operation) => ({
+          operationId: operation.operationId,
+          filesTransferred: operation.files.length,
+          bytesTransferred: 0,
+        })),
+      };
+    };
+    return client;
+  }
+
+  it.each([
+    ["tar fallback", () => makeFilesystemClient()],
+    ["native syncOut", () => makeNativeRestoreClient()],
+  ] as const)(
+    "does not copy a checkout created in the sandbox back to the host without its history (%s)",
+    async (_label, makeClient) => {
+      const { localWorkspaceDir, remoteWorkspaceDir } = await makeDirs("paperclip-sandbox-checkout-");
+      await writeFile(path.join(localWorkspaceDir, "notes.md"), "host\n", "utf8");
+      const prepared = await prepareSandboxManagedRuntime({
+        spec: spec(remoteWorkspaceDir),
+        adapterKey: "test-adapter",
+        client: makeClient(),
+        workspaceLocalDir: localWorkspaceDir,
+      });
+
+      await cloneInSandbox(path.join(remoteWorkspaceDir, "service"));
+      await cloneInSandbox(path.join(remoteWorkspaceDir, "libs", "client"));
+      await writeFile(path.join(remoteWorkspaceDir, "libs", "README.md"), "from sandbox\n", "utf8");
+      await writeFile(path.join(remoteWorkspaceDir, "notes.md"), "sandbox\n", "utf8");
+      const lines: string[] = [];
+      await prepared.restoreWorkspace((line) => { lines.push(line); });
+
+      // Ordinary changes come back as before.
+      await expect(readFile(path.join(localWorkspaceDir, "notes.md"), "utf8")).resolves.toBe("sandbox\n");
+      await expect(readFile(path.join(localWorkspaceDir, "libs", "README.md"), "utf8")).resolves.toBe("from sandbox\n");
+      // The checkouts' `.git` never leaves the sandbox, so their working trees
+      // stay there too instead of landing on the host as plain, stale copies
+      // that the next run would receive as "not a git repository".
+      await expect(stat(path.join(localWorkspaceDir, "service"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(path.join(localWorkspaceDir, "libs", "client"))).rejects.toMatchObject({ code: "ENOENT" });
+      const notice = lines.find((line) => line.includes("Git checkouts created in the sandbox"));
+      expect(notice).toBeDefined();
+      expect(notice).toContain("\"libs/client\"");
+      expect(notice).toContain("\"service\"");
+      // The listing is scratch state of the restore, not workspace content.
+      await expect(
+        readdir(path.join(remoteWorkspaceDir, ".paperclip-runtime", "test-adapter")),
+      ).resolves.not.toContain("nested-git-checkouts.nul");
+    },
+  );
+
+  it("keeps restoring a host directory that became a Git repository in the sandbox", async () => {
+    const { localWorkspaceDir, remoteWorkspaceDir } = await makeDirs("paperclip-sandbox-checkout-host-dir-");
+    await mkdir(path.join(localWorkspaceDir, "docs"), { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "docs", "guide.md"), "host\n", "utf8");
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: spec(remoteWorkspaceDir),
+      adapterKey: "test-adapter",
+      client: makeFilesystemClient(),
+      workspaceLocalDir: localWorkspaceDir,
+    });
+
+    // The host staged `docs/`, so the run's edits in it are host work even
+    // after the agent turned the directory into a repository.
+    await git(path.join(remoteWorkspaceDir, "docs"), ["init", "-q"]);
+    await writeFile(path.join(remoteWorkspaceDir, "docs", "guide.md"), "edited in the sandbox\n", "utf8");
+    await writeFile(path.join(remoteWorkspaceDir, "docs", "new.md"), "added in the sandbox\n", "utf8");
+    await prepared.restoreWorkspace();
+
+    await expect(readFile(path.join(localWorkspaceDir, "docs", "guide.md"), "utf8")).resolves.toBe("edited in the sandbox\n");
+    await expect(readFile(path.join(localWorkspaceDir, "docs", "new.md"), "utf8")).resolves.toBe("added in the sandbox\n");
+    await expect(stat(path.join(localWorkspaceDir, "docs", ".git"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not add a checkout created in the sandbox to a Git-backed host workspace as untracked files", async () => {
+    const { localWorkspaceDir, remoteWorkspaceDir } = await makeDirs("paperclip-sandbox-checkout-git-");
+    await initGitRepo(localWorkspaceDir);
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: spec(remoteWorkspaceDir),
+      adapterKey: "test-adapter",
+      client: makeFilesystemClient(),
+      workspaceLocalDir: localWorkspaceDir,
+    });
+
+    await cloneInSandbox(path.join(remoteWorkspaceDir, "deps", "api"));
+    await writeFile(path.join(remoteWorkspaceDir, "README.md"), "edited in the sandbox\n", "utf8");
+    await prepared.restoreWorkspace();
+
+    await expect(readFile(path.join(localWorkspaceDir, "README.md"), "utf8")).resolves.toBe("edited in the sandbox\n");
+    await expect(stat(path.join(localWorkspaceDir, "deps", "api"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await git(localWorkspaceDir, ["status", "--porcelain", "--untracked-files=all"])).toBe("M README.md");
+  });
+
+  it("acts only on well-formed, complete entries of the sandbox's checkout listing", async () => {
+    const { rootDir, localWorkspaceDir, remoteWorkspaceDir } = await makeDirs("paperclip-sandbox-checkout-listing-");
+    await writeFile(path.join(localWorkspaceDir, "notes.md"), "host\n", "utf8");
+    await writeFile(path.join(rootDir, "outside.txt"), "outside the workspace\n", "utf8");
+    const client = makeFilesystemClient();
+    const runRemote = client.run.bind(client);
+    client.run = async (command, options) => {
+      const listPath = path.join(remoteWorkspaceDir, ".paperclip-runtime", "test-adapter", "nested-git-checkouts.nul");
+      if (!command.includes("nested-git-checkouts.nul")) return await runRemote(command, options);
+      // The sandbox controls this listing: only `service` is a usable entry.
+      await writeFile(
+        listPath,
+        "./service/.git\0./../outside.txt/.git\0./ex*ra/.git\0.//double/.git\0./notes.md\0./partial/.git",
+      );
+    };
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: spec(remoteWorkspaceDir),
+      adapterKey: "test-adapter",
+      client,
+      workspaceLocalDir: localWorkspaceDir,
+    });
+
+    for (const relative of ["service", "ex*ra", "double", "partial"]) {
+      await mkdir(path.join(remoteWorkspaceDir, relative), { recursive: true });
+      await writeFile(path.join(remoteWorkspaceDir, relative, "file.txt"), `${relative}\n`, "utf8");
+    }
+    await writeFile(path.join(remoteWorkspaceDir, "notes.md"), "sandbox\n", "utf8");
+    await prepared.restoreWorkspace();
+
+    await expect(stat(path.join(localWorkspaceDir, "service"))).rejects.toMatchObject({ code: "ENOENT" });
+    for (const relative of ["ex*ra", "double", "partial"]) {
+      await expect(readFile(path.join(localWorkspaceDir, relative, "file.txt"), "utf8")).resolves.toBe(`${relative}\n`);
+    }
+    await expect(readFile(path.join(localWorkspaceDir, "notes.md"), "utf8")).resolves.toBe("sandbox\n");
+    await expect(readFile(path.join(rootDir, "outside.txt"), "utf8")).resolves.toBe("outside the workspace\n");
+  });
+
+  it("restores as before when the sandbox cannot list its checkouts", async () => {
+    const { localWorkspaceDir, remoteWorkspaceDir } = await makeDirs("paperclip-sandbox-checkout-unlisted-");
+    await writeFile(path.join(localWorkspaceDir, "notes.md"), "host\n", "utf8");
+    const client = makeFilesystemClient();
+    const readRemoteFile = client.readFile.bind(client);
+    client.readFile = async (remotePath, options) => {
+      if (remotePath.endsWith("nested-git-checkouts.nul")) throw new Error("listing unavailable");
+      return await readRemoteFile(remotePath, options);
+    };
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: spec(remoteWorkspaceDir),
+      adapterKey: "test-adapter",
+      client,
+      workspaceLocalDir: localWorkspaceDir,
+    });
+
+    await cloneInSandbox(path.join(remoteWorkspaceDir, "service"));
+    await writeFile(path.join(remoteWorkspaceDir, "notes.md"), "sandbox\n", "utf8");
+    await prepared.restoreWorkspace();
+
+    // The listing only narrows the restore; losing it never fails the run's restore.
+    await expect(readFile(path.join(localWorkspaceDir, "notes.md"), "utf8")).resolves.toBe("sandbox\n");
+    await expect(readFile(path.join(localWorkspaceDir, "service", "app.txt"), "utf8")).resolves.toBe(
+      "checked out in the sandbox\n",
+    );
+  });
+});

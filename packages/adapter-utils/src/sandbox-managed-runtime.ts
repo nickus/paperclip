@@ -755,6 +755,52 @@ export function buildReusedBuildDirCommandsForTest(input: {
   return { stash: buildStashBuildDirsCommand(input), restore: buildRestoreBuildDirsCommand(input) };
 }
 
+// Scratch file, under the runtime root, that lists the Git checkouts nested in
+// the sandbox workspace for the restore (see buildListNestedGitCheckoutsCommand).
+const NESTED_GIT_CHECKOUT_LIST_NAME = "nested-git-checkouts.nul";
+// Bounds on that listing: it is sandbox output, so the host reads a fixed
+// amount of it and acts on a fixed number of checkouts. A checkout past either
+// bound is restored as before.
+const NESTED_GIT_CHECKOUT_LIST_MAX_BYTES = 64 * 1024;
+const NESTED_GIT_CHECKOUT_MAX_COUNT = 128;
+
+// Named builder (C3): write the `.git` entry of every Git checkout nested in the
+// sandbox workspace (`./<path>/.git`, NUL-terminated) to `listPath`. It does not
+// descend into a `.git`, the runtime root, or the heavy directories a restore
+// never brings back. Best effort: an unreadable directory is skipped, and the
+// output is cut at a fixed size (the reader drops a cut, unterminated entry).
+function buildListNestedGitCheckoutsCommand(input: {
+  workspaceRemoteDir: string;
+  listPath: string;
+}): string {
+  const heavyDirNameTest = SANDBOX_WORKSPACE_HEAVY_DIR_NAMES.map((name) => `-name ${shellQuote(name)}`).join(" -o ");
+  return (
+    `mkdir -p -- ${shellQuote(path.posix.dirname(input.listPath))} && cd -- ${shellQuote(input.workspaceRemoteDir)} && ` +
+    `{ find . -mindepth 1 \\( -path ./.paperclip-runtime -o ${heavyDirNameTest} \\) -prune -o ` +
+    `-name .git -prune -print0 2>/dev/null; true; } | ` +
+    `head -c ${NESTED_GIT_CHECKOUT_LIST_MAX_BYTES} > ${shellQuote(input.listPath)}`
+  );
+}
+
+// The workspace-relative directory of each checkout in a listing written by
+// buildListNestedGitCheckoutsCommand. Only NUL-terminated `./<path>/.git`
+// entries count, so the workspace root's own `.git` and an entry cut by the
+// size bound are dropped. So is a path with an empty, `.` or `..` segment, or
+// with a glob character: each result becomes a literal restore exclude.
+function parseNestedGitCheckoutList(bytes: Buffer): string[] {
+  const entries = bytes.toString("utf8").split("\0");
+  entries.pop();
+  const checkouts = new Set<string>();
+  for (const entry of entries) {
+    if (!entry.startsWith("./") || !entry.endsWith("/.git")) continue;
+    const relative = entry.slice(2, -"/.git".length);
+    if (!relative || /[*?[\\]/.test(relative)) continue;
+    if (relative.split("/").some((segment) => segment === "" || segment === "." || segment === "..")) continue;
+    checkouts.add(relative);
+  }
+  return [...checkouts];
+}
+
 // Named builder (C3): remove paths deleted in the host git worktree from the
 // sandbox workspace. Every path is shell-quoted; the caller supplies only
 // already-confined relative paths from the git snapshot.
@@ -1817,6 +1863,34 @@ export async function prepareSandboxManagedRuntime(input: {
     (input.assets ?? []).map((asset) => [asset.key, path.posix.join(runtimeRootDir, asset.key)]),
   );
 
+  // The Git checkouts the run created inside the sandbox workspace (an agent's
+  // `git clone`), as workspace-relative paths. The restore leaves them out:
+  // a nested `.git` never leaves the sandbox, so its working tree alone would
+  // land on the host as a plain directory, frozen at this run's checkout, that
+  // every later run is staged with as "not a git repository". A checkout at a
+  // path the host staged, or at one the restore already leaves out, is not
+  // listed: a host directory that the run turned into a repository still holds
+  // host work and is restored as before. The listing only narrows the restore,
+  // so any failure to produce it restores everything as before.
+  const listSandboxOnlyGitCheckouts = async (baseline: DirectorySnapshot, restoreExcludes: string[]): Promise<string[]> => {
+    const listPath = path.posix.join(runtimeRootDir, NESTED_GIT_CHECKOUT_LIST_NAME);
+    let listed: string[];
+    try {
+      await input.client.run(
+        `sh -c ${shellQuote(buildListNestedGitCheckoutsCommand({ workspaceRemoteDir, listPath }))}`,
+        { timeoutMs: input.spec.timeoutMs },
+      );
+      listed = parseNestedGitCheckoutList(toBuffer(await input.client.readFile(listPath)));
+    } catch {
+      return [];
+    } finally {
+      await input.client.remove(listPath).catch(() => undefined);
+    }
+    return listed
+      .filter((relative) => !baseline.entries.has(relative) && !shouldExcludePath(relative, restoreExcludes))
+      .slice(0, NESTED_GIT_CHECKOUT_MAX_COUNT);
+  };
+
   return {
     spec: input.spec,
     workspaceLocalDir: input.workspaceLocalDir,
@@ -1982,6 +2056,20 @@ export async function prepareSandboxManagedRuntime(input: {
                   }
                 }
 
+                const sandboxOnlyCheckouts = await listSandboxOnlyGitCheckouts(baselineSnapshot!, workspaceRestoreExclude);
+                if (sandboxOnlyCheckouts.length > 0) {
+                  try {
+                    await restoreSink?.(
+                      `[paperclip] Git checkouts created in the sandbox were not restored to the workspace, ` +
+                        `because their Git history cannot leave the sandbox: ${JSON.stringify(sandboxOnlyCheckouts)}. ` +
+                        `Push their work to a remote to keep it. To give every run a checkout of a repository, ` +
+                        `add it to the project.\n`,
+                    );
+                  } catch {
+                    // A broken log sink must not fail the restore.
+                  }
+                }
+
                 await emitRuntimeStatus(input.onRuntimeProgress, "restore", "Restoring workspace from environment");
                 const extractedDir = path.join(tempDir, "workspace");
                 if (nativeSyncOut) {
@@ -2049,7 +2137,14 @@ export async function prepareSandboxManagedRuntime(input: {
                 });
                 try {
                 await mergeDirectoryWithBaseline({
-                  baseline: mergeBaseline,
+                  // The host baseline holds nothing under a sandbox-only checkout,
+                  // so leaving its path out of the merge never deletes host files.
+                  // The transfer above still carries it: archive excludes match
+                  // at any depth, so a literal path there could also drop a
+                  // same-named directory elsewhere that the host must receive.
+                  baseline: sandboxOnlyCheckouts.length > 0
+                    ? { ...mergeBaseline, exclude: mergeExcludes(mergeBaseline.exclude, sandboxOnlyCheckouts) }
+                    : mergeBaseline,
                   sourceDir: extractedDir,
                   targetDir: input.workspaceLocalDir,
                   beforeApply: gitHeadToIntegrate
