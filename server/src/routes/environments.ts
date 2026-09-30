@@ -328,17 +328,22 @@ function assertNoClientPlatformProvisionedMarkers(metadata: unknown): void {
 const CANONICAL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Read a path id that names an environment, an environment lease or a custom
- * image setup session. All three have UUID keys. Any other value cannot name
- * a row, and passed on to PostgreSQL it fails the query ("invalid input
- * syntax for type uuid"), so reject it as a bad request instead of a 500.
+ * Check an id that names a row with a UUID key: an environment, an
+ * environment lease, a custom image setup session or a company. Any other
+ * value cannot name a row, and passed on to PostgreSQL it fails the query
+ * ("invalid input syntax for type uuid"), so reject it as a bad request
+ * instead of a 500.
  */
-function readUuidParam(req: Request, name: string, label: string): string {
-  const value = req.params[name];
+function assertUuidId(value: unknown, label: string): string {
   if (typeof value !== "string" || !CANONICAL_UUID_RE.test(value)) {
     throw badRequest(`Invalid ${label} ID`);
   }
   return value;
+}
+
+/** Read a UUID path id (see assertUuidId). */
+function readUuidParam(req: Request, name: string, label: string): string {
+  return assertUuidId(req.params[name], label);
 }
 
 export function environmentRoutes(
@@ -494,7 +499,9 @@ export function environmentRoutes(
         : null;
     if (queryCompanyId) {
       assertCustomImageCompanyAccess(req, queryCompanyId);
-      return queryCompanyId;
+      // The company id goes on to activity rows and secret lookups, so a
+      // malformed one must fail here, before the route changes anything.
+      return assertUuidId(queryCompanyId, "company");
     }
     if (req.actor.type === "board" && req.actor.companyIds?.length === 1) {
       return req.actor.companyIds[0]!;
@@ -543,7 +550,9 @@ export function environmentRoutes(
         : typeof req.query.companyId === "string" && req.query.companyId.trim().length > 0
           ? req.query.companyId.trim()
           : null;
-    if (routeCompanyId) return routeCompanyId;
+    // An explicit company id scopes secret reads and writes, so reject a
+    // malformed one with 400 instead of letting the secret queries fail.
+    if (routeCompanyId) return assertUuidId(routeCompanyId, "company");
     const bindingCompanyIds = await secrets.listBindingCompanyIdsForTarget({
       targetType: "environment",
       targetId: environmentId,
@@ -1045,8 +1054,9 @@ export function environmentRoutes(
   });
 
   router.post("/companies/:companyId/environments", validate(createEnvironmentSchema), async (req, res) => {
-    const companyId = req.params.companyId as string;
     assertCanAccessInstanceEnvironments(req);
+    // The company id scopes the new environment's secret bindings.
+    const companyId = readUuidParam(req, "companyId", "company");
     assertNoClientPlatformProvisionedMarkers(req.body.metadata);
     if (req.body.driver === "local") {
       const existingLocal = await svc.list({ driver: "local" });
@@ -1454,8 +1464,9 @@ export function environmentRoutes(
     "/companies/:companyId/environments/probe-config",
     validate(probeEnvironmentConfigSchema),
     async (req, res) => {
-      const companyId = req.params.companyId as string;
       assertCanAccessInstanceEnvironments(req);
+      // The company id scopes the secret refs the draft config resolves.
+      const companyId = readUuidParam(req, "companyId", "company");
       if (req.body.driver === "sandbox") {
         await assertCanReadSecretsForDraftProbe(req, companyId);
       }

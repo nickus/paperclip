@@ -1065,9 +1065,16 @@ const startAdapterLoginSessionSchema =
     adapterType: true,
   });
 
+// Environment, lease, custom image setup session and company keys are UUIDs,
+// and the environment routes answer any other id with 400. OpenAPI patterns
+// carry no RegExp flags, so spell out both cases.
+const environmentRouteUuidParamSchema = z.string()
+  .regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/)
+  .describe("UUID; malformed values return 400");
+
 const environmentCustomImageCompanyQuerySchema = z
   .object({
-    companyId: z.string().optional(),
+    companyId: environmentRouteUuidParamSchema.optional(),
   })
   .strict();
 
@@ -8159,18 +8166,11 @@ registry.registerPath({
   tags: ["environments"],
   summary: "Create an environment",
   request: {
-    params: z.object({ companyId: z.string() }),
+    params: z.object({ companyId: environmentRouteUuidParamSchema }),
     body: jsonBody(createEnvironmentSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
-
-// Environment, lease and custom image setup session keys are UUIDs, and the
-// routes answer any other path id with 400. OpenAPI patterns carry no RegExp
-// flags, so spell out both cases.
-const environmentRouteUuidParamSchema = z.string()
-  .regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/)
-  .describe("UUID; malformed values return 400");
 
 registry.registerPath({
   method: "get",
@@ -8273,7 +8273,7 @@ registry.registerPath({
   tags: ["environments"],
   summary: "Probe environment config",
   request: {
-    params: z.object({ companyId: z.string() }),
+    params: z.object({ companyId: environmentRouteUuidParamSchema }),
     body: jsonBody(probeEnvironmentConfigSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },

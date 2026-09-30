@@ -106,10 +106,12 @@ vi.mock("../services/plugin-environment-driver.js", () => ({
   })),
 }));
 
-// Environment and setup session ids are UUIDs: the routes reject
+// Environment, setup session and company ids are UUIDs: the routes reject
 // any other form with a 400 before they look the record up.
 const ENV_ID = "11111111-1111-4111-8111-111111111111";
 const SESSION_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const COMPANY_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const OTHER_COMPANY_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
 function createEnvironment(overrides: Record<string, unknown> = {}) {
   return {
@@ -134,7 +136,7 @@ function createEnvironment(overrides: Record<string, unknown> = {}) {
 function createTemplate(overrides: Record<string, unknown> = {}) {
   return {
     id: "template-1",
-    companyId: "company-1",
+    companyId: COMPANY_ID,
     environmentId: ENV_ID,
     provider: "daytona",
     templateKind: "snapshot",
@@ -157,7 +159,7 @@ function createTemplate(overrides: Record<string, unknown> = {}) {
 function createSession(overrides: Record<string, unknown> = {}) {
   return {
     id: SESSION_ID,
-    companyId: "company-1",
+    companyId: COMPANY_ID,
     environmentId: ENV_ID,
     templateId: "template-1",
     promotedTemplateId: null,
@@ -180,7 +182,7 @@ function createSession(overrides: Record<string, unknown> = {}) {
     },
     connectionSecretRef: null,
     metadata: {
-      setupRpcCompanyId: "company-1",
+      setupRpcCompanyId: COMPANY_ID,
       safeLabel: "setup",
       connectUrl: "https://203.0.113.10/setup",
     },
@@ -211,7 +213,7 @@ function boardActor(overrides: Record<string, unknown> = {}) {
     type: "board",
     userId: "user-1",
     source: "session",
-    companyIds: ["company-1"],
+    companyIds: [COMPANY_ID],
     isInstanceAdmin: true,
     ...overrides,
   };
@@ -221,7 +223,7 @@ function agentActor() {
   return {
     type: "agent",
     agentId: "agent-1",
-    companyId: "company-1",
+    companyId: COMPANY_ID,
     source: "agent_key",
     runId: "run-1",
   };
@@ -248,7 +250,7 @@ describe("environment customImage setup routes", () => {
     environmentCustomImageTerminalSessionStore.clear();
     environmentCustomImageTerminalConnectionRegistry.clear();
 
-    mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
+    mockInstanceSettingsService.listCompanyIds.mockResolvedValue([COMPANY_ID]);
     mockEnvironmentService.getById.mockResolvedValue(createEnvironment());
     mockEnvironmentCustomImageService.getOverview.mockResolvedValue({
       activeTemplate: null,
@@ -307,7 +309,7 @@ describe("environment customImage setup routes", () => {
 
   it("starts a setup session, returns the live payload, and logs redacted details", async () => {
     const res = await request(createApp(boardActor()))
-      .post(`/api/environments/${ENV_ID}/custom-image-setup-sessions?companyId=company-1`)
+      .post(`/api/environments/${ENV_ID}/custom-image-setup-sessions?companyId=${COMPANY_ID}`)
       .send({ ttlSeconds: 3600 });
 
     expect(res.status).toBe(201);
@@ -320,7 +322,7 @@ describe("environment customImage setup routes", () => {
         userId: "user-1",
         agentId: null,
       },
-      secretContextCompanyId: "company-1",
+      secretContextCompanyId: COMPANY_ID,
     });
     const activity = loggedActivityJson();
     expect(activity).not.toContain("203.0.113.10");
@@ -408,7 +410,7 @@ describe("environment customImage setup routes", () => {
 
   it("denies terminal token minting to non-admin board users before connection payload refresh", async () => {
     const res = await request(createApp(boardActor({
-      companyIds: ["company-2"],
+      companyIds: [OTHER_COMPANY_ID],
       isInstanceAdmin: false,
     })))
       .post(`/api/environment-custom-image-setup-sessions/${SESSION_ID}/terminal-session-token`)
@@ -537,7 +539,7 @@ describe("environment customImage setup routes", () => {
   it("denies agent API key actors before customImage state or payloads are read", async () => {
     const app = createApp(agentActor());
     const start = await request(app)
-      .post(`/api/environments/${ENV_ID}/custom-image-setup-sessions?companyId=company-1`)
+      .post(`/api/environments/${ENV_ID}/custom-image-setup-sessions?companyId=${COMPANY_ID}`)
       .send({});
     const status = await request(app)
       .get(`/api/environment-custom-image-setup-sessions/${SESSION_ID}`);
@@ -553,7 +555,7 @@ describe("environment customImage setup routes", () => {
     mockEnvironmentCustomImageService.getSessionById.mockResolvedValue(createSession());
 
     const res = await request(createApp(boardActor({
-      companyIds: ["company-2"],
+      companyIds: [OTHER_COMPANY_ID],
       isInstanceAdmin: false,
     })))
       .get(`/api/environment-custom-image-setup-sessions/${SESSION_ID}`);
@@ -564,10 +566,10 @@ describe("environment customImage setup routes", () => {
   });
 
   it("denies single-company fallback when the board actor is not a member", async () => {
-    mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-2"]);
+    mockInstanceSettingsService.listCompanyIds.mockResolvedValue([OTHER_COMPANY_ID]);
 
     const res = await request(createApp(boardActor({
-      companyIds: ["company-1"],
+      companyIds: [COMPANY_ID],
       isInstanceAdmin: false,
     })))
       .post(`/api/environments/${ENV_ID}/custom-image-setup-sessions`)
@@ -581,7 +583,7 @@ describe("environment customImage setup routes", () => {
     mockEnvironmentCustomImageService.getSessionById.mockResolvedValue(createSession());
     const terminal = environmentCustomImageTerminalSessionStore.create({
       setupSessionId: SESSION_ID,
-      companyId: "company-1",
+      companyId: COMPANY_ID,
       environmentId: ENV_ID,
       provider: "daytona",
       ssh: { username: "token-secret", host: "203.0.113.10", port: 2222 },
@@ -633,10 +635,10 @@ describe("environment customImage setup routes", () => {
   it("rolls back and disables active templates through company-scoped routes", async () => {
     const app = createApp(boardActor());
     const rollback = await request(app)
-      .post(`/api/environments/${ENV_ID}/custom-image-template/rollback?companyId=company-1`)
+      .post(`/api/environments/${ENV_ID}/custom-image-template/rollback?companyId=${COMPANY_ID}`)
       .send({});
     const disable = await request(app)
-      .delete(`/api/environments/${ENV_ID}/custom-image-template?companyId=company-1&deleteProviderTemplate=true`);
+      .delete(`/api/environments/${ENV_ID}/custom-image-template?companyId=${COMPANY_ID}&deleteProviderTemplate=true`);
 
     expect(rollback.status).toBe(200);
     expect(disable.status).toBe(200);
@@ -655,7 +657,7 @@ describe("environment customImage setup routes", () => {
 
   it("relinks the active template through the company-scoped route", async () => {
     const res = await request(createApp(boardActor()))
-      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=company-1`)
+      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=${COMPANY_ID}`)
       .send({ confirmBootSourceDrift: true });
 
     expect(res.status).toBe(200);
@@ -670,14 +672,14 @@ describe("environment customImage setup routes", () => {
         runId: null,
         agentApiKeyId: null,
       },
-      companyId: "company-1",
+      companyId: COMPANY_ID,
     });
   });
 
   it("defaults the confirmation flag to false and rejects unknown body keys", async () => {
     const app = createApp(boardActor());
     const withoutFlag = await request(app)
-      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=company-1`)
+      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=${COMPANY_ID}`)
       .send({});
     expect(withoutFlag.status).toBe(200);
     expect(mockEnvironmentCustomImageService.relinkActiveTemplate).toHaveBeenCalledExactlyOnceWith(
@@ -687,7 +689,7 @@ describe("environment customImage setup routes", () => {
     // The strict schema rejects unknown keys before the handler runs, so the
     // relink service is never reached for the malformed body.
     const unknownKey = await request(app)
-      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=company-1`)
+      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=${COMPANY_ID}`)
       .send({ confirmBootSourceDrift: false, unexpected: true });
     expect(unknownKey.status).not.toBe(200);
     expect(mockEnvironmentCustomImageService.relinkActiveTemplate).toHaveBeenCalledTimes(1);
@@ -702,7 +704,7 @@ describe("environment customImage setup routes", () => {
     });
 
     const res = await request(createApp(boardActor()))
-      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=company-1`)
+      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=${COMPANY_ID}`)
       .send({});
 
     expect(res.status).toBe(409);
@@ -710,7 +712,7 @@ describe("environment customImage setup routes", () => {
 
   it("denies agent API key actors before the relink service is called", async () => {
     const res = await request(createApp(agentActor()))
-      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=company-1`)
+      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=${COMPANY_ID}`)
       .send({});
     expect(res.status).toBe(403);
     expect(mockEnvironmentCustomImageService.relinkActiveTemplate).not.toHaveBeenCalled();
@@ -718,10 +720,10 @@ describe("environment customImage setup routes", () => {
 
   it("denies non-admin board users before the relink service is called", async () => {
     const res = await request(createApp(boardActor({
-      companyIds: ["company-2"],
+      companyIds: [OTHER_COMPANY_ID],
       isInstanceAdmin: false,
     })))
-      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=company-1`)
+      .post(`/api/environments/${ENV_ID}/custom-image-template/relink?companyId=${COMPANY_ID}`)
       .send({});
     expect(res.status).toBe(403);
     expect(mockEnvironmentCustomImageService.relinkActiveTemplate).not.toHaveBeenCalled();
@@ -743,7 +745,7 @@ describe("environment customImage setup routes", () => {
       ];
       for (const [method, suffix, body] of routes) {
         for (const id of malformedIds) {
-          const req = request(app)[method](`/api/environments/${encodeURIComponent(id)}${suffix}?companyId=company-1`);
+          const req = request(app)[method](`/api/environments/${encodeURIComponent(id)}${suffix}?companyId=${COMPANY_ID}`);
           const res = body ? await req.send(body) : await req;
           expect(res.status, `${method} ${id}${suffix}`).toBe(400);
           expect(res.body).toEqual({ error: "Invalid environment ID" });
@@ -773,12 +775,38 @@ describe("environment customImage setup routes", () => {
       expect(mockEnvironmentCustomImageService.getSessionById).not.toHaveBeenCalled();
     });
 
+    it("rejects a malformed companyId query with 400 before the custom image service runs", async () => {
+      // The company id is only written to the activity log after the service
+      // call, so it must be checked up front or a rollback would take effect
+      // and then fail.
+      const app = createApp(boardActor());
+      const routes: Array<[method: "get" | "post" | "delete", suffix: string, body?: object]> = [
+        ["get", "/custom-image-template"],
+        ["post", "/custom-image-setup-sessions", {}],
+        ["post", "/custom-image-template/rollback", {}],
+        ["post", "/custom-image-template/relink", { confirmBootSourceDrift: true }],
+        ["delete", "/custom-image-template"],
+      ];
+      for (const [method, suffix, body] of routes) {
+        for (const companyId of ["1a2b3c4d", "undefined"]) {
+          const req = request(app)[method](`/api/environments/${ENV_ID}${suffix}?companyId=${companyId}`);
+          const res = body ? await req.send(body) : await req;
+          expect(res.status, `${method} ${suffix} ${companyId}`).toBe(400);
+          expect(res.body).toEqual({ error: "Invalid company ID" });
+        }
+      }
+      for (const mock of Object.values(mockEnvironmentCustomImageService)) {
+        expect(mock).not.toHaveBeenCalled();
+      }
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
     it("keeps the access checks ahead of id validation", async () => {
       const res = await request(createApp(agentActor()))
         .get("/api/environment-custom-image-setup-sessions/undefined");
       expect(res.status).toBe(403);
-      const template = await request(createApp(boardActor({ companyIds: ["company-2"], isInstanceAdmin: false })))
-        .delete("/api/environments/undefined/custom-image-template?companyId=company-1");
+      const template = await request(createApp(boardActor({ companyIds: [OTHER_COMPANY_ID], isInstanceAdmin: false })))
+        .delete(`/api/environments/undefined/custom-image-template?companyId=${COMPANY_ID}`);
       expect(template.status).toBe(403);
     });
   });

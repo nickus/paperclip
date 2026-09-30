@@ -984,6 +984,26 @@ describe("environment path ID OpenAPI contract", () => {
     }
     expect(checked).toBe(17);
   });
+
+  it("publishes the UUID constraint on the company ids the environment routes check", async () => {
+    const response = await request(createApp()).get("/api/openapi.json");
+    expect(response.status).toBe(200);
+    const companyIdParameter = (path: string, method: string, location: "path" | "query") =>
+      response.body.paths[path][method].parameters.find(
+        (param: { name: string; in: string }) => param.name === "companyId" && param.in === location,
+      );
+    const checkedParameters = [
+      companyIdParameter("/api/companies/{companyId}/environments", "post", "path"),
+      companyIdParameter("/api/companies/{companyId}/environments/probe-config", "post", "path"),
+      companyIdParameter("/api/environments/{environmentId}/custom-image-template/rollback", "post", "query"),
+      companyIdParameter("/api/environments/{environmentId}/custom-image-template", "delete", "query"),
+    ];
+    for (const parameter of checkedParameters) {
+      const pattern = new RegExp(parameter.schema.pattern);
+      expect(pattern.test("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")).toBe(true);
+      expect(pattern.test("1a2b3c4d")).toBe(false);
+    }
+  });
 });
 
 it("documents the account binding required for preference reads", () => {

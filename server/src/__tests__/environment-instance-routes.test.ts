@@ -97,9 +97,11 @@ vi.mock("../services/plugin-environment-driver.js", () => ({
   deletePluginEnvironmentTemplate: vi.fn(),
 }));
 
-// Environment ids are UUIDs: the routes reject
+// Environment and company ids are UUIDs: the routes reject
 // any other form with a 400 before they look the record up.
 const ENV_ID = "11111111-1111-4111-8111-111111111111";
+const COMPANY_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const OTHER_COMPANY_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
 function createEnvironment(overrides: Record<string, unknown> = {}) {
   const now = new Date("2026-06-20T00:00:00.000Z");
@@ -161,7 +163,7 @@ describe("environment instance routes", () => {
     mockSecretService.replaceSecretRefsForInstanceTarget.mockReset();
     mockSecretService.replaceSecretRefsForInstanceTarget.mockResolvedValue([]);
 
-    mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1", "company-2"]);
+    mockInstanceSettingsService.listCompanyIds.mockResolvedValue([COMPANY_ID, OTHER_COMPANY_ID]);
     mockEnvironmentService.list.mockResolvedValue([]);
     mockEnvironmentService.create.mockResolvedValue(createEnvironment());
     mockSecretService.normalizeEnvBindingsForPersistence.mockImplementation(async (_companyId, env) => env ?? {});
@@ -179,7 +181,7 @@ describe("environment instance routes", () => {
       isInstanceAdmin: true,
     });
 
-    const res = await request(app).get("/api/companies/company-1/environments?driver=local");
+    const res = await request(app).get(`/api/companies/${COMPANY_ID}/environments?driver=local`);
 
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
@@ -195,12 +197,12 @@ describe("environment instance routes", () => {
       type: "board",
       userId: "user-1",
       source: "session",
-      companyIds: ["company-1"],
-      memberships: [{ companyId: "company-1", membershipRole: "member", status: "active" }],
+      companyIds: [COMPANY_ID],
+      memberships: [{ companyId: COMPANY_ID, membershipRole: "member", status: "active" }],
       isInstanceAdmin: false,
     });
 
-    const res = await request(app).get("/api/companies/company-1/environments");
+    const res = await request(app).get(`/api/companies/${COMPANY_ID}/environments`);
 
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
@@ -211,12 +213,12 @@ describe("environment instance routes", () => {
     const app = createApp({
       type: "agent",
       agentId: "agent-1",
-      companyId: "company-1",
+      companyId: COMPANY_ID,
       source: "agent_key",
       runId: "run-1",
     });
 
-    const res = await request(app).get("/api/companies/company-1/environments");
+    const res = await request(app).get(`/api/companies/${COMPANY_ID}/environments`);
 
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("Board access required");
@@ -227,12 +229,12 @@ describe("environment instance routes", () => {
       type: "board",
       userId: "user-1",
       source: "session",
-      companyIds: ["company-1"],
+      companyIds: [COMPANY_ID],
       isInstanceAdmin: false,
     });
 
     const res = await request(app)
-      .post("/api/companies/company-1/environments")
+      .post(`/api/companies/${COMPANY_ID}/environments`)
       .send({
         name: "Shared Local",
         driver: "local",
@@ -253,7 +255,7 @@ describe("environment instance routes", () => {
     });
 
     const res = await request(app)
-      .post("/api/companies/company-1/environments")
+      .post(`/api/companies/${COMPANY_ID}/environments`)
       .send({
         name: "Shared Local",
         driver: "local",
@@ -276,13 +278,13 @@ describe("environment instance routes", () => {
       { db: expect.anything() },
     );
     expect(mockSecretService.syncEnvBindingsForTarget).toHaveBeenCalledWith(
-      "company-1",
+      COMPANY_ID,
       { targetType: "environment", targetId: ENV_ID },
       {},
       { db: expect.anything() },
     );
     expect(mockLogActivity).toHaveBeenCalledTimes(2);
-    expect(mockLogActivity.mock.calls.map((call) => call[1].companyId)).toEqual(["company-1", "company-2"]);
+    expect(mockLogActivity.mock.calls.map((call) => call[1].companyId)).toEqual([COMPANY_ID, OTHER_COMPANY_ID]);
   });
 
   it("normalizes and syncs environment envVars on create", async () => {
@@ -299,7 +301,7 @@ describe("environment instance routes", () => {
     });
 
     const res = await request(app)
-      .post("/api/companies/company-1/environments")
+      .post(`/api/companies/${COMPANY_ID}/environments`)
       .send({
         name: "Shared Local",
         driver: "local",
@@ -309,7 +311,7 @@ describe("environment instance routes", () => {
 
     expect(res.status).toBe(201);
     expect(mockSecretService.normalizeEnvBindingsForPersistence).toHaveBeenCalledWith(
-      "company-1",
+      COMPANY_ID,
       envVars,
       expect.objectContaining({ fieldPath: "envVars" }),
     );
@@ -319,7 +321,7 @@ describe("environment instance routes", () => {
       { db: expect.anything() },
     );
     expect(mockSecretService.syncEnvBindingsForTarget).toHaveBeenCalledWith(
-      "company-1",
+      COMPANY_ID,
       { targetType: "environment", targetId: ENV_ID },
       envVars,
       { db: expect.anything() },
