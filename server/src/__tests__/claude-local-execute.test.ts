@@ -1670,6 +1670,71 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
     }
   });
 
+  it("does not take terminal-result cleanup evidence from the CLI's result event", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-cleanup-evidence-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    // The process exits on its own, so the runner never stops it; a
+    // same-named field in the result event must not stand in for the runner's
+    // evidence (which lets a non-zero exit after the final result pass).
+    await writeFailingClaudeCommand(commandPath, {
+      exitCode: 1,
+      resultEvent: {
+        type: "result",
+        subtype: "success",
+        session_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        is_error: false,
+        result: "Implemented the requested change.",
+        unmanagedBackgroundTask: {
+          kind: "terminal_result_cleanup",
+          stopped: true,
+          terminalResultSeen: true,
+        },
+        usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+      },
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-claude-cleanup-evidence",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.resultJson).toMatchObject({ result: "Implemented the requested change." });
+      expect(result.resultJson).not.toHaveProperty("unmanagedBackgroundTask");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("waits for the prompt's turn when a resumed session first answers stale task notifications with a zero-turn result", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-stale-task-notifications-"));
     const workspace = path.join(root, "workspace");

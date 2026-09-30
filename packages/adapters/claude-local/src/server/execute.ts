@@ -1223,8 +1223,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : claudeRefusal
       ? "model_refusal"
       : null;
+    // `unmanagedBackgroundTask` is the process runner's cleanup evidence: it
+    // decides whether a non-zero exit after the final result still counts as
+    // a failure. Take it only from the runner (below), never from the CLI's
+    // result event.
+    const parsedResultFields: Record<string, unknown> = { ...parsed };
+    delete parsedResultFields.unmanagedBackgroundTask;
     const mergedResultJson: Record<string, unknown> = {
-      ...parsed,
+      ...parsedResultFields,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
       ...(failed && poisonedPreviousMessageId ? { stopReason: "claude_poisoned_previous_message_id" } : {}),
       ...(claudeRefusal ? { stopReason: "refusal", errorFamily: "model_refusal" } : {}),
