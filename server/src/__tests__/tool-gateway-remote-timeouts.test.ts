@@ -365,6 +365,54 @@ describeEmbeddedPostgres("tool gateway remote MCP tool-call timeouts", () => {
     await expect(search).resolves.toMatchObject({ status: "completed" });
   });
 
+  it("asks for a health check after consecutive timeouts, still without hiding the connection's tools", async () => {
+    const { company, agent, run, connection } = await createFixture(db, { toolTimeoutMs: 1_000 });
+    await db.update(toolConnections)
+      .set({ healthCheckedAt: new Date() })
+      .where(eq(toolConnections.id, connection.id));
+    const remote = scriptedRemote();
+    const gateway = createToolGatewayService(db, { remoteHttpRequest: remote.remoteHttpRequest });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tools = await gateway.listToolsForSession(session.token);
+    const askTool = tools.find((tool) => tool.upstreamToolName === "ask_question")!;
+    const searchTool = tools.find((tool) => tool.upstreamToolName === "search")!;
+    const connectionRow = async () => (await db.select().from(toolConnections)
+      .where(eq(toolConnections.id, connection.id)))[0]!;
+    const call = (toolName: string) => {
+      const pending = remote.calls.length;
+      const outcome = gateway.executeTool({ sessionToken: session.token, tool: toolName, parameters: {} })
+        .then(() => null, (error: unknown) => error);
+      return { outcome, reached: () => vi.waitFor(() => expect(remote.calls).toHaveLength(pending + 1)) };
+    };
+    const timeOut = async () => {
+      const { outcome, reached } = call(askTool.name);
+      await reached();
+      await vi.advanceTimersByTimeAsync(1_100);
+      expect(await outcome).toMatchObject({ status: 504, reasonCode: "tool_timeout" });
+    };
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    await timeOut();
+    await timeOut();
+    expect(await connectionRow()).toMatchObject({ healthStatus: "ok", healthCheckedAt: expect.any(Date) });
+    // An answered call in between shows the server is responsive: the streak restarts.
+    const search = call(searchTool.name);
+    await search.reached();
+    remote.calls.at(-1)!.answer("found");
+    expect(await search.outcome).toBeNull();
+    await timeOut();
+    await timeOut();
+    expect(await connectionRow()).toMatchObject({ healthStatus: "ok", healthCheckedAt: expect.any(Date) });
+    // A third timeout in a row: the health check is due now (the sweep probes
+    // connections without a recorded check first), but health is unchanged.
+    await timeOut();
+    vi.useRealTimers();
+    expect(await connectionRow()).toMatchObject({ healthStatus: "ok", healthCheckedAt: null });
+    const freshSession = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    expect((await gateway.listToolsForSession(freshSession.token)).map((tool) => tool.upstreamToolName))
+      .toEqual(expect.arrayContaining(["ask_question", "search"]));
+  });
+
   it("marks a connection unhealthy only after consecutive transport failures", async () => {
     const { company, agent, run, connection } = await createFixture(db);
     let reachable = false;

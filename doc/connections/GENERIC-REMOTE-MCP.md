@@ -220,7 +220,11 @@ not change the connection's health, so the connection's other tools stay
 listed. Health follows health checks and reachability: three consecutive calls
 that cannot reach the server at all (connection refused, DNS or TLS failure,
 HTTP 502/503/504) mark the connection `error` until a health check or a
-successful call restores it.
+successful call restores it. Three consecutive timeouts with no answered call
+in between do not change health either, but they make the connection's health
+check due, so the periodic health sweep probes it with `tools/list` on its next
+pass: a server that still answers stays healthy, one that accepts connections
+but never answers is marked `error` and its tools stop being listed.
 
 ## Curated definitions remain optional
 

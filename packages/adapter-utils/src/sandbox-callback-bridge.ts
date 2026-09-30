@@ -1332,6 +1332,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
     detached?: boolean;
   };
   const inFlightRequestGuards = new Map<string, RequestFinalizeGuard>();
+  // Settles when a detached tool-call handler has finalized its request and
+  // released it.
+  const detachedHandlers = new Set<Promise<void>>();
 
   const processRequestFile = async (fileName: string) => {
     // Set once a tool-call handler is handed off to run outside the poll loop;
@@ -1596,7 +1599,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
           scheduleAbortedHandlerBackstop(fileName, guard, message);
         }, TOOL_CALL_BRIDGE_FORWARD_TIMEOUT_MS);
         budgetTimer.unref?.();
-        void runHandler()
+        const running: Promise<void> = runHandler()
           .catch((error) => {
             console.warn(
               `[paperclip] sandbox callback bridge tool call failed for ${request.id}: ${error instanceof Error ? error.message : String(error)}`,
@@ -1605,7 +1608,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
           .finally(() => {
             clearTimeout(budgetTimer);
             releaseRequest();
+            detachedHandlers.delete(running);
           });
+        // `stop` waits on this, so a run that ends mid-call still answers it.
+        detachedHandlers.add(running);
         return;
       }
       await runHandler();
@@ -1725,7 +1731,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
   // operation, and a 503 there would make the caller retry and apply the mutation
   // twice. The stop drain passes `false` (the default): a request the loop
   // already picked up keeps its normal completion, so a late handler result still
-  // wins over the drain 503, exactly like the earlier stop behavior.
+  // wins over the drain 503, exactly like the earlier stop behavior. A connected
+  // tool call still running at stop is aborted before the drain (see `stop`), so
+  // the drain skips it and the tool call's own finalize answers its caller.
   const failPendingRequests = async (
     message: string,
     options: { abandonInFlight?: boolean } = {},
@@ -2053,23 +2061,54 @@ export async function startSandboxCallbackBridgeWorker(input: {
 
   void loop;
 
+  // Resolve once no detached tool-call handler is left, including one the loop
+  // started while this waited.
+  const detachedHandlersSettled = async () => {
+    while (detachedHandlers.size > 0) {
+      await Promise.allSettled([...detachedHandlers]);
+    }
+  };
+  const waitAtMost = async (work: Promise<unknown>, ms: number) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      work,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ms);
+      }),
+    ]);
+    clearTimeout(timer);
+  };
+
   return {
     stop: async (options = {}) => {
       stopping = true;
       const drainMs = normalizeTimeoutMs(options.drainTimeoutMs, DEFAULT_BRIDGE_STOP_TIMEOUT_MS);
       stopDeadline = Date.now() + drainMs;
-      if (!settled) {
-        await Promise.race([
-          settledPromise,
-          new Promise<void>((resolve) => setTimeout(resolve, drainMs)),
-        ]);
+      // The drain window. The loop finishes the requests it holds, and a
+      // connected tool call running outside the loop can still finish with its
+      // real result, as it could when the loop awaited it.
+      if (!settled || detachedHandlers.size > 0) {
+        await waitAtMost(Promise.all([settledPromise, detachedHandlersSettled()]), drainMs);
+      }
+      // A tool call still running will not finish before the run ends. Abort
+      // it, so it answers its caller through its own finalize: the
+      // non-retryable 504 of an aborted handler, because the upstream call may
+      // already have taken effect and a retryable drain 503 could make the
+      // caller repeat it. Arm the 504 backstop for a handler that ignores its
+      // signal. The drain below skips an aborted, handler-owned request, so the
+      // caller gets exactly one response and no late write replaces it.
+      const toolCallStopMessage = "Bridge worker stopped before the tool call finished.";
+      for (const [fileName, guard] of inFlightRequestGuards.entries()) {
+        if (!guard.detached || guard.finalized) continue;
+        guard.controller.abort(new Error(toolCallStopMessage));
+        scheduleAbortedHandlerBackstop(fileName, guard, toolCallStopMessage);
+      }
+      // Let those handlers write their answer while the sandbox channel is
+      // still up, within the grace an aborted handler gets anyway.
+      if (detachedHandlers.size > 0) {
+        await waitAtMost(detachedHandlersSettled(), abortedHandlerGraceMs);
       }
       await failPendingRequests("Bridge worker stopped before request could be handled.");
-      // The run is ending: stop waiting on tool calls still in flight. Their
-      // callers already received the stop drain response above.
-      for (const guard of inFlightRequestGuards.values()) {
-        if (guard.detached) guard.controller.abort(new Error("Bridge worker stopped."));
-      }
     },
   };
 }

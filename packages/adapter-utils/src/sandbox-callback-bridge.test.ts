@@ -3056,6 +3056,107 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  // An in-memory queue holding one tool-call request. Like the built-in
+  // clients, a handler-response write whose request file is already gone is
+  // skipped (`wrote: false`), so only responses a caller could read are kept.
+  function toolCallQueue(queueDir: string) {
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestBodies = new Map<string, string>([
+      [path.posix.join(directories.requestsDir, "tool-call.json"), toolCallRequestJson("tool-call")],
+    ]);
+    const responses: Array<{ file: string; status: number; headers: Record<string, string> }> = [];
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body, options) => {
+        if (options?.requestPath && !requestBodies.has(options.requestPath)) return { wrote: false };
+        const parsed = JSON.parse(body.trim()) as { status: number; headers: Record<string, string> };
+        responses.push({ file: path.posix.basename(remotePath), status: parsed.status, headers: parsed.headers });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+    return { client, responses };
+  }
+
+  async function waitUntil(predicate: () => boolean, timeoutMs: number) {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error("waitUntil timed out");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  it("answers a tool call still running at stop exactly once, with a non-retryable 504, before stop returns", async () => {
+    const queueDir = "/virtual-bridge/tool-call-stop";
+    const queue = toolCallQueue(queueDir);
+    let started = false;
+    let settled = false;
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: queue.client,
+      queueDir,
+      authorizeRequest: async () => null,
+      // Like the real forward, the handler stops when the worker aborts it.
+      handleRequest: (_request, options) => new Promise<never>((_resolve, reject) => {
+        started = true;
+        options?.signal.addEventListener("abort", () => reject(new Error("aborted by the worker")), { once: true });
+      }).finally(() => {
+        settled = true;
+      }),
+    });
+    await waitUntil(() => started, 2_000);
+
+    await worker.stop({ drainTimeoutMs: 50 });
+
+    expect(settled).toBe(true);
+    // The upstream call may already have taken effect: the caller must not get
+    // a retryable drain 503 for it, and nothing may overwrite the answer later.
+    expect(queue.responses).toEqual([{
+      file: "tool-call.json",
+      status: 504,
+      headers: expect.objectContaining({ "x-paperclip-bridge-outcome": "indeterminate" }),
+    }]);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(queue.responses).toHaveLength(1);
+  });
+
+  it("lets a running tool call finish with its real result inside the stop drain window", async () => {
+    const queueDir = "/virtual-bridge/tool-call-drain";
+    const queue = toolCallQueue(queueDir);
+    let started = false;
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: queue.client,
+      queueDir,
+      authorizeRequest: async () => null,
+      handleRequest: (_request, options) => new Promise((resolve, reject) => {
+        started = true;
+        const timer = setTimeout(() => resolve({ status: 200, body: "answer" }), 150);
+        options?.signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(new Error("aborted by the worker"));
+        }, { once: true });
+      }),
+    });
+    await waitUntil(() => started, 2_000);
+
+    await worker.stop({ drainTimeoutMs: 2_000 });
+
+    expect(queue.responses).toEqual([{ file: "tool-call.json", status: 200, headers: {} }]);
+  });
+
   it("waits past the default response deadline only for connected tool calls", async () => {
     const fixture = await prepareGatewayFixture("paperclip-bridge-tool-call-wait-");
     const bridge = await startSandboxCallbackBridgeServer({

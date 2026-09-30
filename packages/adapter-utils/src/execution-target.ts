@@ -50,11 +50,7 @@ import {
   syncRemoteTextFileWithHashSkip,
   syncSandboxCallbackBridgeEntrypoint,
 } from "./sandbox-callback-bridge.js";
-import {
-  isSandboxCallbackBridgeToolCallRoute,
-  requestWithCallerDeadline,
-  sandboxCallbackBridgeForwardTimeoutMs,
-} from "./sandbox-callback-bridge-tool-calls.js";
+import { sendSandboxCallbackBridgeForward } from "./sandbox-callback-bridge-tool-calls.js";
 import {
   createHttp2BridgeServer,
   BridgeProcessCapacityError,
@@ -4690,45 +4686,18 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     }
     headers.set("authorization", `Bearer ${hostApiToken}`);
     headers.set("x-paperclip-run-id", input.runId);
-    // A connected tool call can run for minutes; it gets the tool-call forward
-    // budget instead of the short default (see sandbox-callback-bridge-tool-calls).
-    const toolCallRoute = isSandboxCallbackBridgeToolCallRoute({ method, path: request.path });
-    const requestForwardTimeoutMs = sandboxCallbackBridgeForwardTimeoutMs(
-      { method, path: request.path },
-      forwardTimeoutMs,
-    );
     // Abort the forward when the caller aborts the request (its per-iteration
     // timeout or watchdog fired, or the broker's forward budget ended), or after
-    // the forward budget here, whichever comes first.
-    const timeoutSignal = AbortSignal.timeout(requestForwardTimeoutMs);
-    const forwardSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-    // Build the request-body init. A GET or a HEAD carries no body. The file
-    // bridge passes legacy JSON as a string and binary data as a `Buffer`;
-    // HTTP/2 passes raw `Buffer` bodies. Undici accepts a `Buffer` request body directly (a
-    // `Buffer` is an `ArrayBufferView`), so neither shape needs a conversion.
-    // The cast below only bridges a `BodyInit` typing gap: the DOM library
-    // type this project's ambient `RequestInit` resolves to excludes a
-    // `Buffer`, though Undici accepts one at runtime.
-    const forwardInit: RequestInit = {
-      method,
-      headers,
-      signal: forwardSignal,
-    };
-    if (method !== "GET" && method !== "HEAD" && request.body !== undefined) {
-      forwardInit.body = request.body as BodyInit;
-    }
-    const forwardUrl = buildBridgeForwardUrl(hostApiUrl, request);
-    // Platform fetch gives up on response headers after 300 s on its own, which
-    // a long tool call can reach; those forwards use a request bounded only by
-    // the forward signal.
-    const response = toolCallRoute
-      ? await requestWithCallerDeadline(forwardUrl, {
-          method,
-          headers,
-          body: method !== "GET" && method !== "HEAD" ? request.body : undefined,
-          signal: forwardSignal,
-        })
-      : await fetch(forwardUrl, forwardInit);
+    // the forward budget, whichever comes first. A connected tool call can run
+    // for minutes, so it gets the tool-call forward budget instead of the short
+    // default (see sandbox-callback-bridge-tool-calls). The file bridge passes
+    // legacy JSON as a string and binary data as a `Buffer`; HTTP/2 passes raw
+    // `Buffer` bodies; both are sent as they are.
+    const response = await sendSandboxCallbackBridgeForward(
+      buildBridgeForwardUrl(hostApiUrl, request),
+      { method, path: request.path, headers, body: request.body },
+      { defaultTimeoutMs: forwardTimeoutMs, signal },
+    );
     if (emitDebugLog) {
       await onLog(
         "stdout",

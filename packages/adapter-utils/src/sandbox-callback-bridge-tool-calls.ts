@@ -153,3 +153,37 @@ export function requestWithCallerDeadline(
     }
   });
 }
+
+/**
+ * Send one relayed bridge request to the host API: the forward step of both
+ * bridge transports.
+ *
+ * `signal` is the caller's own (the queue worker's per-request abort, or the
+ * HTTP/2 stream's); the forward also stops at its budget, which is the
+ * tool-call forward budget for a tool-call route and `defaultTimeoutMs` for any
+ * other. A tool-call route goes through `requestWithCallerDeadline`, because
+ * platform `fetch` stops waiting for response headers after its own 300 s
+ * whatever the signal allows; every other route keeps platform `fetch`.
+ */
+export function sendSandboxCallbackBridgeForward(
+  url: URL,
+  request: { method: string; path: string; headers: Headers; body?: string | Buffer },
+  options: { defaultTimeoutMs: number; signal?: AbortSignal | null },
+): Promise<Response> {
+  const route = { method: request.method.trim().toUpperCase() || "GET", path: request.path };
+  const timeoutSignal = AbortSignal.timeout(
+    sandboxCallbackBridgeForwardTimeoutMs(route, options.defaultTimeoutMs),
+  );
+  const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+  // A GET or a HEAD carries no body.
+  const body = route.method !== "GET" && route.method !== "HEAD" ? request.body : undefined;
+  if (isSandboxCallbackBridgeToolCallRoute(route)) {
+    return requestWithCallerDeadline(url, { method: route.method, headers: request.headers, body, signal });
+  }
+  const init: RequestInit = { method: route.method, headers: request.headers, signal };
+  // Undici accepts a `Buffer` body (an `ArrayBufferView`) as it is. The cast
+  // only bridges a typing gap: the DOM `BodyInit` this project's ambient
+  // `RequestInit` resolves to excludes `Buffer`.
+  if (body !== undefined) init.body = body as BodyInit;
+  return fetch(url, init);
+}
