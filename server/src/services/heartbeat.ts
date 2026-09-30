@@ -40,7 +40,10 @@ import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
+  AGENT_PAUSE_STOP_ERROR_CODE,
+  buildProviderStop,
   legacyExecutionNeedsReconciliation,
+  PROVIDER_STOP_RESULT_KEY,
   terminalizeLegacyExecution,
 } from "./legacy-execution-recovery.js";
 import {
@@ -30602,6 +30605,19 @@ export function heartbeatService(
                 parseObject(current?.resultJson),
               )
             : parseObject(run.resultJson);
+        // A pause that stops a provider process this server owns records the
+        // stop with the cancellation, and that it verified the process gone
+        // once termination returns. Recovery continues such a task when the
+        // agent is resumed; a run without the verified stop keeps its hold.
+        const ownedProcess = runningProcesses.get(run.id);
+        const pauseStop =
+          run.runtimeMode === "legacy" &&
+          errorCode === AGENT_PAUSE_STOP_ERROR_CODE &&
+          ownedProcess &&
+          ((Number.isInteger(ownedProcess.child.pid) && (ownedProcess.child.pid ?? 0) > 0) ||
+            (Number.isInteger(ownedProcess.processGroupId) && (ownedProcess.processGroupId ?? 0) > 0))
+            ? { initiator: "agent_pause" as const, requestedAt: new Date() }
+            : null;
         await setRunStatus(run.id, "cancelled", {
           finishedAt: new Date(),
           error: reason,
@@ -30609,7 +30625,12 @@ export function heartbeatService(
           ...(agent
             ? {
                 resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
-                  resultJson: persistedCancellationResult,
+                  resultJson: pauseStop
+                    ? {
+                        ...persistedCancellationResult,
+                        [PROVIDER_STOP_RESULT_KEY]: buildProviderStop(pauseStop),
+                      }
+                    : persistedCancellationResult,
                   errorCode,
                   errorMessage: reason,
                 }),
@@ -30629,6 +30650,27 @@ export function heartbeatService(
             processGroupId: running.processGroupId,
             graceMs: Math.max(1, running.graceSec) * 1000,
           });
+          // Termination returns only once the process (group) is gone. The
+          // run is already cancelled and its executor skips late
+          // finalization, so this merge is not overwritten.
+          if (pauseStop && agent && running === ownedProcess) {
+            await db
+              .update(heartbeatRuns)
+              .set({
+                resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+                  [PROVIDER_STOP_RESULT_KEY]: buildProviderStop({ ...pauseStop, verifiedAt: new Date() }),
+                })}::jsonb`,
+              })
+              .where(and(
+                eq(heartbeatRuns.id, run.id),
+                eq(heartbeatRuns.status, "cancelled"),
+                eq(heartbeatRuns.errorCode, errorCode),
+              ))
+              .catch((err) => {
+                // Without the verified stop the run keeps its hold.
+                logger.warn({ err, runId: run.id }, "failed to record the verified provider stop of a paused run");
+              });
+          }
         }
         runningProcesses.delete(run.id);
         // No adapter owner stopped here, so no executor teardown is guaranteed

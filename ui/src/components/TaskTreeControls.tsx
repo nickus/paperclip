@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { PauseCircle, PlayCircle, Repeat, XCircle } from "lucide-react";
+import { ApiError } from "../api/client";
 import { Button } from "./ui/button";
 import {
   Dialog,
@@ -71,6 +72,19 @@ export function TaskTreeControlMenuItems({
   );
 }
 
+/**
+ * The confirmation a resume offers when a stopped run's reconciliation hold
+ * blocks waking a task, read from the release error; null for other errors.
+ */
+export function readResumeReconciliationConfirmation(error: unknown): string | null {
+  if (!(error instanceof ApiError) || error.status !== 409) return null;
+  const body = error.body as { code?: unknown; details?: { confirmation?: unknown } } | null;
+  return body?.code === "execution_reconciliation_required" &&
+    typeof body.details?.confirmation === "string"
+    ? body.details.confirmation
+    : null;
+}
+
 export function TaskTreeControlDialog({
   open,
   onOpenChange,
@@ -82,6 +96,8 @@ export function TaskTreeControlDialog({
   error,
   pending,
   valid,
+  reconciliationConfirmation,
+  onConfirmReconciliation,
   wakeAgents,
   onWakeAgentsChange,
   onRetry,
@@ -97,6 +113,12 @@ export function TaskTreeControlDialog({
   error?: string | null;
   pending: boolean;
   valid: boolean;
+  /**
+   * Set when a stopped run's reconciliation hold blocks waking a task: what
+   * the operator confirms to continue it from the recorded work.
+   */
+  reconciliationConfirmation?: string | null;
+  onConfirmReconciliation?: () => void;
   wakeAgents: boolean;
   onWakeAgentsChange: (wake: boolean) => void;
   onRetry: () => void;
@@ -132,7 +154,23 @@ export function TaskTreeControlDialog({
                 : `${tasks} will ${mode === "restore" ? "be restored" : "resume"}.`}
           </DialogDescription>
         </DialogHeader>
-        {error ? (
+        {error && reconciliationConfirmation && onConfirmReconciliation ? (
+          <div className="space-y-2">
+            <p role="alert" className="text-sm text-destructive">
+              {error}
+            </p>
+            <p className="text-sm text-muted-foreground">
+              {reconciliationConfirmation}
+            </p>
+            <Button
+              size="sm"
+              disabled={pending}
+              onClick={onConfirmReconciliation}
+            >
+              {pending ? "Applying…" : "Continue from recorded work"}
+            </Button>
+          </div>
+        ) : error ? (
           <div className="space-y-2">
             <p role="alert" className="text-sm text-destructive">
               {error}

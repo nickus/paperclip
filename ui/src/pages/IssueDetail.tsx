@@ -221,6 +221,7 @@ import { TaskSidePanel, type TaskSidePanelProps } from "../components/task-side-
 import { SidePanelToggleButton } from "../components/side-panel";
 import {
   TaskTreeControlDialog,
+  readResumeReconciliationConfirmation,
   TaskTreeControlMenuItems,
 } from "../components/TaskTreeControls";
 import { waitForStoppedRuns } from "../lib/wait-for-stopped-runs";
@@ -4141,11 +4142,14 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       scope,
       runId,
       wakeAgents = false,
+      reconcileExecutionHolds = false,
     }: {
       mode: IssueTreeControlMode;
       scope: "leaf" | "subtree";
       runId?: string;
       wakeAgents?: boolean;
+      /** The operator confirmed continuing tasks whose stopped run holds them. */
+      reconcileExecutionHolds?: boolean;
       feedback?: "composer";
     }) => {
       if (mode === "resume") {
@@ -4162,6 +4166,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             reason: null,
             metadata: {
               wakeAgents,
+              ...(reconcileExecutionHolds ? { reconcileExecutionHolds: true } : {}),
             },
           },
         );
@@ -8086,6 +8091,15 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             }
             pending={executeTreeControl.isPending}
             valid={canApplyTreeControl}
+            reconciliationConfirmation={readResumeReconciliationConfirmation(executeTreeControl.error)}
+            onConfirmReconciliation={() =>
+              executeTreeControl.mutate({
+                mode: treeControlMode,
+                scope: treeControlScope,
+                wakeAgents: true,
+                reconcileExecutionHolds: true,
+              })
+            }
             wakeAgents={treeControlWakeAgentsOnResume}
             onWakeAgentsChange={(wake) => {
               executeTreeControl.reset();

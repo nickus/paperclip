@@ -6,6 +6,12 @@ import {
 } from "@paperclipai/db";
 import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import {
+  isResumeReconcilableBlocker,
+  reconcileExecutionHoldForResume,
+  RESUME_RECONCILIATION_CONFIRMATION,
+  RESUME_RECONCILIATION_REQUIRED_CODE,
+} from "../services/execution-recovery-resolution.js";
 import { conflict } from "../errors.js";
 import {
   createIssueTreeHoldSchema,
@@ -394,8 +400,13 @@ export function issueTreeControlRoutes(
         return;
       }
 
+      const actor = getActorInfo(req);
       // Releasing a pause does not authorize replay of uncertain provider actions.
-      // Check before release so a rejected wake leaves the subtree paused.
+      // Check before release so a rejected wake leaves the subtree paused. A
+      // reconciliation hold is offered to the board operator instead: after
+      // confirming, the resume records the reconciliation and the task's
+      // continuation is delivered like any reconciled one.
+      const reconciledIssueIds = new Set<string>();
       if (req.body.metadata?.wakeAgents === true) {
         const activeHold = await treeControlSvc.getHold(root.companyId, holdId);
         const issueIds =
@@ -410,13 +421,39 @@ export function issueTreeControlRoutes(
               eq(issueRows.companyId, root.companyId), inArray(issueRows.id, issueIds),
               inArray(issueRows.status, RESUME_EXECUTABLE_STATUSES), isNotNull(issueRows.assigneeAgentId),
             ));
+          const held: Array<{ id: string; identifier: string | null; recoveryActionId: string; runId: string | null; nextAction: string }> = [];
           for (const task of candidates) {
             const blocked = await getExecutionBlocker(db, root.companyId, task.id);
-            if (blocked) throw conflict(`Cannot wake ${task.identifier ?? "this task"}: ${blocked.nextAction}`);
+            if (!blocked) continue;
+            if (!isResumeReconcilableBlocker(blocked))
+              throw conflict(`Cannot wake ${task.identifier ?? "this task"}: ${blocked.nextAction}`);
+            held.push({ ...task, recoveryActionId: blocked.recoveryActionId, runId: blocked.runId, nextAction: blocked.nextAction });
+          }
+          if (held.length > 0 && req.body.metadata?.reconcileExecutionHolds !== true) {
+            throw conflict(`Cannot wake ${held[0]!.identifier ?? "this task"}: ${held[0]!.nextAction}`, {
+              code: RESUME_RECONCILIATION_REQUIRED_CODE,
+              confirmation: RESUME_RECONCILIATION_CONFIRMATION,
+              tasks: held.map((task) => ({
+                issueId: task.id,
+                identifier: task.identifier,
+                recoveryActionId: task.recoveryActionId,
+                runId: task.runId,
+              })),
+            });
+          }
+          // Each reconciliation is final on its own: a refusal for a later
+          // task leaves the subtree paused and earlier tasks reconciled.
+          for (const task of held) {
+            await reconcileExecutionHoldForResume(db, {
+              companyId: root.companyId,
+              issueId: task.id,
+              recoveryActionId: task.recoveryActionId,
+              actorId: actor.actorId,
+            });
+            reconciledIssueIds.add(task.id);
           }
         }
       }
-      const actor = getActorInfo(req);
       const hold = await treeControlSvc.releaseHold(
         root.companyId,
         root.id,
@@ -454,6 +491,8 @@ export function issueTreeControlRoutes(
       if (hold.mode === "pause" && req.body.metadata?.wakeAgents === true) {
         for (const member of hold.members ?? []) {
           if (member.skipped) continue;
+          // Its reconciled continuation is delivered with the stopped run's context.
+          if (reconciledIssueIds.has(member.issueId)) continue;
           try {
             const issue = await issuesSvc.getById(member.issueId);
             if (
@@ -508,7 +547,11 @@ export function issueTreeControlRoutes(
         }
       }
 
-      res.json({ ...hold, ...(wakeFailures.length ? { wakeFailures } : {}) });
+      res.json({
+        ...hold,
+        ...(wakeFailures.length ? { wakeFailures } : {}),
+        ...(reconciledIssueIds.size ? { reconciledIssueIds: [...reconciledIssueIds] } : {}),
+      });
     },
   );
 
