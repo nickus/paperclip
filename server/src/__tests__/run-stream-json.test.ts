@@ -164,10 +164,50 @@ describe("readRunStreamJsonPage", () => {
     const tail = await page(terminal(), { tail: true, limitBytes: 1 });
     expect(tail.items).toEqual([all.at(-1)]);
     expect(tail.complete).toBe(true);
-    const before = await page(terminal(), { before: all.at(-1)!.cursor, limitBytes: 600 });
+    // Backward pages continue from their oldest item.
+    expect(tail.nextCursor).toBe(all.at(-1)!.cursor);
+    const before = await page(terminal(), { before: tail.nextCursor, limitBytes: 600 });
     expect(before.items.length).toBeGreaterThan(0);
     expect(before.items.at(-1)).toEqual(all.at(-2));
     expect(before.complete).toBe(false);
+    expect(before.nextCursor).toBe(before.items[0]!.cursor);
+    const older = await page(terminal(), { before: before.nextCursor, limitBytes: 600 });
+    expect(older.items.length).toBeGreaterThan(0);
+    expect(older.items.at(-1)!.cursor).toBe(before.items[0]!.prev);
+  });
+
+  it("pages backward from the tail to the first item without overlap", async () => {
+    await appendRun(23);
+    const runMeta = terminal();
+    const all = (await page(runMeta, {})).items;
+    const pages: HeartbeatRunStreamJsonPage["items"][] = [];
+    let result = await page(runMeta, { tail: true, limitBytes: 700 });
+    pages.unshift(result.items);
+    for (let guard = 0; result.nextCursor !== null; guard += 1) {
+      if (guard > 100) throw new Error("backward paging did not finish");
+      result = await page(runMeta, { before: result.nextCursor, limitBytes: 700 });
+      expect(result.reset).toBe(false);
+      expect(result.items.length).toBeGreaterThan(0);
+      pages.unshift(result.items);
+    }
+    expect(pages.length).toBeGreaterThan(2);
+    // Concatenated oldest-first, the pages are the whole output exactly once.
+    expect(pages.flat()).toEqual(all);
+    expect(result.items[0]!.prev).toBeNull();
+  });
+
+  it("ends backward paging with a null cursor when the page starts at the first item", async () => {
+    await appendRun(4);
+    const all = (await page(terminal(), {})).items;
+    const tail = await page(terminal(), { tail: true });
+    expect(tail.items).toEqual(all);
+    expect(tail.nextCursor).toBeNull();
+    const first = await page(terminal(), { before: all[1]!.cursor });
+    expect(first.items).toEqual([all[0]]);
+    expect(first.nextCursor).toBeNull();
+    const none = await page(terminal(), { before: all[0]!.cursor });
+    expect(none.items).toEqual([]);
+    expect(none.nextCursor).toBeNull();
   });
 
   it("starts over with reset when the cursor belongs to another translation", async () => {
@@ -181,7 +221,7 @@ describe("readRunStreamJsonPage", () => {
     const otherVersion = await page(meta(), { after: cursor.replace("claude_local@1", "claude_local@2") });
     expect(otherVersion.reset).toBe(true);
     const tailReset = await page(meta(), { before: `${tag}/OTHERSID00/${position}`, limitBytes: 1 });
-    expect(tailReset).toMatchObject({ reset: true, items: [all.at(-1)] });
+    expect(tailReset).toMatchObject({ reset: true, items: [all.at(-1)], nextCursor: all.at(-1)!.cursor });
   });
 
   it("changes the source id when the log is rewritten", async () => {

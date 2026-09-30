@@ -67,8 +67,14 @@ export interface HeartbeatRunStreamJsonPage {
   translator: string;
   sid: string;
   items: HeartbeatRunStreamJsonItem[];
+  /**
+   * Continues in the request's direction. `after`: the newest item's cursor
+   * (the request cursor while caught up), for the next `after`. `before` and
+   * `tail`: the oldest item's cursor, for the next `before`; null once the page
+   * starts at the beginning of the output.
+   */
   nextCursor: string | null;
-  /** The run is terminal, its finish was emitted, and nothing follows `nextCursor`. */
+  /** The run is terminal, its finish was emitted, and no item follows this page. */
   complete: boolean;
   runStatus: string;
   /** The request's cursor belonged to another translation; items start over. */

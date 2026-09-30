@@ -280,9 +280,13 @@ function toWireItem(item: StreamJsonItem): HeartbeatRunStreamJsonItem {
 /**
  * Translates a run's log from the start and returns one page of items.
  * `after` pages forward (items strictly after the cursor); `before` and
- * `tail` return the newest items before the cursor or the end. A cursor from
- * another translation (translator version or source id) sets `reset` and
- * starts over: from the start for `after`, from the end for `before`.
+ * `tail` return the newest items before the cursor or the end. `nextCursor`
+ * continues in the request's direction: for `after` it is the newest item's
+ * cursor (the request cursor while caught up), for `before` and `tail` the
+ * oldest item's cursor, or null once the page starts at the beginning of the
+ * output. A cursor from another translation (translator version or source
+ * id) sets `reset` and starts over: from the start for `after`, from the end
+ * for `before`.
  */
 export async function readRunStreamJsonPage(
   deps: {
@@ -337,6 +341,8 @@ export async function readRunStreamJsonPage(
     const selected: StreamJsonItem[] = [];
     let selectedBytes = 0;
     let moreAfterSelection = false;
+    // `before`/`tail`: items older than the window were dropped from it.
+    let olderBeforeSelection = false;
     let done = false;
 
     const take = (items: StreamJsonItem[]) => {
@@ -364,6 +370,7 @@ export async function readRunStreamJsonPage(
         selectedBytes += bytes;
         while (selected.length > 1 && selectedBytes > limitBytes) {
           selectedBytes -= utf8ByteLength(selected.shift()!.chunk);
+          olderBeforeSelection = true;
         }
       }
     };
@@ -387,14 +394,22 @@ export async function readRunStreamJsonPage(
       }
     }
 
-    const last = selected.at(-1) ?? null;
+    // Forward pages continue after their newest item (or keep the request
+    // cursor while caught up); backward pages continue before their oldest
+    // item, so `before=nextCursor` always moves further back.
+    const nextCursor =
+      mode === "after"
+        ? (selected.at(-1)?.cursor ?? (reset ? null : after))
+        : olderBeforeSelection
+          ? selected[0]!.cursor
+          : null;
     return {
       runId: meta.id,
       format: STREAM_JSON_FORMAT,
       translator: tag,
       sid,
       items: selected.map(toWireItem),
-      nextCursor: last ? last.cursor : mode === "after" && !reset ? after : null,
+      nextCursor,
       complete: outcome !== null && translation.finished && reachedEnd && !moreAfterSelection,
       runStatus: meta.status,
       reset,

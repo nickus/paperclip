@@ -7111,8 +7111,12 @@ const heartbeatRunStreamJsonPageSchema = registry.register(
     translator: z.string(),
     sid: z.string().describe("Source identity; a new value invalidates earlier cursors"),
     items: z.array(heartbeatRunStreamJsonItemSchema),
-    nextCursor: z.string().nullable(),
-    complete: z.boolean().describe("The run is terminal, its finish was emitted and nothing follows nextCursor"),
+    nextCursor: z.string().nullable().describe(
+      "Continues in the request's direction: after `after`, the newest item's cursor (the request cursor while " +
+        "caught up), for the next `after`; after `before` or `tail`, the oldest item's cursor, for the next " +
+        "`before`, or null once the page starts at the beginning of the output",
+    ),
+    complete: z.boolean().describe("The run is terminal, its finish was emitted and no item follows this page"),
     runStatus: z.string(),
     reset: z.boolean().describe("The request cursor belonged to another translation; items start over"),
   }),

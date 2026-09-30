@@ -36,9 +36,9 @@ Access checks and read-time redaction are the same as for the raw log. `offset` 
 }
 ```
 
-- `after` returns items strictly after the cursor, until their total `chunk` size reaches `limitBytes` (default and maximum 1 MiB; at least one item is returned). Continue with `nextCursor`.
-- `before` returns the newest items strictly before the cursor; `tail=1` the newest items of the log.
-- `complete` is true when the run is terminal, its final lines were emitted and nothing follows `nextCursor`.
+- `after` returns items strictly after the cursor, until their total `chunk` size reaches `limitBytes` (default and maximum 1 MiB; at least one item is returned). `nextCursor` is the newest item's cursor (the request cursor when nothing new follows); continue forward with `after=<nextCursor>`.
+- `before` returns the newest items strictly before the cursor; `tail=1` the newest items of the log (same size limit). `nextCursor` is the oldest item's cursor; continue backward with `before=<nextCursor>`. It is `null` once the page starts at the beginning of the output. To follow new output after a `tail` or `before` page, use `after=<cursor of its last item>`.
+- `complete` is true when the run is terminal, its final lines were emitted and no item follows the page.
 - A cursor from another translation (another translator version, or a rewritten log: another `sid`) sets `reset: true`; the items then start from the beginning (`after`) or the end (`before`).
 - Logs over 64 MiB are not translated (413 `log_too_large_for_translation`); read them in the raw format.
 
