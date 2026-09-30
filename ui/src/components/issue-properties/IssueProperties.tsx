@@ -52,7 +52,7 @@ import {
   useMonitorCountdown,
 } from "../../lib/issue-monitor";
 import { extractProviderIdWithFallback } from "../../lib/model-utils";
-import { formatRetryReason } from "../../lib/runRetryState";
+import { formatRetryReason, isContinuationRetryReason } from "../../lib/runRetryState";
 import { useRetryNowMutation } from "../../hooks/useRetryNowMutation";
 import { RetryErrorBand } from "../IssueScheduledRetryCard";
 import { StatusIcon } from "../StatusIcon";
@@ -1404,8 +1404,9 @@ export function IssueProperties({
     && scheduledRetry.scheduledRetryAttempt > 0
       ? scheduledRetry.scheduledRetryAttempt
       : null;
-  const scheduledRetryIsContinuation =
-    scheduledRetry?.scheduledRetryReason === "max_turns_continuation";
+  const scheduledRetryIsContinuation = isContinuationRetryReason(
+    scheduledRetry?.scheduledRetryReason,
+  );
   const scheduledRetryRelativeLabel = (() => {
     if (!scheduledRetryRelative) return "Pending schedule";
     const action = scheduledRetryIsContinuation ? "Continuation" : "Retry";

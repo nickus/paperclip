@@ -25,7 +25,13 @@ const RETRY_REASON_LABELS: Record<string, string> = {
   assignment_recovery: "Assignment recovery",
   issue_continuation_needed: "Continuation needed",
   max_turns_continuation: "Max-turn continuation",
+  time_cap_continuation: "Time-cap continuation",
 };
+
+// Continuations resume a run that stopped at a per-run budget while working.
+export function isContinuationRetryReason(reason: string | null | undefined) {
+  return reason === "max_turns_continuation" || reason === "time_cap_continuation";
+}
 
 function readNonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -52,7 +58,7 @@ export function describeRunRetryState(run: RetryAwareRun): RunRetryStateSummary 
   const retryOfRunId = readNonEmptyString(run.retryOfRunId);
   const exhaustedReason = readNonEmptyString(run.retryExhaustedReason);
   const dueAt = run.scheduledRetryAt ? formatDateTime(run.scheduledRetryAt) : null;
-  const isMaxTurnContinuation = run.scheduledRetryReason === "max_turns_continuation";
+  const isContinuation = isContinuationRetryReason(run.scheduledRetryReason);
   const hasRetryMetadata =
     Boolean(retryOfRunId)
     || Boolean(reasonLabel)
@@ -65,12 +71,12 @@ export function describeRunRetryState(run: RetryAwareRun): RunRetryStateSummary 
   if (run.status === "scheduled_retry") {
     return {
       kind: "scheduled",
-      badgeLabel: isMaxTurnContinuation ? "Continuation scheduled" : "Retry scheduled",
+      badgeLabel: isContinuation ? "Continuation scheduled" : "Retry scheduled",
       tone: "border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300",
       detail: joinFragments([attemptLabel, reasonLabel]),
       secondary: dueAt
-        ? `${isMaxTurnContinuation ? "Next continuation" : "Next retry"} ${dueAt}`
-        : `${isMaxTurnContinuation ? "Next continuation" : "Next retry"} pending schedule`,
+        ? `${isContinuation ? "Next continuation" : "Next retry"} ${dueAt}`
+        : `${isContinuation ? "Next continuation" : "Next retry"} pending schedule`,
       retryOfRunId,
     };
   }
@@ -78,7 +84,7 @@ export function describeRunRetryState(run: RetryAwareRun): RunRetryStateSummary 
   if (exhaustedReason) {
     return {
       kind: "exhausted",
-      badgeLabel: isMaxTurnContinuation ? "Continuation exhausted" : "Retry exhausted",
+      badgeLabel: isContinuation ? "Continuation exhausted" : "Retry exhausted",
       tone: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
       detail: joinFragments([attemptLabel, reasonLabel, "Automatic retries exhausted"]),
       secondary: exhaustedReason.includes("Manual intervention required")
@@ -90,7 +96,7 @@ export function describeRunRetryState(run: RetryAwareRun): RunRetryStateSummary 
 
   return {
     kind: "attempted",
-    badgeLabel: isMaxTurnContinuation ? "Continued run" : "Retried run",
+    badgeLabel: isContinuation ? "Continued run" : "Retried run",
     tone: "border-slate-500/20 bg-slate-500/10 text-slate-700 dark:text-slate-300",
     detail: joinFragments([attemptLabel, reasonLabel]),
     secondary: null,

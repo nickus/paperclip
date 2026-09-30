@@ -4,6 +4,8 @@ export type HeartbeatRunStopReason =
   | "completed"
   | "interrupted"
   | "timeout"
+  | "idle_timeout"
+  | "time_cap_checkpoint"
   | "cancelled"
   | "budget_paused"
   | "paused"
@@ -49,6 +51,11 @@ export function normalizeMaxTurnStopReason(value: unknown): Extract<HeartbeatRun
     : null;
 }
 
+/** A hard-cap stop taken as a checkpoint; it continues without reconciliation. */
+export function isTimeCapCheckpointStopReason(value: unknown): boolean {
+  return value === "time_cap_checkpoint";
+}
+
 export function resolveHeartbeatRunTimeoutPolicy(
   adapterType: string,
   adapterConfig: Record<string, unknown> | null | undefined,
@@ -88,7 +95,11 @@ export function inferHeartbeatRunStopReason(input: {
   if (input.outcome === "interrupted") return "interrupted";
   const maxTurnStopReason = normalizeMaxTurnStopReason(input.errorCode);
   if (maxTurnStopReason) return maxTurnStopReason;
-  if (input.outcome === "timed_out") return "timeout";
+  if (input.outcome === "timed_out") {
+    if (input.errorCode === "idle_timeout") return "idle_timeout";
+    if (input.errorCode === "time_cap_checkpoint") return "time_cap_checkpoint";
+    return "timeout";
+  }
   if (input.outcome === "failed" && input.errorCode === "unmanaged_background_task_stopped") return "unmanaged_background_task_stopped";
   if (input.outcome === "failed" && input.errorCode === "process_lost") return "process_lost";
   if (input.outcome === "cancelled") {
@@ -126,7 +137,10 @@ export function buildHeartbeatRunStopMetadata(input: {
   return {
     ...timeoutPolicy,
     stopReason,
-    timeoutFired: stopReason === "timeout",
+    timeoutFired:
+      stopReason === "timeout" ||
+      stopReason === "idle_timeout" ||
+      stopReason === "time_cap_checkpoint",
   };
 }
 

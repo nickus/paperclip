@@ -386,10 +386,22 @@ describe("IssueRunLedger", () => {
           resultJson: { stopReason: "paused" },
           createdAt: "2026-04-18T19:55:00.000Z",
         }),
+        createRun({
+          runId: "run-time-cap",
+          resultJson: { stopReason: "time_cap_checkpoint", timeoutFired: true, effectiveTimeoutSec: 3600 },
+          createdAt: "2026-04-18T19:54:00.000Z",
+        }),
+        createRun({
+          runId: "run-idle",
+          resultJson: { stopReason: "idle_timeout", timeoutFired: true },
+          createdAt: "2026-04-18T19:53:00.000Z",
+        }),
       ],
     });
 
     expect(container.textContent).toContain("timeout (30s timeout)");
+    expect(container.textContent).toContain("time cap checkpoint (3600s timeout), continuing");
+    expect(container.textContent).toContain("stopped after no output");
     expect(container.textContent).toContain("cancelled");
     expect(container.textContent).toContain("budget paused");
     expect(container.textContent).toContain("unmanaged background task stopped");

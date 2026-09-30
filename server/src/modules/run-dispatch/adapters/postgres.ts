@@ -42,10 +42,10 @@ import type {
   ScheduledRetryFacts,
 } from "../domain/policy.js";
 import {
-  MAX_TURN_CONTINUATION_RETRY_REASON,
   allowsIssueInteractionWake,
   deriveCommentId,
   isNonAssigneeWorkspaceBusyRetry,
+  isProductiveContinuationRetryReason,
   isResolvedInteractionContinuationWakeContext,
 } from "../domain/wake-context.js";
 import type {
@@ -124,7 +124,8 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 function classifyRetryReasonKind(retryReason: string | null): RetryReasonKind {
-  if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) return "max_turn_continuation";
+  // A time-cap continuation follows the same gate as a max-turn continuation.
+  if (isProductiveContinuationRetryReason(retryReason)) return "max_turn_continuation";
   if (retryReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON) return "disposition_repair";
   if (retryReason === "ai_connection_busy") return "ai_connection_wait";
   if (retryReason === "native_safe_replacement") return "native_safe_replacement";

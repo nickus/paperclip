@@ -85,6 +85,7 @@ export const ADAPTER_AGNOSTIC_KEYS = [
   "instructionsFilePath",
   "cwd",
   "timeoutSec",
+  "idleTimeoutSec",
   "graceSec",
   "bootstrapPromptTemplate",
   "paperclipSkillSync",

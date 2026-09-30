@@ -16,6 +16,7 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
+export const TIME_CAP_CONTINUATION_RETRY_REASON = "time_cap_continuation";
 export const WORKSPACE_BUSY_RETRY_REASON = "workspace_busy";
 export const AI_CONNECTION_BUSY_RETRY_REASON = "ai_connection_busy";
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
@@ -27,6 +28,21 @@ export const RESOLVED_INTERACTION_CONTINUATION_STATUSES = new Set([
   "cancelled",
   "rejected",
 ]);
+
+/**
+ * True for a continuation of a run that stopped at a per-run budget (turn
+ * limit or hard time cap) while it was still working. These continuations
+ * share one lane: they spend no failure budget, need the issue to stay
+ * in_progress and keep its execution lock, and are bounded per chain.
+ */
+export function isProductiveContinuationRetryReason(
+  retryReason: string | null | undefined,
+): boolean {
+  return (
+    retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+    retryReason === TIME_CAP_CONTINUATION_RETRY_REASON
+  );
+}
 
 /**
  * True for a resource-wait retry whose original run did not

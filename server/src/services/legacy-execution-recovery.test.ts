@@ -86,3 +86,17 @@ it("retains conversation retry eligibility for a transient restore lock timeout"
     workspaceRestoreFailure: "restore_lock_timeout", conversationContinuation: "continue_conversation_v1",
   } })).toBe(false);
 });
+
+it("takes a productive hard-cap stop as a checkpoint but keeps the hold for other timeouts", () => {
+  const capped = { runtimeMode: "legacy", status: "timed_out", errorCode: "time_cap_checkpoint",
+    resultJson: { stopReason: "time_cap_checkpoint" } };
+  expect(legacyExecutionNeedsReconciliation(capped)).toBe(false);
+  // Continuations do not spend the failure budget, so a chain stays a checkpoint.
+  expect(legacyExecutionNeedsReconciliation({ ...capped, scheduledRetryReason: "time_cap_continuation", scheduledRetryAttempt: 3 })).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...capped, errorCode: "timeout", resultJson: { stopReason: "timeout" } })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...capped, errorCode: "idle_timeout", resultJson: { stopReason: "idle_timeout" } })).toBe(true);
+  // A workspace that could not be restored safely still needs a person.
+  expect(legacyExecutionNeedsReconciliation({ ...capped, resultJson: {
+    stopReason: "time_cap_checkpoint", workspaceRestoreFailure: "restore_unsafe_archive",
+  } })).toBe(true);
+});

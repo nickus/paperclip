@@ -66,10 +66,19 @@ In agent runtime settings, configure heartbeat policy:
 For local adapters, set:
 
 - `cwd` (working directory)
-- `timeoutSec` (max runtime per heartbeat; `0` uses the target default — no adapter timeout on local/SSH, a 4-hour backstop on sandbox targets — and a negative value disables the adapter timeout everywhere, including sandboxes)
+- `idleTimeoutSec` (inactivity timeout; default `900`, off by default for the `process` and `http` adapters): stops a run that has produced no output or progress for this long. Every log line, adapter event and runtime progress report resets it, so a slow but steady run is never stopped by it. A negative value disables it. It applies to every adapter; Paperclip stops the run through the same handles as **Stop** (the local or SSH process, or the adapter's cancellation hook). A run with neither, such as one whose sandbox command has no cancellation hook, keeps going until it ends or reaches `timeoutSec`, and the run log notes the missed stop.
+- `timeoutSec` (hard time cap per heartbeat; `0` uses the target default — no adapter timeout on local/SSH, a 4-hour backstop on sandbox targets — and a negative value disables the adapter timeout everywhere, including sandboxes). This is a safety cap, not a work budget: stalled runs are caught by `idleTimeoutSec`, so keep the cap generous.
 - `graceSec` (time before force-kill after timeout/cancel)
 - optional env vars and extra CLI args
 - use **Test environment** in agent configuration to run adapter-specific diagnostics before saving
+
+When a run reaches `timeoutSec` while it is still producing output, Paperclip treats the stop as a checkpoint rather than a failure:
+
+- the run ends as `timed_out` with error code `time_cap_checkpoint`, and its result records that the platform stopped the process;
+- no reconciliation hold is created, and the agent does not go into an error state;
+- the same task gets a continuation run with the note "Your previous run reached the time cap at <time>; continue from the workspace state." The task keeps its execution workspace, and a reusable sandbox is resumed where the environment supports it.
+
+Continuations are bounded per continuation chain, together with max-turn continuations. Configure them in the agent runtime settings under `heartbeat.timeCapContinuation` (`enabled`, default `true`; `maxAttempts`, default `3`; `delayMs`, default `1000`). A cap hit after a long quiet spell, a cap shorter than `idleTimeoutSec`, and a cap hit with no continuation left keep the ordinary timeout behavior. "Still producing output" means agent output within the last `idleTimeoutSec` (900 seconds when the inactivity timeout is off): adapter events and log lines other than Paperclip's own status lines. Status lines are recognized by the `[paperclip] ` prefix at the start of a line, so if an agent prints nothing but lines with that exact prefix for a whole window, the cap stop is treated as a quiet one.
 
 ## 3.4 Prompt templates
 

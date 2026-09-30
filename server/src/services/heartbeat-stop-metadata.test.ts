@@ -43,6 +43,25 @@ describe("heartbeat stop metadata", () => {
     });
   });
 
+  it("names inactivity stops and time-cap checkpoints as timeouts of their own kind", () => {
+    const idle = buildHeartbeatRunStopMetadata({
+      adapterType: "codex_local",
+      adapterConfig: { timeoutSec: 3600, idleTimeoutSec: 900 },
+      outcome: "timed_out",
+      errorCode: "idle_timeout",
+      errorMessage: "Run stopped after 900s without output or progress",
+    });
+    expect(idle).toMatchObject({ stopReason: "idle_timeout", timeoutFired: true });
+    const checkpoint = buildHeartbeatRunStopMetadata({
+      adapterType: "codex_local",
+      adapterConfig: { timeoutSec: 3600 },
+      outcome: "timed_out",
+      errorCode: "time_cap_checkpoint",
+      errorMessage: "Run reached its hard time cap while still making progress",
+    });
+    expect(checkpoint).toMatchObject({ stopReason: "time_cap_checkpoint", timeoutFired: true, effectiveTimeoutSec: 3600 });
+  });
+
   it("distinguishes budget cancellation from manual cancellation", () => {
     expect(
       buildHeartbeatRunStopMetadata({

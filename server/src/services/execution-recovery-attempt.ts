@@ -12,6 +12,15 @@ export interface ExecutionRetryAccounting {
   maxTurnContinuations: number;
 }
 
+// Productive continuations resume a run that stopped at a per-run budget (turn
+// limit or hard time cap) while it was still working. They share one counter,
+// so one continuation chain is bounded no matter which budget it reached.
+const PRODUCTIVE_CONTINUATION_REASONS = new Set(["max_turns_continuation", "time_cap_continuation"]);
+
+function isProductiveContinuationReason(reason: string | null | undefined): boolean {
+  return PRODUCTIVE_CONTINUATION_REASONS.has(reason ?? "");
+}
+
 function count(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
@@ -27,7 +36,7 @@ function savedAccounting(run: RetryRun): ExecutionRetryAccounting | null {
 }
 
 function historicalFailureCount(run: RetryRun): number {
-  if (run.scheduledRetryReason === "max_turns_continuation" || run.scheduledRetryReason === "issue_disposition_repair") return 0;
+  if (isProductiveContinuationReason(run.scheduledRetryReason) || run.scheduledRetryReason === "issue_disposition_repair") return 0;
   if (run.scheduledRetryReason === "ai_connection_busy") {
     const saved = count(run.contextSnapshot?.failureRetriesBeforeAiConnectionWait);
     if (saved !== null) return saved;
@@ -42,12 +51,13 @@ function historicalFailureCount(run: RetryRun): number {
 
 export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccounting {
   const saved = savedAccounting(run);
-  const nonFailureLane = ["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy"].includes(run.scheduledRetryReason ?? "");
+  const nonFailureLane = isProductiveContinuationReason(run.scheduledRetryReason) ||
+    ["issue_disposition_repair", "workspace_busy", "ai_connection_busy"].includes(run.scheduledRetryReason ?? "");
   return {
     version: 1,
     failureRetries: Math.max(saved?.failureRetries ?? 0, saved && nonFailureLane ? 0 : historicalFailureCount(run)),
     maxTurnContinuations: Math.max(saved?.maxTurnContinuations ?? 0,
-      run.scheduledRetryReason === "max_turns_continuation" ? count(run.scheduledRetryAttempt) ?? 0 : 0),
+      isProductiveContinuationReason(run.scheduledRetryReason) ? count(run.scheduledRetryAttempt) ?? 0 : 0),
   };
 }
 
@@ -61,12 +71,12 @@ export function executionRetryAttemptCount(run: RetryRun, reason: string): numbe
     return run.scheduledRetryReason === reason ? count(run.scheduledRetryAttempt) ?? 0 : 0;
   }
   const accounting = executionRetryAccounting(run);
-  return reason === "max_turns_continuation" ? accounting.maxTurnContinuations : accounting.failureRetries;
+  return isProductiveContinuationReason(reason) ? accounting.maxTurnContinuations : accounting.failureRetries;
 }
 
 export function accountingForScheduledRetry(run: RetryRun, reason: string, attempt: number): ExecutionRetryAccounting {
   const accounting = executionRetryAccounting(run);
-  if (reason === "max_turns_continuation") accounting.maxTurnContinuations = attempt;
+  if (isProductiveContinuationReason(reason)) accounting.maxTurnContinuations = attempt;
   else if (reason !== "workspace_busy" && reason !== "ai_connection_busy") accounting.failureRetries = attempt;
   return accounting;
 }

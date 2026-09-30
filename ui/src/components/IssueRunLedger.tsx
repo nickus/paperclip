@@ -315,6 +315,12 @@ function stopReasonLabel(run: RunForIssue) {
       ? `${effectiveTimeoutSec}s timeout`
       : null;
 
+  if (stopReason === "time_cap_checkpoint") {
+    return timeoutText
+      ? `time cap checkpoint (${timeoutText}), continuing`
+      : "time cap checkpoint, continuing";
+  }
+  if (stopReason === "idle_timeout") return "stopped after no output";
   if (timeoutFired || stopReason === "timeout") {
     return timeoutText ? `timeout (${timeoutText})` : "timeout";
   }
