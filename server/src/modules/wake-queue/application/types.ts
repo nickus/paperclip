@@ -52,6 +52,8 @@ export type InvokableAgentSnapshot = {
   companyId: string;
   name: string | null;
   invokable: boolean;
+  /** True when the agent's own status is paused (and so it is not invokable). */
+  paused?: boolean;
 };
 
 /** A new heartbeat run reached the queued state and should be published and dispatched. */

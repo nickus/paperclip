@@ -82,6 +82,11 @@ Pause an agent to temporarily stop heartbeats:
 POST /api/agents/{agentId}/pause
 ```
 
+A pause cancels the agent's live and queued runs. To let the live run finish
+instead, pause after the current run: `{ "afterCurrentRun": true }` (CLI:
+`npx paperclipai agent pause <agentId> --after-current-run`). No new run starts,
+and queued runs wait until the agent is resumed.
+
 Resume to restart:
 
 ```

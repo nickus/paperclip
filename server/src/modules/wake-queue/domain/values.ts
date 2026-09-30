@@ -17,6 +17,14 @@ export const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 export const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
 
+/**
+ * Payload key a release writes onto a deferred wake it kept because the
+ * wake's agent was paused. It names the finishing run whose release reached
+ * the wake, so a later sweep can run that same release again once the agent
+ * resumes. Wake callers never set it; enqueue strips it from their payloads.
+ */
+export const HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY = "heldForPausedAgent";
+
 export function isWorkspaceValidationFailedRun(run: { errorCode: string | null }): boolean {
   return run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE;
 }

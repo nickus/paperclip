@@ -42,6 +42,7 @@ import {
   updateAgentPermissionsSchema,
   updateAgentInstructionsPathSchema,
   wakeAgentSchema,
+  pauseAgentSchema,
   updateAgentSchema,
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
@@ -5464,6 +5465,8 @@ export function agentRoutes(
 
   router.post("/agents/:id/pause", async (req, res) => {
     assertBoard(req);
+    // The body is optional: a bare POST keeps its long-standing meaning.
+    const { afterCurrentRun } = pauseAgentSchema.parse(req.body ?? {});
     const id = req.params.id as string;
     if (!(await getAccessibleAgent(req, res, id))) {
       return;
@@ -5474,7 +5477,13 @@ export function agentRoutes(
       return;
     }
 
-    await heartbeat.cancelActiveForAgent(id);
+    // A paused agent starts no run and the scheduler leaves its queued runs
+    // queued, so pausing after the current run only has to skip the
+    // cancellation: the live run finishes normally and queued work starts
+    // once the agent is resumed.
+    if (!afterCurrentRun) {
+      await heartbeat.cancelActiveForAgent(id);
+    }
 
     await logActivity(db, {
       companyId: agent.companyId,
@@ -5483,6 +5492,7 @@ export function agentRoutes(
       action: "agent.paused",
       entityType: "agent",
       entityId: agent.id,
+      ...(afterCurrentRun ? { details: { afterCurrentRun: true } } : {}),
     });
 
     res.json(redactAgentRowForResponse(agent));

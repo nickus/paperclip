@@ -65,6 +65,10 @@ interface AgentDeleteOptions extends BaseClientOptions {
   yes?: boolean;
 }
 
+interface AgentPauseOptions extends BaseClientOptions {
+  afterCurrentRun?: boolean;
+}
+
 interface AgentResetSessionOptions extends BaseClientOptions {
   taskKey?: string;
 }
@@ -415,8 +419,30 @@ export function registerAgentCommands(program: Command): void {
       }),
   );
 
+  addCommonClientOptions(
+    agent
+      .command("pause")
+      .description("Pause an agent")
+      .argument("<agentId>", "Agent ID")
+      .option(
+        "--after-current-run",
+        "Let the live run finish instead of cancelling it; queued runs wait for resume",
+      )
+      .action(async (agentId: string, opts: AgentPauseOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const result = await ctx.api.post(
+            apiPath`/api/agents/${agentId}/pause`,
+            opts.afterCurrentRun ? { afterCurrentRun: true } : {},
+          );
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
   for (const [name, path, description] of [
-    ["pause", "pause", "Pause an agent"],
     ["resume", "resume", "Resume an agent"],
     ["approve", "approve", "Approve a pending agent"],
     ["terminate", "terminate", "Terminate an agent"],

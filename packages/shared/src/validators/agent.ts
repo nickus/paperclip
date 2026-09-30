@@ -248,6 +248,17 @@ export const wakeAgentSchema = z.object({
 
 export type WakeAgent = z.infer<typeof wakeAgentSchema>;
 
+export const pauseAgentSchema = z.object({
+  /**
+   * Let the agent's live run finish instead of cancelling it. The agent is
+   * paused at once, so no new run starts; queued runs stay queued and start
+   * after the agent is resumed. Default: cancel the live and queued runs.
+   */
+  afterCurrentRun: z.boolean().optional(),
+});
+
+export type PauseAgent = z.infer<typeof pauseAgentSchema>;
+
 export const resetAgentSessionSchema = z.object({
   taskKey: z.string().min(1).optional().nullable(),
 });

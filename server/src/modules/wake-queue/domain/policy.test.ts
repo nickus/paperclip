@@ -253,6 +253,29 @@ describe("decideWakeOutcome", () => {
       expected: { kind: "fail_not_invokable" },
     },
     {
+      name: "fail_not_invokable: the agent is not invokable and not paused (explicitly)",
+      facts: { ...baseWakeOutcomeFacts, agent: { agentFound: true, invokable: false, paused: false } },
+      expected: { kind: "fail_not_invokable" },
+    },
+    {
+      name: "hold_for_paused_agent: the agent is paused, so its wake waits for it to resume",
+      facts: { ...baseWakeOutcomeFacts, agent: { agentFound: true, invokable: false, paused: true } },
+      expected: { kind: "hold_for_paused_agent" },
+    },
+    {
+      name: "hold_for_paused_agent: a paused agent's wake waits even under an active pause hold (checked again on resume)",
+      facts: {
+        agent: { agentFound: true, invokable: false, paused: true },
+        pauseHold: { activePauseHold: true, treeHoldInteractionWake: false },
+      },
+      expected: { kind: "hold_for_paused_agent" },
+    },
+    {
+      name: "fail_not_invokable: a paused flag without a found agent still fails",
+      facts: { ...baseWakeOutcomeFacts, agent: { agentFound: false, invokable: false, paused: true } },
+      expected: { kind: "fail_not_invokable" },
+    },
+    {
       name: "cancel_pause_hold: an active pause hold with no verified tree-hold interaction",
       facts: { ...baseWakeOutcomeFacts, pauseHold: { activePauseHold: true, treeHoldInteractionWake: false } },
       expected: { kind: "cancel_pause_hold" },

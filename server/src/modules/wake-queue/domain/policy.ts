@@ -142,6 +142,12 @@ export type DeferredWakeAgentFacts = {
   agentFound: boolean;
   /** True when the agent is invokable (status, org chain). Meaningless when agentFound is false. */
   invokable: boolean;
+  /**
+   * True when the agent's own status is paused. A pause is temporary, so the
+   * wake waits for the agent to resume instead of failing. Missing means the
+   * agent is not paused.
+   */
+  paused?: boolean;
 };
 
 export type DeferredWakePauseHoldFacts = {
@@ -158,6 +164,7 @@ export type DeferredWakeOutcomeFacts = {
 
 export type DeferredWakeOutcomeDecision =
   | { kind: "fail_not_invokable" }
+  | { kind: "hold_for_paused_agent" }
   | { kind: "cancel_pause_hold" }
   | { kind: "promote" };
 
@@ -180,9 +187,15 @@ export function decideQueuedCommentAction(
   return { kind: "proceed" };
 }
 
-/** Decides the outcome for a deferred wake whose queued-comment action resolved to "proceed" (or finished its rewrite): fail, cancel, or promote. */
+/** Decides the outcome for a deferred wake whose queued-comment action resolved to "proceed" (or finished its rewrite): fail, hold, cancel, or promote. */
 export function decideWakeOutcome(facts: DeferredWakeOutcomeFacts): DeferredWakeOutcomeDecision {
   const { agent, pauseHold } = facts;
+
+  // A paused agent resumes later; its wake stays deferred until then. Every
+  // other check (including a subtree pause hold) runs again at that point.
+  if (agent.agentFound && !agent.invokable && agent.paused === true) {
+    return { kind: "hold_for_paused_agent" };
+  }
 
   if (!agent.agentFound || !agent.invokable) {
     return { kind: "fail_not_invokable" };

@@ -8,6 +8,7 @@ import {
 } from "../domain/policy.js";
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+  HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY,
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
   readNonEmptyString,
@@ -159,19 +160,20 @@ async function runReleaseDrain(
     return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
   }
 
-  // Each `continue` path either excludes a pending handoff receipt from
-  // this drain or leaves the wake row off the
-  // `deferred_issue_execution` status, so the next queue read cannot
-  // return that same row again. That invariant is what ends this loop.
-  // The `processedWakeIds` guard below makes a break of the invariant
-  // fail loudly, instead of holding this transaction open forever.
+  // Each `continue` path either excludes a wake it leaves deferred (a
+  // pending handoff receipt, or a paused agent's wake) from this drain or
+  // leaves the wake row off the `deferred_issue_execution` status, so the
+  // next queue read cannot return that same row again. That invariant is
+  // what ends this loop. The `processedWakeIds` guard below makes a break
+  // of the invariant fail loudly, instead of holding this transaction open
+  // forever.
   const processedWakeIds = new Set<string>();
-  const handoffWakeIds: string[] = [];
+  const excludedWakeIds: string[] = [];
 
   while (true) {
     const candidate = await ports.transaction.findNextDeferredWake({
       companyId: run.companyId, issueId: issue.id,
-      ...(handoffWakeIds.length ? { excludedWakeIds: handoffWakeIds } : {}),
+      ...(excludedWakeIds.length ? { excludedWakeIds } : {}),
     });
     if (!candidate) break;
     if (processedWakeIds.has(candidate.id)) {
@@ -239,7 +241,7 @@ async function runReleaseDrain(
         // The old owner can release before assignment admission adopts these
         // exact IDs. Leave its receipt intact, skip it for this drain, and let
         // a current-assignee wake behind it proceed.
-        handoffWakeIds.push(candidate.id);
+        excludedWakeIds.push(candidate.id);
       } else {
         // The current owner has finished. An obsolete assignment cannot
         // launch another former-owner run or reopen its completed task.
@@ -317,9 +319,26 @@ async function runReleaseDrain(
 
     // A comment-id rewrite cannot change the agent or pause-hold facts already fetched above, so one decision covers both the rewritten and un-rewritten cases.
     const wakeOutcome = decideWakeOutcome({
-      agent: { agentFound: deferredAgent !== null, invokable: deferredAgent?.invokable ?? false },
+      agent: {
+        agentFound: deferredAgent !== null,
+        invokable: deferredAgent?.invokable ?? false,
+        paused: deferredAgent?.paused === true,
+      },
       pauseHold: { activePauseHold: pauseHold.activePauseHold, treeHoldInteractionWake: pauseHold.treeHoldInteractionWake },
     });
+
+    if (wakeOutcome.kind === "hold_for_paused_agent") {
+      // The wake stays queued for its agent. Skip it for the rest of this
+      // drain so a wake behind it (for another agent) can still promote.
+      await ports.transaction.holdDeferredWakeForPausedAgent({
+        companyId: run.companyId,
+        wakeId: workingCandidate.id,
+        finishingRunId: run.id,
+        now: input.now,
+      });
+      excludedWakeIds.push(workingCandidate.id);
+      continue;
+    }
 
     if (wakeOutcome.kind === "fail_not_invokable") {
       await ports.transaction.failDeferredWake({ companyId: run.companyId, wakeId: workingCandidate.id, now: input.now });
@@ -443,6 +462,7 @@ async function promoteDeferredWake(
   const promotedPayload = { ...workingCandidate.payload };
   delete promotedPayload["_paperclipWakeContext"];
   delete promotedPayload["queuedCommentInterrupt"];
+  delete promotedPayload[HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY];
 
   const promotedContextSeed: Record<string, unknown> = { ...workingCandidate.deferredContextSeed };
   if (pauseHold.activePauseHold) {

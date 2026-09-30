@@ -53,6 +53,7 @@ const {
   }));
   const heartbeatServiceMock = {
     resolveSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
+    applyTaskDrain: vi.fn(),
     recoverNativeRunsAfterRestart: vi.fn(async () => ({
       restartKind: "hard",
       dispositions: [],
@@ -210,7 +211,9 @@ vi.mock("detect-port", () => ({
   default: detectPortMock,
 }));
 
-vi.mock("@paperclipai/db", () => ({
+vi.mock("@paperclipai/db", async (importOriginal) => ({
+  // Table definitions for modules that build SQL fragments at import time.
+  ...(await importOriginal<typeof import("@paperclipai/db")>()),
   createDb: createDbMock,
   ensurePostgresDatabase: vi.fn(),
   getPostgresDataDirectory: vi.fn(),
@@ -621,6 +624,83 @@ describe("startServer feedback export wiring", () => {
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(2);
     } finally {
       setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("holds startup heartbeat recovery behind a task drain saved by the previous process until the drain ends", async () => {
+    const originalHome = process.env.PAPERCLIP_HOME;
+    const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-saved-task-drain-"));
+    const drainPath = path.join(tempHome, "instances", "default", "data", "task-drain.json");
+    mkdirSync(path.dirname(drainPath), { recursive: true });
+    writeFileSync(drainPath, JSON.stringify({ version: 1, startedAt: "2026-03-01T00:00:00.000Z", expiresAt: null }));
+    process.env.PAPERCLIP_HOME = tempHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    const schedulerIntervalMs = 31_337;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    let draining = true;
+    resolveHeartbeatSchedulingSuppressionMock.mockImplementation(() => (
+      draining ? { suppressed: true, reason: "task_drain" } : { suppressed: false, reason: null }
+    ));
+    let schedulerTick: (() => void) | undefined;
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((
+      callback: () => void,
+      interval: number,
+    ) => {
+      if (interval === schedulerIntervalMs) schedulerTick = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    const settle = async () => {
+      for (let i = 0; i < 20; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    };
+
+    try {
+      await startServer();
+
+      expect(heartbeatServiceMock.applyTaskDrain).toHaveBeenCalledWith({
+        startedAt: new Date("2026-03-01T00:00:00.000Z"),
+        expiresAt: null,
+        persistAcrossRestart: true,
+      });
+      expect(heartbeatServiceMock.recoverNativeRunsAfterRestart).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.resumeQueuedRuns).not.toHaveBeenCalled();
+      expect(schedulerTick).toBeDefined();
+
+      // Still draining: the tick runs its other work, and recovery waits.
+      schedulerTick?.();
+      await settle();
+      expect(heartbeatServiceMock.recoverNativeRunsAfterRestart).not.toHaveBeenCalled();
+      expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
+
+      // The drain ends: the next tick runs the startup recovery in its place.
+      draining = false;
+      schedulerTick?.();
+      await settle();
+      expect(heartbeatServiceMock.recoverNativeRunsAfterRestart).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledWith();
+      expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
+      expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
+
+      // Later ticks run normally and never repeat the startup recovery.
+      schedulerTick?.();
+      await settle();
+      expect(heartbeatServiceMock.recoverNativeRunsAfterRestart).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.tickTimers).toHaveBeenCalledTimes(1);
+      expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(2);
+    } finally {
+      setIntervalSpy.mockRestore();
+      resolveHeartbeatSchedulingSuppressionMock.mockReset();
+      if (originalHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = originalHome;
+      if (originalInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = originalInstanceId;
+      rmSync(tempHome, { recursive: true, force: true });
     }
   });
 

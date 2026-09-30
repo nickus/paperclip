@@ -29,6 +29,7 @@ export type {
 } from "./application/types.js";
 export { WakeQueueApplicationError } from "./application/types.js";
 export { hasInteractionContinuationWakeContext } from "./domain/context.js";
+export { HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY } from "./domain/values.js";
 export type {
   IssueSnapshot,
   RunSnapshot,

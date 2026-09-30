@@ -38,6 +38,7 @@ import {
   writeStatusCardQuerySchema,
   writeStatusCardSummarySchema,
   wakeAgentSchema,
+  pauseAgentSchema,
   resetAgentSessionSchema,
   agentSkillSyncSchema,
   testAdapterEnvironmentSchema,
@@ -3630,8 +3631,13 @@ registry.registerPath({
   path: "/api/agents/{id}/pause",
   tags: ["agents"],
   summary: "Pause an agent",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  description:
+    "Pauses the agent and cancels its live and queued runs. With afterCurrentRun, the live run finishes normally and queued runs stay queued until the agent is resumed; no new run starts either way.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: { ...jsonBody(pauseAgentSchema), required: false },
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -6194,7 +6200,7 @@ registry.registerPath({
   path: "/api/instance/task-drain",
   tags: ["instance"],
   summary:
-    "Get the task-drain status for this process only; quiescent counts in-process work, and a process restart clears it even when the database still holds running rows",
+    "Get the task-drain status for this process only; quiescent counts in-process work, and a process restart clears the drain (unless it was started with persistAcrossRestart) even when the database still holds running rows",
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -6203,7 +6209,7 @@ registry.registerPath({
   path: "/api/instance/task-drain",
   tags: ["instance"],
   summary:
-    "Start a task drain, so new run admission holds until active runs finish",
+    "Start a task drain, so new run admission holds until active runs finish; with persistAcrossRestart the drain also holds after a server restart until it is stopped",
   request: { body: jsonBody(startTaskDrainRequestSchema) },
   responses: {
     200: r.ok(),

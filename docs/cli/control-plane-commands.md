@@ -73,6 +73,12 @@ command.
 ```sh
 npx paperclipai agent list
 npx paperclipai agent get <agent-id>
+
+# Pause; cancels the live and queued runs
+npx paperclipai agent pause <agent-id>
+# Pause, but let the live run finish; queued runs wait for resume
+npx paperclipai agent pause <agent-id> --after-current-run
+npx paperclipai agent resume <agent-id>
 ```
 
 ## Skills Commands
@@ -148,6 +154,22 @@ npx paperclipai instance settings:experimental:update --payload-json '{...}'
 ```
 
 Experimental features are opt-in and are provided without compatibility guarantees. They may break, change, or be removed at any time. Use them at your own risk.
+
+## Task Drain
+
+A task drain holds new run admission for the server process: running runs
+finish, and new wakes and queued runs wait until the drain ends. Use it to
+restart without cutting runs off (instance-admin access):
+
+```sh
+npx paperclipai instance task-drain:start [--ttl-ms <ms>] [--persist-across-restart]
+npx paperclipai instance task-drain          # status: activeRuns, pendingWakes, quiescent
+npx paperclipai instance task-drain:wait [--timeout-sec 1800] [--interval-sec 5]
+npx paperclipai instance task-drain:stop
+```
+
+A restart ends the drain unless it was started with `--persist-across-restart`;
+then the restarted server keeps holding admission until `task-drain:stop`.
 
 ## Heartbeat
 

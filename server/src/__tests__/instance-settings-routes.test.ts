@@ -29,6 +29,10 @@ const mockCompanyService = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockPublishActivity = vi.hoisted(() => vi.fn());
+const mockTaskDrainStore = vi.hoisted(() => ({
+  saveTaskDrain: vi.fn(),
+  clearSavedTaskDrain: vi.fn(),
+}));
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
@@ -41,6 +45,7 @@ function registerModuleMocks() {
   vi.doMock("../services/environments.js", () => ({
     environmentService: () => mockEnvironmentService,
   }));
+  vi.doMock("../services/task-drain-store.js", () => mockTaskDrainStore);
 }
 
 // Identity object the mocked db.transaction hands to writers; tests assert
@@ -954,6 +959,14 @@ describe("instance settings routes", () => {
       quiescent: true,
     };
 
+    beforeEach(() => {
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);
+      mockTaskDrainStore.saveTaskDrain.mockReset();
+      mockTaskDrainStore.saveTaskDrain.mockResolvedValue(undefined);
+      mockTaskDrainStore.clearSavedTaskDrain.mockReset();
+      mockTaskDrainStore.clearSavedTaskDrain.mockResolvedValue(false);
+    });
+
     afterEach(() => {
       // A drain the mock left active must not carry over into an unrelated
       // test, so every test starts from the idle status again.
@@ -961,6 +974,137 @@ describe("instance settings routes", () => {
       mockHeartbeatService.computeTaskDrain.mockReset();
       mockHeartbeatService.applyTaskDrain.mockReset();
       mockHeartbeatService.stopTaskDrain.mockReset();
+    });
+
+    describe("persistAcrossRestart", () => {
+      const persistedStatus = {
+        draining: true,
+        startedAt: new Date("2026-08-28T00:00:00.000Z"),
+        expiresAt: null,
+        persistAcrossRestart: true,
+        activeRuns: 0,
+        pendingWakes: 0,
+        quiescent: true,
+      };
+
+      it("saves the drain before auditing it, and applies it marked to persist", async () => {
+        const drain = { startedAt: new Date("2026-08-29T00:00:00.000Z"), expiresAt: null };
+        mockHeartbeatService.computeTaskDrain.mockReturnValue(drain);
+        const order: string[] = [];
+        mockTaskDrainStore.saveTaskDrain.mockImplementation(async () => { order.push("save"); });
+        mockDb.transaction.mockImplementation((fn: (tx: unknown) => Promise<unknown>) => {
+          order.push("audit");
+          return fn(TX_SENTINEL);
+        });
+        const app = await createApp(adminActor);
+
+        const res = await request(app)
+          .post("/api/instance/task-drain")
+          .send({ persistAcrossRestart: true });
+
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ startedAt: "2026-08-29T00:00:00.000Z", expiresAt: null, persistAcrossRestart: true });
+        expect(order).toEqual(["save", "audit"]);
+        expect(mockTaskDrainStore.saveTaskDrain).toHaveBeenCalledWith(drain);
+        expect(mockTaskDrainStore.clearSavedTaskDrain).not.toHaveBeenCalled();
+        for (const call of mockLogActivity.mock.calls) {
+          expect(call[1]).toMatchObject({
+            action: "instance.task_drain.started",
+            details: { persistAcrossRestart: true },
+          });
+        }
+        expect(mockHeartbeatService.applyTaskDrain).toHaveBeenCalledWith({ ...drain, persistAcrossRestart: true });
+      });
+
+      it("removes any saved drain when a drain starts without it", async () => {
+        const drain = { startedAt: "2026-08-29T00:00:00.000Z", expiresAt: null };
+        mockHeartbeatService.computeTaskDrain.mockReturnValue(drain);
+        mockHeartbeatService.getTaskDrainStatus.mockReturnValue(persistedStatus);
+        const app = await createApp(adminActor);
+
+        const res = await request(app).post("/api/instance/task-drain").send({});
+
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual(drain);
+        expect(mockTaskDrainStore.clearSavedTaskDrain).toHaveBeenCalledTimes(1);
+        expect(mockTaskDrainStore.saveTaskDrain).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.applyTaskDrain).toHaveBeenCalledWith(drain);
+      });
+
+      it("fails without auditing or applying anything when the drain cannot be saved", async () => {
+        mockHeartbeatService.computeTaskDrain.mockReturnValue({ startedAt: new Date(), expiresAt: null });
+        mockTaskDrainStore.saveTaskDrain.mockRejectedValue(new Error("disk full"));
+        const app = await createApp(adminActor);
+
+        const res = await request(app)
+          .post("/api/instance/task-drain")
+          .send({ persistAcrossRestart: true });
+
+        expect(res.status).toBeGreaterThanOrEqual(500);
+        expect(mockDb.transaction).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.applyTaskDrain).not.toHaveBeenCalled();
+      });
+
+      it("puts the saved copy back in line with the live drain when the start's audit fails", async () => {
+        mockHeartbeatService.computeTaskDrain.mockReturnValue({ startedAt: new Date(), expiresAt: null });
+        mockLogActivity.mockRejectedValue(new Error("activity insert failed"));
+        const app = await createApp(adminActor);
+
+        const res = await request(app)
+          .post("/api/instance/task-drain")
+          .send({ persistAcrossRestart: true });
+
+        expect(res.status).toBeGreaterThanOrEqual(500);
+        expect(mockHeartbeatService.applyTaskDrain).not.toHaveBeenCalled();
+        // No drain was live before the failed start, so no copy may remain.
+        expect(mockTaskDrainStore.saveTaskDrain).toHaveBeenCalledTimes(1);
+        expect(mockTaskDrainStore.clearSavedTaskDrain).toHaveBeenCalledTimes(1);
+      });
+
+      it("removes the saved copy before a stop is audited", async () => {
+        mockHeartbeatService.getTaskDrainStatus.mockReturnValue(persistedStatus);
+        const order: string[] = [];
+        mockTaskDrainStore.clearSavedTaskDrain.mockImplementation(async () => { order.push("clear"); return true; });
+        mockDb.transaction.mockImplementation((fn: (tx: unknown) => Promise<unknown>) => {
+          order.push("audit");
+          return fn(TX_SENTINEL);
+        });
+        const app = await createApp(adminActor);
+
+        const res = await request(app).delete("/api/instance/task-drain");
+
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ wasActive: true });
+        expect(order).toEqual(["clear", "audit"]);
+        expect(mockHeartbeatService.stopTaskDrain).toHaveBeenCalledWith();
+      });
+
+      it("keeps the drain when its saved copy cannot be removed", async () => {
+        mockHeartbeatService.getTaskDrainStatus.mockReturnValue(persistedStatus);
+        mockTaskDrainStore.clearSavedTaskDrain.mockRejectedValue(new Error("permission denied"));
+        const app = await createApp(adminActor);
+
+        const res = await request(app).delete("/api/instance/task-drain");
+
+        expect(res.status).toBeGreaterThanOrEqual(500);
+        expect(mockDb.transaction).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.stopTaskDrain).not.toHaveBeenCalled();
+      });
+
+      it("saves the live drain again when the stop's audit fails", async () => {
+        mockHeartbeatService.getTaskDrainStatus.mockReturnValue(persistedStatus);
+        mockLogActivity.mockRejectedValue(new Error("activity insert failed"));
+        const app = await createApp(adminActor);
+
+        const res = await request(app).delete("/api/instance/task-drain");
+
+        expect(res.status).toBeGreaterThanOrEqual(500);
+        expect(mockHeartbeatService.stopTaskDrain).not.toHaveBeenCalled();
+        expect(mockTaskDrainStore.saveTaskDrain).toHaveBeenCalledWith({
+          startedAt: persistedStatus.startedAt,
+          expiresAt: null,
+        });
+      });
     });
 
     it("returns the idle status", async () => {

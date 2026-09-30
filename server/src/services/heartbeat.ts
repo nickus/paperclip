@@ -559,6 +559,7 @@ import {
 } from "../modules/run-dispatch/index.js";
 import {
   createWakeQueue,
+  HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY,
   WakeQueueApplicationError,
   type IssueSnapshot as WakeQueueIssueSnapshot,
   type PostCommitEffect as WakeQueuePostCommitEffect,
@@ -1401,12 +1402,17 @@ const nativeSessionResumeDispatchTimers = new Map<
 // lives in process memory only — a process restart clears it — and it sits at
 // module scope like activeRunExecutions above, so both the pure
 // resolveHeartbeatSchedulingSuppression() check and every heartbeatService()
-// instance see the same drain.
-let taskDrainState: { startedAt: Date; expiresAt: Date | null } | null = null;
+// instance see the same drain. A drain started with `persistAcrossRestart` is
+// also saved to disk by its caller (see task-drain-store.ts), and server
+// startup applies it again before it schedules any work.
+type TaskDrainState = {
+  startedAt: Date;
+  expiresAt: Date | null;
+  persistAcrossRestart?: boolean;
+};
+let taskDrainState: TaskDrainState | null = null;
 
-function readTaskDrain(
-  now: Date,
-): { startedAt: Date; expiresAt: Date | null } | null {
+function readTaskDrain(now: Date): TaskDrainState | null {
   if (
     taskDrainState &&
     taskDrainState.expiresAt !== null &&
@@ -1430,10 +1436,7 @@ export function computeTaskDrain(opts: { ttlMs?: number | null } = {}): {
 }
 
 /** Assign the given drain as the current task-drain state. */
-export function applyTaskDrain(drain: {
-  startedAt: Date;
-  expiresAt: Date | null;
-}): void {
+export function applyTaskDrain(drain: TaskDrainState): void {
   taskDrainState = drain;
 }
 
@@ -1456,12 +1459,14 @@ export function stopTaskDrain(): { wasActive: boolean } {
  * Report the task-drain state for this process only. `activeRuns` and
  * `pendingWakes` count in-process work. A process restart clears both
  * counters, even when the database still holds `running` rows for runs
- * this process did not finish.
+ * this process did not finish. `persistAcrossRestart` reports whether the
+ * current drain holds admission again after a restart.
  */
 export function getTaskDrainStatus(): {
   draining: boolean;
   startedAt: Date | null;
   expiresAt: Date | null;
+  persistAcrossRestart: boolean;
   activeRuns: number;
   pendingWakes: number;
   quiescent: boolean;
@@ -1473,6 +1478,7 @@ export function getTaskDrainStatus(): {
     draining: state !== null,
     startedAt: state?.startedAt ?? null,
     expiresAt: state?.expiresAt ?? null,
+    persistAcrossRestart: state?.persistAcrossRestart === true,
     activeRuns,
     pendingWakes,
     quiescent: activeRuns === 0 && pendingWakes === 0,
@@ -19985,6 +19991,81 @@ export function heartbeatService(
     return { checked: candidates.length, finalized };
   }
 
+  // A release keeps a paused agent's deferred wake on
+  // `deferred_issue_execution` and stamps it with the finishing run whose
+  // release reached it (HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY). With the issue's
+  // execution lock released, no later run is guaranteed to drain that queue
+  // again, so once the agent is no longer paused, run that same release
+  // again: every admission gate (terminal issue, reassignment, pause hold,
+  // an agent that is still not invokable) applies to the wake as usual.
+  // The drain runs with the rules of a drain after an execution hold: a
+  // live run on the issue, of any agent, owns the next turn, and a blocked
+  // outcome that the original release already escalated is not repeated.
+  async function releaseDeferredWakesHeldForPausedAgents() {
+    const cutoff = await getWorktreeExecutionCutoff();
+    const held = await db
+      .select({
+        wakeId: agentWakeupRequests.id,
+        companyId: agentWakeupRequests.companyId,
+        issueId: issues.id,
+        runId: sql<string | null>`${agentWakeupRequests.payload} -> ${HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY}::text ->> 'runId'`,
+      })
+      .from(agentWakeupRequests)
+      .innerJoin(agents, and(
+        eq(agents.id, agentWakeupRequests.agentId),
+        eq(agents.companyId, agentWakeupRequests.companyId),
+      ))
+      .innerJoin(issues, and(
+        eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+      ))
+      .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
+      .where(and(
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload} -> ${HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY}::text ->> 'runId' is not null`,
+        ne(agents.status, "paused"),
+        // A run that holds the lock drains this queue itself when it ends.
+        isNull(issues.executionRunId),
+        // Queued-comment interrupts retry through their own path above.
+        sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+        lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
+        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined,
+      ))
+      .orderBy(asc(agentWakeupRequests.updatedAt))
+      .limit(50);
+
+    let released = 0;
+    const releasedRunIds = new Set<string>();
+    for (const wake of held) {
+      // Stamp the row first, so a release that leaves it deferred (another
+      // execution gate still applies) waits a full interval before a retry.
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        eq(agentWakeupRequests.id, wake.wakeId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      if (!wake.runId || releasedRunIds.has(wake.runId)) continue;
+      const run = await getRun(wake.runId);
+      // Only the terminal run whose release held this wake, on the same
+      // issue and company, may drain it again. An unsuccessful native run's
+      // release can record its own recovery, so it is never run twice; its
+      // queue drains with the next run on the issue.
+      if (
+        !run ||
+        run.companyId !== wake.companyId ||
+        !isHeartbeatRunTerminalStatus(run.status) ||
+        (run.runtimeMode === "native" && run.status !== "succeeded") ||
+        (run.nativeIssueId ?? readNonEmptyString(parseObject(run.contextSnapshot).issueId)) !== wake.issueId
+      ) continue;
+      releasedRunIds.add(run.id);
+      try {
+        await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true, afterExecutionHold: true });
+        released += 1;
+      } catch (err) {
+        logger.warn({ err, runId: run.id, wakeupRequestId: wake.wakeId }, "failed to release a deferred wake held while its agent was paused");
+      }
+    }
+    return { checked: held.length, released };
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
@@ -19995,6 +20076,9 @@ export function heartbeatService(
     if (terminalWakes.finalized > 0) {
       logger.warn({ ...terminalWakes }, "resumeQueuedRuns finalized deferred wakes for terminal issues");
     }
+    await releaseDeferredWakesHeldForPausedAgents().catch((err) => {
+      logger.error({ err }, "failed to release deferred wakes held while their agent was paused");
+    });
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
@@ -20028,6 +20112,8 @@ export function heartbeatService(
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
         ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+        // A wake held for a paused agent has its own sweep above.
+        sql`${agentWakeupRequests.payload} -> ${HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY}::text is null`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const { wake } of strandedQueues) {
@@ -27267,6 +27353,7 @@ export function heartbeatService(
     if (payload) {
       delete payload.queuedCommentInterrupt;
       delete payload.manualUserWake;
+      delete payload[HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY];
     }
     if (opts.manualUserWake) {
       if (opts.requestedByActorType !== "user" || !opts.requestedByActorId || opts.failedRunId) {
@@ -30715,6 +30802,8 @@ export function heartbeatService(
     resumeQueuedRuns,
     finalizeDeferredWakesForTerminalIssues,
     promoteDeferredWakesAfterRunSettled,
+
+    releaseDeferredWakesHeldForPausedAgents,
 
     scheduleBoundedRetry: async (
       runId: string,
