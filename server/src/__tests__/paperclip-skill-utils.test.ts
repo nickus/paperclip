@@ -9,6 +9,11 @@ import {
   listPaperclipSkillEntries,
   removeMaintainerOnlySkillSymlinks,
 } from "@paperclipai/adapter-utils/server-utils";
+import {
+  addIssueCommentSchema,
+  updateIssueSchema,
+  upsertIssueDocumentSchema,
+} from "@paperclipai/shared";
 
 async function makeTempDir(prefix: string): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -558,6 +563,95 @@ describe("paperclip skill utils", () => {
     for (const name of referenced) {
       await expect(fs.access(path.join(skillRoot, "scripts", name)), name).resolves.toBeUndefined();
     }
+  });
+
+  it("tells agents that shell state does not survive between tool calls", async () => {
+    const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
+    const reference = await fs.readFile(path.resolve("skills/paperclip/references/shell-and-state.md"), "utf8");
+    const normalizedSkillBody = skillBody.replace(/\s+/g, " ");
+    const normalizedReference = reference.replace(/\s+/g, " ");
+
+    expect(normalizedSkillBody).toContain("Each shell tool call starts a new shell");
+    expect(skillBody).toContain("references/shell-and-state.md");
+    expect(normalizedReference).toContain("every shell tool call starts a new shell");
+    expect(normalizedReference).toContain("Background processes (`cmd &`, `nohup cmd &`) may be killed");
+    expect(normalizedReference).toContain("spell the variable out in every call");
+    expect(reference).toContain('"$PAPERCLIP_RUN_SCRATCH_DIR/build.pid"');
+    // The pkill -f self-match trap and its bracket-pattern fix.
+    expect(normalizedReference).toContain("`pkill` then kills its own shell");
+    expect(reference).toContain("pkill -f '[f]etch_data.py'");
+    expect(reference).toContain('"$PAPERCLIP_API_URL/api/issues/');
+    expect(reference).not.toMatch(/localhost:\d+|127\.0\.0\.1/);
+  });
+
+  it("documents the exact request payloads of the issue routes", async () => {
+    const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
+    const cookbook = await fs.readFile(path.resolve("skills/paperclip/references/payload-cookbook.md"), "utf8");
+
+    expect(skillBody).toContain("references/payload-cookbook.md");
+    expect(cookbook).toContain("'{body: $body}'");
+    expect(cookbook).toContain("'{status: $status, comment: $comment}'");
+    expect(cookbook).toContain("'{format: \"markdown\", title: \"Plan\", body: $body}'");
+    expect(cookbook).toContain("unblockDescriptor: {owner: {agentId: $me}");
+    expect(cookbook).toContain("blockedByIssueIds: [$blocker]");
+
+    // The documented bodies are what the validators accept, and the misnamed
+    // fields the cookbook warns about are not.
+    const multiline = "Line 1\n\n- item\n";
+    expect(addIssueCommentSchema.safeParse({ body: multiline }).success).toBe(true);
+    expect(addIssueCommentSchema.safeParse({ comment: multiline }).success).toBe(false);
+    expect(updateIssueSchema.parse({ status: "in_review", comment: multiline })).toMatchObject({
+      status: "in_review",
+      comment: multiline,
+    });
+    expect(upsertIssueDocumentSchema.safeParse({ format: "markdown", title: "Plan", body: multiline }).success).toBe(true);
+    expect(upsertIssueDocumentSchema.safeParse({ body: multiline }).success).toBe(false);
+    expect(
+      updateIssueSchema.safeParse({
+        status: "blocked",
+        unblockDescriptor: {
+          owner: { agentId: "11111111-1111-4111-8111-111111111111" },
+          action: "Restore the test database, then resume.",
+        },
+      }).success,
+    ).toBe(true);
+    expect(updateIssueSchema.safeParse({ status: "blocked", unblockDescriptor: "restore it" }).success).toBe(false);
+    expect(updateIssueSchema.safeParse({ blockedByIssueIds: ["ABC-12"] }).success).toBe(false);
+  });
+
+  it("quotes blocked-status errors exactly as the server sends them", async () => {
+    const cookbook = await fs.readFile(path.resolve("skills/paperclip/references/payload-cookbook.md"), "utf8");
+    const serverSource = [
+      await fs.readFile(path.resolve("server/src/routes/issues.ts"), "utf8"),
+      await fs.readFile(path.resolve("server/src/services/issues.ts"), "utf8"),
+    ].join("\n");
+    const errorRows = cookbook.split("\n").filter((line) => /^\| `(?:403|422)` /.test(line));
+    const quoted = errorRows.flatMap((line) =>
+      [...line.split(" | ")[0]!.matchAll(/`([^`]{12,})`/g)].map((match) => match[1]!),
+    );
+
+    expect(quoted).toEqual(
+      expect.arrayContaining([
+        "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
+        "Agents may only name themselves as an unblock owner",
+      ]),
+    );
+    for (const message of quoted) expect(serverSource, message).toContain(`"${message}"`);
+  });
+
+  it("documents how the API rewrites escaped line breaks in text bodies", async () => {
+    const cookbook = await fs.readFile(path.resolve("skills/paperclip/references/payload-cookbook.md"), "utf8");
+    const normalizedCookbook = cookbook.replace(/\s+/g, " ");
+    const escaped = "keep \\n literally";
+
+    // The documented behavior: a literal backslash-n becomes a line break.
+    expect(upsertIssueDocumentSchema.parse({ format: "markdown", body: escaped }).body).toBe("keep \n literally");
+    expect(addIssueCommentSchema.parse({ body: escaped }).body).toBe("keep \n literally");
+    expect(normalizedCookbook).toContain(
+      "turns the escape sequences `\\n`, `\\r` and `\\r\\n`, written as a literal backslash and letter, into real line breaks",
+    );
+    expect(cookbook).toContain("jq -j .body");
+    expect(cookbook).toContain("sha256sum");
   });
 
   it("keeps the create-issue-interaction-ui guide as a maintainer-only skill", async () => {

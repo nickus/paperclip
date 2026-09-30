@@ -682,6 +682,8 @@ Results are ranked by relevance: title matches first, then identifier, descripti
 
 For detailed API tables, JSON response schemas, worked examples (IC and Manager heartbeats), governance/approvals, cross-team delegation rules, error codes, issue lifecycle diagram, and the common mistakes table, read: `skills/paperclip/references/api-reference.md`
 
+**Shell state and request payloads.** Each shell tool call starts a new shell: variables, `cd` and `trap`s do not carry over, and background processes may be killed when the call returns. Keep files under `"$PAPERCLIP_RUN_SCRATCH_DIR"` (private to this run and removed after it), never at fixed shared `/tmp` paths, and take the API base URL from `$PAPERCLIP_API_URL`, never a guessed host. Read `references/shell-and-state.md` before a recipe that spans several calls, and `references/payload-cookbook.md` for exact request bodies: comments take `body`, `PATCH` takes `status` plus `comment`, documents need `format: "markdown"`, and `blocked` needs a blocker or a self-owned unblock descriptor.
+
 **Asking a free-text question.**
 
 For an open answer, use a text field, not invented choices. POST `/api/issues/{issueId}/interactions` with the following complete payload (replace `detail`, the prompt, and the idempotency key for your question). `questionSet` controls presentation; the matching `questions` entry is required storage compatibility and must not be sent alone.
