@@ -206,7 +206,9 @@ export interface AdapterRuntimeEvent {
 export interface AdapterExecutionContext {
   /** Run-scoped operator cancellation; adapters must settle before returning. */
   signal?: AbortSignal;
-  /** Opt in to signal-based cancellation before starting provider work. */
+  /** Opt in to signal-based cancellation before starting provider work. On a sandbox target
+   * the host otherwise stops the sandbox itself when the run is cancelled (see
+   * `executeWithSandboxCancellation`); opting in hands that decision to the adapter. */
   onCancellationReady?: () => Promise<void>;
   /** Host-owned stop of this run's sandbox during setup or direct CLI execution. Resolves only after
    * provider termination is verified; never accepts an agent-selected lease. */

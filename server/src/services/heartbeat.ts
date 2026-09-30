@@ -51,8 +51,10 @@ import {
   captureAdapterStopOwnership,
   createAdapterExecutionControl,
   registerAdapterExecutionControl,
+  sandboxExecutionStops,
   waitForAdapterStop,
 } from "./adapter-execution-control.js";
+import { executeWithSandboxCancellation } from "@paperclipai/adapter-utils/sandbox-cancellation";
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
@@ -21170,6 +21172,9 @@ export function heartbeatService(
     } | null;
     // When the adapter call returned; a hard-cap stop is classified against it.
     let adapterReturnedAtMs = null as number | null;
+    // This executor's entry in sandboxExecutionStops while it holds the
+    // sandbox lease of a legacy run.
+    let sandboxExecutionStop = null as ((reason: Error) => Promise<void>) | null;
     let runScratch: HeartbeatRunScratch | null = null;
     let remoteRunScratch: SshRunScratch | null = null;
     let sandboxRunScratch: SandboxRunScratch | null = null;
@@ -23315,6 +23320,37 @@ export function heartbeatService(
       });
       sshWorkspaceReuseClaim = sshWorkspaceReuse.claim;
       const executionTarget = sshWorkspaceReuse.target;
+      // Stop the work inside this run's sandbox: the provider ends every
+      // process in it and keeps the sandbox. Resolves only after the stop is
+      // verified. Stop, the inactivity timeout and the adapter invocation all
+      // share one attempt, so they never stop the sandbox twice.
+      let sandboxStopAttempt: Promise<void> | null = null;
+      const stopSandboxExecution =
+        executionTarget?.kind === "remote" && executionTarget.transport === "sandbox"
+          ? () => {
+              if (!sandboxStopAttempt) {
+                const attempt = (async () => {
+                  const release = await envOrchestrator.releaseForRun({
+                    heartbeatRunId: run.id,
+                    companyId: agent.companyId,
+                    agentId: agent.id,
+                    status: "released",
+                    providerResourceDisposition: "stop_and_retain",
+                    cancelActiveWork: true,
+                  });
+                  if (release.errors.length || !await remoteExecutionHasStopped(db, agent.companyId, run.id)) {
+                    throw new Error("Could not verify remote startup stopped");
+                  }
+                })();
+                sandboxStopAttempt = attempt;
+                // A failed attempt can be retried by the next caller.
+                attempt.catch(() => {
+                  if (sandboxStopAttempt === attempt) sandboxStopAttempt = null;
+                });
+              }
+              return sandboxStopAttempt;
+            }
+          : null;
       if (managedAiRuntime && aiBinding) {
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
@@ -24985,6 +25021,19 @@ export function heartbeatService(
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));
+          if (stopSandboxExecution) {
+            // From here on a Stop that finds no adapter execution control
+            // still stops the sandbox instead of only recording the run as
+            // cancelled while its commands keep running.
+            const stopSandbox = stopSandboxExecution;
+            sandboxExecutionStop = async (reason) => {
+              if (!executionControl.controller.signal.aborted) {
+                executionControl.controller.abort(reason);
+              }
+              await stopSandbox();
+            };
+            sandboxExecutionStops.set(run.id, sandboxExecutionStop);
+          }
         }
         const localAgentJwtScope =
           issueRef?.workMode === "skill_test"
@@ -25546,8 +25595,10 @@ export function heartbeatService(
             let idleStopUnavailableReported = false;
             // Stop a run that went quiet, through the same handles as an
             // operator Stop: the adapter's cancellation signal when it opted
-            // in, and the local or SSH client process the platform spawned.
-            // Returns false when neither exists yet, so the watchdog keeps
+            // in (on a sandbox target the host registers it for every
+            // adapter), the local or SSH client process the platform spawned,
+            // and otherwise the host-owned sandbox stop.
+            // Returns false when none exists yet, so the watchdog keeps
             // watching and a process started later can still be stopped.
             const stopRunForIdleTimeout = (
               snapshot: ReturnType<RunActivityWatchdog["snapshot"]>,
@@ -25557,7 +25608,11 @@ export function heartbeatService(
                 adapterExecutionControls.get(run.id) === executionControl
                   ? executionControl
                   : null;
-              const enforced = Boolean(running || control);
+              const sandboxStop =
+                !control && sandboxExecutionStops.get(run.id) === sandboxExecutionStop
+                  ? sandboxExecutionStop
+                  : null;
+              const enforced = Boolean(running || control || sandboxStop);
               const lastActivityAt = new Date(snapshot.lastActivityAt).toISOString();
               if (!enforced) {
                 if (!idleStopUnavailableReported) {
@@ -25610,6 +25665,7 @@ export function heartbeatService(
                     graceMs: Math.max(1, running.graceSec) * 1000,
                   });
                 }
+                if (sandboxStop) await sandboxStop(new Error(message));
               })().catch((err) => {
                 logger.warn(
                   { err, runId: run.id },
@@ -25626,7 +25682,11 @@ export function heartbeatService(
                     idleTimeoutMs: idleTimeoutPolicy.idleTimeoutSec * 1000,
                     onIdle: stopRunForIdleTimeout,
                   });
-                  return adapter.execute({
+                  // A command in a sandbox has no host process that a Stop
+                  // could signal. Unless the adapter opts in to cancellation
+                  // itself, this guard stops the sandbox when the run's signal
+                  // aborts (Stop, pause, inactivity timeout, lost ownership).
+                  return executeWithSandboxCancellation({
                     runId: run.id,
                     agent,
                     runtime: runtimeForAdapter,
@@ -25660,24 +25720,14 @@ export function heartbeatService(
                     },
                     onDispatch: markDispatchStarted,
                     signal: executionControl.controller.signal,
-                    ...(executionTarget?.kind === "remote" && executionTarget.transport === "sandbox" ? {
+                    ...(stopSandboxExecution ? {
                       stopRemoteStartup: async () => {
                         // Scope comes from the running host invocation, never agent
                         // config. Keep adapter ownership until setup has unwound.
                         if (!executionControl.controller.signal.aborted) {
                           throw new Error("Remote startup stop requires a cancelled run");
                         }
-                        const release = await envOrchestrator.releaseForRun({
-                          heartbeatRunId: run.id,
-                          companyId: agent.companyId,
-                          agentId: agent.id,
-                          status: "released",
-                          providerResourceDisposition: "stop_and_retain",
-                          cancelActiveWork: true,
-                        });
-                        if (release.errors.length || !await remoteExecutionHasStopped(db, agent.companyId, run.id)) {
-                          throw new Error("Could not verify remote startup stopped");
-                        }
+                        await stopSandboxExecution();
                       },
                     } : {}),
                     onCancellationReady: async () => {
@@ -25700,7 +25750,7 @@ export function heartbeatService(
                       });
                     },
                     authToken: authToken ?? undefined,
-                  });
+                  }, (invocation) => adapter.execute(invocation));
                 },
               );
             if (!guardedDispatch.dispatched) return;
@@ -27536,6 +27586,10 @@ export function heartbeatService(
         }
       }
     } finally {
+      // The teardown below releases the lease itself.
+      if (sandboxExecutionStop && sandboxExecutionStops.get(run.id) === sandboxExecutionStop) {
+        sandboxExecutionStops.delete(run.id);
+      }
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
       try {
@@ -30732,6 +30786,13 @@ export function heartbeatService(
         ? captureAdapterStopOwnership(run.id)
         : undefined;
     const control = stopOwnership?.control;
+    // A sandbox run has no host process to terminate. While its executor holds
+    // the sandbox lease and no adapter control is registered, stop the work in
+    // the sandbox before recording the run as cancelled.
+    const sandboxStop =
+      run.runtimeMode !== "native" && !control && !running
+        ? sandboxExecutionStops.get(run.id)
+        : undefined;
     // Capture the existing adapter owner before waiting on the run lock. Then
     // atomically fence preparation and refresh the selected runtime, so Stop
     // cannot miss a native handoff that won after its first read.
@@ -30774,7 +30835,7 @@ export function heartbeatService(
       const processCancellationSettlement =
         run.runtimeMode !== "native" &&
         !control &&
-        running
+        (running || sandboxStop)
           ? {
               settled: new Promise<void>((resolve) => {
                 releaseProcessCancellation = resolve;
@@ -30840,6 +30901,10 @@ export function heartbeatService(
                   options.terminationGraceMs,
                 ),
               });
+            } else if (sandboxStop) {
+              // Throws unless the provider verified the stop, which leaves the
+              // run running and the error with the caller.
+              await sandboxStop(new Error(reason));
             }
             terminationSettled = true;
           } finally {
@@ -30895,10 +30960,10 @@ export function heartbeatService(
                       // A scheduler placeholder has no process to acknowledge.
                       // Preserve its normal release policy instead of treating
                       // it as an operator stop of provider work.
-                      ...(processCancellationSettlement && agent && running && (
+                      ...(processCancellationSettlement && agent && (sandboxStop || (running && (
                         (Number.isInteger(running.child.pid) && (running.child.pid ?? 0) > 0) ||
                         (Number.isInteger(running.processGroupId) && (running.processGroupId ?? 0) > 0)
-                      )
+                      )))
                         ? mergeRunStopMetadataForAgent(agent, "cancelled", {
                             resultJson: {
                               ...resultJson,
