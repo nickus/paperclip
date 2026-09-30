@@ -92,6 +92,15 @@ describe("decideScheduledRetryGate", () => {
     });
   });
 
+  it("does not suppress a retry because its agent is paused, and still applies every other rule", () => {
+    const paused = { ...baseGateFacts(), agentInvokable: false, agentPaused: true };
+    expect(decideScheduledRetryGate(paused, NOW)).toEqual({ allowed: true });
+    expect(decideScheduledRetryGate({ ...paused, issueAssigneeAgentId: "agent-2" }, NOW))
+      .toMatchObject({ allowed: false, errorCode: "issue_reassigned" });
+    expect(decideScheduledRetryGate({ ...paused, issueStatus: "cancelled" }, NOW))
+      .toMatchObject({ allowed: false, errorCode: "issue_cancelled" });
+  });
+
   it.each([
     {
       name: "budget_blocked",

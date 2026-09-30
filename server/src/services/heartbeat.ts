@@ -15737,7 +15737,10 @@ export function heartbeatService(
     }
     if (retryReason !== MAX_TURN_CONTINUATION_RETRY_REASON) {
       const invokability = await getAgentInvokability(agent);
-      if (!invokability.invokable) {
+      // A pause is temporary: a paused agent's retry is scheduled as usual
+      // and stays scheduled until the agent is resumed, so pausing an agent
+      // after its current run never drops that run's retry.
+      if (!invokability.invokable && invokability.reason !== "paused") {
         await appendRunEvent(run, {
           eventType: "lifecycle",
           stream: "system",
@@ -17018,6 +17021,17 @@ export function heartbeatService(
     });
     if (promotion.outcome === "promoted") {
       applyRunDispatchPostCommitEffects(promotion.postCommitEffects);
+    }
+    // The retry stays scheduled and runs once the agent is resumed.
+    if (promotion.outcome === "held_for_paused_agent") {
+      return {
+        outcome: "gate_suppressed" as const,
+        message: promotion.reason,
+        scheduledRetry: summarizeIssueScheduledRetryRun({
+          run: updated,
+          agentName: scheduled.agentName,
+        }),
+      };
     }
     const promotedRow = await getIssueRetryRun(issue.companyId, issue.id, [
       "queued",

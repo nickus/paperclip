@@ -94,7 +94,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
   }
 
   async function seedIssueWithRetry(input: {
-    agentStatus?: "active" | "paused";
+    agentStatus?: "active" | "paused" | "terminated";
     retryStatus?: "scheduled_retry" | "queued" | "running";
     issueStatus?: "in_progress" | "todo" | "done" | "cancelled";
   } = {}) {
@@ -352,7 +352,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
   });
 
   it("uses normal promotion gates and records gate-suppressed retries", async () => {
-    const { companyId, issueId, retryRunId } = await seedIssueWithRetry({ agentStatus: "paused" });
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry({ agentStatus: "terminated" });
 
     const res = await request(createApp(boardActor(companyId)))
       .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
@@ -383,6 +383,26 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       entityId: issueId,
       runId: retryRunId,
     });
+  });
+
+  it("keeps a paused agent's retry scheduled and says it waits for the agent", async () => {
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry({ agentStatus: "paused" });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({
+      outcome: "gate_suppressed",
+      message: "Scheduled retry waits until the agent is resumed",
+      scheduledRetry: { runId: retryRunId, status: "scheduled_retry" },
+    });
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run).toEqual({ status: "scheduled_retry", errorCode: null });
   });
 
   it("requires board access for retry-now", async () => {

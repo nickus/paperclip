@@ -187,7 +187,8 @@ suite("task project repository provisioning", () => {
     await heartbeat.promoteDueScheduledRetries();
     await heartbeat.resumeQueuedRuns();
     if (scenario === "paused") {
-      expect((await heartbeat.getRun(retry!.id))?.status).toBe("cancelled");
+      // The retry waits for the agent to be resumed instead of running.
+      expect((await heartbeat.getRun(retry!.id))?.status).toBe("scheduled_retry");
       expect(execute.mock.calls.filter(([input]) => input.agent.id === agentId)).toHaveLength(0);
       return;
     }

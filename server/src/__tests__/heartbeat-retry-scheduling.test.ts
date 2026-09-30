@@ -655,6 +655,40 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(promotedRun?.status).toBe("queued");
   });
 
+  it.each([
+    { agentStatus: "paused", expected: "scheduled" },
+    { agentStatus: "terminated", expected: "not_scheduled" },
+  ] as const)("schedules a retry for a $agentStatus agent: $expected", async ({ agentStatus, expected }) => {
+    const runId = randomUUID();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedRetryFixture({ runId, companyId, agentId, now, errorCode: "claude_transient_upstream" });
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Retry fixture", status: "in_progress", assigneeAgentId: agentId, executionRunId: runId,
+    });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, wakeReason: "issue_assigned" } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agents).set({ status: agentStatus }).where(eq(agents.id, agentId));
+
+    const result = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+
+    expect(result.outcome).toBe(expected);
+    if (result.outcome !== "scheduled") {
+      expect(result).toMatchObject({ errorCode: "agent_not_invokable" });
+      return;
+    }
+    // A pause only delays the retry: it waits in scheduled_retry, holding the
+    // task, until the agent is resumed.
+    expect(result.run).toMatchObject({ status: "scheduled_retry", agentId });
+    const [issue] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, issueId));
+    expect(issue!.executionRunId).toBe(result.run.id);
+    expect(await heartbeat.promoteDueScheduledRetries(result.dueAt)).toEqual({ promoted: 0, runIds: [] });
+    expect((await heartbeat.getRun(result.run.id))?.status).toBe("scheduled_retry");
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
+    expect(await heartbeat.promoteDueScheduledRetries(result.dueAt)).toEqual({ promoted: 1, runIds: [result.run.id] });
+  });
+
   it.each([1, 2])("ACCT-01 a failed disposition repair %s receives its own first infrastructure retry", async repairAttempt => {
     const f = await seedMaxTurnFixture();
     const episode = { id: f.runId, attempt: repairAttempt, maxAttempts: 2 };
