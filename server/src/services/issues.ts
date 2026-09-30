@@ -184,6 +184,7 @@ import {
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { dependencyBlockersAwaitDecision } from "./issue-dependency-wakeups.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
@@ -2031,6 +2032,8 @@ export type IssueDependencyReadiness = {
   unresolvedBlockerCount: number;
   /** Blockers whose status is `done` but whose execution workspace has not yet finalized. */
   pendingFinalizeBlockerIssueIds: string[];
+  /** Unresolved blockers whose status is `cancelled`; they never resolve on their own. */
+  cancelledBlockerIssueIds: string[];
   allBlockersDone: boolean;
   isDependencyReady: boolean;
 };
@@ -2330,6 +2333,7 @@ function createIssueDependencyReadiness(
     unresolvedBlockerIssueIds: [],
     unresolvedBlockerCount: 0,
     pendingFinalizeBlockerIssueIds: [],
+    cancelledBlockerIssueIds: [],
     allBlockersDone: true,
     isDependencyReady: true,
   };
@@ -2644,10 +2648,15 @@ async function listIssueDependencyReadinessMap(
       createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
     // Only done blockers resolve dependents; cancelled blockers stay unresolved
-    // until an operator removes or replaces the blocker relationship explicitly.
+    // until the blocker relationship is removed or replaced explicitly. They are
+    // listed separately: when only cancelled blockers remain, nothing will
+    // resolve them, so the assignee is asked to decide instead of waiting.
     if (row.blockerStatus !== "done") {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
+      if (row.blockerStatus === "cancelled") {
+        current.cancelledBlockerIssueIds.push(row.blockerIssueId);
+      }
       current.allBlockersDone = false;
       current.isDependencyReady = false;
     } else if (
@@ -2670,6 +2679,59 @@ async function listIssueDependencyReadinessMap(
   }
 
   return readinessMap;
+}
+
+/**
+ * Open, agent-assigned dependents of `blockerIssueId` with their current
+ * dependency readiness. Conversation issues are excluded: their turns are
+ * driven by the conversation, not by blocker changes.
+ */
+async function listWakeableDependentReadiness(
+  dbOrTx: Pick<Db, "select">,
+  blockerIssueId: string,
+) {
+  const blockerIssue = await dbOrTx
+    .select({ id: issues.id, companyId: issues.companyId })
+    .from(issues)
+    .where(eq(issues.id, blockerIssueId))
+    .then((rows) => rows[0] ?? null);
+  if (!blockerIssue) return [];
+
+  const candidates = await dbOrTx
+    .select({
+      id: issues.id,
+      assigneeAgentId: issues.assigneeAgentId,
+      status: issues.status,
+      blockedTransitionAt: issues.blockedTransitionAt,
+    })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+    .where(
+      and(
+        eq(issueRelations.companyId, blockerIssue.companyId),
+        eq(issueRelations.type, "blocks"),
+        eq(issueRelations.issueId, blockerIssueId),
+        isNull(issues.conversationAgentId),
+      ),
+    );
+  const wakeableCandidates = candidates.filter(
+    (candidate) =>
+      candidate.assigneeAgentId &&
+      !["backlog", "done", "cancelled"].includes(candidate.status),
+  );
+  if (wakeableCandidates.length === 0) return [];
+
+  const readinessMap = await listIssueDependencyReadinessMap(
+    dbOrTx,
+    blockerIssue.companyId,
+    wakeableCandidates.map((candidate) => candidate.id),
+  );
+  return wakeableCandidates.map((candidate) => ({
+    candidate,
+    readiness:
+      readinessMap.get(candidate.id) ??
+      createIssueDependencyReadiness(candidate.id),
+  }));
 }
 
 async function listUnresolvedBlockerDetails(
@@ -9032,57 +9094,13 @@ export function issueService(db: Db) {
     },
 
     listWakeableBlockedDependents: async (blockerIssueId: string) => {
-      const blockerIssue = await db
-        .select({ id: issues.id, companyId: issues.companyId })
-        .from(issues)
-        .where(eq(issues.id, blockerIssueId))
-        .then((rows) => rows[0] ?? null);
-      if (!blockerIssue) return [];
-
-      const candidates = await db
-        .select({
-          id: issues.id,
-          assigneeAgentId: issues.assigneeAgentId,
-          status: issues.status,
-          blockedTransitionAt: issues.blockedTransitionAt,
-        })
-        .from(issueRelations)
-        .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
-        .where(
-          and(
-            eq(issueRelations.companyId, blockerIssue.companyId),
-            eq(issueRelations.type, "blocks"),
-            eq(issueRelations.issueId, blockerIssueId),
-            isNull(issues.conversationAgentId),
-          ),
-        );
-      if (candidates.length === 0) return [];
-
-      const wakeableCandidates = candidates.filter(
-        (candidate) =>
-          candidate.assigneeAgentId &&
-          !["backlog", "done", "cancelled"].includes(candidate.status),
-      );
-      if (wakeableCandidates.length === 0) return [];
-
       // Defer to the unified readiness check so that a dependent only fires when
       // (a) every blocker is done AND (b) every done blocker's workspace has
       // recorded a successful workspace_finalize. The finalize hook also calls
       // this function on completion, so a wake initially gated by an in-flight
       // sync-back will re-fire once the restore lands locally.
-      const readinessMap = await listIssueDependencyReadinessMap(
-        db,
-        blockerIssue.companyId,
-        wakeableCandidates.map((candidate) => candidate.id),
-      );
-
-      return wakeableCandidates
-        .map((candidate) => {
-          const readiness =
-            readinessMap.get(candidate.id) ??
-            createIssueDependencyReadiness(candidate.id);
-          return { candidate, readiness };
-        })
+      const dependents = await listWakeableDependentReadiness(db, blockerIssueId);
+      return dependents
         .filter(
           ({ readiness }) =>
             readiness.isDependencyReady && readiness.blockerIssueIds.length > 0,
@@ -9091,6 +9109,24 @@ export function issueService(db: Db) {
           id: candidate.id,
           assigneeAgentId: candidate.assigneeAgentId!,
           blockerIssueIds: readiness.blockerIssueIds,
+          blockedTransitionAt: candidate.blockedTransitionAt,
+        }));
+    },
+
+    /**
+     * Dependents of `blockerIssueId` whose remaining blockers are all
+     * cancelled. Callers use it after the blocker reaches a terminal status:
+     * such a dependent will never become ready, so its assignee must be woken
+     * to decide what to do with the cancelled blockers.
+     */
+    listBlockedDependentsAwaitingDecision: async (blockerIssueId: string) => {
+      const dependents = await listWakeableDependentReadiness(db, blockerIssueId);
+      return dependents
+        .filter(({ readiness }) => dependencyBlockersAwaitDecision(readiness))
+        .map(({ candidate, readiness }) => ({
+          id: candidate.id,
+          assigneeAgentId: candidate.assigneeAgentId!,
+          cancelledBlockerIssueIds: readiness.cancelledBlockerIssueIds,
           blockedTransitionAt: candidate.blockedTransitionAt,
         }));
     },

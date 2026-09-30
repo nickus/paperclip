@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
+  buildIssueBlockersCancelledWakeup,
   buildIssueBlockersResolvedWakeIdempotencyKey,
   buildIssueBlockersResolvedWakeStateKey,
   buildIssueBlockersResolvedWakeStateKeyWithoutCycle,
+  dependencyBlockersAwaitDecision,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "./issue-dependency-wakeups.js";
 
@@ -227,5 +229,46 @@ describe("findExistingIssueBlockersResolvedWakeForReadyState", () => {
       readyState,
     );
     expect(completed).toBeNull();
+  });
+});
+
+describe("cancelled blocker decisions", () => {
+  it("awaits a decision only when every unresolved blocker is cancelled", () => {
+    expect(dependencyBlockersAwaitDecision({
+      unresolvedBlockerCount: 2,
+      cancelledBlockerIssueIds: [blockerIssueId, dependentIssueId],
+    })).toBe(true);
+    // An open or not yet finalized blocker can still resolve on its own.
+    expect(dependencyBlockersAwaitDecision({
+      unresolvedBlockerCount: 2,
+      cancelledBlockerIssueIds: [blockerIssueId],
+    })).toBe(false);
+    // Every blocker done: the ready path owns the wake.
+    expect(dependencyBlockersAwaitDecision({
+      unresolvedBlockerCount: 0,
+      cancelledBlockerIssueIds: [],
+    })).toBe(false);
+    expect(dependencyBlockersAwaitDecision(null)).toBe(false);
+  });
+
+  it("keys the decision wake on the cancelled set and the blocked cycle", () => {
+    const wake = (cancelledBlockerIssueIds: string[], blockedTransitionAt: Date) =>
+      buildIssueBlockersCancelledWakeup({
+        dependentIssueId,
+        cancelledBlockerIssueIds,
+        blockedTransitionAt,
+        source: "test",
+        requestedByActorType: "system",
+        requestedByActorId: "test",
+      });
+    const first = wake([blockerIssueId, companyId], firstCycle);
+    expect(first).toMatchObject({
+      reason: "issue_blockers_cancelled",
+      payload: { issueId: dependentIssueId, cancelledBlockerIssueIds: [blockerIssueId, companyId] },
+      contextSnapshot: { wakeReason: "issue_blockers_cancelled", source: "test" },
+    });
+    expect(wake([companyId, blockerIssueId], firstCycle).idempotencyKey).toBe(first.idempotencyKey);
+    expect(wake([blockerIssueId], firstCycle).idempotencyKey).not.toBe(first.idempotencyKey);
+    expect(wake([blockerIssueId, companyId], secondCycle).idempotencyKey).not.toBe(first.idempotencyKey);
   });
 });

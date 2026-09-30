@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  allowsDependencyBlockedWake,
   allowsIssueInteractionWake,
   deriveCommentId,
   extractWakeCommentIds,
@@ -59,6 +60,49 @@ describe("wake context", () => {
       wakeCommentId: "comment-1",
     }, allowed)).toBe(false);
     expect(allowsIssueInteractionWake({ wakeReason: "issue_commented" }, allowed)).toBe(false);
+  });
+
+  it("lets new comments and interaction responses through the dependency gate", () => {
+    const allowed = new Set(["issue_commented"]);
+    // The interaction wake rule still applies.
+    expect(allowsDependencyBlockedWake({
+      wakeReason: "issue_commented",
+      wakeCommentId: "comment-1",
+    }, allowed)).toBe(true);
+    // An answer to a thread interaction carries no comment id.
+    expect(allowsDependencyBlockedWake({
+      wakeReason: "issue_commented",
+      interactionId: "interaction-1",
+      interactionStatus: "answered",
+    }, allowed)).toBe(true);
+    expect(allowsDependencyBlockedWake({
+      wakeReason: "issue_commented",
+      interactionId: "interaction-1",
+      interactionStatus: "pending",
+    }, allowed)).toBe(false);
+    // A later automatic wake replaced the reason of a queued comment wake.
+    expect(allowsDependencyBlockedWake({
+      wakeReason: "issue_blockers_resolved",
+      wakeCommentIds: ["comment-1"],
+    }, allowed)).toBe(true);
+    // An assignment made with a comment carries that comment.
+    expect(allowsDependencyBlockedWake({
+      wakeReason: "issue_assigned",
+      wakeCommentIds: ["comment-1"],
+    }, allowed)).toBe(true);
+    // Automatic wakes and retries stay gated, even with a comment on record.
+    expect(allowsDependencyBlockedWake({ wakeReason: "issue_assigned" }, allowed)).toBe(false);
+    expect(allowsDependencyBlockedWake({
+      wakeReason: "transient_failure_retry",
+      retryReason: "transient_failure_retry",
+      wakeCommentIds: ["comment-1"],
+    }, allowed)).toBe(false);
+    expect(allowsDependencyBlockedWake({
+      wakeReason: "missing_issue_comment",
+      retryOfRunId: "run-1",
+      wakeCommentIds: ["comment-1"],
+    }, allowed)).toBe(false);
+    expect(allowsDependencyBlockedWake(null, allowed)).toBe(false);
   });
 
   it.each(["accepted", "answered", "cancelled", "rejected"])(

@@ -191,7 +191,7 @@ The response also includes `blockedBy` and `blocks` arrays showing first-class d
 }
 ```
 
-Blocker wake semantics are strict: `issue_blockers_resolved` only fires when every blocker reaches `done`. A blocker moved to `cancelled` still requires manual re-triage or relation cleanup.
+Blocker wake semantics are strict: `issue_blockers_resolved` only fires when every blocker reaches `done`. A blocker moved to `cancelled` still requires manual re-triage or relation cleanup: when every remaining blocker is `cancelled`, the assignee gets an `issue_blockers_cancelled` wake to remove or replace the blockers, re-plan, or cancel or hand back the issue.
 
 ### Issue Update Response (`PATCH /api/issues/:issueId`)
 

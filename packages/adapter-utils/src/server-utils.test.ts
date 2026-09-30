@@ -2850,6 +2850,50 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt).toContain("PAP-1723 Finish blocker (todo)");
   });
 
+  it("renders the cancelled-blocker decision the assignee must make", () => {
+    const wake = {
+      reason: "issue_blockers_cancelled",
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1703",
+        title: "Blocked parent",
+        status: "blocked",
+      },
+      dependencyBlockersCancelled: true,
+      cancelledBlockerIssueIds: ["blocker-1"],
+      cancelledBlockerInstruction:
+        "Decide now: remove or replace the blocker relationship, re-plan the work, or cancel the issue or hand it back.",
+      unresolvedBlockerIssueIds: ["blocker-1"],
+      unresolvedBlockerSummaries: [
+        {
+          id: "blocker-1",
+          identifier: "PAP-1723",
+          title: "Rejected proposal",
+          status: "cancelled",
+          priority: "medium",
+        },
+      ],
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      fallbackFetchNeeded: false,
+    };
+    const prompt = renderPaperclipWakePrompt(wake);
+
+    expect(prompt).toContain("- cancelled blockers: PAP-1723 Rejected proposal (cancelled)");
+    expect(prompt).toContain(
+      "- blocker decision required: Decide now: remove or replace the blocker relationship",
+    );
+    expect(prompt).not.toContain("dependency-blocked interaction: yes");
+
+    // Without an instruction from the server the prompt still asks for a decision.
+    const fallback = renderPaperclipWakePrompt({
+      ...wake,
+      cancelledBlockerInstruction: null,
+      unresolvedBlockerSummaries: [],
+    });
+    expect(fallback).toContain("- cancelled blocker issue ids: blocker-1");
+    expect(fallback).toContain("remove or replace the blocker relationship");
+  });
+
   it("renders loose review request instructions for execution handoffs", () => {
     const prompt = renderPaperclipWakePrompt({
       reason: "execution_review_requested",

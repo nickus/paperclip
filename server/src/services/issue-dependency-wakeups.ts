@@ -5,6 +5,62 @@ import { agentWakeupRequests, agents } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 
 export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
+/**
+ * Wakes the assignee when every blocker that still holds an issue is
+ * cancelled. A cancelled blocker never counts as done, so no
+ * `issue_blockers_resolved` wake will follow: the assignee has to decide.
+ */
+export const ISSUE_BLOCKERS_CANCELLED_WAKE_REASON = "issue_blockers_cancelled";
+
+export const ISSUE_BLOCKERS_CANCELLED_INSTRUCTION =
+  "Every remaining blocker of this issue is cancelled, so it will never complete and Paperclip will not unblock this issue on its own. Decide now: remove or replace the blocker relationship, re-plan the work, or cancel the issue or hand it back with a comment that explains why.";
+
+type DependencyDecisionReadiness = {
+  unresolvedBlockerCount: number;
+  cancelledBlockerIssueIds?: readonly string[] | null;
+};
+
+/**
+ * True when an issue still has unresolved blockers and all of them are
+ * cancelled. Waiting cannot resolve that state, so the dependency gate lets
+ * the issue's wakes run instead of holding them, and the assignee's wakes ask
+ * for a decision.
+ *
+ * Every wake type gets through, not only the issue_blockers_cancelled wake.
+ * That wake is sent once per cancelled blocker set and blocked cycle, whoever
+ * the assignee is, so it cannot be the only way in: the child-completion wake
+ * sent when a child blocker is cancelled, a new assignee's assignment wake, a
+ * retry or continuation of a decision run that did not finish, and a decision
+ * wake whose reason another wake replaced by coalescing into it all have to
+ * reach the assignee too. Each of those wakes keeps its own limits.
+ */
+export function dependencyBlockersAwaitDecision(
+  readiness: DependencyDecisionReadiness | null | undefined,
+): boolean {
+  if (!readiness || readiness.unresolvedBlockerCount <= 0) return false;
+  const cancelledCount = new Set(readiness.cancelledBlockerIssueIds ?? []).size;
+  return cancelledCount === readiness.unresolvedBlockerCount;
+}
+
+/**
+ * One key per dependent, cancelled blocker set and blocked cycle, so the same
+ * decision is requested once, and a new cancellation or a new blocked cycle
+ * asks again.
+ */
+export function buildIssueBlockersCancelledWakeIdempotencyKey(input: {
+  dependentIssueId: string;
+  cancelledBlockerIssueIds: string[];
+  blockedTransitionAt?: IssueBlockersResolvedWakeCycleInput;
+}) {
+  const sortedBlockerIssueIds = uniqueSortedBlockerIssueIds(input.cancelledBlockerIssueIds);
+  const cycle = formatIssueBlockersResolvedWakeCycle(input.blockedTransitionAt);
+  return [
+    ISSUE_BLOCKERS_CANCELLED_WAKE_REASON,
+    input.dependentIssueId,
+    String(sortedBlockerIssueIds.length),
+    hashBlockerReadyStateDigest(sortedBlockerIssueIds, cycle),
+  ].join(":");
+}
 
 // A wake counts as "already delivered or in flight for the current ready state"
 // for these statuses. The level-triggered state key uses this full set so that
@@ -237,6 +293,75 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
     }),
   );
   return covering ?? null;
+}
+
+/**
+ * Find a wake that already asked for a decision on the same cancelled blocker
+ * set in the same blocked cycle. Like the ready-state key, a completed wake
+ * counts, so the same decision is requested once; a skipped or failed wake does
+ * not, so reconciliation asks again.
+ */
+export async function findExistingIssueBlockersCancelledWake(
+  db: Db,
+  input: { companyId: string; idempotencyKey: string },
+) {
+  const [row] = await db
+    .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
+        inArray(agentWakeupRequests.status, [...IDEMPOTENT_DEPENDENCY_WAKE_STATUSES]),
+      ),
+    )
+    .limit(1);
+  return row ?? null;
+}
+
+/**
+ * The wake request that asks a dependent's assignee to decide what to do with
+ * cancelled blockers. `source` names the path that noticed the state.
+ */
+export function buildIssueBlockersCancelledWakeup(input: {
+  dependentIssueId: string;
+  cancelledBlockerIssueIds: string[];
+  blockedTransitionAt?: IssueBlockersResolvedWakeCycleInput;
+  /** The blocker whose change left only cancelled blockers, when known. */
+  settledBlockerIssueId?: string | null;
+  source: string;
+  requestedByActorType: "user" | "agent" | "system";
+  requestedByActorId: string | null;
+}) {
+  const cancelledBlockerIssueIds = uniqueSortedBlockerIssueIds(input.cancelledBlockerIssueIds);
+  const settled = input.settledBlockerIssueId
+    ? { settledBlockerIssueId: input.settledBlockerIssueId }
+    : {};
+  return {
+    source: "automation" as const,
+    triggerDetail: "system" as const,
+    reason: ISSUE_BLOCKERS_CANCELLED_WAKE_REASON,
+    payload: {
+      issueId: input.dependentIssueId,
+      cancelledBlockerIssueIds,
+      ...settled,
+    },
+    idempotencyKey: buildIssueBlockersCancelledWakeIdempotencyKey({
+      dependentIssueId: input.dependentIssueId,
+      cancelledBlockerIssueIds,
+      blockedTransitionAt: input.blockedTransitionAt,
+    }),
+    requestedByActorType: input.requestedByActorType,
+    requestedByActorId: input.requestedByActorId,
+    contextSnapshot: {
+      issueId: input.dependentIssueId,
+      taskId: input.dependentIssueId,
+      wakeReason: ISSUE_BLOCKERS_CANCELLED_WAKE_REASON,
+      source: input.source,
+      cancelledBlockerIssueIds,
+      ...settled,
+    },
+  };
 }
 
 /** Receipt statuses written when a wake was not dispatched now. */
