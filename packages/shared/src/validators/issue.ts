@@ -1489,6 +1489,8 @@ export const requestConfirmationToolActionPayloadSchema = z.object({
   invocationId: z.string().guid(),
   toolName: z.string().trim().min(1).max(500),
   toolDisplayName: z.string().trim().min(1).max(500),
+  exposedToolName: z.string().trim().min(1).max(500).nullable().optional(),
+  upstreamToolName: z.string().trim().min(1).max(500).nullable().optional(),
   connectionId: z.string().guid().nullable(),
   applicationId: z.string().guid().nullable(),
   appDisplayName: z.string().trim().min(1).max(500).nullable(),
