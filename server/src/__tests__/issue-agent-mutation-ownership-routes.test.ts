@@ -1836,6 +1836,67 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("rejects a misnamed issue update field instead of returning success without applying it", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+    const blockerId = "33333333-3333-4333-8333-333333333333";
+
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
+      status: "blocked",
+      blockedBy: [blockerId],
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toBe(
+      "Unknown field in issue update: blockedBy (did you mean blockedByIssueIds?)",
+    );
+    expect(res.body.code).toBe("unknown_fields");
+    expect(res.body.details.acceptedFields).toEqual(
+      expect.arrayContaining(["blockedByIssueIds", "comment", "status", "unblockDescriptor"]),
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("points an issue update `body` at comment or description", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
+      status: "done",
+      body: "Shipped the fix",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.details.suggestions).toEqual({
+      body: "comment (adds a comment) or description (replaces the issue description)",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("accepts `comment` as the comment text on comment creation", async () => {
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ comment: "progress update" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "progress update",
+      expect.any(Object),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("rejects issue fields on comment creation and names the route that applies them", async () => {
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Done here", status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toContain("Unknown field in issue comment: status");
+    expect(res.body.details.suggestions.status).toContain(`PATCH /api/issues/{issueId}`);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["board", "board"],
     ["a company user", { userId: "board-user" }],
