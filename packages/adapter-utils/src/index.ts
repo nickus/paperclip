@@ -157,3 +157,8 @@ export type {
   SandboxCallbackBridgeWorkerHandle,
   StartedSandboxCallbackBridgeServer,
 } from "./sandbox-callback-bridge.js";
+export type {
+  StreamJsonLineTranslator,
+  StreamJsonOps,
+  StreamJsonTranslator,
+} from "./stream-json/types.js";
