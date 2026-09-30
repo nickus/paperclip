@@ -78,6 +78,7 @@ import {
 import type {
   AppDefinition,
   ConnectionGrantKind,
+  ConnectionToolOverride,
   ConnectionMethodDef,
   ConnectionTokenIssuanceOutcome,
   ConnectionTokenIssuancePath,
@@ -1701,18 +1702,32 @@ function toCatalogEntry(
   };
 }
 
+/**
+ * Adds what agents see for a tool when its connection overrides it. The
+ * entry's own name and description stay the upstream values.
+ */
+function withExposedToolPresentation(
+  entry: ToolCatalogEntry,
+  overrides: ReadonlyMap<string, ConnectionToolOverride>,
+): ToolCatalogEntry {
+  const override = overrides.get(entry.toolName);
+  return {
+    ...entry,
+    exposedName: override?.name ?? null,
+    exposedDescription: override?.description ?? null,
+  };
+}
+
 function toCatalogEntryForConnection(
   row: typeof toolCatalogEntries.$inferSelect,
   connection: typeof toolConnections.$inferSelect,
 ): ToolCatalogEntry {
-  const rawCatalogEntry = toCatalogEntry(row);
-  // What agents see for this tool when the connection overrides it. The
-  // entry's own name and description stay the upstream values.
-  const override = readConnectionToolOverrides(connection.config).get(row.toolName);
+  const rawCatalogEntry = withExposedToolPresentation(
+    toCatalogEntry(row),
+    readConnectionToolOverrides(connection.config),
+  );
   const catalogEntry = {
     ...rawCatalogEntry,
-    exposedName: override?.name ?? null,
-    exposedDescription: override?.description ?? null,
     inputSchema: projectedConnectionToolInputSchema(
       connection,
       rawCatalogEntry.inputSchema ?? {},
@@ -7686,9 +7701,14 @@ export function toolAccessService(
       actor,
     });
 
+    // Report the exposed names and descriptions the catalog listing reports,
+    // so a caller rendering this result shows the same tool presentation.
+    const toolOverrides = readConnectionToolOverrides(updatedConnection.config);
     return {
       connection: toConnection(updatedConnection),
-      catalog: updatedEntries,
+      catalog: updatedEntries.map((entry) =>
+        withExposedToolPresentation(entry, toolOverrides),
+      ),
       discoveredCount: descriptors.length,
       quarantinedCount,
     };

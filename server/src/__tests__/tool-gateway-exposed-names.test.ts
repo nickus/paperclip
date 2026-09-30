@@ -40,7 +40,12 @@ type Db = ReturnType<typeof createDb>;
 const SIGNING_SECRET = "exposed-names-test-only-signing-secret";
 const REMOTE_URL = "https://tickets.example.test/mcp";
 
-type RemoteTool = { name: string; inputSchema?: Record<string, unknown>; annotations?: Record<string, unknown> };
+type RemoteTool = {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
+};
 
 /** A remote MCP server behind the transport seam that records which upstream tool each call names. */
 function recordingRemote(initialTools: RemoteTool[] = []) {
@@ -530,6 +535,61 @@ describeEmbeddedPostgres("tool connection exposed tool name overrides", () => {
       config: { url: REMOTE_URL, toolOverrides: { search: { name: "find_other_tickets" } } },
     });
     expect(updated.config).toMatchObject({ toolOverrides: { search: { name: "find_other_tickets" } } });
+  });
+
+  it("reports exposed names and descriptions in the catalog a refresh returns, as the catalog listing does", async () => {
+    const { company } = await createCompanyFixture(db);
+    const remote = recordingRemote([
+      {
+        name: "search",
+        description: "Upstream search description.",
+        inputSchema: { type: "object", properties: { query: { type: "string" } } },
+        annotations: { readOnlyHint: true },
+      },
+      { name: "create_ticket", description: "Upstream create description.", inputSchema: { type: "object", properties: {} } },
+    ]);
+    const service = toolAccessService(db, {
+      remoteHttpRequest: remote.remoteHttpRequest,
+      remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+    });
+    const connection = await service.createConnection(company.id, {
+      name: "Tickets",
+      transport: "mcp_remote",
+      authKind: "none",
+      connectionPurpose: "tool",
+      ownership: "customer",
+      connectionKind: "managed",
+      credentialSecretRefs: [],
+      transportConfig: {},
+      config: {
+        url: REMOTE_URL,
+        toolOverrides: { search: { name: "find_tickets", description: "Find support tickets by keyword." } },
+      },
+    });
+
+    // Callers such as the connect flow render the refresh result directly.
+    const refresh = await service.refreshCatalog(connection.id);
+    const refreshed = new Map(refresh.catalog.map((entry) => [entry.toolName, entry]));
+    expect(refreshed.get("search")).toMatchObject({
+      toolName: "search",
+      description: "Upstream search description.",
+      exposedName: "find_tickets",
+      exposedDescription: "Find support tickets by keyword.",
+    });
+    expect(refreshed.get("create_ticket")).toMatchObject({
+      toolName: "create_ticket",
+      exposedName: null,
+      exposedDescription: null,
+    });
+
+    const listed = await service.listCatalog(connection.id, company.id);
+    expect(listed).toHaveLength(2);
+    for (const entry of listed) {
+      expect(refreshed.get(entry.toolName)).toMatchObject({
+        exposedName: entry.exposedName,
+        exposedDescription: entry.exposedDescription,
+      });
+    }
   });
 
   it("keeps overrides through catalog refreshes and still quarantines a changed upstream schema", async () => {

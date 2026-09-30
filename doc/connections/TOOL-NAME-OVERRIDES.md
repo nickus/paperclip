@@ -52,7 +52,9 @@ curl -fsS -X PATCH -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: a
 
 `GET /api/tool-connections/:id/catalog` reports the effective values per entry
 as `exposedName` and `exposedDescription`; the entry's own `name`,
-`toolName` and `description` stay the upstream values.
+`toolName` and `description` stay the upstream values. The `catalog` returned
+by `POST /api/tool-connections/:id/catalog/refresh` and by the connect flows
+carries the same two fields.
 
 ### Validation
 
