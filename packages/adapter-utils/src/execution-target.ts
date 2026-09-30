@@ -51,6 +51,11 @@ import {
   syncSandboxCallbackBridgeEntrypoint,
 } from "./sandbox-callback-bridge.js";
 import {
+  isSandboxCallbackBridgeToolCallRoute,
+  requestWithCallerDeadline,
+  sandboxCallbackBridgeForwardTimeoutMs,
+} from "./sandbox-callback-bridge-tool-calls.js";
+import {
   createHttp2BridgeServer,
   BridgeProcessCapacityError,
   type BridgeBodyReservation,
@@ -4685,10 +4690,17 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     }
     headers.set("authorization", `Bearer ${hostApiToken}`);
     headers.set("x-paperclip-run-id", input.runId);
+    // A connected tool call can run for minutes; it gets the tool-call forward
+    // budget instead of the short default (see sandbox-callback-bridge-tool-calls).
+    const toolCallRoute = isSandboxCallbackBridgeToolCallRoute({ method, path: request.path });
+    const requestForwardTimeoutMs = sandboxCallbackBridgeForwardTimeoutMs(
+      { method, path: request.path },
+      forwardTimeoutMs,
+    );
     // Abort the forward when the caller aborts the request (its per-iteration
     // timeout or watchdog fired, or the broker's forward budget ended), or after
     // the forward budget here, whichever comes first.
-    const timeoutSignal = AbortSignal.timeout(forwardTimeoutMs);
+    const timeoutSignal = AbortSignal.timeout(requestForwardTimeoutMs);
     const forwardSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     // Build the request-body init. A GET or a HEAD carries no body. The file
     // bridge passes legacy JSON as a string and binary data as a `Buffer`;
@@ -4705,7 +4717,18 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     if (method !== "GET" && method !== "HEAD" && request.body !== undefined) {
       forwardInit.body = request.body as BodyInit;
     }
-    const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), forwardInit);
+    const forwardUrl = buildBridgeForwardUrl(hostApiUrl, request);
+    // Platform fetch gives up on response headers after 300 s on its own, which
+    // a long tool call can reach; those forwards use a request bounded only by
+    // the forward signal.
+    const response = toolCallRoute
+      ? await requestWithCallerDeadline(forwardUrl, {
+          method,
+          headers,
+          body: method !== "GET" && method !== "HEAD" ? request.body : undefined,
+          signal: forwardSignal,
+        })
+      : await fetch(forwardUrl, forwardInit);
     if (emitDebugLog) {
       await onLog(
         "stdout",

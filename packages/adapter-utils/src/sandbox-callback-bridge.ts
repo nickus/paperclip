@@ -12,6 +12,11 @@ import {
   type SandboxCallbackBridgeBody,
 } from "./sandbox-callback-bridge-body.js";
 import type { BridgeBodyReservation } from "./http2-bridge-server.js";
+import {
+  isSandboxCallbackBridgeToolCallRoute,
+  sandboxCallbackBridgeGatewayWaitSource,
+  TOOL_CALL_BRIDGE_FORWARD_TIMEOUT_MS,
+} from "./sandbox-callback-bridge-tool-calls.js";
 
 import {
   runWithoutActiveStep,
@@ -1289,10 +1294,17 @@ export async function startSandboxCallbackBridgeWorker(input: {
     controller: AbortController;
     finalized: boolean;
     backstopTimer?: ReturnType<typeof setTimeout>;
+    // Set for a connected tool call whose handler runs outside the poll loop
+    // (see `processRequestFile`). Its own tool-call budget bounds it, so the
+    // recovery path for an unrelated slow or failed request leaves it running.
+    detached?: boolean;
   };
   const inFlightRequestGuards = new Map<string, RequestFinalizeGuard>();
 
   const processRequestFile = async (fileName: string) => {
+    // Set once a tool-call handler is handed off to run outside the poll loop;
+    // its own completion then releases the reservations and the guard.
+    let detached = false;
     // Skip a request that already has an active attempt. The guard map holds only
     // in-flight attempts; the attempt's finally removes its guard when it ends. A
     // file that still has a guard is in flight, or it waits for its aborted-handler
@@ -1470,70 +1482,106 @@ export async function startSandboxCallbackBridgeWorker(input: {
 
       // Build the response, then finalize once. The handler already holds the
       // claim, so `finalize` writes the real response.
-      let response: SandboxCallbackBridgeResponse;
-      let handlerReturned = false;
-      try {
-        const { bodyEncoding, ...forwardRequest } = request;
-        const result = await input.handleRequest({ ...forwardRequest,
-          body: bodyEncoding === "base64" ? decodeSandboxBridgeBody(request, maxBodyBytes) : request.body,
-        }, { signal: guard.controller.signal, reservation });
-        handlerReturned = true;
-        const responseBytes = Buffer.byteLength(result.body ?? "");
-        if (responseBytes > maxBodyBytes) throw new Error("Bridge response body exceeded the configured size limit.");
-        if (!reservation.reserve(4 * sandboxBridgeEnvelopeLimit(responseBytes))) {
-          throw new Error("Bridge host response body capacity is busy.");
-        }
-        const responseBody = encodeSandboxBridgeBody(result.body ?? "", maxBodyBytes);
-        response = {
-          id: request.id,
-          status: result.status,
-          headers: result.headers ?? {},
-          ...responseBody,
-          completedAt: new Date().toISOString(),
-        };
-      } catch (error) {
-        console.warn(
-          `[paperclip] sandbox callback bridge handler failed for ${request.id}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        // Tell a worker abort apart from a normal handler failure. The recovery
-        // path aborts `guard.controller` when the per-iteration timeout or the
-        // watchdog fires. The abort reaches this catch only after the handler
-        // claimed the request and started the host operation. The bridge cannot
-        // cancel a host operation that is in flight, so the mutation may have
-        // committed. A 502 (or 503) is a retryable status: the caller retries it
-        // and applies the mutation twice. So return a non-retryable 504 and mark
-        // the outcome indeterminate. The caller must not retry a 504 from the
-        // bridge, unlike the retry-safe 503 that the recovery path writes only
-        // before the host operation starts.
-        if (guard.controller.signal.aborted || (handlerReturned && !["GET", "HEAD", "OPTIONS", "TRACE"].includes(request.method))) {
+      const runHandler = async () => {
+        let response: SandboxCallbackBridgeResponse;
+        let handlerReturned = false;
+        try {
+          const { bodyEncoding, ...forwardRequest } = request;
+          const result = await input.handleRequest({ ...forwardRequest,
+            body: bodyEncoding === "base64" ? decodeSandboxBridgeBody(request, maxBodyBytes) : request.body,
+          }, { signal: guard.controller.signal, reservation });
+          handlerReturned = true;
+          const responseBytes = Buffer.byteLength(result.body ?? "");
+          if (responseBytes > maxBodyBytes) throw new Error("Bridge response body exceeded the configured size limit.");
+          if (!reservation.reserve(4 * sandboxBridgeEnvelopeLimit(responseBytes))) {
+            throw new Error("Bridge host response body capacity is busy.");
+          }
+          const responseBody = encodeSandboxBridgeBody(result.body ?? "", maxBodyBytes);
           response = {
             id: request.id,
-            status: 504,
-            headers: {
-              "content-type": "application/json",
-              "x-paperclip-bridge-outcome": "indeterminate",
-            },
-            body: JSON.stringify({
-              error: error instanceof Error ? error.message : String(error),
-              outcome: "indeterminate",
-              retryable: false,
-            }),
+            status: result.status,
+            headers: result.headers ?? {},
+            ...responseBody,
             completedAt: new Date().toISOString(),
           };
-        } else {
-          response = {
-            id: request.id,
-            status: 502,
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              error: error instanceof Error ? error.message : String(error),
-            }),
-            completedAt: new Date().toISOString(),
-          };
+        } catch (error) {
+          console.warn(
+            `[paperclip] sandbox callback bridge handler failed for ${request.id}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          // Tell a worker abort apart from a normal handler failure. The recovery
+          // path aborts `guard.controller` when the per-iteration timeout or the
+          // watchdog fires. The abort reaches this catch only after the handler
+          // claimed the request and started the host operation. The bridge cannot
+          // cancel a host operation that is in flight, so the mutation may have
+          // committed. A 502 (or 503) is a retryable status: the caller retries it
+          // and applies the mutation twice. So return a non-retryable 504 and mark
+          // the outcome indeterminate. The caller must not retry a 504 from the
+          // bridge, unlike the retry-safe 503 that the recovery path writes only
+          // before the host operation starts.
+          if (guard.controller.signal.aborted || (handlerReturned && !["GET", "HEAD", "OPTIONS", "TRACE"].includes(request.method))) {
+            response = {
+              id: request.id,
+              status: 504,
+              headers: {
+                "content-type": "application/json",
+                "x-paperclip-bridge-outcome": "indeterminate",
+              },
+              body: JSON.stringify({
+                error: error instanceof Error ? error.message : String(error),
+                outcome: "indeterminate",
+                retryable: false,
+              }),
+              completedAt: new Date().toISOString(),
+            };
+          } else {
+            response = {
+              id: request.id,
+              status: 502,
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                error: error instanceof Error ? error.message : String(error),
+              }),
+              completedAt: new Date().toISOString(),
+            };
+          }
         }
+        await finalize(response);
+      };
+
+      // A connected tool call can take minutes. Awaiting it here would hold
+      // the poll loop, and with it every other request of the run, past the
+      // per-iteration timeout, which would abort the call. Run it outside the
+      // loop instead: the guard stays in the map so the loop skips the file,
+      // the forward's own tool-call budget bounds the call, and a watchdog at
+      // that budget aborts a handler that ignores its signal and arms the 504
+      // backstop, so the caller never strands.
+      if (isSandboxCallbackBridgeToolCallRoute(request)) {
+        detached = true;
+        guard.detached = true;
+        const budgetTimer = setTimeout(() => {
+          const message = `Sandbox callback bridge tool call exceeded its ${TOOL_CALL_BRIDGE_FORWARD_TIMEOUT_MS}ms budget.`;
+          guard.controller.abort(new Error(message));
+          scheduleAbortedHandlerBackstop(fileName, guard, message);
+        }, TOOL_CALL_BRIDGE_FORWARD_TIMEOUT_MS);
+        budgetTimer.unref?.();
+        void runHandler()
+          .catch((error) => {
+            console.warn(
+              `[paperclip] sandbox callback bridge tool call failed for ${request.id}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          })
+          .finally(() => {
+            clearTimeout(budgetTimer);
+            releaseRequest();
+          });
+        return;
       }
-      await finalize(response);
+      await runHandler();
     } finally {
+      if (!detached) releaseRequest();
+    }
+
+    function releaseRequest() {
       envelopeReadReservation.release();
       reservation.release();
       // Drop the guard only when it still points to this attempt. A retry can
@@ -1662,7 +1710,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
       // 503 for a handler-owned request: the recovery cannot cancel a committed
       // host mutation, so a retryable status there could apply the mutation twice.
       for (const [fileName, guard] of inFlightRequestGuards.entries()) {
-        if (guard.claim === "handler") {
+        // A detached tool call is bounded by its own budget and watchdog; the
+        // slow or failed request that triggered this pass is not its problem.
+        if (guard.claim === "handler" && !guard.detached) {
           guard.controller.abort(new Error(message));
           scheduleAbortedHandlerBackstop(fileName, guard, message);
         }
@@ -1983,6 +2033,11 @@ export async function startSandboxCallbackBridgeWorker(input: {
         ]);
       }
       await failPendingRequests("Bridge worker stopped before request could be handled.");
+      // The run is ending: stop waiting on tool calls still in flight. Their
+      // callers already received the stop drain response above.
+      for (const guard of inFlightRequestGuards.values()) {
+        if (guard.detached) guard.controller.abort(new Error("Bridge worker stopped."));
+      }
     },
   };
 }
@@ -2572,6 +2627,7 @@ const pollIntervalMs = Number(process.env.PAPERCLIP_BRIDGE_POLL_INTERVAL_MS || "
 const responseTimeoutMs = Number(
   process.env.PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS || "${DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS}",
 );
+${sandboxCallbackBridgeGatewayWaitSource()}
 const maxQueueDepth = Number(process.env.PAPERCLIP_BRIDGE_MAX_QUEUE_DEPTH || "${DEFAULT_BRIDGE_MAX_QUEUE_DEPTH}");
 const maxBodyBytes = Number(process.env.PAPERCLIP_BRIDGE_MAX_BODY_BYTES || "${DEFAULT_BRIDGE_MAX_BODY_BYTES}");
 // The header allowlist. Both the file gateway and the http2 gateway strip an
@@ -2740,6 +2796,11 @@ async function runFileGateway() {
     return entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).length;
   }
 
+  // Request files this process still waits on. A connected tool call can
+  // legitimately wait longer than the default deadline, so the sweep below
+  // never treats a live caller's file as an orphan.
+  const liveRequestFiles = new Set();
+
   // Delete request files older than the response deadline. Every live caller
   // cleans its own request file when it times out, so a file this old is an
   // orphan: its writer was killed mid-wait, or a previous gateway process died
@@ -2750,6 +2811,7 @@ async function runFileGateway() {
     const entries = await fs.readdir(requestsDir, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      if (liveRequestFiles.has(entry.name)) continue;
       const filePath = path.posix.join(requestsDir, entry.name);
       const stats = await fs.stat(filePath).catch(() => null);
       if (stats && stats.mtimeMs < staleBefore) {
@@ -2758,9 +2820,9 @@ async function runFileGateway() {
     }
   }
 
-  async function waitForResponse(requestId, reserveResponse) {
+  async function waitForResponse(requestId, reserveResponse, waitTimeoutMs) {
     const responsePath = path.posix.join(responsesDir, \`\${requestId}.json\`);
-    const deadline = Date.now() + responseTimeoutMs;
+    const deadline = Date.now() + waitTimeoutMs;
     while (Date.now() < deadline) {
       const handle = await fs.open(responsePath, "r").catch(error => {
         if (error.code === "ENOENT") return null;
@@ -2799,6 +2861,7 @@ async function runFileGateway() {
     let releaseBodyReservation = null;
     let envelopeReservation = 0;
     let dispatched = false;
+    let liveRequestFile = null;
     try {
       const auth = req.headers.authorization || "";
       const receivedToken = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
@@ -2847,6 +2910,8 @@ async function runFileGateway() {
       const tempPath = \`\${requestPath}.tmp\`;
       await fs.writeFile(tempPath, \`\${JSON.stringify(payload)}\\n\`, "utf8");
       dispatched = true;
+      liveRequestFile = \`\${requestId}.json\`;
+      liveRequestFiles.add(liveRequestFile);
       await fs.rename(tempPath, requestPath);
 
       let response;
@@ -2854,7 +2919,7 @@ async function runFileGateway() {
         response = await waitForResponse(requestId, bytes => {
           if (!processBodyLedger.reserve(bytes)) throw new BridgeProcessCapacityError();
           envelopeReservation += bytes;
-        });
+        }, responseTimeoutMsFor(payload.method, payload.path));
       } catch (error) {
         // The host never delivered a response inside the deadline. Remove this
         // request's file so it cannot pile up toward the queue-depth cap. The
@@ -2895,6 +2960,7 @@ async function runFileGateway() {
         ...(uncertainWrite ? { outcome: "indeterminate", retryable: false } : {}),
       });
     } finally {
+      if (liveRequestFile) liveRequestFiles.delete(liveRequestFile);
       releaseBodyReservation?.();
       processBodyLedger.release(envelopeReservation);
     }
