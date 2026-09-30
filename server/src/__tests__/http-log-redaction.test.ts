@@ -428,6 +428,35 @@ describe("HTTP logger redaction", () => {
     expect(log.res.statusCode).toBe(status);
   });
 
+  it.each([200, 409, 500])("redacts tool gateway session tokens from HTTP %i logs", async (status) => {
+    const sessionToken = "tool-gateway-session-token-canary";
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.post("/api/tool-gateway/tools/call", (_req, res) => {
+      res.status(status).json({ status });
+    });
+
+    await request(app)
+      .post("/api/tool-gateway/tools/call")
+      .set("X-Paperclip-Tool-Gateway-Token", sessionToken)
+      .send({ tool: "search", parameters: {} })
+      .expect(status);
+
+    const output = chunks.join("");
+    expect(output).not.toContain(sessionToken);
+    const log = JSON.parse(output.trim());
+    expect(log.req.headers["x-paperclip-tool-gateway-token"]).toBe("[Redacted]");
+    expect(log.req.url).toBe("/api/tool-gateway/tools/call");
+    expect(log.res.statusCode).toBe(status);
+  });
+
   it.each([200, 403, 500])("redacts cloud credentials and assertions from HTTP %i logs", async (status) => {
     const headers = {
       "X-Paperclip-Cloud-Tenant-Token": "cloud-tenant-token-canary",
