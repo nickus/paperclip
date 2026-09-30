@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
+import { TOOL_CALL_CLIENT_TIMEOUT_MS } from "@paperclipai/shared/tool-call-timeouts";
 import {
   claudeCommandSupportsEffortFlag,
   claudeSessionCwdMatchesExecutionTarget,
@@ -418,6 +419,7 @@ describe("claude execute", () => {
             type: "http",
             url: "https://paperclip.example/api/tool-gateway/gateways/alpha/mcp",
             headers: { Authorization: "Bearer alpha-token" },
+            timeout: TOOL_CALL_CLIENT_TIMEOUT_MS,
           },
         },
       });
