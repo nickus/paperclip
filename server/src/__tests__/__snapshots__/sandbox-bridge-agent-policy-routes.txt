@@ -330,7 +330,6 @@ DENY GET /api/tool-connections/:connectionId/usage
 DENY GET /api/tool-gateway/audit
 DENY GET /api/tool-gateway/gateways/:gatewayId/mcp
 DENY GET /api/tool-gateway/runtime-slots
-DENY GET /api/tool-gateway/tools
 DENY GET /api/tool-profiles/:profileId/new-tools
 DENY GET /api/tools/oauth/callback
 DENY GET /api/tools/oauth/client-metadata
@@ -469,6 +468,7 @@ ALLOW GET /api/status-cards/:id
 ALLOW GET /api/status-cards/:id/dry-run
 ALLOW GET /api/status-cards/:id/summary-revisions
 ALLOW GET /api/status-cards/:id/updates
+ALLOW GET /api/tool-gateway/tools
 ALLOW GET /llms/agent-configuration.txt
 ALLOW GET /llms/agent-configuration/:adapterType.txt
 ALLOW GET /llms/agent-icons.txt
@@ -760,9 +760,6 @@ DENY POST /api/tool-gateway/gateways/:gatewayId/mcp
 DENY POST /api/tool-gateway/gateways/:gatewayId/tokens
 DENY POST /api/tool-gateway/runtime-slots/:slotId/restart
 DENY POST /api/tool-gateway/runtime-slots/:slotId/stop
-DENY POST /api/tool-gateway/sessions
-DENY POST /api/tool-gateway/sessions/:sessionId/revoke
-DENY POST /api/tool-gateway/tools/call
 DENY POST /api/tool-profiles/:profileId/duplicate
 DENY POST /api/tool-profiles/:profileId/entries
 DENY POST /api/tool-profiles/:profileId/new-tools/review
@@ -833,6 +830,9 @@ ALLOW POST /api/routines/:id/description/annotations/:threadId/comments
 ALLOW POST /api/routines/:id/revisions/:revisionId/restore
 ALLOW POST /api/routines/:id/run
 ALLOW POST /api/routines/:id/triggers
+ALLOW POST /api/tool-gateway/sessions
+ALLOW POST /api/tool-gateway/sessions/:sessionId/revoke
+ALLOW POST /api/tool-gateway/tools/call
 ALLOW POST /runtime-tools/github/credentials
 ALLOW PUT /api/companies/:companyId/summary-slots/:scopeKind/:slotKey
 ALLOW PUT /api/issues/:id/documents/:key

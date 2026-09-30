@@ -2529,6 +2529,132 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
+  it("forwards the REST tool gateway routes and their session token without logging it", async () => {
+    // Verbose bridge logs on: even they must not carry the token.
+    vi.stubEnv("PAPERCLIP_BRIDGE_DEBUG", "1");
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-tools-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
+    await mkdir(runtimeRootDir, { recursive: true });
+
+    const sessionToken = "tool-gateway-session-token-canary";
+    const sessionId = "3f1c2a4e-5b6d-4e7f-8a9b-0c1d2e3f4a5b";
+    const received: Array<{ route: string; token: string | null; auth: string | null; body: string }> = [];
+    const apiServer = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        const token = req.headers["x-paperclip-tool-gateway-token"];
+        received.push({
+          route: `${req.method ?? "GET"} ${req.url ?? "/"}`,
+          token: typeof token === "string" ? token : null,
+          auth: req.headers.authorization ?? null,
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      apiServer.once("error", reject);
+      apiServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = apiServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected the bridge test API server to listen on a TCP port.");
+    }
+    const apiPort = address.port;
+
+    const baseTarget: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+      timeoutMs: 30_000,
+      streamRunLogs: false,
+    };
+    const toolCall = JSON.stringify({ tool: "search", parameters: { query: "bridge" } });
+    const calls: Array<{ method: string; route: string; token?: boolean; body?: string }> = [
+      { method: "POST", route: "/api/tool-gateway/sessions", body: "{}" },
+      { method: "GET", route: "/api/tool-gateway/tools", token: true },
+      { method: "POST", route: "/api/tool-gateway/tools/call", token: true, body: toolCall },
+      { method: "POST", route: `/api/tool-gateway/sessions/${sessionId}/revoke`, body: "{}" },
+      // The rest of the gateway stays closed.
+      { method: "GET", route: "/api/tool-gateway/audit", token: true },
+      { method: "POST", route: "/api/tool-gateway/gateways/gw-1/tokens", token: true, body: "{}" },
+    ];
+
+    try {
+      for (const policy of [undefined, "agent", "steward"] as const) {
+        const logs: string[] = [];
+        const bridge = await startAdapterExecutionTargetPaperclipBridge({
+          runId: `run-bridge-tools-${policy ?? "restricted"}`,
+          target: policy
+            ? { ...baseTarget, paperclipApiBridgePolicy: policy, paperclipApiBridgeCompanyId: "co-1" }
+            : baseTarget,
+          runtimeRootDir,
+          adapterKey: "codex",
+          hostApiToken: "real-run-jwt",
+          hostApiUrl: `http://127.0.0.1:${apiPort}`,
+          onLog: async (_stream, chunk) => { logs.push(chunk); },
+        });
+        const statuses: number[] = [];
+        try {
+          for (const call of calls) {
+            const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}${call.route}`, {
+              method: call.method,
+              headers: {
+                authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
+                "content-type": "application/json",
+                ...(call.token ? { "x-paperclip-tool-gateway-token": sessionToken } : {}),
+              },
+              ...(call.body !== undefined ? { body: call.body } : {}),
+            });
+            statuses.push(response.status);
+            await response.arrayBuffer();
+          }
+        } finally {
+          await bridge?.stop();
+        }
+        expect(statuses, policy ?? "restricted").toEqual([200, 200, 200, 200, 403, 403]);
+        expect(received).toEqual([
+          { route: "POST /api/tool-gateway/sessions", token: null, auth: "Bearer real-run-jwt", body: "{}" },
+          { route: "GET /api/tool-gateway/tools", token: sessionToken, auth: "Bearer real-run-jwt", body: "" },
+          { route: "POST /api/tool-gateway/tools/call", token: sessionToken, auth: "Bearer real-run-jwt", body: toolCall },
+          {
+            route: `POST /api/tool-gateway/sessions/${sessionId}/revoke`,
+            token: null,
+            auth: "Bearer real-run-jwt",
+            body: "{}",
+          },
+        ]);
+        received.length = 0;
+        // The debug log names the forwarded routes, never the token.
+        const logText = logs.join("");
+        expect(logText).toContain("Bridge proxy GET /api/tool-gateway/tools");
+        expect(logText).not.toContain(sessionToken);
+        const bridgeLog = await readFile(
+          path.join(runtimeRootDir, "paperclip-bridge", "queue", "logs", "bridge.log"),
+          "utf8",
+        );
+        expect(bridgeLog).not.toContain(sessionToken);
+        // Nor does the request queue keep a copy once the calls are answered.
+        const queueDir = path.join(runtimeRootDir, "paperclip-bridge", "queue");
+        const queued = await readdir(queueDir, { recursive: true, withFileTypes: true });
+        for (const entry of queued.filter((item) => item.isFile())) {
+          const content = await readFile(path.join(entry.parentPath, entry.name), "utf8");
+          expect(content, entry.name).not.toContain(sessionToken);
+        }
+      }
+    } finally {
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
   it("creates a sandbox run log tail factory when bridge streaming is enabled", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-stream-"));
     cleanupDirs.push(rootDir);
