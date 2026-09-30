@@ -22,7 +22,40 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
-import { prepareClaudeConfigSeed, prepareSandboxClaudeProbeRuntime } from "./claude-config.js";
+import { MAX_TOOL_CALL_TIMEOUT_MS } from "@paperclipai/shared/tool-call-timeouts";
+import {
+  prepareClaudeConfigSeed,
+  prepareSandboxClaudeProbeRuntime,
+  writePaperclipClaudeMcpConfig,
+} from "./claude-config.js";
+
+describe("writePaperclipClaudeMcpConfig", () => {
+  it("gives Paperclip-managed MCP servers a request timeout above the longest gateway tool call", async () => {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-mcp-config-"));
+    try {
+      const configPath = await writePaperclipClaudeMcpConfig({
+        stateDir,
+        runId: "run-1",
+        servers: [{
+          name: "paperclip-assigned",
+          url: "https://paperclip.example/mcp/gateways/gw_1",
+          token: "gateway-token",
+          connectionId: "assignment:1",
+        }],
+      });
+      const written = JSON.parse(await fs.readFile(configPath, "utf8")) as {
+        mcpServers: Record<string, { type: string; url: string; timeout?: number }>;
+      };
+      const server = written.mcpServers["paperclip-assigned"]!;
+      expect(server).toMatchObject({ type: "http", url: "https://paperclip.example/mcp/gateways/gw_1" });
+      // Without a per-server timeout Claude Code aborts an HTTP MCP request at
+      // 60 s, long before a five-minute gateway tool call can answer.
+      expect(server.timeout).toBeGreaterThan(MAX_TOOL_CALL_TIMEOUT_MS);
+    } finally {
+      await fs.rm(stateDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("prepareClaudeConfigSeed", () => {
   const cleanupDirs: string[] = [];

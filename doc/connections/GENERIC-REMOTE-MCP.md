@@ -182,6 +182,46 @@ The discovered auth kind, issuer, and resource are persisted on the connection,
 so refresh, reconnect, revoke and diagnostics all use the generic path instead of
 falling back to `authKind: none` semantics.
 
+### Tool-call timeouts
+
+Each tool call runs under one deadline that the gateway owns. When it passes,
+the call fails with `reasonCode: "tool_timeout"` (HTTP `504`).
+
+| Source | Applies when | Range |
+| --- | --- | --- |
+| `timeoutMs` in a `POST /api/tool-gateway/tools/call` body | The REST caller names one | Clamped to 1–300000 ms |
+| `toolTimeoutMs` in the connection's `config` | The call names none: native MCP clients through an MCP gateway, REST calls without `timeoutMs`, and test calls | Integer, 1000–300000 ms, validated on create and update |
+| Built-in default | Neither of the above | 10000 ms |
+
+Set a longer default for a server whose tools are known to be slow, for
+example one that answers questions by running a model:
+
+```sh
+curl -fsS -X PATCH -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
+  "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID" \
+  -d '{ "config": { "url": "https://mcp.example.com/mcp", "toolTimeoutMs": 60000 } }'
+```
+
+`config` replaces the stored object, so send the connection's full config with
+the new key. When Paperclip itself carries out an action a human approved, it
+allows at least 60 s, or the connection's `toolTimeoutMs` when that is longer.
+
+The hops around the gateway leave room for the longest call: the MCP client
+configuration Paperclip writes for Claude Code and Codex runs, and the sandbox
+callback bridge's tool-call routes (`POST /api/tool-gateway/tools/call`,
+`POST /mcp/gateways/:id`), wait slightly longer than 300 s, so the caller sees
+the gateway's `tool_timeout` answer rather than a transport error. A reverse
+proxy in front of Paperclip needs a read timeout above that too if agents reach
+the gateway through it; many default to 60 s.
+
+A tool-call timeout, or any other error from a server that answered (a JSON-RPC
+error, an HTTP error status, an unusable body), fails only that call. It does
+not change the connection's health, so the connection's other tools stay
+listed. Health follows health checks and reachability: three consecutive calls
+that cannot reach the server at all (connection refused, DNS or TLS failure,
+HTTP 502/503/504) mark the connection `error` until a health check or a
+successful call restores it.
+
 ## Curated definitions remain optional
 
 A curated definition matching a pasted endpoint is offered as a branded

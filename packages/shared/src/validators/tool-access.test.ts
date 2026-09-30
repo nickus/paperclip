@@ -8,6 +8,7 @@ import {
   toolCredentialSecretRefSchema,
   toolRedactedValueSummarySchema,
   toolTransportConfigSchema,
+  updateToolConnectionSchema,
 } from "./tool-access.js";
 
 describe("tool access validators", () => {
@@ -58,6 +59,33 @@ describe("tool access validators", () => {
     if (!parsed.success) {
       expect(parsed.error.issues[0]?.message).toContain("credentialSecretRefs");
     }
+  });
+
+  it("accepts a bounded default tool-call timeout on connection config", () => {
+    for (const toolTimeoutMs of [1_000, 45_000, 300_000]) {
+      expect(toolTransportConfigSchema.safeParse({ url: "https://example.test/mcp", toolTimeoutMs }).success).toBe(true);
+    }
+    expect(createToolConnectionSchema.parse({
+      name: "Slow answers",
+      transport: "mcp_remote",
+      config: { url: "https://example.test/mcp", toolTimeoutMs: 120_000 },
+    }).config).toEqual({ url: "https://example.test/mcp", toolTimeoutMs: 120_000 });
+    expect(updateToolConnectionSchema.parse({
+      config: { url: "https://example.test/mcp", toolTimeoutMs: 300_000 },
+    }).config?.toolTimeoutMs).toBe(300_000);
+  });
+
+  it("rejects out-of-range or non-integer default tool-call timeouts", () => {
+    for (const toolTimeoutMs of [0, 999, 300_001, 1_500.5, "60000", null]) {
+      const parsed = toolTransportConfigSchema.safeParse({ url: "https://example.test/mcp", toolTimeoutMs });
+      expect(parsed.success).toBe(false);
+      if (!parsed.success) {
+        expect(parsed.error.issues[0]?.path).toEqual(["toolTimeoutMs"]);
+      }
+    }
+    expect(updateToolConnectionSchema.safeParse({
+      config: { url: "https://example.test/mcp", toolTimeoutMs: 600_000 },
+    }).success).toBe(false);
   });
 
   it("keeps app method configuration separate from secrets", () => {

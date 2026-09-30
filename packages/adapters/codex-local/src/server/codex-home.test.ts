@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MAX_TOOL_CALL_TIMEOUT_MS } from "@paperclipai/shared/tool-call-timeouts";
 import {
   CODEX_SYNC_ALLOWLIST,
   codexHomeHasUsableAuth,
@@ -1024,6 +1025,10 @@ describe("evaluateCodexCredentialReadiness", () => {
       const zero = await fs.readFile(path.join(zeroHome, "config.toml"), "utf8");
       expect(alpha).toContain('[mcp_servers."alpha"]');
       expect(alpha).toContain('http_headers = { Authorization = "Bearer alpha-token" }');
+      // Codex's own per-tool timeout (60 s unless set) must outlast the
+      // gateway's longest tool call so the gateway's answer arrives first.
+      const toolTimeoutSec = Number(/^tool_timeout_sec = (\d+)$/m.exec(alpha)?.[1]);
+      expect(toolTimeoutSec * 1000).toBeGreaterThan(MAX_TOOL_CALL_TIMEOUT_MS);
       expect(alpha).not.toMatch(/^headers\s*=/m);
       expect(zero).not.toContain("mcp_servers.");
       expect(zero).not.toContain("stale-token");

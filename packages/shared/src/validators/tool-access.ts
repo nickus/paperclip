@@ -37,6 +37,12 @@ import {
   mcpRemoteHeaderNameFromConfigPath,
   mcpRemoteHeaderRejectionMessage,
 } from "../mcp-remote-headers.js";
+import {
+  isValidConfiguredToolCallTimeoutMs,
+  MAX_TOOL_CALL_TIMEOUT_MS,
+  MIN_CONFIGURED_TOOL_CALL_TIMEOUT_MS,
+  REMOTE_MCP_TOOL_TIMEOUT_CONFIG_KEY,
+} from "../tool-call-timeouts.js";
 import { jsonSchemaSchema } from "./plugin.js";
 import { objectWithoutDefaults } from "./partial.js";
 
@@ -146,7 +152,24 @@ export const mcpConnectionCredentialRefSchema = z.object({
   prefix: z.string().max(120).nullable().optional(),
 });
 
-export const toolTransportConfigSchema = z.record(z.string(), z.unknown()).superRefine(rejectSensitiveConfigKeys);
+// A remote MCP connection's default tool-call timeout, used when a call names
+// none. Bounded so one slow provider cannot hold a gateway request open
+// indefinitely.
+function validateToolCallTimeoutConfig(value: Record<string, unknown>, ctx: z.RefinementCtx) {
+  if (!Object.prototype.hasOwnProperty.call(value, REMOTE_MCP_TOOL_TIMEOUT_CONFIG_KEY)) return;
+  if (!isValidConfiguredToolCallTimeoutMs(value[REMOTE_MCP_TOOL_TIMEOUT_CONFIG_KEY])) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: [REMOTE_MCP_TOOL_TIMEOUT_CONFIG_KEY],
+      message: `${REMOTE_MCP_TOOL_TIMEOUT_CONFIG_KEY} must be an integer number of milliseconds from ${MIN_CONFIGURED_TOOL_CALL_TIMEOUT_MS} to ${MAX_TOOL_CALL_TIMEOUT_MS}.`,
+    });
+  }
+}
+
+export const toolTransportConfigSchema = z.record(z.string(), z.unknown()).superRefine((value, ctx) => {
+  rejectSensitiveConfigKeys(value, ctx);
+  validateToolCallTimeoutConfig(value, ctx);
+});
 
 export const toolRedactedValueSummarySchema = z.object({
   summary: z.string().max(4000),

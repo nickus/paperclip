@@ -2965,6 +2965,197 @@ describe("sandbox callback bridge", () => {
     expect(leftover).toEqual([]);
   }, 30_000);
 
+  function toolCallRequestJson(id: string): string {
+    return `${JSON.stringify({
+      id,
+      method: "POST",
+      path: "/api/tool-gateway/tools/call",
+      query: "",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tool: "ask", parameters: {} }),
+      createdAt: new Date().toISOString(),
+    })}\n`;
+  }
+
+  it("runs a connected tool call outside the poll loop, past the per-iteration timeout, while other requests keep flowing", async () => {
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+    const queueDir = "/virtual-bridge/tool-call-queue";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(path.posix.join(directories.requestsDir, "tool-call.json"), toolCallRequestJson("tool-call"));
+    const responseWrites: Array<{ file: string; status: number; at: number }> = [];
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        responseWrites.push({ file: path.posix.basename(remotePath), status: JSON.parse(body.trim()).status, at: Date.now() });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+    const { runtimeSpan, workerErrors } = createWorkerErrorCapture();
+    let toolCallStarted = false;
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      // Far shorter than the tool call below: awaiting the call inside the
+      // poll loop would time it out and abort it.
+      iterationTimeoutMs: 50,
+      watchdogTimeoutMs: 150,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      // A cooperating handler, like the real forward: it stops when the worker
+      // aborts it and otherwise answers after 400 ms.
+      handleRequest: (request, options) => new Promise((resolve, reject) => {
+        if (request.path !== "/api/tool-gateway/tools/call") {
+          resolve({ status: 200, body: "quick" });
+          return;
+        }
+        toolCallStarted = true;
+        const timer = setTimeout(() => resolve({ status: 200, body: "answer" }), 400);
+        options?.signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(new Error("aborted by the worker"));
+        }, { once: true });
+      }),
+    });
+    try {
+      await waitFor(() => toolCallStarted, 2_000);
+      requestBodies.set(path.posix.join(directories.requestsDir, "quick.json"), bridgeRequestJson("quick"));
+      await waitFor(() => responseWrites.some((write) => write.file === "tool-call.json"), 3_000);
+
+      const quick = responseWrites.find((write) => write.file === "quick.json");
+      const toolCall = responseWrites.find((write) => write.file === "tool-call.json");
+      expect(toolCall?.status).toBe(200);
+      // The quick request was answered while the tool call was still running.
+      expect(quick?.status).toBe(200);
+      expect(quick!.at).toBeLessThan(toolCall!.at);
+      expect(workerErrors).toEqual([]);
+    } finally {
+      await worker.stop({ drainTimeoutMs: 10 });
+    }
+  });
+
+  it("waits past the default response deadline only for connected tool calls", async () => {
+    const fixture = await prepareGatewayFixture("paperclip-bridge-tool-call-wait-");
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner: fixture.runner,
+      remoteCwd: fixture.remoteWorkspaceDir,
+      assetRemoteDir: fixture.assetRemoteDir,
+      queueDir: fixture.queueDir,
+      bridgeToken: fixture.bridgeToken,
+      timeoutMs: 30_000,
+      responseTimeoutMs: 300,
+      pollIntervalMs: 20,
+    });
+    cleanupFns.push(async () => {
+      await bridge.stop();
+    });
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir: fixture.queueDir,
+      authorizeRequest: async () => null,
+      handleRequest: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ok: true }),
+        };
+      },
+    });
+    cleanupFns.push(async () => {
+      await worker.stop();
+    });
+
+    const toolCall = await fetch(`${bridge.baseUrl}/api/tool-gateway/tools/call`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${fixture.bridgeToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ tool: "ask", parameters: {} }),
+    });
+    expect(toolCall.status).toBe(200);
+    await expect(toolCall.json()).resolves.toEqual({ ok: true });
+
+    const quick = await fetch(`${bridge.baseUrl}/api/agents/me`, {
+      headers: { authorization: `Bearer ${fixture.bridgeToken}` },
+    });
+    expect(quick.status).toBe(502);
+    await expect(quick.json()).resolves.toMatchObject({ error: expect.stringContaining("Timed out") });
+  }, 30_000);
+
+  it("never sweeps a live tool call's request file as stale at the queue-depth cap", async () => {
+    const fixture = await prepareGatewayFixture("paperclip-bridge-tool-call-sweep-");
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner: fixture.runner,
+      remoteCwd: fixture.remoteWorkspaceDir,
+      assetRemoteDir: fixture.assetRemoteDir,
+      queueDir: fixture.queueDir,
+      bridgeToken: fixture.bridgeToken,
+      timeoutMs: 30_000,
+      responseTimeoutMs: 100,
+      pollIntervalMs: 20,
+      maxQueueDepth: 1,
+    });
+    cleanupFns.push(async () => {
+      await bridge.stop();
+    });
+    const release: { answer: (() => void) | null } = { answer: null };
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir: fixture.queueDir,
+      authorizeRequest: async () => null,
+      handleRequest: () => new Promise((resolve) => {
+        release.answer = () => resolve({
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ answered: true }),
+        });
+      }),
+    });
+    cleanupFns.push(async () => {
+      await worker.stop();
+    });
+
+    const toolCall = fetch(`${bridge.baseUrl}/api/tool-gateway/tools/call`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${fixture.bridgeToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ tool: "ask", parameters: {} }),
+    });
+    // Let the live request file age past the default sweep threshold
+    // (response deadline + 2 s).
+    await new Promise((resolve) => setTimeout(resolve, 2_400));
+    const rejected = await fetch(`${bridge.baseUrl}/api/agents/me`, {
+      headers: { authorization: `Bearer ${fixture.bridgeToken}` },
+    });
+    expect(rejected.status).toBe(503);
+    await expect(rejected.json()).resolves.toMatchObject({ error: expect.stringContaining("queue is full") });
+
+    release.answer?.();
+    const answered = await toolCall;
+    expect(answered.status).toBe(200);
+    await expect(answered.json()).resolves.toEqual({ answered: true });
+  }, 30_000);
+
   it("skips a request file that vanished before the read instead of escalating", async () => {
     // The gateway deletes a request file when its caller stops waiting. The
     // worker's read then races the deletion; a vanished file must be a quiet
