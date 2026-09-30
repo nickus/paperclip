@@ -86,6 +86,10 @@ import type {
   UpdateToolMcpGateway,
 } from "@paperclipai/shared";
 import {
+  clampToolCallTimeoutMs,
+  DEFAULT_TOOL_CALL_TIMEOUT_MS,
+  MAX_TOOL_CALL_TIMEOUT_MS,
+  readConfiguredToolCallTimeoutMs,
   isGitHubConnectorProfileId,
   isGoogleWorkspaceConnectorProfileId,
   type GitHubConnectorProfileId,
@@ -163,7 +167,7 @@ import { extendApprovedExecutionWaitDeadline } from "./approved-execution-wait.j
 
 const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
-const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
+const DEFAULT_TOOL_TIMEOUT_MS = DEFAULT_TOOL_CALL_TIMEOUT_MS;
 
 export function resolveCredentialGrantKind(
   policy: "shared" | "per_user" | "per_user_with_fallback" | "per_agent",
@@ -192,18 +196,23 @@ export function isConnectionGrantAudienceAllowed(
 // providers (e.g. Zapier Google Sheets `add_row`) routinely take longer than
 // the 10s interactive default, so an approved action would otherwise abort with
 // `tool_timeout` even though the approval succeeded. Give approved executions
-// the full permitted headroom instead.
+// at least this much headroom; a remote MCP connection that configures a longer
+// default tool timeout keeps that longer budget.
 const APPROVED_EXECUTION_TIMEOUT_MS = 60_000;
 const ACTION_REQUEST_EXECUTION_POLL_MS = 25;
+// A concurrent consumer that is still waiting once the default approved budget
+// has passed is joining a long-running execution; poll it less often.
+const ACTION_REQUEST_EXECUTION_SLOW_POLL_MS = 500;
 // Approval execution performs live target, signature, managed-argument, and
 // issue-state checks before provider dispatch. Give that preparation a
 // separate bounded window so it cannot consume the provider's execution
 // budget for concurrent consumers.
 const ACTION_REQUEST_PREPARATION_WAIT_MS = 2 * 60 * 1000;
 // Concurrent consumers must wait at least as long as the provider execution
-// they are joining. The extra grace lets the owner persist the terminal request
+// they are joining, which can use a connection's configured tool timeout up to
+// the global cap. The extra grace lets the owner persist the terminal request
 // state after the provider timeout/result settles.
-const ACTION_REQUEST_EXECUTION_WAIT_MS = APPROVED_EXECUTION_TIMEOUT_MS + 5_000;
+const ACTION_REQUEST_EXECUTION_WAIT_MS = MAX_TOOL_CALL_TIMEOUT_MS + 5_000;
 // The gateway creates an ask-first request in two steps: it inserts the row
 // with a null signature, then it signs the row and sets the expiry. A concurrent
 // matching call can observe the row in this window. A null signature alone does
@@ -212,6 +221,20 @@ const ACTION_REQUEST_EXECUTION_WAIT_MS = APPROVED_EXECUTION_TIMEOUT_MS + 5_000;
 // grace must exceed the normal sign path (approval-snapshot fetch + interaction
 // create) so a live create keeps its own row.
 const MAX_REMOTE_MCP_RESPONSE_BYTES = 1_000_000;
+// A tools/call that cannot reach the provider at all (connection refused, DNS,
+// TLS, a gateway-class HTTP status) is a transport failure. One such failure can
+// be a blip, and marking the connection unhealthy hides every one of its tools
+// until the next health check, so the gateway only does that after this many
+// consecutive transport failures with no reachable answer in between. Per-call
+// errors from a server that answered (timeouts, JSON-RPC errors, rejected
+// arguments) never count.
+const REMOTE_MCP_CONSECUTIVE_TRANSPORT_FAILURES_BEFORE_ERROR = 3;
+const REMOTE_MCP_TRANSPORT_FAILURE_TRACKING_LIMIT = 10_000;
+const REMOTE_MCP_UNREACHABLE_HTTP_STATUSES = new Set([502, 503, 504]);
+const REMOTE_MCP_UNREACHABLE_REASON_CODES = new Set([
+  "remote_http_connect_failed",
+  "remote_http_dns_failed",
+]);
 const ACTIVE_GATEWAY_RUN_STATUSES = new Set(["running"]);
 const uuidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -392,6 +415,8 @@ type RemoteHttpExecutionResult = {
   result: unknown;
   headerSummary?: HeaderPolicySummary;
   execution?: RemoteHttpExecutionAudit;
+  /** The deadline the provider call ran under, when the executor resolved it. */
+  timeoutMs?: number;
 };
 
 type RemoteHttpExecutionAudit = {
@@ -662,9 +687,39 @@ function gatewaySessionFromRow(
 
 function timeoutMs(value: number | undefined) {
   if (!Number.isFinite(value)) return DEFAULT_TOOL_TIMEOUT_MS;
-  return Math.max(
-    1,
-    Math.min(60_000, Math.floor(value ?? DEFAULT_TOOL_TIMEOUT_MS)),
+  return clampToolCallTimeoutMs(value ?? DEFAULT_TOOL_TIMEOUT_MS);
+}
+
+/**
+ * The time budget a remote MCP tool call asks for. `requestedMs` is the
+ * caller's explicit `timeoutMs` (undefined when the call names none);
+ * `minimumMs` raises the resolved budget, for server-run approved actions.
+ */
+type RemoteToolCallTimeout = {
+  requestedMs?: number;
+  minimumMs?: number;
+};
+
+/**
+ * Resolve the deadline for one remote MCP tool call. Precedence: an explicit
+ * caller timeout, then the connection's configured default
+ * (`config.toolTimeoutMs`), then a provider-specific default, then the
+ * gateway-wide default. The result never exceeds the global cap.
+ */
+function resolveRemoteToolCallTimeoutMs(input: {
+  timeout: RemoteToolCallTimeout;
+  connectionConfig: unknown;
+  providerDefaultMs?: number | null;
+}): number {
+  const requested = input.timeout.requestedMs;
+  const base = Number.isFinite(requested)
+    ? timeoutMs(requested)
+    : readConfiguredToolCallTimeoutMs(input.connectionConfig) ??
+      input.providerDefaultMs ??
+      DEFAULT_TOOL_TIMEOUT_MS;
+  const minimum = input.timeout.minimumMs;
+  return clampToolCallTimeoutMs(
+    Number.isFinite(minimum) ? Math.max(base, minimum as number) : base,
   );
 }
 
@@ -3500,6 +3555,36 @@ export function createToolGatewayService(
     return { headers, summary };
   }
 
+  // Consecutive tools/call transport failures per connection, in this process.
+  const remoteTransportFailureCounts = new Map<string, number>();
+
+  function recordRemoteTransportSuccess(
+    connection: typeof toolConnections.$inferSelect,
+  ) {
+    remoteTransportFailureCounts.delete(connection.id);
+  }
+
+  async function recordRemoteTransportFailure(
+    connection: typeof toolConnections.$inferSelect,
+    message: string,
+  ) {
+    const failures = (remoteTransportFailureCounts.get(connection.id) ?? 0) + 1;
+    remoteTransportFailureCounts.delete(connection.id);
+    if (remoteTransportFailureCounts.size >= REMOTE_MCP_TRANSPORT_FAILURE_TRACKING_LIMIT) {
+      // Drop the least recently failing connection; Map keeps insertion order.
+      const oldest = remoteTransportFailureCounts.keys().next().value;
+      if (oldest !== undefined) remoteTransportFailureCounts.delete(oldest);
+    }
+    remoteTransportFailureCounts.set(connection.id, failures);
+    if (failures >= REMOTE_MCP_CONSECUTIVE_TRANSPORT_FAILURES_BEFORE_ERROR) {
+      await markRemoteConnectionHealth(
+        connection,
+        "error",
+        `${message} ${failures} consecutive tool calls could not reach the server.`,
+      );
+    }
+  }
+
   async function markRemoteConnectionHealth(
     connection: typeof toolConnections.$inferSelect,
     status: "ok" | "error" | "missing_secret" | "degraded",
@@ -5851,10 +5936,9 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
     parameters: unknown,
-    ms: number,
+    timeout: RemoteToolCallTimeout,
     invocationId: string,
     callerHeaders?: ExecuteGatewayToolInput["callerHeaders"],
-    useDefaultTimeout = false,
   ): Promise<RemoteHttpExecutionResult> {
     const { entry, connection } = await resolveConnectedRemoteTool(
       session,
@@ -5863,9 +5947,14 @@ export function createToolGatewayService(
     // Recheck immediately before dispatch, including previously approved calls
     // and connections whose stored grant/catalog predates scope reduction.
     assertGoogleChatToolArgumentsSupported(connection, entry.toolName, parameters);
-    if (useDefaultTimeout && isRailwayConnection(connection) && entry.toolName === `${RAILWAY_TOOL_PREFIX}run-command`) {
-      ms = railwayCommandBudgetMs(parameters);
-    }
+    const ms = resolveRemoteToolCallTimeoutMs({
+      timeout,
+      connectionConfig: connection.config,
+      providerDefaultMs:
+        isRailwayConnection(connection) && entry.toolName === `${RAILWAY_TOOL_PREFIX}run-command`
+          ? railwayCommandBudgetMs(parameters)
+          : null,
+    });
     const grant = await resolveConnectionGrant(session, connection);
     const endpoint = await resolvedRemoteEndpoint(session, connection, grant);
     // Method-defined headers are trusted catalog configuration. Treat them as
@@ -5937,6 +6026,7 @@ export function createToolGatewayService(
           result: normalizeMcpToolResult({ content: [{ type: "text", text: JSON.stringify(data) }], structuredContent: data, isError: failedCommand }, "mcp_http", entry.toolName === `${RAILWAY_TOOL_PREFIX}run-command`, "railway"),
           headerSummary,
           execution,
+          timeoutMs: ms,
         };
       }
       let requestHeaders = headers;
@@ -6117,10 +6207,17 @@ export function createToolGatewayService(
           response.headers.get("traceparent"),
       };
       if (!response.ok) {
-        // Session expiration is recoverable on an explicit retry. Marking the
-        // connection unhealthy here would hide every tool and prevent it.
-        if (!sessionExpired) {
-          await markRemoteConnectionHealth(connection, "error", "Remote MCP server returned an HTTP error.");
+        // An HTTP error answer to one tools/call is a per-call failure from a
+        // server that responded (a rejected argument, a provider-side error, an
+        // expired session that an explicit retry recovers). Marking the
+        // connection unhealthy here would hide every one of its tools until the
+        // next health check. Only gateway-class statuses, which say the
+        // provider behind the endpoint could not be reached, count toward the
+        // consecutive transport-failure threshold.
+        if (!sessionExpired && REMOTE_MCP_UNREACHABLE_HTTP_STATUSES.has(response.status)) {
+          await recordRemoteTransportFailure(connection, `Remote MCP server returned HTTP ${response.status}.`);
+        } else {
+          recordRemoteTransportSuccess(connection);
         }
         throw new ToolGatewayHttpError(
           502,
@@ -6135,15 +6232,13 @@ export function createToolGatewayService(
           },
         );
       }
+      // The server answered; whatever the answer says about this one call, the
+      // endpoint itself is reachable.
+      recordRemoteTransportSuccess(connection);
       let payload: unknown;
       try {
         payload = JSON.parse(body);
       } catch {
-        await markRemoteConnectionHealth(
-          connection,
-          "error",
-          "Remote MCP server returned invalid JSON.",
-        );
         throw new ToolGatewayHttpError(
           502,
           "Remote MCP server returned invalid JSON",
@@ -6172,12 +6267,8 @@ export function createToolGatewayService(
         });
       }
       if (payloadRecord.error !== undefined) {
+        // A JSON-RPC error answers this one call; the server is responsive.
         const errorRecord = asRecord(payloadRecord.error);
-        await markRemoteConnectionHealth(
-          connection,
-          "error",
-          "Remote MCP server returned a JSON-RPC error.",
-        );
         throw new ToolGatewayHttpError(
           502,
           "Remote MCP server returned an error",
@@ -6220,13 +6311,15 @@ export function createToolGatewayService(
         "ok",
         "Remote MCP server responded to tools/call.",
       );
-      return { result, headerSummary, execution };
+      return { result, headerSummary, execution, timeoutMs: ms };
     } catch (error) {
       if (error instanceof McpHttpResponseError) {
+        // A response the gateway cannot use (too large, malformed, invalid
+        // JSON) still came from a reachable server: a per-call failure.
+        recordRemoteTransportSuccess(connection);
         const failure = error.reason === "too_large" ? responseTooLargeError()
           : error.reason === "malformed_response" ? malformedRemoteMcpResponse()
           : new ToolGatewayHttpError(502, "Remote MCP server returned invalid JSON", "mcp_remote_invalid_json");
-        await markRemoteConnectionHealth(connection, "error", failure.message);
         throw new ToolGatewayHttpError(failure.status, failure.message, failure.reasonCode, {
           connectionId: connection.id, catalogEntryId: entry.id, execution,
         });
@@ -6235,6 +6328,9 @@ export function createToolGatewayService(
         throw new ToolGatewayHttpError(error.status, error.message, error.code, { connectionId: connection.id, catalogEntryId: entry.id, execution });
       }
       if (error instanceof ToolGatewayHttpError) {
+        if (REMOTE_MCP_UNREACHABLE_REASON_CODES.has(error.reasonCode)) {
+          await recordRemoteTransportFailure(connection, error.message);
+        }
         throw new ToolGatewayHttpError(
           error.status,
           error.message,
@@ -6246,11 +6342,10 @@ export function createToolGatewayService(
         );
       }
       if (error instanceof Error && error.name === "AbortError") {
-        await markRemoteConnectionHealth(
-          connection,
-          "error",
-          "Remote MCP tool call timed out.",
-        );
+        // The call outlived its own deadline. That says nothing about the
+        // connection's health: the provider may simply be slow for this input.
+        // Leave the health indicator alone so the connection's other tools stay
+        // listed.
         throw new ToolGatewayHttpError(
           504,
           "Remote MCP tool call timed out",
@@ -6258,15 +6353,12 @@ export function createToolGatewayService(
           {
             connectionId: connection.id,
             catalogEntryId: entry.id,
+            timeoutMs: ms,
             execution,
           },
         );
       }
-      await markRemoteConnectionHealth(
-        connection,
-        "error",
-        "Remote MCP tool call failed.",
-      );
+      await recordRemoteTransportFailure(connection, "Remote MCP tool call failed.");
       throw new ToolGatewayHttpError(
         502,
         "Remote MCP tool call failed",
@@ -7133,10 +7225,8 @@ export function createToolGatewayService(
               args.session,
               args.tool,
               args.parameters,
-              executionTimeoutMs,
+              { requestedMs: args.timeoutMs },
               args.invocationId,
-              undefined,
-              args.timeoutMs === undefined,
             )
           : args.tool.providerType === "mcp_local_stdio"
             ? await executeLocalStdioTool(
@@ -7424,7 +7514,8 @@ export function createToolGatewayService(
   }
 
   async function waitForActionRequestExecution(actionRequestId: string) {
-    let deadline = Date.now() + ACTION_REQUEST_EXECUTION_WAIT_MS;
+    const waitStartedAt = Date.now();
+    let deadline = waitStartedAt + ACTION_REQUEST_EXECUTION_WAIT_MS;
     while (true) {
       const [match] = await db
         .select({
@@ -7451,11 +7542,12 @@ export function createToolGatewayService(
       });
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) break;
+      const pollMs =
+        Date.now() - waitStartedAt < APPROVED_EXECUTION_TIMEOUT_MS
+          ? ACTION_REQUEST_EXECUTION_POLL_MS
+          : ACTION_REQUEST_EXECUTION_SLOW_POLL_MS;
       await new Promise((resolve) =>
-        setTimeout(
-          resolve,
-          Math.min(ACTION_REQUEST_EXECUTION_POLL_MS, remainingMs),
-        ),
+        setTimeout(resolve, Math.min(pollMs, remainingMs)),
       );
     }
     throw new ToolGatewayHttpError(
@@ -7971,18 +8063,19 @@ export function createToolGatewayService(
     });
 
     try {
-      const executionTimeoutMs = timeoutMs(APPROVED_EXECUTION_TIMEOUT_MS);
+      let executionTimeoutMs = timeoutMs(APPROVED_EXECUTION_TIMEOUT_MS);
       const result =
         tool.providerType === "mcp_remote_http"
-          ? (
-              await executeRemoteHttpTool(
-                session,
-                tool,
-                parameters,
-                executionTimeoutMs,
-                invocation.id,
-              )
-            ).result
+          ? await executeRemoteHttpTool(
+              session,
+              tool,
+              parameters,
+              { minimumMs: APPROVED_EXECUTION_TIMEOUT_MS },
+              invocation.id,
+            ).then((execution) => {
+              executionTimeoutMs = execution.timeoutMs ?? executionTimeoutMs;
+              return execution.result;
+            })
           : tool.providerType === "mcp_local_stdio"
             ? (
                 await executeLocalStdioTool(
@@ -10425,10 +10518,9 @@ export function createToolGatewayService(
                 session,
                 tool,
                 effectiveParameters,
-                executionTimeoutMs,
+                { requestedMs: input.timeoutMs },
                 invocationId,
                 input.callerHeaders,
-                input.timeoutMs === undefined,
               )
             : tool.providerType === "mcp_local_stdio"
               ? await executeLocalStdioTool(
@@ -10531,6 +10623,9 @@ export function createToolGatewayService(
               : {}),
             ...(connectedMcpExecution
               ? { execution: connectedMcpExecution.execution }
+              : {}),
+            ...(connectedMcpExecution?.timeoutMs
+              ? { timeoutMs: connectedMcpExecution.timeoutMs }
               : {}),
           },
           tool,
