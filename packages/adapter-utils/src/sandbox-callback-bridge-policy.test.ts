@@ -7,9 +7,12 @@ import {
   authorizeSandboxCallbackBridgeRequestForPolicy,
   createFileSystemSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAuthorizer,
+  DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST,
   describeNonCanonicalSandboxCallbackBridgePath,
+  getSandboxCallbackBridgeServerSource,
   normalizeSandboxCallbackBridgePolicy,
   sandboxCallbackBridgeDirectories,
+  sanitizeSandboxCallbackBridgeHeaders,
   startSandboxCallbackBridgeWorker,
 } from "./sandbox-callback-bridge.js";
 
@@ -29,6 +32,67 @@ function agent(request: RouteCase) {
 function steward(request: RouteCase) {
   return authorizeSandboxCallbackBridgeRequestForPolicy(request, { policy: "steward", companyId: COMPANY });
 }
+
+// The REST tool gateway routes every policy forwards: create a session for
+// the calling run, list its tools, call one, revoke the session.
+const TOOL_GATEWAY_ALLOWED: RouteCase[] = [
+  { method: "POST", path: "/api/tool-gateway/sessions" },
+  { method: "POST", path: "/api/tool-gateway/sessions/3f1c2a4e-5b6d-4e7f-8a9b-0c1d2e3f4a5b/revoke" },
+  { method: "GET", path: "/api/tool-gateway/tools" },
+  { method: "POST", path: "/api/tool-gateway/tools/call" },
+];
+
+// The rest of the tool gateway, and lookalikes of the four routes above, which
+// no policy forwards.
+const TOOL_GATEWAY_DENIED: RouteCase[] = [
+  // Other methods on the forwarded routes.
+  { method: "GET", path: "/api/tool-gateway/sessions" },
+  { method: "PUT", path: "/api/tool-gateway/sessions" },
+  { method: "DELETE", path: "/api/tool-gateway/sessions" },
+  { method: "GET", path: "/api/tool-gateway/sessions/s-1/revoke" },
+  { method: "DELETE", path: "/api/tool-gateway/sessions/s-1/revoke" },
+  { method: "POST", path: "/api/tool-gateway/tools" },
+  { method: "DELETE", path: "/api/tool-gateway/tools" },
+  { method: "GET", path: "/api/tool-gateway/tools/call" },
+  { method: "PUT", path: "/api/tool-gateway/tools/call" },
+  // Paths next to them.
+  { method: "GET", path: "/api/tool-gateway" },
+  { method: "POST", path: "/api/tool-gateway" },
+  { method: "GET", path: "/api/tool-gateway/sessions/s-1" },
+  { method: "POST", path: "/api/tool-gateway/sessions/s-1" },
+  { method: "DELETE", path: "/api/tool-gateway/sessions/s-1" },
+  { method: "POST", path: "/api/tool-gateway/sessions/revoke" },
+  { method: "POST", path: "/api/tool-gateway/sessions/s-1/revoke/extra" },
+  { method: "POST", path: "/api/tool-gateway/sessions/s-1/s-2/revoke" },
+  { method: "POST", path: "/api/tool-gateway/sessions/s-1/refresh" },
+  { method: "POST", path: "/api/tool-gateway/session" },
+  { method: "POST", path: "/api/tool-gateway/sessions-x" },
+  { method: "GET", path: "/api/tool-gateway/tools/tool-1" },
+  { method: "GET", path: "/api/tool-gateway/tools-x" },
+  { method: "POST", path: "/api/tool-gateway/tools/call/extra" },
+  { method: "POST", path: "/api/tool-gateway/tools/tool-1/call" },
+  { method: "POST", path: "/api/tool-gateway/tools/calls" },
+  { method: "POST", path: "/api/tool-gateway-sessions" },
+  { method: "POST", path: "/api/companies/co-1/tool-gateway/sessions" },
+  { method: "POST", path: "/tool-gateway/sessions" },
+  { method: "POST", path: "/tool-gateway/tools/call" },
+  // Named gateways and their tokens, approval decisions, runtime slots, audit.
+  { method: "PATCH", path: "/api/tool-gateway/gateways/gw-1" },
+  { method: "POST", path: "/api/tool-gateway/gateways/gw-1/tokens" },
+  { method: "GET", path: "/api/tool-gateway/gateways/gw-1/mcp" },
+  { method: "POST", path: "/api/tool-gateway/gateways/gw-1/mcp" },
+  { method: "POST", path: "/api/tool-gateway/gateway-tokens/tok-1/revoke" },
+  { method: "POST", path: "/api/tool-gateway/action-requests/ar-1/approve" },
+  { method: "POST", path: "/api/tool-gateway/action-requests/ar-1/decline" },
+  { method: "GET", path: "/api/tool-gateway/runtime-slots" },
+  { method: "POST", path: "/api/tool-gateway/runtime-slots/slot-1/stop" },
+  { method: "POST", path: "/api/tool-gateway/runtime-slots/slot-1/restart" },
+  { method: "GET", path: "/api/tool-gateway/audit" },
+  { method: "GET", path: "/api/companies/co-1/tools/gateways" },
+  { method: "POST", path: "/api/companies/co-1/tools/gateways" },
+  { method: "GET", path: "/mcp/gateways/gw-public-1" },
+  { method: "POST", path: "/mcp/gateways/gw-public-1" },
+];
 
 // Every route the restricted allowlist carries, one sample each.
 const RESTRICTED_ALLOWED: RouteCase[] = [
@@ -108,6 +172,7 @@ const RESTRICTED_ALLOWED: RouteCase[] = [
   { method: "POST", path: "/api/routines/r-1/triggers" },
   { method: "PATCH", path: "/api/routine-triggers/t-1" },
   { method: "DELETE", path: "/api/routine-triggers/t-1" },
+  ...TOOL_GATEWAY_ALLOWED,
 ];
 
 // Routes agents call that only the `agent` policy forwards. The server still
@@ -619,6 +684,56 @@ describe("sandbox callback bridge route policies", () => {
     });
   });
 
+  describe("REST tool gateway", () => {
+    it("forwards exactly the session, list, call and revoke routes under every policy", () => {
+      for (const policy of ["restricted", "agent", "steward"] as const) {
+        const authorize = createSandboxCallbackBridgeAuthorizer({ policy, companyId: COMPANY });
+        for (const request of TOOL_GATEWAY_ALLOWED) {
+          expect(authorize(request), `${policy} ${request.method} ${request.path}`).toBeNull();
+        }
+        for (const request of TOOL_GATEWAY_DENIED) {
+          const denial = authorize(request);
+          expect(denial, `${policy} ${request.method} ${request.path}`).not.toBeNull();
+          expect(denial).toContain(`${request.method} ${request.path}`);
+        }
+      }
+      // An unstamped bridge uses the restricted list, which carries them too.
+      const authorizeDefault = createSandboxCallbackBridgeAuthorizer();
+      for (const request of TOOL_GATEWAY_ALLOWED) {
+        expect(authorizeDefault(request), `${request.method} ${request.path}`).toBeNull();
+      }
+    });
+
+    it("forwards the session token header and nothing that only looks like it", () => {
+      const forwarded = sanitizeSandboxCallbackBridgeHeaders({
+        "X-Paperclip-Tool-Gateway-Token": "session-token",
+        "content-type": "application/json",
+        "x-paperclip-tool-gateway-token-extra": "dropped",
+        "x-paperclip-tool-gateway": "dropped",
+        "x-paperclip-tool-gateway-session": "dropped",
+        "x-paperclip-run-id": "dropped",
+        authorization: "Bearer dropped",
+      });
+      expect(forwarded).toEqual({
+        "X-Paperclip-Tool-Gateway-Token": "session-token",
+        "content-type": "application/json",
+      });
+      // Only this one header joins the allowlist.
+      expect([...DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST]).toEqual([
+        "accept",
+        "content-type",
+        "if-match",
+        "if-none-match",
+        "x-paperclip-github-capability",
+        "x-paperclip-tool-gateway-token",
+      ]);
+      // The in-sandbox gateway filters with the same list before the host does.
+      expect(getSandboxCallbackBridgeServerSource()).toContain(
+        `const allowedHeaders = new Set(${JSON.stringify([...DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST])});`,
+      );
+    });
+  });
+
   it("refuses non-canonical paths under every policy", () => {
     for (const request of NON_CANONICAL) {
       expect(describeNonCanonicalSandboxCallbackBridgePath(request.path), JSON.stringify(request.path)).not.toBeNull();
@@ -629,6 +744,7 @@ describe("sandbox callback bridge route policies", () => {
     }
     for (const request of [
       ...RESTRICTED_ALLOWED, ...AGENT_ONLY_ALLOWED, ...AGENT_DENIED, ...STEWARD_ONLY_ALLOWED, ...STEWARD_DENIED,
+      ...TOOL_GATEWAY_DENIED,
     ]) {
       expect(describeNonCanonicalSandboxCallbackBridgePath(request.path), request.path).toBeNull();
     }

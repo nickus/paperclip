@@ -197,6 +197,19 @@ function classify(route: RouteEntry, policy: WidePolicy = "agent"): string {
   return `MIXED (allows ${allowedLabels.join("; ")})`;
 }
 
+/**
+ * The REST tool gateway routes every policy forwards, so agents without a
+ * native MCP client can reach their connected tools. They act only for the
+ * calling run, and the server applies the agent's tool profiles, policies and
+ * approval gates to each call. The rest of `/api/tool-gateway` stays closed.
+ */
+const TOOL_GATEWAY_AGENT_ROUTES = [
+  "POST /api/tool-gateway/sessions",
+  "POST /api/tool-gateway/sessions/:sessionId/revoke",
+  "GET /api/tool-gateway/tools",
+  "POST /api/tool-gateway/tools/call",
+];
+
 function decisionOf(route: RouteEntry, policy: WidePolicy = "agent"): "allow" | "deny" | "mixed" {
   const decision = classify(route, policy);
   return decision === "ALLOW" ? "allow" : decision === "DENY" ? "deny" : "mixed";
@@ -225,6 +238,7 @@ describe("agent bridge policy route inventory", () => {
 
   it("never forwards secret, credential, environment, or administration routes", () => {
     const mustDeny = routes.filter((route) => {
+      if (TOOL_GATEWAY_AGENT_ROUTES.includes(`${route.method} ${route.path}`)) return false;
       const path = route.path.toLowerCase();
       return (
         /(?:^|\/)[^/]*secret[^/]*(?:\/|$)/.test(path) ||
@@ -252,6 +266,16 @@ describe("agent bridge policy route inventory", () => {
     const forwarded = mustDeny.filter((route) => decisionOf(route) !== "deny")
       .map((route) => `${route.method} ${route.path} (${route.file})`);
     expect(forwarded).toEqual([]);
+  });
+
+  it("forwards exactly the session, list, call and revoke routes of the tool gateway", () => {
+    for (const policy of ["agent", "steward"] as const) {
+      const reachable = [...new Set(routes
+        .filter((route) => /^\/api\/tool-gateway(?:\/|$)/.test(route.path))
+        .filter((route) => decisionOf(route, policy) !== "deny")
+        .map((route) => `${classify(route, policy)} ${route.method} ${route.path}`))].sort();
+      expect(reachable, policy).toEqual(TOOL_GATEWAY_AGENT_ROUTES.map((route) => `ALLOW ${route}`).sort());
+    }
   });
 
   it("forwards the task, artifact, interaction, run, and summary routes agents rely on", () => {

@@ -124,6 +124,26 @@ export interface SandboxCallbackBridgeRouteRule {
   path: RegExp;
 }
 
+// The REST tool gateway: the harness-neutral way to reach connected tools
+// (MCP tool connections and the other gateway tools) with plain HTTP, for
+// agent CLIs without a native MCP client. Every route policy forwards exactly
+// these four routes, because they only ever act for the calling run:
+// - creating a session binds it on the server to the calling agent, its
+//   company and an active run of that agent (the body cannot name others);
+// - listing and calling tools authenticate with that session's token and go
+//   through the agent's tool profiles, tool policies, approval gates and audit
+//   on the server, so a run sees and calls only the tools it was granted;
+// - revoking only reaches the caller's own sessions.
+// Nothing here returns connection credentials. The rest of the gateway
+// (named gateways and their tokens, approval decisions, runtime slots, the
+// audit log) stays unreachable from every policy.
+const TOOL_GATEWAY_ROUTE_RULES: readonly SandboxCallbackBridgeRouteRule[] = [
+  { method: "POST", path: /^\/api\/tool-gateway\/sessions$/ },
+  { method: "POST", path: /^\/api\/tool-gateway\/sessions\/[^/]+\/revoke$/ },
+  { method: "GET", path: /^\/api\/tool-gateway\/tools$/ },
+  { method: "POST", path: /^\/api\/tool-gateway\/tools\/call$/ },
+];
+
 // Routes the in-sandbox heartbeat skill is documented to call. The server
 // still enforces actor-level permissions on top of this allowlist; the list
 // exists to bound the surface area a compromised CLI could reach via the
@@ -228,17 +248,25 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/routines\/[^/]+\/triggers$/ },
   { method: "PATCH", path: /^\/api\/routine-triggers\/[^/]+$/ },
   { method: "DELETE", path: /^\/api\/routine-triggers\/[^/]+$/ },
+
+  // Connected tools through the REST tool gateway (see TOOL_GATEWAY_ROUTE_RULES).
+  ...TOOL_GATEWAY_ROUTE_RULES,
 ] as const;
 
 // Keep the public alias for callers selecting the HTTP/2 transport.
 export const HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST = DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST;
 
+// Header values are forwarded, never logged: the bridge's debug and failure
+// logs carry the method, the path and the query, not headers.
 export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST = [
   "accept",
   "content-type",
   "if-match",
   "if-none-match",
   "x-paperclip-github-capability",
+  // The REST tool gateway session token. It authenticates tool listing and
+  // calls for the caller's own run only.
+  "x-paperclip-tool-gateway-token",
 ] as const;
 
 export interface SandboxCallbackBridgeRequest extends SandboxCallbackBridgeBody {
@@ -662,6 +690,10 @@ export const AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRout
 
   // Runtime capability authentication is independently checked by the controller.
   { methods: ["POST"], path: /^\/runtime-tools\/github\/credentials$/ },
+
+  // Connected tools through the REST tool gateway, the same four routes the
+  // restricted list carries (see TOOL_GATEWAY_ROUTE_RULES).
+  ...TOOL_GATEWAY_ROUTE_RULES.map((rule) => ({ methods: [rule.method], path: rule.path })),
 ];
 
 /**
