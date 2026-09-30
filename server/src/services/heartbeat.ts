@@ -363,6 +363,7 @@ import {
   buildHeartbeatRunStopMetadata,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
+  wasStoppedAfterTerminalResult,
 } from "./heartbeat-stop-metadata.js";
 import {
   CHAT_CONTROL_RECOVERY_ADMISSION_KEY,
@@ -25499,6 +25500,13 @@ export function heartbeatService(
           processRunCancellationSettlements.get(run.id) ??
           failedProcessRunCancellations.get(run.id);
         await processCancellation?.settled;
+        // A process that kept running after the agent's final result (for
+        // example because a background task was still alive) is stopped by the
+        // terminal-result cleanup. Its signal or exit status then does not
+        // describe the turn, so only the adapter's own error decides the outcome.
+        const stoppedAfterTerminalResult = wasStoppedAfterTerminalResult(
+          parseObject(adapterResult.resultJson),
+        );
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
@@ -25517,9 +25525,9 @@ export function heartbeatService(
         } else if (adapterResult.timedOut) {
           outcome = "timed_out";
         } else if (
-          (adapterResult.exitCode ?? 0) === 0 &&
+          (((adapterResult.exitCode ?? 0) === 0 && !adapterResult.signal) ||
+            stoppedAfterTerminalResult) &&
           !adapterResult.errorMessage &&
-          !adapterResult.signal &&
           !processCancellation?.failed
         ) {
           outcome = "succeeded";
@@ -25863,6 +25871,21 @@ export function heartbeatService(
               exitCode: adapterResult.exitCode,
             },
           });
+          if (outcome === "succeeded" && stoppedAfterTerminalResult) {
+            await appendRunEvent(finalizedRun, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message:
+                "The agent finished its turn, but a background task it started was still running; " +
+                "the task was stopped. It does not keep the issue live.",
+              payload: {
+                reason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+                exitCode: adapterResult.exitCode,
+                signal: adapterResult.signal,
+              },
+            });
+          }
           try {
             await completeSkillTestRunForHeartbeatOutcome({
               run: finalizedRun,

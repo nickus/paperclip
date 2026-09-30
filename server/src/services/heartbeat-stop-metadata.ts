@@ -100,6 +100,20 @@ export function inferHeartbeatRunStopReason(input: {
   return "adapter_failed";
 }
 
+/**
+ * Whether the adapter's process was stopped by the terminal-result cleanup,
+ * i.e. after the agent had already printed the result that ends its turn and
+ * the process kept running (typically because a background task the agent
+ * started was still alive). The signal or non-zero exit status such a stop
+ * leaves behind comes from the cleanup, not from the agent's turn.
+ */
+export function wasStoppedAfterTerminalResult(resultJson: Record<string, unknown> | null | undefined): boolean {
+  const evidence = resultJson?.unmanagedBackgroundTask;
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return false;
+  const record = evidence as Record<string, unknown>;
+  return record.kind === "terminal_result_cleanup" && record.stopped === true && record.terminalResultSeen === true;
+}
+
 export function buildHeartbeatRunStopMetadata(input: {
   adapterType: string;
   adapterConfig: Record<string, unknown> | null | undefined;
