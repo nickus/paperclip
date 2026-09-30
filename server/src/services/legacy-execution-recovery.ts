@@ -10,6 +10,7 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
+type Task = typeof issues.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
 /** One terminal run is one incident; its recovery identity is the run id. */
@@ -53,6 +54,30 @@ export function legacyExecutionNeedsReconciliation(
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false
+  );
+}
+
+function isCurrentReviewParticipant(task: Task, agentId: string): boolean {
+  const review = task.status === "in_review" ? parseIssueExecutionState(task.executionState) : null;
+  return review?.status === "pending" &&
+    review.currentParticipant?.type === "agent" && review.currentParticipant.agentId === agentId;
+}
+
+/**
+ * Whether a terminal legacy run records its reconciliation hold on the task:
+ * only while its agent still owns the open task (as assignee or as the
+ * current review participant) and the run is not an older turn of a
+ * conversation that has moved on. Anything that waits for that hold must use
+ * the same test, or it can wait for a hold that is never recorded.
+ */
+export function legacyExecutionHoldApplies(
+  task: Task,
+  run: Pick<Run, "id" | "agentId" | "contextSnapshot">,
+): boolean {
+  return (
+    !["done", "cancelled"].includes(task.status) &&
+    (task.assigneeAgentId === run.agentId || isCurrentReviewParticipant(task, run.agentId)) &&
+    !isSupersededConversationRun(task, run)
   );
 }
 
@@ -114,15 +139,8 @@ export async function terminalizeLegacyExecution(input: {
         .update(issues)
         .set({ checkoutRunId: null })
         .where(eq(issues.id, task.id));
-    const review = task?.status === "in_review" ? parseIssueExecutionState(task.executionState) : null;
-    const isCurrentReviewer = review?.status === "pending" &&
-      review.currentParticipant?.type === "agent" && review.currentParticipant.agentId === run.agentId;
-    if (
-      task &&
-      !isSupersededConversationRun(task, updated) &&
-      (task.assigneeAgentId === run.agentId || isCurrentReviewer) &&
-      !["done", "cancelled"].includes(task.status)
-    ) {
+    if (task && legacyExecutionHoldApplies(task, updated)) {
+      const isCurrentReviewer = isCurrentReviewParticipant(task, run.agentId);
       const fingerprint = legacyExecutionRecoveryFingerprint(run.id);
       // Periodic stranded-work checks, retry paths and late finalizers may
       // revisit this terminal run. Its incident is recorded once. A closed

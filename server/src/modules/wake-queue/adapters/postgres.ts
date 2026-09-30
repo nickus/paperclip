@@ -18,7 +18,10 @@ import {
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
-import { legacyExecutionNeedsReconciliation } from "../../../services/legacy-execution-recovery.js";
+import {
+  legacyExecutionHoldApplies,
+  legacyExecutionNeedsReconciliation,
+} from "../../../services/legacy-execution-recovery.js";
 import {
   authorizeFailedChatRunRetryWake,
   FailedChatRunRetryAuthorizationError,
@@ -1145,17 +1148,14 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           issueRow.assigneeAgentId !== run.agentId,
         );
         // A legacy run whose outcome needs reconciliation records its hold only
-        // while its agent still owns the task: as assignee or as the current
-        // review participant (see terminalizeLegacyExecution). A run that has
-        // handed the task to someone else records none, so no hold release
-        // would ever drain the wakes parked behind it, such as the new
+        // under the conditions of legacyExecutionHoldApplies: its agent still
+        // owns the open task and the run is not a superseded conversation
+        // turn. A run that has handed the task to someone else, whose task was
+        // closed, or whose conversation moved on records none, so no hold
+        // release would ever drain the wakes parked behind it, such as a new
         // assignee's. A hold recorded while the run still owned the task keeps
         // standing the drain down below, as an execution blocker.
-        const review = issueRow?.status === "in_review" ? parseIssueExecutionState(issueRow.executionState) : null;
-        const runOwnsTask = !issueRow || issueRow.assigneeAgentId === run.agentId || (
-          review?.status === "pending" && review.currentParticipant?.type === "agent" &&
-          review.currentParticipant.agentId === run.agentId
-        );
+        const holdApplies = issueRow !== null && legacyExecutionHoldApplies(issueRow, run);
         const preDrainFacts: PreDrainFacts = {
           issueRowPresent: issueRow !== null,
           executionRunIdMatchesRun: !issueRow || !issueRow.executionRunId || issueRow.executionRunId === run.id,
@@ -1168,7 +1168,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // drain after the executor settled (afterOwnerSettled) does not:
           // wakes behind a run awaiting reconciliation stay parked for that
           // afterExecutionHold release.
-          legacyExecutionNeedsReconciliation: runOwnsTask && legacyExecutionNeedsReconciliation(run) && !heldRunReleased,
+          legacyExecutionNeedsReconciliation: holdApplies && legacyExecutionNeedsReconciliation(run) && !heldRunReleased,
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.
