@@ -103,6 +103,19 @@ export type PromoteDeferredWakeInput = {
   now: Date;
 };
 
+export type CarryHandoffQueuedCommentsInput = {
+  companyId: string;
+  issueId: string;
+  /** The previous owner's run that handed the task over and kept running. */
+  sourceRunId: string;
+  /** The task's new owner, whose run was just queued. */
+  newOwnerAgentId: string;
+  /** The new owner's wake and the run it queued. */
+  wakeId: string;
+  runId: string;
+  now: Date;
+};
+
 /**
  * Every member is bound to the one transaction that `withIssueExecutionLock`
  * owns. The interface holds both reads and writes that drain and resolve
@@ -193,6 +206,13 @@ export interface WakeQueueTransaction {
    * issue's execution lock. Call only after that claim returns `true`.
    */
   finalizePromotedWake(input: PromoteDeferredWakeInput): Promise<RunSummary>;
+  /**
+   * Moves the task messages still queued for the previous owner of a task
+   * that `sourceRunId` handed over into the new owner's just-queued run,
+   * once, and retires those queued wakes so the previous owner does not run
+   * for them. Returns the comment ids added to the new run.
+   */
+  carryHandoffQueuedComments(input: CarryHandoffQueuedCommentsInput): Promise<string[]>;
   /** An open run already on this issue (optionally scoped to one agent) that would race a new recovery run. */
   hasExistingExecutionPath(input: {
     companyId: string;

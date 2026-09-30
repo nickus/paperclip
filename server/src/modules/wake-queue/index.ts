@@ -1,5 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import {
+  carryHandoffQueuedComments,
   createAdmissionTransactionScope as buildAdmissionTransactionScope,
   createPostgresWakeQueueAdapter,
   createWakeAdmissionReader,
@@ -14,6 +15,7 @@ import {
   createReorderQueuedComments,
 } from "./application/queued-comment-use-cases.js";
 import type {
+  CarryHandoffQueuedCommentsInput,
   IssueSnapshot,
   RecoveryEscalationPort,
   RunSnapshot,
@@ -104,6 +106,15 @@ export function createWakeQueue(db: Db, deps: WakeQueueDeps) {
     }),
     createAdmissionTransactionScope(companyId: string, tx: Db): TransactionScope {
       return buildAdmissionTransactionScope(companyId, tx);
+    },
+    /**
+     * For admission, which runs in the transaction `heartbeat.ts` owns: a
+     * hand-off wake that is queued directly (its source run released the task
+     * before the wake was admitted) carries the same messages a parked one
+     * carries when it is promoted.
+     */
+    carryHandoffQueuedComments(tx: Db, input: CarryHandoffQueuedCommentsInput): Promise<string[]> {
+      return carryHandoffQueuedComments(tx, input);
     },
   };
 }

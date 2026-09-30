@@ -29863,9 +29863,11 @@ export function heartbeatService(
                   or(isNull(heartbeatRuns.nativeIssueId), eq(heartbeatRuns.nativeIssueId, issue.id)),
                 )).then(rows => rows[0] ?? null)
               : null;
-          const pendingComments =
+          const queuedCommentsAdoptable =
             !isConversation(issue) && opts.allowRunCoalescing !== false &&
-            !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id))
+            !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id));
+          const pendingComments =
+            queuedCommentsAdoptable
               ? await tx
                   .select()
                   .from(agentWakeupRequests)
@@ -29971,6 +29973,27 @@ export function heartbeatService(
                 payload: withQueuedCommentIdsInWakePayload(payload, adoptedCommentIds),
               })
               .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+          }
+
+          // A run that hands its own task over keeps running, so its agent's
+          // saved task messages are not adopted above. Its release normally
+          // promotes the new owner's parked wake, which carries them then; a
+          // wake admitted after that run already released the task carries
+          // them here instead.
+          const handoffSourceRunId = readNonEmptyString(enrichedContextSnapshot.handoffSourceRunId);
+          if (
+            queuedCommentsAdoptable && !handoffSource && handoffSourceRunId &&
+            source === "assignment" && reason === "issue_assigned" && issue.assigneeAgentId === agentId
+          ) {
+            await wakeQueue.carryHandoffQueuedComments(tx as unknown as Db, {
+              companyId: issue.companyId,
+              issueId: issue.id,
+              sourceRunId: handoffSourceRunId,
+              newOwnerAgentId: agentId,
+              wakeId: wakeupRequest.id,
+              runId: newRun.id,
+              now: new Date(),
+            });
           }
 
           // executionRunId is NOT stamped here (enqueueWakeup queues the run but

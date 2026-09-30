@@ -543,6 +543,28 @@ async function promoteDeferredWake(
     now: input.now,
   });
 
+  // A run that hands its own task to another agent keeps running, so the new
+  // owner's assignment wake waited behind it, and task messages that arrived
+  // for the previous owner during that run are still queued for it. They
+  // belong to the task, so they go to the new owner's run, as admission does
+  // for a hand-off that stopped the previous owner's run first.
+  const handoffSourceRunId = readNonEmptyString(workingCandidate.deferredContextSeed.handoffSourceRunId);
+  if (
+    handoffSourceRunId &&
+    workingCandidate.agentId === currentIssue.assigneeAgentId &&
+    !(currentIssue.conversationAgentId && currentIssue.conversationUserId)
+  ) {
+    await ports.transaction.carryHandoffQueuedComments({
+      companyId: run.companyId,
+      issueId: currentIssue.id,
+      sourceRunId: handoffSourceRunId,
+      newOwnerAgentId: workingCandidate.agentId,
+      wakeId: workingCandidate.id,
+      runId: promotedRun.id,
+      now: input.now,
+    });
+  }
+
   postCommitEffects.push({ kind: "run_queued", run: promotedRun });
   return { outcome: { kind: "promoted", run: promotedRun }, postCommitEffects };
 }

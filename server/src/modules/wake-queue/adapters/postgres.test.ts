@@ -19,6 +19,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../../../__tests__/helpers/embedded-postgres.js";
 import {
+  carryHandoffQueuedComments,
   createAdmissionTransactionScope,
   createPostgresWakeQueueAdapter,
   createWakeAdmissionWriter,
@@ -604,6 +605,68 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     const [preserved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, previous));
     expect(preserved.status).toBe("deferred_issue_execution");
     expect(preserved.runId).toBeNull();
+  });
+
+  it("carries only the previous owner's ordinary saved messages into the new owner's run, once", async () => {
+    const companyId = await seedCompany();
+    const builderId = await seedAgent({ companyId, name: "Builder" });
+    const reviewerId = await seedAgent({ companyId, name: "Reviewer" });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: reviewerId });
+    const otherIssueId = await seedIssue({ companyId });
+    const sourceRunId = await seedRun({ companyId, agentId: builderId, status: "succeeded", contextSnapshot: { issueId } });
+    const otherTaskRunId = await seedRun({ companyId, agentId: builderId, status: "succeeded", contextSnapshot: { issueId: otherIssueId } });
+    const comment = async (values: Partial<typeof issueComments.$inferInsert>) => (await db.insert(issueComments).values({
+      companyId, issueId, authorType: "user", authorUserId: "board-user", body: "Please also cover the empty-input case.", ...values,
+    }).returning())[0]!.id;
+    const userCommentId = await comment({});
+    const mentionCommentId = await comment({ body: "@Builder can you check this?" });
+    const handOffCommentId = await comment({
+      authorType: "agent", authorUserId: null, authorAgentId: builderId, createdByRunId: sourceRunId, body: "Please review.",
+    });
+    const queued = (wakeReason: string, commentId: string, extra: Record<string, unknown> = {}) => seedDeferredWake({
+      companyId, agentId: builderId, issueId, requestedByActorId: "board-user",
+      payload: { commentId, ...extra, _paperclipWakeContext: { issueId, wakeReason, wakeCommentIds: [commentId] } },
+    });
+    const ordinaryWakeId = await queued("issue_commented", userCommentId);
+    const mentionWakeId = await queued("issue_comment_mentioned", mentionCommentId);
+    const interactionWakeId = await queued("issue_commented", userCommentId, { mutation: "interaction" });
+
+    // The new owner's just-queued wake and run, carrying its hand-off note.
+    const newWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: newWakeId, companyId, agentId: reviewerId, source: "assignment", reason: "issue_assigned", status: "queued",
+      payload: { issueId, commentId: handOffCommentId },
+    });
+    const newRunId = await seedRun({
+      companyId, agentId: reviewerId, status: "queued",
+      contextSnapshot: { issueId, wakeReason: "issue_assigned", wakeCommentIds: [handOffCommentId], wakeCommentId: handOffCommentId },
+    });
+    const carry = (sourceRun: string) => carryHandoffQueuedComments(db as unknown as Db, {
+      companyId, issueId, sourceRunId: sourceRun, newOwnerAgentId: reviewerId, wakeId: newWakeId, runId: newRunId, now: new Date(),
+    });
+
+    // A run of the previous owner on another task is not this hand-off.
+    expect(await carry(otherTaskRunId)).toEqual([]);
+    expect(await carry(sourceRunId)).toEqual([userCommentId]);
+    // Nothing is left to carry a second time.
+    expect(await carry(sourceRunId)).toEqual([]);
+
+    const [newRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, newRunId));
+    expect(newRun.contextSnapshot).toMatchObject({
+      wakeCommentIds: [userCommentId, handOffCommentId],
+      wakeCommentId: handOffCommentId,
+    });
+    const [newWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, newWakeId));
+    expect(newWake.payload).toMatchObject({
+      commentId: handOffCommentId,
+      _paperclipWakeContext: { wakeCommentIds: [userCommentId, handOffCommentId] },
+    });
+    const statuses = new Map((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, builderId)))
+      .map((wake) => [wake.id, { status: wake.status, runId: wake.runId }]));
+    expect(statuses.get(ordinaryWakeId)).toEqual({ status: "coalesced", runId: newRunId });
+    // A mention addresses the agent and an interaction keeps its own contract.
+    expect(statuses.get(mentionWakeId)).toEqual({ status: "deferred_issue_execution", runId: null });
+    expect(statuses.get(interactionWakeId)).toEqual({ status: "deferred_issue_execution", runId: null });
   });
 
   it("keeps a paused agent's deferred wake queued through a release, and promotes it once the agent resumes", async () => {
