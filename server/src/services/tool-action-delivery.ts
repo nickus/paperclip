@@ -230,8 +230,17 @@ export function toolActionDeliveryService(
                       request.status === "cancelled"
                     ? "The review is no longer available. Do not execute the stored request. Explain the recorded outcome before requesting another review."
                     : "The approved action did not complete successfully. Do not automatically replay it; inspect the recorded outcome first.";
+            // Name the tool the way agents see it: when the connection
+            // presents it under an alias, the approval card recorded it.
+            const payload = interaction.payload as {
+              toolAction?: { exposedToolName?: unknown };
+            } | null;
+            const exposedToolName =
+              typeof payload?.toolAction?.exposedToolName === "string"
+                ? payload.toolAction.exposedToolName
+                : null;
             return {
-              toolName: invocation.toolName.slice(0, 256),
+              toolName: (exposedToolName ?? invocation.toolName).slice(0, 256),
               actionRequestId: request.id,
               invocationId: invocation.id,
               decision:

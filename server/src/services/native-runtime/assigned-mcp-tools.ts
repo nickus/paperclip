@@ -87,7 +87,9 @@ export async function createAssignedMcpTools(input: {
   });
   const tools = new Map<string, ToolGatewayDescriptor>();
   for (const descriptor of listed) {
-    const name = assignedToolName(descriptor.name);
+    // Keep the runner's app_ namespace so an assigned tool can never shadow a
+    // runner tool, but derive it from the connection's alias when there is one.
+    const name = assignedToolName(descriptor.exposedName ?? descriptor.name);
     if (tools.has(name)) throw new Error("assigned_mcp_tool_name_collision");
     tools.set(name, descriptor);
   }

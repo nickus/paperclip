@@ -708,6 +708,32 @@ describeEmbeddedPostgres("connectionIntentService", () => {
     expect((await service.search(claims, "heliotrope")).results[0]).toMatchObject({ state: "unavailable" });
   });
 
+  it("shows a custom connection and its renamed tools the way agents are meant to see them", async () => {
+    const [application] = await db.insert(toolApplications).values({ companyId: claims.company_id, applicationKey: randomUUID(), name: "Helpdesk backend", description: "Upstream application description.", type: "mcp_http", status: "active" }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: claims.company_id, applicationId: application!.id, uid: randomUUID(), name: "helpdesk-prod-7",
+      transport: "mcp_remote", authKind: "none", enabled: true, status: "active", healthStatus: "ok",
+      config: {
+        agentDisplayName: "Ticket desk",
+        agentDescription: "Customer support tickets.",
+        toolOverrides: { ticket_lookup: { name: "zephyr_lookup", description: "Find the saffron escalation ticket" } },
+      },
+    }).returning();
+    const id = `connection:${connection!.id}`;
+    await db.insert(connectionGrants).values({ companyId: claims.company_id, connectionId: connection!.id, kind: "user", subjectUserId: claims.responsible_user_id, status: "active" });
+    await db.insert(toolCatalogEntries).values({ companyId: claims.company_id, connectionId: connection!.id, toolName: "ticket_lookup", name: "ticket_lookup", description: "Upstream-only cobalt wording", versionHash: "fixture-v1", status: "active", entryKind: "tool" });
+    const service = connectionIntentService(db);
+    expect((await service.search(claims, "saffron")).results).toEqual([
+      expect.objectContaining({ service: id, name: "Ticket desk", description: "Customer support tickets." }),
+    ]);
+    // The exposed tool name is searchable; the replaced upstream description is not.
+    expect((await service.search(claims, "zephyr")).results).toEqual([expect.objectContaining({ service: id })]);
+    expect((await service.search(claims, "cobalt")).results.some((result) => result.service === id)).toBe(false);
+    // The card asks the person about the connection they know, by its own name.
+    const requested = await service.request(claims, id);
+    expect((await service.loadIntent(requested.interactionId!)).interaction.payload).toMatchObject({ serviceName: "helpdesk-prod-7" });
+  });
+
   it("returns only selection metadata for an agent-authorized custom connection", async () => {
     const [application] = await db.insert(toolApplications).values({ companyId: claims.company_id, applicationKey: randomUUID(), name: "Private archive", type: "mcp_http", status: "active" }).returning();
     const [connection] = await db.insert(toolConnections).values({
