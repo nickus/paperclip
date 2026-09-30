@@ -27,6 +27,33 @@ curl -sS -o "$PAPERCLIP_RUN_SCRATCH_DIR/response.json" -w '%{http_code}\n' \
 
 A key a route does not know can be dropped without an error, so a misspelled field may return `200` and change nothing. Check that the response shows your change. Paths accept an issue identifier such as `ABC-12`, but body fields that hold issue ids (`blockedByIssueIds`, `parentId`) need the UUID: read `id` from `GET /api/issues/ABC-12`.
 
+## Response shapes
+
+There is no single envelope. Some routes answer with a bare JSON array; others answer with an object. None of the array routes below wrap their rows in `items`, `data`, `results`, or a pagination block — the array **is** the whole body. Check the shape before reading a top-level key off the response (`jq -e 'type'`, or in Python `isinstance(response, list)`); assuming every response is an object and calling `.get(...)` on one of the array routes raises `'list' object has no attribute 'get'`.
+
+| Route | Top-level shape |
+| --- | --- |
+| `GET /api/issues/{issueId}` | object — issue fields plus `ancestors`, `project`, `goal`, `blockedBy`, `blocks` |
+| `GET /api/companies/{companyId}/issues` (also how to list an issue's children: add `?parentId={issueId}`) | bare array |
+| `GET /api/issues/{issueId}/heartbeat-context` | object — `issue`, ancestor/goal/project summaries, comment cursor, current execution workspace |
+| `GET /api/issues/{issueId}/comments[?after=…]` | bare array — no `next`/`cursor`/`total` field; page by passing the last row's own `id` as `after` |
+| `GET /api/issues/{issueId}/comments/{commentId}` | object (one comment) |
+| `GET /api/issues/{issueId}/interactions` | bare array |
+| `GET /api/issues/{issueId}/documents` | bare array |
+| `GET /api/issues/{issueId}/documents/{key}` | object (one document, has `latestRevisionId`) |
+| `GET /api/issues/{issueId}/documents/{key}/revisions` | bare array |
+| `GET /api/issues/{issueId}/attachments` | bare array |
+| `GET /api/issues/{issueId}/work-products` | bare array |
+| `GET /api/issues/{issueId}/approvals` | bare array |
+| `GET /api/agents/me`, `GET /api/agents/{agentId}` | object |
+| `GET /api/companies/{companyId}/agents` | bare array |
+| `GET /api/routines/{routineId}/runs` | bare array |
+| `POST /api/tool-gateway/sessions` | object — `sessionId`, `token`, `expiresAt`, … |
+| `GET /api/tool-gateway/tools` | bare array |
+| `POST /api/tool-gateway/tools/call` | object — `invocationId`, `status`, `tool`, `result` |
+
+The single-resource GET and the compound context/session/call routes are the object shapes above; every plain "list the sub-resources of an issue" route is a bare array. When in doubt, the rule is: one thing back → object; more than zero-or-more things back → array.
+
 ## Comment
 
 ```bash
