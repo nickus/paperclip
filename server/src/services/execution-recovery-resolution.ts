@@ -1,10 +1,14 @@
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
-import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
+import {
+  conversationRecoveryActionPredicate,
+  getConversationOwnershipBlocker,
+  runUsedConversationAdapter,
+} from "./conversation-continuation.js";
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, asc, eq, inArray, isNull, not, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import {
   agents,
   chatActions,
@@ -16,7 +20,7 @@ import {
   nativeRunFinalizations,
   type Db,
 } from "@paperclipai/db";
-import { conflict } from "../errors.js";
+import { conflict, HttpError } from "../errors.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import {
   EXECUTION_RECONCILIATION_CAUSES,
@@ -25,7 +29,12 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { DIRECT_NON_INVOKABLE_STATUSES } from "./agent-invokability.js";
-import { LEGACY_RECOVERY_CAUSE } from "./legacy-execution-recovery.js";
+import {
+  AGENT_PAUSE_STOP_ERROR_CODE,
+  isVerifiedAgentPauseStop,
+  LEGACY_RECOVERY_CAUSE,
+  PROVIDER_STOP_RESULT_KEY,
+} from "./legacy-execution-recovery.js";
 import {
   assessInertLegacyRun,
   describeInertRunEvidence,
@@ -415,6 +424,147 @@ export async function deliverReconciledExecutions(
   }
 }
 
+export const AGENT_PAUSE_RESUME_POLICY = "agent_pause_resume_v1";
+
+/**
+ * How long the automatic disposition leaves a run the agent pause cancelled
+ * while the pause is still stopping its process: the verified stop and the
+ * release of the run's execution environment follow the cancellation. After
+ * this window a run without both keeps the regular no-replay disposition.
+ */
+export const AGENT_PAUSE_STOP_SETTLE_GRACE_MS = 5 * 60_000;
+
+/** Null-safe: true only for a recent pause stop that is not yet verified or released. */
+function agentPauseStopPendingCondition(now: Date): SQL {
+  const cutoff = new Date(now.getTime() - AGENT_PAUSE_STOP_SETTLE_GRACE_MS);
+  const stop = sql`${heartbeatRuns.resultJson} -> ${PROVIDER_STOP_RESULT_KEY}::text`;
+  return sql`(
+    ${heartbeatRuns.runtimeMode} = 'legacy'
+    and ${heartbeatRuns.status} = 'cancelled'
+    and coalesce(${heartbeatRuns.errorCode}, '') = ${AGENT_PAUSE_STOP_ERROR_CODE}
+    and coalesce(${stop} ->> 'initiator', '') = 'agent_pause'
+    and coalesce(${heartbeatRuns.finishedAt} > ${cutoff.toISOString()}::timestamptz, false)
+    and (
+      coalesce(${stop} ->> 'processTerminated', '') <> 'true'
+      or exists (
+        select 1 from ${environmentLeases}
+        where ${environmentLeases.companyId} = ${heartbeatRuns.companyId}
+          and ${environmentLeases.heartbeatRunId} = ${heartbeatRuns.id}
+          and ${environmentLeases.releasedAt} is null
+      )
+    )
+  )`;
+}
+
+/**
+ * Continue a task whose run an agent pause stopped. The pause stopped the
+ * provider process and verified it (see `isVerifiedAgentPauseStop`), and the
+ * run's adapter takes a conversation turn, so a new turn sees the recorded
+ * comments and documents and decides what remains; nothing is replayed
+ * blindly. The decision is the one an operator records for such a run
+ * (`providerStopped: true`, `actionOutcome: "mixed"`) and goes through the
+ * same validation and delivery path: the continuation is delivered once the
+ * agent can be invoked again, that is when it is resumed.
+ *
+ * Returns false when the operator path would refuse the decision; the caller
+ * then applies the regular no-replay disposition. Runs inside the caller's
+ * transaction, which already holds the task, coordinator, run and action.
+ */
+async function continueAfterAgentPause(
+  tx: Db,
+  input: {
+    task: typeof issues.$inferSelect;
+    run: typeof heartbeatRuns.$inferSelect;
+    action: typeof issueRecoveryActions.$inferSelect;
+    now: Date;
+  },
+) {
+  const { task, run, action, now } = input;
+  const stop = run.resultJson?.[PROVIDER_STOP_RESULT_KEY] as { verifiedAt?: unknown } | undefined;
+  const decision: ExecutionReconciliation = {
+    runId: run.id,
+    providerStopped: true,
+    // Work before the pause may have happened; it stands and is not repeated.
+    actionOutcome: "mixed",
+    outcomeEvidence:
+      `Automatic reconciliation (${AGENT_PAUSE_RESUME_POLICY}): the agent was paused while this run was working. ` +
+      `The run's process was stopped and verified gone${typeof stop?.verifiedAt === "string" ? ` at ${stop.verifiedAt}` : ""}. ` +
+      "Comments, documents and other work the run recorded before the pause stand; a new turn continues the task.",
+  };
+  try {
+    await validateExecutionReconciliation({
+      db: tx,
+      companyId: task.companyId,
+      issueId: task.id,
+      agentId: task.assigneeAgentId,
+      sourceRunId: action.evidence.runId,
+      decision,
+    });
+  } catch (err) {
+    // A refusal keeps the regular disposition. A database error aborts the
+    // transaction instead, and the candidate is retried on the next sweep.
+    if (!(err instanceof HttpError)) throw err;
+    logger.info(
+      { err, recoveryActionId: action.id, runId: run.id },
+      "Paused run keeps its no-replay disposition; the continuation was refused",
+    );
+    return false;
+  }
+  await markExecutionReconciliation(tx, action, decision, "execution-recovery");
+  const note =
+    "The agent was paused during this run and its process was stopped. Recorded work is preserved; the task continues in a new run when the agent is resumed.";
+  await tx
+    .update(issueRecoveryActions)
+    .set({
+      status: "resolved",
+      outcome: "restored",
+      resolvedAt: now,
+      updatedAt: now,
+      nextAction: note,
+      resolutionNote: note,
+      wakePolicy: null,
+      monitorPolicy: null,
+    })
+    .where(eq(issueRecoveryActions.id, action.id));
+  await persistActivity(tx, {
+    companyId: run.companyId,
+    actorType: "system",
+    actorId: "execution-recovery",
+    action: "issue.execution_recovery_settled",
+    entityType: "issue",
+    entityId: task.id,
+    runId: run.id,
+    details: {
+      recoveryActionId: action.id,
+      outcome: "restored",
+      replay: "authorized_on_resume",
+      actionOutcome: decision.actionOutcome,
+      automatic: true,
+      policy: AGENT_PAUSE_RESUME_POLICY,
+    },
+  });
+  await tx
+    .update(heartbeatRuns)
+    .set({ executionStatusDeliveryId: randomUUID() })
+    .where(eq(heartbeatRuns.id, run.id));
+  await appendHeartbeatRunEvent(tx, {
+    companyId: run.companyId,
+    agentId: run.agentId,
+    runId: run.id,
+    eventType: "lifecycle",
+    stream: "system",
+    level: "info",
+    message: note,
+    payload: {
+      recoveryActionId: action.id,
+      cause: action.cause,
+      automaticRecovery: AGENT_PAUSE_RESUME_POLICY,
+      actionOutcome: decision.actionOutcome,
+    },
+  });
+  return true;
+}
+
 /**
  * Failed execution is a system responsibility, not a user questionnaire. After
  * automatic recovery is ruled out, preserve evidence and stop without replay.
@@ -518,6 +668,12 @@ export async function settleUnrecoverableExecutions(
             sql`not (${issueRecoveryActions.evidence} ? 'inertRunAssessment')`,
           )!)
           : undefined,
+        // The agent pause records a verified stop after it cancels the run.
+        // Settling first would block a task that resuming the agent continues.
+        not(and(
+          eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+          agentPauseStopPendingCondition(now),
+        )!),
       ),
     )
     .limit(25);
@@ -599,6 +755,21 @@ export async function settleUnrecoverableExecutions(
           !["done", "cancelled"].includes(task.status) &&
           (!task.executionRunId || task.executionRunId === run.id) &&
           (!task.checkoutRunId || task.checkoutRunId === run.id);
+        // Pausing an agent is not a decision to stop its task. A verified
+        // pause stop of the task owner's own conversation turn continues when
+        // the agent is resumed; every other stop keeps the disposition below.
+        if (
+          current &&
+          action.cause === LEGACY_RECOVERY_CAUSE &&
+          run.agentId === task.assigneeAgentId &&
+          CONTINUABLE_TASK_STATUSES.includes(task.status) &&
+          isVerifiedAgentPauseStop(run) &&
+          (await runUsedConversationAdapter(tx as unknown as Db, run)) &&
+          (await continueAfterAgentPause(tx as unknown as Db, { task, run, action, now }))
+        ) {
+          options.failpoint?.("persisted");
+          return;
+        }
         const note = current
           ? hasWorkspaceRestoreFailure(run.resultJson)
             ? "Workspace repair required. Verify safe staging or repair before continuing. Saved work and approval decisions remain in force."

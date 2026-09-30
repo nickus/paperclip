@@ -17,6 +17,42 @@ export function legacyExecutionRecoveryFingerprint(runId: string) {
   return `legacy-execution:${runId}`;
 }
 
+/**
+ * `resultJson` key recording that an operator action (`initiator`) stopped a
+ * run's provider process, which this server owned. The cancellation records
+ * the request; `processTerminated` follows once termination verified that the
+ * process is gone, so it may trail the terminal status briefly.
+ */
+export const PROVIDER_STOP_RESULT_KEY = "providerStop";
+export const AGENT_PAUSE_STOP_ERROR_CODE = "agent_paused";
+
+export function buildProviderStop(stop: { initiator: "agent_pause"; requestedAt: Date; verifiedAt?: Date }) {
+  return {
+    initiator: stop.initiator,
+    requestedAt: stop.requestedAt.toISOString(),
+    ...(stop.verifiedAt ? { processTerminated: true, verifiedAt: stop.verifiedAt.toISOString() } : {}),
+  };
+}
+
+/**
+ * A legacy run that an agent pause stopped, with the stop of its provider
+ * process verified. Resuming the agent is the operator's decision to continue
+ * the task: the run's recorded work stands, and a new turn decides what
+ * remains. Any other stop, including one whose termination was not verified,
+ * keeps the regular reconciliation hold.
+ */
+export function isVerifiedAgentPauseStop(
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson">,
+): boolean {
+  if (run.runtimeMode !== "legacy" || run.status !== "cancelled" ||
+      run.errorCode !== AGENT_PAUSE_STOP_ERROR_CODE) return false;
+  if (hasWorkspaceRestoreFailure(run.resultJson)) return false;
+  // A board Stop of the same run is the operator's own decision to stop.
+  if (typeof run.resultJson?.cancelledByActorType === "string") return false;
+  const stop = run.resultJson?.[PROVIDER_STOP_RESULT_KEY] as Record<string, unknown> | undefined;
+  return stop?.initiator === "agent_pause" && stop.processTerminated === true;
+}
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,

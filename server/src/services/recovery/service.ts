@@ -4323,6 +4323,26 @@ export function recoveryService(
     );
   }
 
+  async function hasPendingReconciledContinuation(
+    issue: typeof issues.$inferSelect,
+    agentId: string,
+  ) {
+    const [pending] = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, issue.companyId),
+          eq(issueRecoveryActions.sourceIssueId, issue.id),
+          eq(issueRecoveryActions.status, "resolved"),
+          eq(issueRecoveryActions.returnOwnerAgentId, agentId),
+          sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+        ),
+      )
+      .limit(1);
+    return Boolean(pending);
+  }
+
   async function reconcileStrandedAssignedIssues(opts?: {
     issueCreatedAtGte?: Date | null;
   }) {
@@ -4481,6 +4501,17 @@ export function recoveryService(
         agent?.status === "paused" &&
         agent.companyId === issue.companyId &&
         (await hasCurrentNativePassiveWait(issue, latestRun))
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+      // A reconciled continuation already waits for this paused owner and is
+      // delivered when the agent is resumed. The work is not stranded.
+      if (
+        issue.status !== "in_review" &&
+        agent?.status === "paused" &&
+        agent.companyId === issue.companyId &&
+        (await hasPendingReconciledContinuation(issue, agentId))
       ) {
         result.skipped += 1;
         continue;
