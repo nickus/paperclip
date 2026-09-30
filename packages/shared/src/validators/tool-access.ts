@@ -48,6 +48,10 @@ import {
   isToolContentRetention,
   TOOL_CONTENT_RETENTION_MODES,
 } from "../tool-content-retention.js";
+import {
+  CONNECTION_TOOL_OVERRIDES_CONFIG_KEY,
+  validateConnectionToolOverridesConfig,
+} from "../connection-tool-overrides.js";
 import { jsonSchemaSchema } from "./plugin.js";
 import { objectWithoutDefaults } from "./partial.js";
 
@@ -132,6 +136,14 @@ function rejectSensitiveConfigKeys(value: unknown, ctx: z.RefinementCtx, path: A
         message: `Tool access config cannot persist sensitive field: ${key}. Use credentialSecretRefs instead.`,
       });
     }
+    if (path.length === 0 && key === CONNECTION_TOOL_OVERRIDES_CONFIG_KEY && nested && typeof nested === "object" && !Array.isArray(nested)) {
+      // Tool overrides are keyed by upstream tool names, which are not config
+      // fields: a tool may be called "token". Check each override's fields.
+      for (const [toolName, override] of Object.entries(nested)) {
+        rejectSensitiveConfigKeys(override, ctx, [key, toolName]);
+      }
+      continue;
+    }
     rejectSensitiveConfigKeys(nested, ctx, [...path, key]);
   }
 }
@@ -184,10 +196,20 @@ function validateContentRetentionConfig(value: Record<string, unknown>, ctx: z.R
   }
 }
 
+// Agent-facing tool and connection presentation overrides. Cross-connection
+// name uniqueness needs the company's other connections and is checked by the
+// server on create and update.
+function validateToolOverridesConfig(value: Record<string, unknown>, ctx: z.RefinementCtx) {
+  for (const issue of validateConnectionToolOverridesConfig(value)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: issue.path, message: issue.message });
+  }
+}
+
 export const toolTransportConfigSchema = z.record(z.string(), z.unknown()).superRefine((value, ctx) => {
   rejectSensitiveConfigKeys(value, ctx);
   validateToolCallTimeoutConfig(value, ctx);
   validateContentRetentionConfig(value, ctx);
+  validateToolOverridesConfig(value, ctx);
 });
 
 export const toolRedactedValueSummarySchema = z.object({

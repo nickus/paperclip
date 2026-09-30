@@ -2795,5 +2795,6 @@ export { MEMORY_CONNECTOR_IDS, isMemoryConnectorId, type MemoryConnectorId } fro
 export * from "./connection-routing.js";
 export * from "./tool-call-timeouts.js";
 export * from "./tool-content-retention.js";
+export * from "./connection-tool-overrides.js";
 
 export { WORKSPACE_RESTORE_FAILURE_CODES, hasWorkspaceRestoreFailure, safeWorkspaceRestorePath, isNativeWorkspaceExportRepairCause } from "./workspace-restore.js";

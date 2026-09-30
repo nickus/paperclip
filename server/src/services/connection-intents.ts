@@ -1,6 +1,10 @@
 import { logActivity } from "./activity-log.js";
 import { aiConnectionService } from "./ai-connections.js";
-import { aiConnectionBindingSchema } from "@paperclipai/shared";
+import {
+  aiConnectionBindingSchema,
+  readConnectionAgentPresentation,
+  readConnectionToolOverrides,
+} from "@paperclipai/shared";
 import { and, eq, desc, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -311,7 +315,8 @@ export function connectionIntentService(db: Db) {
       const app = getAppStoreDefinition(service);
       if (!app) throw notFound("Connection service was not found");
       const methods = purpose === "ai" ? getAvailableConnectionMethods(app).filter(method => method.transport === "runtime_auth") : availableToolConnectionMethods(app);
-      return { ...app, available: app.availability?.available !== false,
+      return { ...app, agentName: app.name, agentDescription: app.description ?? null,
+        available: app.availability?.available !== false,
         searchCapabilities: methods.map((method) =>
           `${method.whenToUse} ${method.capabilityProfile?.label ?? ""} ${method.capabilityProfile?.description ?? ""}`).join(" "),
         methods: methods.map((method) => ({
@@ -330,8 +335,13 @@ export function connectionIntentService(db: Db) {
       || (grant.kind === "agent" && grant.subjectAgentId === agentId)
     ))) throw notFound("Configured connection was not found");
     const application = await access.getApplication(connection.applicationId, companyId);
+    // An operator can give the connection a different name and description
+    // for agents. Cards for people keep the connection's own name.
+    const presentation = readConnectionAgentPresentation(connection.config);
     return {
-      slug: service, name: connection.name, description: application.description, searchCapabilities: "",
+      slug: service, name: connection.name, description: application.description,
+      agentName: presentation.name ?? connection.name,
+      agentDescription: presentation.description ?? application.description ?? null, searchCapabilities: "",
       branding: { logoUrl: undefined, darkLogoUrl: undefined },
       available: connection.enabled,
       methods: [{ key: "configured", label: "Use configured connection", auth:
@@ -364,18 +374,27 @@ export function connectionIntentService(db: Db) {
           grant.kind === "organization" || (grant.kind === "user" && grant.subjectUserId === run.responsibleUserId)
           || (grant.kind === "agent" && grant.subjectAgentId === agent.id)
         ));
-        return authorized ? indexedCatalog(connection.id, run.companyId) : [];
+        if (!authorized) return [];
+        // Match the names and descriptions agents are shown for renamed tools.
+        const overrides = readConnectionToolOverrides(connection.config);
+        return (await indexedCatalog(connection.id, run.companyId)).map((entry) => {
+          const override = overrides.get(entry.toolName);
+          return {
+            ...entry,
+            searchText: `${entry.toolName} ${override?.name ?? ""} ${override?.description ?? entry.description ?? ""}`,
+          };
+        });
       }));
       const catalog = catalogs.flat().filter((entry) => entry.status === "active");
-      const haystack = `${app.slug} ${app.name} ${app.description ?? ""} ${app.searchCapabilities} ${catalog.map((tool) => `${tool.toolName} ${tool.description ?? ""}`).join(" ")}`.toLocaleLowerCase();
-      const score = !normalized ? 1 : app.slug === normalized || app.name.toLocaleLowerCase() === normalized
+      const haystack = `${app.slug} ${app.name} ${app.agentName} ${app.agentDescription ?? ""} ${app.searchCapabilities} ${catalog.map((tool) => tool.searchText).join(" ")}`.toLocaleLowerCase();
+      const score = !normalized ? 1 : app.slug === normalized || app.name.toLocaleLowerCase() === normalized || app.agentName.toLocaleLowerCase() === normalized
         ? 1000 : tokens.reduce((sum, token) => sum + (haystack.includes(token) ? 1 : 0), 0);
       if (!score) continue;
       const ready = await usableConnectionForAgent({ companyId: run.companyId, agentId: agent.id,
         responsibleUserId: run.responsibleUserId!, serviceSlug: service, inventory });
       const denied = !ready && matching.length > 0 && await administrativeDenial(run.companyId, agent.id, service, inventory);
       candidates.push({ score, item: {
-        service, name: app.name, description: app.description ?? null, logoUrl: app.branding.logoUrl ?? null,
+        service, name: app.agentName, description: app.agentDescription, logoUrl: app.branding.logoUrl ?? null,
         methods: app.methods, source: app.source,
         state: ready ? "ready" : denied ? "unavailable" : !app.available || !app.methods.length ? "unavailable"
           : matching.length ? "needs_user_action" : "available",
@@ -578,7 +597,7 @@ export function connectionIntentService(db: Db) {
         state: "ready",
         connectionId: ready.id,
         interactionId: null,
-        instruction: isRemoteMcpConnectorId(app.slug) ? aggregatorContinuationInstruction(app.slug, upstreamService?.name ?? "The requested app") : options.purpose === "ai" ? `${app.name} authentication is available for the next execution.` : `${app.name} is connected. Use its installed tools; a native continuation will refresh tools if needed.`,
+        instruction: isRemoteMcpConnectorId(app.slug) ? aggregatorContinuationInstruction(app.slug, upstreamService?.name ?? "The requested app") : options.purpose === "ai" ? `${app.agentName} authentication is available for the next execution.` : `${app.agentName} is connected. Use its installed tools; a native continuation will refresh tools if needed.`,
       };
     }
     if (options.purpose !== "ai" && await administrativeDenial(context.run.companyId, context.agent.id, app.slug, await connectionInventory(context.run.companyId))) {

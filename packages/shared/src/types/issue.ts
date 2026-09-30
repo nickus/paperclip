@@ -1285,6 +1285,10 @@ export interface RequestConfirmationToolActionPayload {
   invocationId: string;
   toolName: string;
   toolDisplayName: string;
+  /** Name the agent used for the tool when the connection presents it under another name. */
+  exposedToolName?: string | null;
+  /** Name of the tool on the connected server. */
+  upstreamToolName?: string | null;
   connectionId: string | null;
   applicationId: string | null;
   appDisplayName: string | null;

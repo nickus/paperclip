@@ -564,6 +564,10 @@ export interface ToolCatalogEntry {
   reviewedByUserId: string | null;
   quarantinedAt?: Date | string | null;
   quarantineReason?: string | null;
+  /** Name agents see for this tool, from the connection's `config.toolOverrides`. */
+  exposedName?: string | null;
+  /** Description agents see for this tool, from the connection's `config.toolOverrides`. */
+  exposedDescription?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -1621,6 +1625,8 @@ export interface ToolConnectionTestToolAccess {
   toolName: string;
   /** Gateway-namespaced tool name (matches the catalog gateway entry). */
   gatewayToolName: string;
+  /** Name agents see for the tool when the connection renames it. */
+  exposedName?: string | null;
   displayName: string | null;
   risk: "read" | "write" | "destructive";
   decision: ToolConnectionTestDecision;

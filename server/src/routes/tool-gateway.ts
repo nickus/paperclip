@@ -13,7 +13,12 @@ import {
   updateToolMcpGatewaySchema,
 } from "@paperclipai/shared/validators/tool-access";
 import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getActorInfo } from "./authz.js";
-import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
+import {
+  agentFacingToolName,
+  presentGatewayToolForAgent,
+  ToolGatewayHttpError,
+  type ToolGatewayService,
+} from "../services/tool-gateway.js";
 import { forbidden, HttpError } from "../errors.js";
 import { accessService } from "../services/index.js";
 import { listConnectionLifecycleEvents } from "../services/tool-connection-activity.js";
@@ -118,7 +123,9 @@ async function handleMcpGatewayProtocol(
         result: {
           tools: [
             ...tools.map((tool) => ({
-            name: tool.name,
+            // A connection may present the tool under an alias; tools/call
+            // accepts it and maps it back to the upstream tool.
+            name: agentFacingToolName(tool),
             title: tool.displayName,
             description: tool.description,
             inputSchema: tool.parametersSchema ?? { type: "object", properties: {} },
@@ -565,7 +572,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
         return;
       }
       const tools = await toolGateway.listToolsForSession(token);
-      res.json(tools);
+      res.json(tools.map(presentGatewayToolForAgent));
     } catch (err) {
       sendGatewayError(res, err);
     }
@@ -840,6 +847,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
           ilike(toolCallEvents.toolName, like),
           ilike(toolCallEvents.reasonCode, like),
           sql`${toolCallEvents.metadata}->>'upstreamToolName' ilike ${like}`,
+          sql`${toolCallEvents.metadata}->>'exposedToolName' ilike ${like}`,
           ilike(toolInvocations.toolName, like),
         ];
         if (matchedAgentIds.length > 0) {
@@ -1001,6 +1009,8 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
         const applicationId = row.applicationId ?? item.invocationApplicationId ?? connection?.applicationId ?? null;
         const application = applicationId ? applicationsById.get(applicationId) ?? null : null;
         const rawToolName = row.toolName ?? item.invocationToolName;
+        // The name the agent saw, when the connection presented the tool under an alias.
+        const exposedToolName = detailString(row.metadata, "exposedToolName");
         const appDisplayName = connection
           ? humanizeConnectionDisplayName(connection)
           : application
@@ -1046,7 +1056,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
           appDisplayName,
           applicationDisplayName: application ? humanizeConnectionDisplayName(application.name) : null,
           connectionDisplayName: connection ? humanizeConnectionDisplayName(connection) : null,
-          toolDisplayName: rawToolName ? humanizeConnectionDisplayName(rawToolName) : null,
+          toolDisplayName: exposedToolName ?? (rawToolName ? humanizeConnectionDisplayName(rawToolName) : null),
           lifecycleType: null as ToolConnectionLifecycleEventType | null,
           normalizedOutcome: normalizedAuditOutcome(row.eventType, row.outcome, row.decision),
           invocation: item.invocationId && item.invocationToolName && item.invocationStatus && item.invocationApprovalState

@@ -151,6 +151,51 @@ describe("tool access validators", () => {
     expect(toolRedactedValueSummarySchema.safeParse({ summary: "", contentRetention: "summary" }).success).toBe(false);
   });
 
+  it("accepts agent-facing tool and connection overrides on connection config", () => {
+    const config = {
+      url: "https://example.test/mcp",
+      agentDisplayName: "Ticket desk",
+      agentDescription: "Support tickets for the help desk.",
+      toolOverrides: {
+        search: { name: "find_tickets", description: "Find support tickets by keyword." },
+        create_ticket: { name: "open-ticket" },
+        // Upstream tool names are keys, not config fields: "token" is a fine tool name.
+        token: { description: "Issue a ticket token." },
+      },
+    };
+    expect(updateToolConnectionSchema.parse({ config }).config).toEqual(config);
+    expect(createToolConnectionSchema.safeParse({ name: "Tickets", transport: "mcp_remote", config }).success).toBe(true);
+  });
+
+  it("rejects unsafe, reserved or duplicate exposed tool names", () => {
+    const issuesFor = (toolOverrides: unknown) => {
+      const parsed = toolTransportConfigSchema.safeParse({ url: "https://example.test/mcp", toolOverrides });
+      return parsed.success ? [] : parsed.error.issues.map((issue) => ({ path: issue.path, message: issue.message }));
+    };
+    for (const name of ["find tickets", "tickets.search", "mcp:search", "1password", "_search", "", "x".repeat(65)]) {
+      expect(issuesFor({ search: { name } })).toEqual([
+        expect.objectContaining({ path: ["toolOverrides", "search", "name"] }),
+      ]);
+    }
+    for (const name of ["search_tools", "RUN_TOOL", "paperclip_list_resources", "PaperclipSearch"]) {
+      expect(issuesFor({ search: { name } })).toEqual([
+        expect.objectContaining({ path: ["toolOverrides", "search", "name"], message: expect.stringContaining("reserved") }),
+      ]);
+    }
+    expect(issuesFor({ search: { name: "find" }, lookup: { name: "FIND" } })).toEqual([
+      expect.objectContaining({ path: ["toolOverrides", "lookup", "name"], message: expect.stringContaining("already used") }),
+    ]);
+    expect(issuesFor({ search: {} })).toEqual([expect.objectContaining({ path: ["toolOverrides", "search"] })]);
+    expect(issuesFor({ search: { name: "find", title: "Find" } })).toEqual([
+      expect.objectContaining({ path: ["toolOverrides", "search", "title"] }),
+    ]);
+    expect(issuesFor({ search: { description: "   " } })).toEqual([
+      expect.objectContaining({ path: ["toolOverrides", "search", "description"] }),
+    ]);
+    expect(issuesFor(["search"])).toEqual([expect.objectContaining({ path: ["toolOverrides"] })]);
+    expect(toolTransportConfigSchema.safeParse({ agentDisplayName: "x".repeat(161) }).success).toBe(false);
+  });
+
   it("keeps app method configuration separate from secrets", () => {
     expect(connectToolAppSchema.safeParse({
       galleryKey: "posthog",

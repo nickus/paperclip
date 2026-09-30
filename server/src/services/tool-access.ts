@@ -1,5 +1,13 @@
 import { COGNEE_STDIO_TEMPLATE, cogneeCloudUrl } from "./cognee-connection.js";
-import { isMemoryConnectorId, isRemoteMcpConnectorMethod, connectionPurposeTransportSchema } from "@paperclipai/shared";
+import {
+  isMemoryConnectorId,
+  isRemoteMcpConnectorMethod,
+  connectionPurposeTransportSchema,
+  CONNECTION_TOOL_OVERRIDES_CONFIG_KEY,
+  exposedToolNameKey,
+  readConnectionToolOverrides,
+  validateConnectionToolOverridesConfig,
+} from "@paperclipai/shared";
 import { instanceSettingsService } from "./instance-settings.js";
 import { githubBotRequest } from "./chat-github-client.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
@@ -70,6 +78,7 @@ import {
 import type {
   AppDefinition,
   ConnectionGrantKind,
+  ConnectionToolOverride,
   ConnectionMethodDef,
   ConnectionTokenIssuanceOutcome,
   ConnectionTokenIssuancePath,
@@ -1693,11 +1702,30 @@ function toCatalogEntry(
   };
 }
 
+/**
+ * Adds what agents see for a tool when its connection overrides it. The
+ * entry's own name and description stay the upstream values.
+ */
+function withExposedToolPresentation(
+  entry: ToolCatalogEntry,
+  overrides: ReadonlyMap<string, ConnectionToolOverride>,
+): ToolCatalogEntry {
+  const override = overrides.get(entry.toolName);
+  return {
+    ...entry,
+    exposedName: override?.name ?? null,
+    exposedDescription: override?.description ?? null,
+  };
+}
+
 function toCatalogEntryForConnection(
   row: typeof toolCatalogEntries.$inferSelect,
   connection: typeof toolConnections.$inferSelect,
 ): ToolCatalogEntry {
-  const rawCatalogEntry = toCatalogEntry(row);
+  const rawCatalogEntry = withExposedToolPresentation(
+    toCatalogEntry(row),
+    readConnectionToolOverrides(connection.config),
+  );
   const catalogEntry = {
     ...rawCatalogEntry,
     inputSchema: projectedConnectionToolInputSchema(
@@ -5032,6 +5060,76 @@ export function toolAccessService(
     }
   }
 
+  /**
+   * Agent-facing tool aliases must be unambiguous for any agent, and an agent
+   * can be granted tools from several connections, so an exposed name must be
+   * unique among the company's connections (case-insensitively). The aliases
+   * in the written config are checked against every other connection that is
+   * not archived; an update that does not write config skips the check.
+   */
+  async function assertConnectionToolOverrides(
+    companyId: string,
+    transport: string,
+    config: Record<string, unknown>,
+    options: { excludeConnectionId?: string } = {},
+  ) {
+    const issues = validateConnectionToolOverridesConfig(config);
+    if (issues.length > 0) {
+      throw unprocessable(issues[0]!.message, {
+        code: "invalid_tool_overrides",
+        issues,
+      });
+    }
+    const overrides = readConnectionToolOverrides(config);
+    if (overrides.size === 0) return;
+    if (transport !== "mcp_remote" && transport !== "local_stdio") {
+      throw unprocessable(
+        `${CONNECTION_TOOL_OVERRIDES_CONFIG_KEY} applies only to MCP tool connections.`,
+        { code: "invalid_tool_overrides" },
+      );
+    }
+    const requested = new Map<string, { exposedName: string; upstreamToolName: string }>();
+    for (const [upstreamToolName, override] of overrides) {
+      if (override.name) {
+        requested.set(exposedToolNameKey(override.name), {
+          exposedName: override.name,
+          upstreamToolName,
+        });
+      }
+    }
+    if (requested.size === 0) return;
+    const rows = await db
+      .select({
+        id: toolConnections.id,
+        name: toolConnections.name,
+        config: toolConnections.config,
+      })
+      .from(toolConnections)
+      .where(
+        and(
+          eq(toolConnections.companyId, companyId),
+          ne(toolConnections.status, "archived"),
+        ),
+      );
+    for (const row of rows) {
+      if (row.id === options.excludeConnectionId) continue;
+      for (const [otherUpstreamToolName, other] of readConnectionToolOverrides(row.config)) {
+        if (!other.name) continue;
+        const clash = requested.get(exposedToolNameKey(other.name));
+        if (!clash) continue;
+        throw unprocessable(
+          `Exposed tool name "${clash.exposedName}" is already used by connection "${row.name}" for its tool "${otherUpstreamToolName}".`,
+          {
+            code: "exposed_tool_name_conflict",
+            exposedName: clash.exposedName,
+            upstreamToolName: clash.upstreamToolName,
+            conflictingConnectionId: row.id,
+          },
+        );
+      }
+    }
+  }
+
   async function assertCatalogEntry(
     companyId: string,
     catalogEntryId: string | null | undefined,
@@ -7603,9 +7701,14 @@ export function toolAccessService(
       actor,
     });
 
+    // Report the exposed names and descriptions the catalog listing reports,
+    // so a caller rendering this result shows the same tool presentation.
+    const toolOverrides = readConnectionToolOverrides(updatedConnection.config);
     return {
       connection: toConnection(updatedConnection),
-      catalog: updatedEntries,
+      catalog: updatedEntries.map((entry) =>
+        withExposedToolPresentation(entry, toolOverrides),
+      ),
       discoveredCount: descriptors.length,
       quarantinedCount,
     };
@@ -17430,6 +17533,7 @@ export function toolAccessService(
       if (transport === "local_stdio") await stdioTemplateId(companyId, config);
       assertLocalStdioCanBeEnabled(transport, input.enabled ?? false, config);
       await assertGoogleSheetsSpreadsheetOwnership(companyId, config);
+      await assertConnectionToolOverrides(companyId, transport, config);
       if (applicationId) {
         const app = await assertApplication(companyId, applicationId);
         applicationNamespace = app.applicationKey ?? app.name;
@@ -18357,6 +18461,14 @@ export function toolAccessService(
       await assertGoogleSheetsSpreadsheetOwnership(existing.companyId, config, {
         excludeConnectionId: existing.id,
       });
+      if (input.config || input.transportConfig) {
+        await assertConnectionToolOverrides(
+          existing.companyId,
+          existing.transport,
+          config,
+          { excludeConnectionId: existing.id },
+        );
+      }
       await assertSecretRefs(existing.companyId, [
         ...(input.credentialRefs ?? existing.credentialRefs),
         ...(input.credentialSecretRefs ?? existing.credentialSecretRefs),

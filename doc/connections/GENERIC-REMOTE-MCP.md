@@ -294,6 +294,14 @@ failed tool-call request (`POST /api/tool-gateway/tools/call`,
 same handlers); an approval-gated call answers `409`, so these bodies used to
 reach the log.
 
+### Tool names and descriptions agents see
+
+`config.toolOverrides` presents an upstream tool to agents under another name
+and description, keyed by the upstream tool name, and `config.agentDisplayName`
+/ `config.agentDescription` change how the connection itself is shown to them.
+Access, review and audit keep following the generated gateway name. See
+[Presenting connected tools under other names](./TOOL-NAME-OVERRIDES.md).
+
 ## Curated definitions remain optional
 
 A curated definition matching a pasted endpoint is offered as a branded

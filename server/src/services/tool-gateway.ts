@@ -93,6 +93,10 @@ import {
   readConfiguredToolCallTimeoutMs,
   strictestToolContentRetention,
   type ToolContentRetention,
+  readConnectionAgentPresentation,
+  readConnectionToolOverrides,
+  exposedToolNameKey,
+  isReservedExposedToolName,
   isGitHubConnectorProfileId,
   isGoogleWorkspaceConnectorProfileId,
   type GitHubConnectorProfileId,
@@ -311,6 +315,8 @@ export interface ConnectedMcpGatewayMetadata {
   transport: "mcp_remote" | "local_stdio";
   gatewayToolName: string;
   upstreamToolName: string;
+  /** Name agents see and call, when the connection renames this tool. */
+  exposedToolName: string | null;
   catalogName: string;
   inputSchema: Record<string, unknown>;
   outputSchema: Record<string, unknown> | null;
@@ -333,6 +339,13 @@ export interface ToolGatewayDescriptor extends AgentToolDescriptor {
   connectionId?: string | null;
   catalogEntryId?: string | null;
   upstreamToolName?: string | null;
+  /**
+   * Agent-facing alias from the connection's `config.toolOverrides`. `name`
+   * stays the generated gateway tool name: it is the identity that profiles,
+   * policies, approvals and invocation records match, so a rename never
+   * changes access. Agents see and may call the tool by this alias.
+   */
+  exposedName?: string | null;
   providerMetadata?: ConnectedMcpGatewayMetadata | Record<string, unknown>;
   /**
    * What the gateway may store about calls to this tool, from its connection's
@@ -340,6 +353,23 @@ export interface ToolGatewayDescriptor extends AgentToolDescriptor {
    * descriptors; other connection-backed tools are looked up per call.
    */
   contentRetention?: ToolContentRetention;
+}
+
+/** The name an agent sees for, and calls, a gateway tool. */
+export function agentFacingToolName(
+  tool: Pick<ToolGatewayDescriptor, "name" | "exposedName">,
+): string {
+  return tool.exposedName ?? tool.name;
+}
+
+/**
+ * A tool as agents see it in a listing: named by its alias when the
+ * connection renames it. Calls by either name resolve to the same tool.
+ */
+export function presentGatewayToolForAgent(
+  tool: ToolGatewayDescriptor,
+): ToolGatewayDescriptor {
+  return tool.exposedName ? { ...tool, name: tool.exposedName } : tool;
 }
 
 export interface ToolGatewaySession {
@@ -844,6 +874,7 @@ function toolAuditMetadata(
     connectionId: tool.connectionId ?? null,
     catalogEntryId: tool.catalogEntryId ?? null,
     upstreamToolName: tool.upstreamToolName ?? tool.name,
+    exposedToolName: tool.exposedName ?? null,
     providerType: tool.providerType,
     risk: tool.risk,
     riskLevel: tool.risk,
@@ -1385,6 +1416,45 @@ export function createToolGatewayService(
       },
       new Map(),
     );
+    // Agent-facing overrides, keyed by upstream tool name so they survive
+    // catalog refreshes. Writes are validated, but stored configs may predate
+    // that or two connections may since have converged on one name: an alias
+    // that is reserved, names another gateway tool, or is claimed by more than
+    // one tool is dropped (the tool keeps its generated name) rather than
+    // shadowing or making a call ambiguous.
+    const overridesByConnection = new Map<
+      string,
+      ReturnType<typeof readConnectionToolOverrides>
+    >();
+    const overrides = eligibleRows.map(({ catalogEntry, connection }) => {
+      let connectionOverrides = overridesByConnection.get(connection.id);
+      if (!connectionOverrides) {
+        connectionOverrides = readConnectionToolOverrides(connection.config);
+        overridesByConnection.set(connection.id, connectionOverrides);
+      }
+      return connectionOverrides.get(catalogEntry.toolName) ?? null;
+    });
+    const platformToolNameKeys = new Set(
+      [...allTools(), ...VIRTUAL_TOOLS].map((tool) => exposedToolNameKey(tool.name)),
+    );
+    const exposedNameCounts = new Map<string, number>();
+    for (const override of overrides) {
+      if (!override?.name) continue;
+      const key = exposedToolNameKey(override.name);
+      exposedNameCounts.set(key, (exposedNameCounts.get(key) ?? 0) + 1);
+    }
+    const usableExposedName = (name: string | null | undefined) => {
+      if (!name) return null;
+      const key = exposedToolNameKey(name);
+      if (
+        isReservedExposedToolName(name) ||
+        platformToolNameKeys.has(key) ||
+        (exposedNameCounts.get(key) ?? 0) > 1
+      ) {
+        return null;
+      }
+      return name;
+    };
 
     return eligibleRows.map(
       ({ catalogEntry, connection, application }, index) => {
@@ -1411,6 +1481,11 @@ export function createToolGatewayService(
         const annotations = catalogEntry.annotations ?? {};
         const risk = riskFromCatalogEntry(catalogEntry);
         const onDemandTools = readOnDemandToolsEnabled(connection);
+        const override = overrides[index];
+        const exposedName = usableExposedName(override?.name);
+        const connectionAgentName =
+          readConnectionAgentPresentation(connection.config).name ??
+          connection.name;
         const providerMetadata: ConnectedMcpGatewayMetadata = {
           applicationId: application.id,
           applicationKey,
@@ -1420,6 +1495,7 @@ export function createToolGatewayService(
           transport: connection.transport,
           gatewayToolName,
           upstreamToolName: catalogEntry.toolName,
+          exposedToolName: exposedName,
           catalogName: catalogEntry.name,
           inputSchema,
           outputSchema,
@@ -1434,10 +1510,11 @@ export function createToolGatewayService(
         };
         return {
           name: gatewayToolName,
-          displayName: catalogEntry.title ?? catalogEntry.toolName,
+          displayName: exposedName ?? catalogEntry.title ?? catalogEntry.toolName,
           description:
+            override?.description ??
             googleChatToolDescription(connection, catalogEntry.toolName, catalogEntry.description) ??
-            `Connected MCP tool ${catalogEntry.toolName} from ${connection.name}.`,
+            `Connected MCP tool ${exposedName ?? catalogEntry.toolName} from ${connectionAgentName}.`,
           parametersSchema: inputSchema,
           pluginId: `mcp:${applicationKey ?? application.id}`,
           providerType:
@@ -1451,6 +1528,7 @@ export function createToolGatewayService(
           connectionId: connection.id,
           catalogEntryId: catalogEntry.id,
           upstreamToolName: catalogEntry.toolName,
+          exposedName,
           providerMetadata,
           contentRetention: resolveConnectionContentRetention(connection.config),
         };
@@ -2421,7 +2499,7 @@ export function createToolGatewayService(
         "approval_path_missing",
         {
           invocationId: input.invocation.id,
-          tool: input.tool.name,
+          tool: agentFacingToolName(input.tool),
           instructions:
             "This session is not attached to a task, so an approval card cannot be posted. Re-run this action from a run that has the task checked out.",
         },
@@ -2447,7 +2525,7 @@ export function createToolGatewayService(
         "approval_request_missing",
         {
           invocationId: input.invocation.id,
-          tool: input.tool.name,
+          tool: agentFacingToolName(input.tool),
         },
       );
     }
@@ -2497,15 +2575,21 @@ export function createToolGatewayService(
           "signing_secret_unconfigured",
           {
             invocationId: input.invocation.id,
-            tool: input.tool.name,
+            tool: agentFacingToolName(input.tool),
           },
         );
       }
       throw error;
     }
     // Board-only technical detail for the formal-approval interaction (target=custom).
+    // A renamed tool shows the name the agent used and the upstream tool that runs.
+    const agentToolName = agentFacingToolName(input.tool);
+    const upstreamToolName = input.tool.exposedName
+      ? (input.tool.upstreamToolName ?? null)
+      : null;
     const detailsMarkdown = [
-      `Tool: \`${input.tool.name}\``,
+      `Tool: \`${agentToolName}\``,
+      ...(upstreamToolName ? [`Upstream tool: \`${upstreamToolName}\``] : []),
       `Risk: \`${input.tool.risk}\``,
       "",
       ...(contentRetention === "none"
@@ -2541,8 +2625,8 @@ export function createToolGatewayService(
           type: "request_board_approval",
           requestedByAgentId: input.session.agentId,
           payload: {
-            title: `Approve high-risk tool action: ${input.tool.name}`,
-            summary: `${input.tool.name} is classified as ${input.tool.risk} and requires formal board approval before execution.`,
+            title: `Approve high-risk tool action: ${agentToolName}`,
+            summary: `${agentToolName}${upstreamToolName ? ` (upstream tool ${upstreamToolName})` : ""} is classified as ${input.tool.risk} and requires formal board approval before execution.`,
             recommendedAction:
               "Approve only if the reviewed arguments match the intended operation.",
             risks: [
@@ -2553,6 +2637,8 @@ export function createToolGatewayService(
             invocationId: input.invocation.id,
             actionRequestId: actionRequest.id,
             tool: input.tool.name,
+            exposedToolName: input.tool.exposedName ?? null,
+            upstreamToolName: input.tool.upstreamToolName ?? null,
             risk: input.tool.risk,
             argumentsHash: canonicalArgumentsHash,
           },
@@ -2593,14 +2679,16 @@ export function createToolGatewayService(
             type: "custom",
             key: `tool-action:${actionRequest.id}`,
             revisionId: canonicalArgumentsHash,
-            label: input.tool.name,
+            label: agentToolName,
           },
           toolAction: {
             version: 1,
             actionRequestId: actionRequest.id,
             invocationId: input.invocation.id,
             toolName: input.tool.name,
-            toolDisplayName: input.tool.displayName?.trim() || input.tool.name,
+            toolDisplayName: input.tool.displayName?.trim() || agentToolName,
+            exposedToolName: input.tool.exposedName ?? null,
+            upstreamToolName: input.tool.upstreamToolName ?? null,
             connectionId: input.tool.connectionId ?? null,
             applicationId: input.tool.applicationId ?? null,
             appDisplayName: input.tool.applicationDisplayName?.trim() || null,
@@ -2673,7 +2761,7 @@ export function createToolGatewayService(
         {
           invocationId: input.invocation.id,
           actionRequestId: actionRequest.id,
-          tool: input.tool.name,
+          tool: agentFacingToolName(input.tool),
           instructions:
             "A parallel call already handled this approval. Retry the same call now to reach the live approval request.",
         },
@@ -2735,7 +2823,7 @@ export function createToolGatewayService(
       actionRequestId: actionRequest.id,
       interactionId: interaction.id,
       issueId: input.session.issueId,
-      toolName: input.tool.name,
+      toolName: agentFacingToolName(input.tool),
       argumentsHash: canonicalArgumentsHash,
     });
   }
@@ -2836,14 +2924,19 @@ export function createToolGatewayService(
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
     const githubBotTools = await githubBotToolsForSession(db, session);
-    const tool = [...allTools(), ...connectedTools, ...virtualTools, ...githubBotTools, ...await slackToolsForSession(db, session)]
+    const candidates = [...allTools(), ...connectedTools, ...virtualTools, ...githubBotTools, ...await slackToolsForSession(db, session)]
       .filter(
         (candidate) =>
           session.agentId ||
           (candidate.providerType !== "paperclip_self" &&
             candidate.providerType !== "paperclip_plugin"),
-      )
-      .find((candidate) => candidate.name === toolName);
+      );
+    // A connection may present a tool under an alias. The generated name
+    // always wins, and aliases cannot contain its separators, so the two
+    // lookups never disagree.
+    const tool =
+      candidates.find((candidate) => candidate.name === toolName) ??
+      candidates.find((candidate) => candidate.exposedName === toolName);
     if (!tool) {
       throw new ToolGatewayHttpError(
         404,
@@ -3015,6 +3108,7 @@ export function createToolGatewayService(
         if (!query) return true;
         return [
           tool.name,
+          tool.exposedName,
           tool.displayName,
           tool.description,
           tool.applicationKey,
@@ -3025,8 +3119,8 @@ export function createToolGatewayService(
       })
       .slice(0, limit)
       .map((tool) => ({
-        name: tool.name,
-        displayName: tool.displayName ?? tool.name,
+        name: agentFacingToolName(tool),
+        displayName: tool.displayName ?? agentFacingToolName(tool),
         description: tool.description ?? null,
         parametersSchema: tool.parametersSchema,
         applicationId: tool.applicationId ?? null,
@@ -5982,7 +6076,7 @@ export function createToolGatewayService(
         409,
         "MCP elicitation is not supported for non-interactive gateway clients",
         "elicitation_not_supported",
-        { invocationId: input.invocationId, tool: input.tool.name },
+        { invocationId: input.invocationId, tool: agentFacingToolName(input.tool) },
       );
     }
     const interaction = await interactions.create(
@@ -6064,7 +6158,7 @@ export function createToolGatewayService(
       {
         invocationId: input.invocationId,
         interactionId: interaction.id,
-        tool: input.tool.name,
+        tool: agentFacingToolName(input.tool),
       },
     );
   }
@@ -8537,6 +8631,8 @@ export function createToolGatewayService(
   async function replayMatchingAgentAction(input: {
     session: ToolGatewaySession;
     toolName: string;
+    /** Name the agent used for the tool, echoed back in approval errors. */
+    agentToolName?: string;
     argumentsHash: string;
   }) {
     const match = await matchingAgentActionRequest(input);
@@ -8556,7 +8652,7 @@ export function createToolGatewayService(
         actionRequestId: actionRequest.id,
         interactionId: actionRequest.interactionId,
         issueId: input.session.issueId!,
-        toolName: input.toolName,
+        toolName: input.agentToolName ?? input.toolName,
         argumentsHash: input.argumentsHash,
       });
     }
@@ -9291,6 +9387,7 @@ export function createToolGatewayService(
           return {
             toolName: tool.upstreamToolName ?? tool.name,
             gatewayToolName: tool.name,
+            exposedName: tool.exposedName ?? null,
             displayName: tool.displayName,
             risk: tool.risk,
             decision: testDecision,
@@ -9351,16 +9448,19 @@ export function createToolGatewayService(
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
       };
-      const tool = (
-        await connectedMcpToolsForConnection(
-          input.companyId,
-          input.connectionId,
-        )
-      ).find(
-        (candidate) =>
-          candidate.name === input.toolName ||
-          candidate.upstreamToolName === input.toolName,
+      const connectionTools = await connectedMcpToolsForConnection(
+        input.companyId,
+        input.connectionId,
       );
+      const tool =
+        connectionTools.find(
+          (candidate) =>
+            candidate.name === input.toolName ||
+            candidate.upstreamToolName === input.toolName,
+        ) ??
+        connectionTools.find(
+          (candidate) => candidate.exposedName === input.toolName,
+        );
       if (!tool) {
         throw new ToolGatewayHttpError(
           404,
@@ -10295,14 +10395,15 @@ export function createToolGatewayService(
         const replay = await replayMatchingAgentAction({
           session,
           toolName: tool.name,
+          agentToolName: agentFacingToolName(tool),
           argumentsHash: argumentValidation.summary.sha256 ?? "",
         });
         if (replay?.matched) {
           return {
             invocationId: replay.invocationId,
             status: "replayed" as const,
-            tool: virtualToolName ?? tool.name,
-            targetTool: virtualToolName ? tool.name : undefined,
+            tool: virtualToolName ?? agentFacingToolName(tool),
+            targetTool: virtualToolName ? agentFacingToolName(tool) : undefined,
             result: replay.result,
           };
         }
@@ -10586,7 +10687,7 @@ export function createToolGatewayService(
             {
               invocationId: storedInvocation.id,
               actionRequestId: actionRequest.id,
-              tool: tool.name,
+              tool: agentFacingToolName(tool),
             },
           );
         }
@@ -10719,7 +10820,7 @@ export function createToolGatewayService(
           return {
             invocationId,
             status: "replayed" as const,
-            tool: tool.name,
+            tool: agentFacingToolName(tool),
             result: recorded.invocation.resultSummary ?? null,
           };
         }
@@ -10765,7 +10866,7 @@ export function createToolGatewayService(
             accessDecision.reasonCode,
             {
               invocationId,
-              tool: tool.name,
+              tool: agentFacingToolName(tool),
               decision: accessDecision.decision,
               matchedPolicyIds: accessDecision.matchedPolicyIds,
               rateLimitState: accessDecision.rateLimitState ?? null,
@@ -10970,8 +11071,8 @@ export function createToolGatewayService(
         return {
           invocationId,
           status: "completed" as const,
-          tool: virtualToolName ?? tool.name,
-          targetTool: virtualToolName ? tool.name : undefined,
+          tool: virtualToolName ?? agentFacingToolName(tool),
+          targetTool: virtualToolName ? agentFacingToolName(tool) : undefined,
           result: resultValidation.value,
         };
       } catch (err) {
