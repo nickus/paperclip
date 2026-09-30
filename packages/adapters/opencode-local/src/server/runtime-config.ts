@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
+import { TOOL_CALL_CLIENT_TIMEOUT_MS } from "@paperclipai/shared/tool-call-timeouts";
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
@@ -103,13 +105,68 @@ async function readJsonObject(filepath: string): Promise<Record<string, unknown>
   }
 }
 
+/**
+ * OpenCode names each MCP tool `<server>_<tool>`, replacing every character
+ * outside [a-zA-Z0-9_-] with "_". Keying the config by that same form keeps two
+ * servers whose names differ only in punctuation from shadowing each other's
+ * tools.
+ */
+function openCodeMcpServerKey(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+/**
+ * OpenCode `mcp` entries for the Paperclip-managed MCP servers of one run, in
+ * OpenCode's remote MCP server format. The bearer token goes into the entry's
+ * request headers, so it only ever lives in the per-run config file.
+ */
+export function buildOpenCodeRuntimeMcpConfig(
+  servers: AdapterRuntimeMcpServer[],
+): Record<string, Record<string, unknown>> {
+  const entries: Record<string, Record<string, unknown>> = {};
+  for (const server of servers) {
+    const baseKey = openCodeMcpServerKey(server.name) || "paperclip-mcp";
+    // Same collision handling as the Claude adapter: suffix the connection id.
+    const connectionSuffix = openCodeMcpServerKey(server.connectionId.slice(0, 8));
+    let key = baseKey;
+    if (Object.hasOwn(entries, key)) key = `${baseKey}-${connectionSuffix}`;
+    let suffix = 2;
+    while (Object.hasOwn(entries, key)) {
+      key = `${baseKey}-${connectionSuffix}-${suffix}`;
+      suffix += 1;
+    }
+    entries[key] = {
+      type: "remote",
+      url: server.url,
+      headers: { Authorization: `Bearer ${server.token}` },
+      // The server authenticates with the bearer token above. Without this,
+      // OpenCode answers a 401 by starting OAuth discovery against the server.
+      oauth: false,
+      enabled: true,
+      // OpenCode gives up on an MCP tool call after 60 s unless the server
+      // entry sets a timeout (in ms, used for every request to that server).
+      // The Paperclip gateway enforces each tool's own deadline, up to five
+      // minutes, and answers with a `tool_timeout` error when it passes; give
+      // the client a little more so that answer arrives instead of a
+      // client-side abort.
+      timeout: TOOL_CALL_CLIENT_TIMEOUT_MS,
+    };
+  }
+  return entries;
+}
+
 export async function prepareOpenCodeRuntimeConfig(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
   targetIsRemote?: boolean;
+  /** Paperclip-managed MCP servers of this run (`ctx.runtimeMcp.getServers()`). */
+  runtimeMcpServers?: AdapterRuntimeMcpServer[];
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
-  if (!skipPermissions) {
+  const runtimeMcpServers = input.runtimeMcpServers ?? [];
+  // The Paperclip-managed MCP servers need a per-run config even when the
+  // agent keeps OpenCode's own permission prompts.
+  if (!skipPermissions && runtimeMcpServers.length === 0) {
     return {
       env: input.env,
       notes: [],
@@ -150,6 +207,65 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   }
 
   const existingConfig = await readJsonObject(runtimeConfigPath);
+  const writeRuntimeConfig = async (
+    nextConfig: Record<string, unknown>,
+    notes: string[],
+  ): Promise<PreparedOpenCodeRuntimeConfig> => {
+    if (runtimeMcpServers.length > 0) {
+      const managedMcp = buildOpenCodeRuntimeMcpConfig(runtimeMcpServers);
+      // Keep the user's own MCP servers, except where a Paperclip-managed
+      // server takes the same name (and so the same tool names).
+      const inheritedMcp = isPlainObject(nextConfig.mcp) ? nextConfig.mcp : {};
+      const keptMcp: Record<string, unknown> = {};
+      const replacedMcp: string[] = [];
+      for (const [key, value] of Object.entries(inheritedMcp)) {
+        if (Object.hasOwn(managedMcp, openCodeMcpServerKey(key))) replacedMcp.push(key);
+        else keptMcp[key] = value;
+      }
+      nextConfig.mcp = { ...keptMcp, ...managedMcp };
+      notes.push(
+        `Added ${runtimeMcpServers.length} Paperclip-managed MCP server(s) to the runtime OpenCode config: ${Object.keys(managedMcp).join(", ")}.`,
+      );
+      if (replacedMcp.length > 0) {
+        notes.push(
+          `Paperclip-managed MCP servers replace the OpenCode MCP server(s) of the same name from the user config: ${replacedMcp.join(", ")}.`,
+        );
+      }
+    }
+    // The runtime config can carry credentials (MCP bearer tokens, resolved
+    // provider keys), so it is written owner-only. The copied entry is removed
+    // first: it may be a symlink into the user's own config, which must never
+    // receive the run's settings.
+    try {
+      await fs.rm(runtimeConfigPath, { force: true });
+      await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+    } catch (err) {
+      // Do not leave a partly written config behind for a run that never starts.
+      await fs.rm(runtimeConfigHome, { recursive: true, force: true }).catch(() => undefined);
+      throw err;
+    }
+    return {
+      env: {
+        ...input.env,
+        XDG_CONFIG_HOME: runtimeConfigHome,
+      },
+      notes,
+      cleanup: async () => {
+        await fs.rm(runtimeConfigHome, { recursive: true, force: true });
+      },
+    };
+  };
+
+  if (!skipPermissions) {
+    // Only the managed MCP servers are added; OpenCode keeps the user's
+    // permission rules and providers as they are.
+    return await writeRuntimeConfig({ ...existingConfig }, []);
+  }
+
   const notes = [
     "Injected runtime OpenCode config with permission=allow for all tools and connections.",
   ];
@@ -222,18 +338,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     nextConfig.small_model = smallModel;
     notes.push(`Pinned OpenCode small_model to ${smallModel}.`);
   }
-  await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
-
-  return {
-    env: {
-      ...input.env,
-      XDG_CONFIG_HOME: runtimeConfigHome,
-    },
-    notes,
-    cleanup: async () => {
-      await fs.rm(runtimeConfigHome, { recursive: true, force: true });
-    },
-  };
+  return await writeRuntimeConfig(nextConfig, notes);
 }
 
 /**

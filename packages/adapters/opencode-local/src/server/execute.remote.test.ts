@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -52,7 +52,7 @@ const {
     stderr: "",
     exitCode: 0,
   })),
-  syncDirectoryToSsh: vi.fn(async () => undefined),
+  syncDirectoryToSsh: vi.fn(async (_input: { localDir: string; remoteDir: string }): Promise<void> => undefined),
   startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => ({
     env: {
       PAPERCLIP_API_URL: "http://127.0.0.1:4310",
@@ -115,6 +115,7 @@ describe("opencode remote execution", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
+    syncDirectoryToSsh.mockImplementation(async () => undefined);
     vi.unstubAllEnvs();
     if (originalOpenCodeAllowAllModels === undefined) {
       delete process.env.OPENCODE_ALLOW_ALL_MODELS;
@@ -482,5 +483,111 @@ describe("opencode remote execution", () => {
     expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
       remoteDir: "/remote/workspace/.paperclip-runtime/runs/run-2/opencode/skills",
     }));
+  });
+
+  it("ships the run's managed MCP servers to the SSH target and resumes only with the same set", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-mcp-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    const key = "0123456789abcdef0123456789abcdef";
+    const gatewayToken = "remote-gateway-secret";
+    const assigned = {
+      name: "paperclip-assigned",
+      url: "https://paperclip.example.test/mcp/gateways/gw_1",
+      token: gatewayToken,
+      connectionId: "assignment:0123456789abcdef",
+    };
+    const shipped: Array<{ mode: number; contents: Record<string, unknown> }> = [];
+    // Restored by the afterEach hook; the asset only exists until the run ends.
+    syncDirectoryToSsh.mockImplementation(async (input: { localDir: string; remoteDir: string }) => {
+      if (!input.remoteDir.endsWith("/xdgConfig")) return;
+      const configPath = path.join(input.localDir, "opencode", "opencode.json");
+      shipped.push({
+        mode: (await stat(configPath)).mode & 0o777,
+        contents: JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>,
+      });
+    });
+    const target: AdapterSshExecutionTarget = {
+      kind: "remote",
+      transport: "ssh",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd: "/remote/workspace",
+      spec: {
+        host: "127.0.0.1",
+        port: 2222,
+        username: "fixture",
+        remoteWorkspacePath: "/remote/workspace",
+        remoteCwd: "/remote/workspace",
+        privateKey: "PRIVATE KEY",
+        knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+        strictHostKeyChecking: true,
+      },
+      workspaceReuseKey: key,
+    };
+    const logs: string[] = [];
+    const run = (runId: string, servers: Array<typeof assigned>, sessionParams: Record<string, unknown> | null) =>
+      execute({
+        runId,
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "OpenCode Builder",
+          adapterType: "opencode_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: (sessionParams?.sessionId as string | undefined) ?? null,
+          sessionParams,
+          sessionDisplayId: null,
+          taskKey: "task-1",
+        },
+        // Permission prompts stay on: the managed servers still need the runtime config.
+        config: { command: "opencode", model: "opencode/gpt-5-nano", dangerouslySkipPermissions: false },
+        context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+        executionTarget: target,
+        runtimeMcp: { getServers: () => servers.map((server) => ({ ...server })) },
+        onLog: async (_stream, chunk) => {
+          logs.push(chunk);
+        },
+      });
+
+    const first = await run("run-1", [assigned], null);
+
+    expect(shipped).toHaveLength(1);
+    expect(shipped[0]?.mode).toBe(0o600);
+    expect(shipped[0]?.contents.mcp).toEqual({
+      "paperclip-assigned": {
+        type: "remote",
+        url: assigned.url,
+        headers: { Authorization: `Bearer ${gatewayToken}` },
+        oauth: false,
+        enabled: true,
+        timeout: 330_000,
+      },
+    });
+    const runCall = runChildProcess.mock.calls.find((entry) => Array.isArray(entry[2]) && entry[2].includes("run")) as
+      | [string, string, string[], { env: Record<string, string> }]
+      | undefined;
+    expect(runCall?.[3].env.XDG_CONFIG_HOME).toBe("/remote/workspace/.paperclip-runtime/runs/run-1/opencode/xdgConfig");
+    expect(JSON.stringify(runCall?.[2])).not.toContain(gatewayToken);
+    expect(JSON.stringify(runCall?.[3].env)).not.toContain(gatewayToken);
+    expect(logs.join("")).not.toContain(gatewayToken);
+
+    // The host stores the session through the codec, as a JSON column.
+    const saved = sessionCodec.deserialize(JSON.parse(JSON.stringify(sessionCodec.serialize(first.sessionParams ?? null))));
+    expect(saved).toMatchObject({ sessionId: "session_123", mcpServerIdentity: expect.any(String) });
+
+    runChildProcess.mockClear();
+    await run("run-2", [assigned], saved);
+    const resumed = runChildProcess.mock.calls.find((entry) => Array.isArray(entry[2]) && entry[2].includes("run"));
+    expect(resumed?.[2]).toContain("--session");
+
+    runChildProcess.mockClear();
+    await run("run-3", [{ ...assigned, url: "https://paperclip.example.test/mcp/gateways/gw_2" }], saved);
+    const fresh = runChildProcess.mock.calls.find((entry) => Array.isArray(entry[2]) && entry[2].includes("run"));
+    expect(fresh?.[2]).not.toContain("--session");
+    expect(logs.join("")).toContain("was saved with a different runtime MCP server set");
   });
 });

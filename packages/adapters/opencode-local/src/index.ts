@@ -114,4 +114,9 @@ Notes:
 - When \`dangerouslySkipPermissions\` is enabled, Paperclip injects a temporary \
   runtime config with \`permission=allow\` so headless runs do \
   not stall on approval prompts.
+- Paperclip-managed MCP servers of a run (for example the agent's assigned \
+  connections) are added to a temporary runtime config as remote MCP servers, \
+  also when \`dangerouslySkipPermissions\` is off, with the run's token in their \
+  request headers. A stored session is resumed only when it was saved with the \
+  same set of managed MCP servers.
 `;

@@ -221,6 +221,190 @@ describe("OpenCode local skill injection", () => {
   });
 });
 
+describe("OpenCode runtime MCP servers", () => {
+  const gatewayToken = "gateway-bearer-secret";
+  const runtimeMcpServer = {
+    name: "paperclip-assigned",
+    url: "https://paperclip.example.test/mcp/gateways/gw_1",
+    token: gatewayToken,
+    connectionId: "assignment:0123456789abcdef",
+  };
+  const runtimeMcpIdentity = JSON.stringify([
+    { name: runtimeMcpServer.name, url: runtimeMcpServer.url, connectionId: runtimeMcpServer.connectionId },
+  ]);
+  let root: string;
+  let workspace: string;
+  let commandPath: string;
+  let seenConfig: { path: string; mode: number; contents: Record<string, unknown> } | null;
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-runtime-mcp-"));
+    workspace = path.join(root, "workspace");
+    commandPath = path.join(root, "opencode");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(path.join(root, "xdg", "opencode"), { recursive: true });
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    vi.stubEnv("XDG_CONFIG_HOME", path.join(root, "xdg"));
+    seenConfig = null;
+    runProcessMock.mockReset();
+    runProcessMock.mockImplementation(async (_runId, _target, _command, _args, options) => {
+      // The runtime config only exists while OpenCode runs; capture it here.
+      const configHome = (options as { env: Record<string, string> }).env.XDG_CONFIG_HOME;
+      const configPath = path.join(configHome, "opencode", "opencode.json");
+      const stat = await fs.stat(configPath).catch(() => null);
+      if (stat) {
+        seenConfig = {
+          path: configPath,
+          mode: stat.mode & 0o777,
+          contents: JSON.parse(await fs.readFile(configPath, "utf8")) as Record<string, unknown>,
+        };
+      }
+      return probeResult({
+        stdout: JSON.stringify({ type: "text", sessionID: "session-new", part: { text: "done" } }),
+      });
+    });
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  function runWith(input: {
+    servers?: Array<typeof runtimeMcpServer>;
+    sessionParams?: Record<string, unknown> | null;
+    config?: Record<string, unknown>;
+    logs?: string[];
+    metadata?: unknown[];
+  }) {
+    return execute({
+      runId: "run-runtime-mcp",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: {
+        sessionId: null,
+        sessionParams: input.sessionParams ?? null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: commandPath,
+        cwd: workspace,
+        model: "openai/gpt-5",
+        env: { HOME: path.join(root, "home"), OPENCODE_ALLOW_ALL_MODELS: "1" },
+        promptTemplate: "Run the task.",
+        ...input.config,
+      },
+      context: {},
+      ...(input.servers
+        ? { runtimeMcp: { getServers: () => input.servers!.map((server) => ({ ...server })) } }
+        : {}),
+      onLog: async (_stream, chunk) => {
+        input.logs?.push(chunk);
+      },
+      onMeta: async (meta) => {
+        input.metadata?.push(meta);
+      },
+    });
+  }
+
+  it("adds the run's Paperclip-managed MCP servers to OpenCode as remote MCP servers", async () => {
+    const logs: string[] = [];
+    const metadata: unknown[] = [];
+    const result = await runWith({ servers: [runtimeMcpServer], logs, metadata });
+
+    expect(result.exitCode).toBe(0);
+    expect(seenConfig?.contents.mcp).toEqual({
+      "paperclip-assigned": {
+        type: "remote",
+        url: runtimeMcpServer.url,
+        headers: { Authorization: `Bearer ${gatewayToken}` },
+        oauth: false,
+        enabled: true,
+        timeout: 330_000,
+      },
+    });
+    // Owner-only, and gone once the run ends.
+    expect(seenConfig?.mode).toBe(0o600);
+    await expect(fs.access(seenConfig!.path)).rejects.toThrow();
+    // The token lives only in that file: never in argv, env, logs or run metadata.
+    const executionCall = runProcessMock.mock.calls.at(-1)!;
+    expect(JSON.stringify(executionCall[3])).not.toContain(gatewayToken);
+    expect(JSON.stringify((executionCall[4] as { env: Record<string, string> }).env)).not.toContain(gatewayToken);
+    expect(JSON.stringify({ logs, metadata, result })).not.toContain(gatewayToken);
+    expect(JSON.stringify(metadata)).toContain("Paperclip-managed MCP server");
+    expect(result.sessionParams).toMatchObject({
+      sessionId: "session-new",
+      mcpServerIdentity: runtimeMcpIdentity,
+    });
+  });
+
+  it("adds the managed MCP servers when OpenCode keeps its own permission prompts", async () => {
+    await fs.writeFile(
+      path.join(root, "xdg", "opencode", "opencode.json"),
+      JSON.stringify({ permission: { bash: "ask" } }),
+    );
+    const result = await runWith({ servers: [runtimeMcpServer], config: { dangerouslySkipPermissions: false } });
+
+    expect(result.exitCode).toBe(0);
+    expect(seenConfig?.contents.permission).toEqual({ bash: "ask" });
+    expect(Object.keys(seenConfig?.contents.mcp as Record<string, unknown>)).toEqual(["paperclip-assigned"]);
+  });
+
+  it("does not resume a session saved with a different MCP server set", async () => {
+    const logs: string[] = [];
+    const result = await runWith({
+      servers: [runtimeMcpServer],
+      sessionParams: {
+        sessionId: "session-old",
+        cwd: workspace,
+        mcpServerIdentity: JSON.stringify([{ name: "other", url: "https://other.example.test/mcp", connectionId: "c2" }]),
+      },
+      logs,
+    });
+
+    expect(runProcessMock.mock.calls.at(-1)![3]).not.toContain("--session");
+    expect(logs.join("")).toContain("was saved with a different runtime MCP server set");
+    expect(result.sessionId).toBe("session-new");
+  });
+
+  it("does not resume a session saved before the run had managed MCP servers", async () => {
+    await runWith({ servers: [runtimeMcpServer], sessionParams: { sessionId: "session-old", cwd: workspace } });
+    expect(runProcessMock.mock.calls.at(-1)![3]).not.toContain("--session");
+  });
+
+  it("does not keep a skipped session when OpenCode reports no session id", async () => {
+    runProcessMock.mockImplementation(async () => probeResult({ stdout: "" }));
+    const result = await runWith({
+      servers: [runtimeMcpServer],
+      sessionParams: { sessionId: "session-old", cwd: workspace },
+    });
+    expect(result.sessionId).toBeNull();
+    expect(result.sessionParams).toBeNull();
+  });
+
+  it("resumes a session saved with the same MCP server set", async () => {
+    await runWith({
+      servers: [runtimeMcpServer],
+      sessionParams: { sessionId: "session-old", cwd: workspace, mcpServerIdentity: runtimeMcpIdentity },
+    });
+    const args = runProcessMock.mock.calls.at(-1)![3] as string[];
+    expect(args.slice(args.indexOf("--session"), args.indexOf("--session") + 2)).toEqual(["--session", "session-old"]);
+  });
+
+  it("leaves runs without managed MCP servers as they were", async () => {
+    await fs.writeFile(
+      path.join(root, "xdg", "opencode", "opencode.json"),
+      JSON.stringify({ mcp: { local: { type: "local", command: ["local-mcp"] } } }),
+    );
+    const result = await runWith({ sessionParams: { sessionId: "session-old", cwd: workspace } });
+
+    expect(seenConfig?.contents.mcp).toEqual({ local: { type: "local", command: ["local-mcp"] } });
+    const args = runProcessMock.mock.calls.at(-1)![3] as string[];
+    expect(args).toContain("--session");
+    expect(result.sessionParams).not.toHaveProperty("mcpServerIdentity");
+  });
+});
+
 describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
   afterEach(() => {
     delete process.env.OPENCODE_ALLOW_ALL_MODELS;

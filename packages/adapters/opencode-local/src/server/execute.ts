@@ -333,7 +333,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  // Paperclip-managed MCP servers reach OpenCode as remote MCP servers in the
+  // per-run config; their bearer tokens stay out of argv and env.
+  const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
+  const runtimeMcpIdentity = JSON.stringify(
+    runtimeMcpServers.map(({ name, url, connectionId }) => ({ name, url, connectionId })),
+  );
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config, runtimeMcpServers });
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
@@ -520,20 +526,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
     const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
     const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
-    const canResumeSession =
-      runtimeSessionId.length > 0 &&
+    const runtimeMcpServerIdentity = asString(runtimeSessionParams.mcpServerIdentity, "");
+    // A session saved before its run had managed MCP servers carries no
+    // identity; it only matches a run that has none either.
+    const hasMatchingMcpServers =
+      runtimeMcpServerIdentity.length === 0
+        ? runtimeMcpServers.length === 0
+        : runtimeMcpServerIdentity === runtimeMcpIdentity;
+    const sessionLocationMatches =
       (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
       adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
+    const canResumeSession =
+      runtimeSessionId.length > 0 && sessionLocationMatches && hasMatchingMcpServers;
     const sessionId = canResumeSession ? runtimeSessionId : null;
-    if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
+    if (executionTargetIsRemote && runtimeSessionId && !sessionLocationMatches) {
       await onLog(
         "stdout",
         `[paperclip] OpenCode session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
       );
-    } else if (runtimeSessionId && !canResumeSession) {
+    } else if (runtimeSessionId && !sessionLocationMatches) {
       await onLog(
         "stdout",
         `[paperclip] OpenCode session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
+      );
+    }
+    if (runtimeSessionId && !hasMatchingMcpServers) {
+      await onLog(
+        "stdout",
+        `[paperclip] OpenCode session "${runtimeSessionId}" was saved with a different runtime MCP server set and will not be resumed.\n`,
       );
     }
     const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
@@ -695,13 +715,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
 
+      // Never carry a session over that was skipped for its MCP server set:
+      // it would be saved with this run's identity and resumed next time.
       const resolvedSessionId =
         attempt.parsed.sessionId ??
-        (clearSessionOnMissingSession ? null : runtimeSessionId ?? runtime.sessionId ?? null);
+        (clearSessionOnMissingSession || !hasMatchingMcpServers
+          ? null
+          : runtimeSessionId ?? runtime.sessionId ?? null);
       const resolvedSessionParams = resolvedSessionId
         ? ({
             sessionId: resolvedSessionId,
             cwd: effectiveExecutionCwd,
+            ...(runtimeMcpServers.length > 0 ? { mcpServerIdentity: runtimeMcpIdentity } : {}),
             ...(workspaceId ? { workspaceId } : {}),
             ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
             ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
