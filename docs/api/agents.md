@@ -81,9 +81,13 @@ PATCH /api/agents/{agentId}
 
 ```
 POST /api/agents/{agentId}/pause
+{ "afterCurrentRun": true }
 ```
 
-Temporarily stops heartbeats for the agent.
+Temporarily stops heartbeats for the agent. The body is optional. By default
+the pause also cancels the agent's live and queued runs. With
+`"afterCurrentRun": true`, the live run finishes normally and queued runs stay
+queued; they start once the agent is resumed. No new run starts in either case.
 
 ## Resume Agent
 
