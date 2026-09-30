@@ -13588,13 +13588,42 @@ export function heartbeatService(
     );
   }
 
-  function withUnmanagedBackgroundTaskStopReason(
-    resultJson: Record<string, unknown> | null | undefined,
+  // A successful run whose agent started a background task that the
+  // terminal-result cleanup then stopped, and that left its issue open with no
+  // durable live path: the stopped task was the only thing that would have
+  // moved the issue forward. The run keeps its status; its liveness reason,
+  // stop reason and a warning event name the stopped task, so the follow-up
+  // that was requested is not explained by a generic no-progress heuristic.
+  async function markRunLeftWaitingOnStoppedBackgroundTask(
+    run: typeof heartbeatRuns.$inferSelect,
+    followUp: { reason: string; outcome: string },
   ) {
-    return {
-      ...(resultJson ?? {}),
-      stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-    };
+    const updated = await db
+      .update(heartbeatRuns)
+      .set({
+        livenessReason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+        // Merge in the database so fields written after `run` was read (for
+        // example the presentation decision) are kept.
+        resultJson: sql`(case when jsonb_typeof(${heartbeatRuns.resultJson}) = 'object' then ${heartbeatRuns.resultJson} else '{}'::jsonb end) || ${JSON.stringify({ stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON })}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, run.id))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    await appendRunEvent(updated ?? run, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message:
+        "The issue was left open with only the stopped background task to move it forward; " +
+        "a follow-up was requested to give it a durable next step.",
+      payload: {
+        reason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+        livenessReason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+        followUpReason: followUp.reason,
+        followUpOutcome: followUp.outcome,
+      },
+    });
   }
 
   function buildDetectedSuccessfulRunProgressSummary(
@@ -13920,16 +13949,10 @@ export function heartbeatService(
     if (decision.kind !== "enqueue" || !issue) return;
 
     if (hasUnmanagedBackgroundTaskEvidence(parseObject(run.resultJson))) {
-      await db
-        .update(heartbeatRuns)
-        .set({
-          livenessReason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-          resultJson: withUnmanagedBackgroundTaskStopReason(
-            parseObject(run.resultJson),
-          ),
-          updatedAt: new Date(),
-        })
-        .where(eq(heartbeatRuns.id, run.id));
+      await markRunLeftWaitingOnStoppedBackgroundTask(run, {
+        reason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+        outcome: "queued",
+      });
     }
 
     const handoffRun = await enqueueWakeup(decision.targetAgentId, {
@@ -26103,7 +26126,23 @@ export function heartbeatService(
           if (!conversationSettled) {
             await handleIssueReviewPathDisposition(livenessRun);
             if (livenessRun.runtimeMode !== "native") {
-              await recovery.reconcileLegacyContinuation(livenessRun.id);
+              const legacyContinuation =
+                await recovery.reconcileLegacyContinuation(livenessRun.id);
+              // A repair was needed because the issue has no durable live
+              // path. When the agent had left it to a background task that the
+              // cleanup stopped, say so on the run.
+              if (
+                (legacyContinuation === "queued" ||
+                  legacyContinuation === "escalated") &&
+                hasUnmanagedBackgroundTaskEvidence(
+                  parseObject(livenessRun.resultJson),
+                )
+              ) {
+                await markRunLeftWaitingOnStoppedBackgroundTask(livenessRun, {
+                  reason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
+                  outcome: legacyContinuation,
+                });
+              }
             } else {
               await handleRunLivenessContinuation(livenessRun);
               await handleSuccessfulRunHandoff(

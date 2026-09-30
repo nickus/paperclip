@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -165,7 +165,8 @@ describe("heartbeat finalization after terminal-result cleanup", () => {
     const warnings = await db
       .select()
       .from(heartbeatRunEvents)
-      .where(and(eq(heartbeatRunEvents.runId, run.id), eq(heartbeatRunEvents.level, "warn")));
+      .where(and(eq(heartbeatRunEvents.runId, run.id), eq(heartbeatRunEvents.level, "warn")))
+      .orderBy(asc(heartbeatRunEvents.seq));
     return { run, agent, warnings };
   }
 
@@ -189,6 +190,7 @@ describe("heartbeat finalization after terminal-result cleanup", () => {
       unmanagedBackgroundTask: { kind: "terminal_result_cleanup", terminalResultSeen: true },
     });
     expect(run.livenessState).not.toBe("failed");
+    expect(run.livenessReason).not.toBe("unmanaged background task stopped; no durable live path");
     expect(agent.status).not.toBe("error");
     expect(warnings).toEqual([
       expect.objectContaining({
@@ -271,7 +273,29 @@ describe("heartbeat finalization after terminal-result cleanup", () => {
 
     expect(run.status).toBe("succeeded");
     expect(agent.status).not.toBe("error");
-    expect(warnings).toHaveLength(1);
+    // The run names the stopped task as the reason the issue needs a durable
+    // next step, rather than a generic no-progress reason.
+    expect(run.livenessReason).toBe("unmanaged background task stopped; no durable live path");
+    expect(run.resultJson).toMatchObject({
+      stopReason: "unmanaged_background_task_stopped",
+      unmanagedBackgroundTask: { kind: "terminal_result_cleanup" },
+    });
+    // Fields written earlier in finalization are kept.
+    expect(run.resultJson).toHaveProperty("presentationDecision");
+    expect(warnings).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({ reason: "unmanaged_background_task_stopped", exitCode: 255 }),
+      }),
+      expect.objectContaining({
+        eventType: "lifecycle",
+        message: expect.stringContaining("left open"),
+        payload: expect.objectContaining({
+          livenessReason: "unmanaged background task stopped; no durable live path",
+          followUpReason: "issue_disposition_repair",
+          followUpOutcome: "queued",
+        }),
+      }),
+    ]);
     const followups = await db
       .select()
       .from(heartbeatRuns)
