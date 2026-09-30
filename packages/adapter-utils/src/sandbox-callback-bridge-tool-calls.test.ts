@@ -9,6 +9,7 @@ import {
   isSandboxCallbackBridgeToolCallRoute,
   requestWithCallerDeadline,
   sandboxCallbackBridgeForwardTimeoutMs,
+  sendSandboxCallbackBridgeForward,
   TOOL_CALL_BRIDGE_FORWARD_TIMEOUT_MS,
   TOOL_CALL_BRIDGE_GATEWAY_WAIT_MS,
 } from "./sandbox-callback-bridge-tool-calls.js";
@@ -56,23 +57,23 @@ describe("sandbox callback bridge tool-call budgets", () => {
   });
 });
 
+const closers: Array<() => Promise<void>> = [];
+
+afterEach(async () => {
+  while (closers.length > 0) await closers.pop()!();
+});
+
+async function startServer(handler: Parameters<typeof createServer>[1]) {
+  const server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  closers.push(() => new Promise<void>((resolve) => {
+    server.closeAllConnections();
+    server.close(() => resolve());
+  }));
+  return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+}
+
 describe("requestWithCallerDeadline", () => {
-  const closers: Array<() => Promise<void>> = [];
-
-  afterEach(async () => {
-    while (closers.length > 0) await closers.pop()!();
-  });
-
-  async function startServer(handler: Parameters<typeof createServer>[1]) {
-    const server = createServer(handler);
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    closers.push(() => new Promise<void>((resolve) => {
-      server.closeAllConnections();
-      server.close(() => resolve());
-    }));
-    return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  }
-
   it("relays the method, headers and body and returns the raw response", async () => {
     const baseUrl = await startServer((req, res) => {
       const chunks: Buffer[] = [];
@@ -114,6 +115,71 @@ describe("requestWithCallerDeadline", () => {
       method: "POST",
       headers: new Headers({ "content-type": "application/json" }),
       body: "{}",
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 50);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+});
+
+describe("sendSandboxCallbackBridgeForward", () => {
+  function forward(baseUrl: string, method: string, path: string, options: {
+    defaultTimeoutMs: number;
+    signal?: AbortSignal;
+  }) {
+    return sendSandboxCallbackBridgeForward(
+      new URL(path, baseUrl),
+      { method, path, headers: new Headers({ "content-type": "application/json" }), body: "{}" },
+      options,
+    );
+  }
+
+  it("gives tool-call routes the tool-call budget and a caller-deadline request, other routes the default", async () => {
+    const received: Array<{ path: string; encoding: string | undefined; body: string }> = [];
+    const baseUrl = await startServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        received.push({
+          path: req.url ?? "",
+          encoding: req.headers["accept-encoding"],
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
+        // Answer after the default forward budget used below has passed.
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ path: req.url }));
+        }, 300);
+      });
+    });
+
+    // The REST tool gateway and the MCP gateway both outlive the default.
+    for (const path of ["/api/tool-gateway/tools/call", "/mcp/gateways/gw_0123abcd"]) {
+      const response = await forward(baseUrl, "POST", path, { defaultTimeoutMs: 100 });
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ path });
+    }
+    // Any other route keeps the default budget.
+    await expect(forward(baseUrl, "POST", "/api/issues/abc/comments", { defaultTimeoutMs: 100 }))
+      .rejects.toMatchObject({ name: "TimeoutError" });
+
+    // Tool calls went out as caller-deadline requests (identity encoding),
+    // the other route through platform fetch; every body was relayed.
+    expect(received.map(({ path, encoding }) => ({ path, identity: encoding === "identity" }))).toEqual([
+      { path: "/api/tool-gateway/tools/call", identity: true },
+      { path: "/mcp/gateways/gw_0123abcd", identity: true },
+      { path: "/api/issues/abc/comments", identity: false },
+    ]);
+    expect(received.map(({ body }) => body)).toEqual(["{}", "{}", "{}"]);
+  });
+
+  it("still stops a tool-call forward when the caller's signal aborts", async () => {
+    const baseUrl = await startServer(() => {
+      // Never answers.
+    });
+    const controller = new AbortController();
+    const pending = forward(baseUrl, "POST", "/mcp/gateways/gw_0123abcd", {
+      defaultTimeoutMs: 30_000,
       signal: controller.signal,
     });
     setTimeout(() => controller.abort(), 50);
