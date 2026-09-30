@@ -3301,6 +3301,56 @@ describe("ACPX engine remote sandbox staging seam (PR 1: workspace + cwd)", () =
     expect(sessionInputs[0]?.cwd).not.toBe(localCwd);
   });
 
+  it("hands the in-sandbox agent the managed MCP servers at the callback bridge", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    const apiUrl = "http://paperclip.example.test:3100";
+    // The server builds managed MCP URLs from its public API URL.
+    vi.stubEnv("PAPERCLIP_API_URL", apiUrl);
+    const servers = [
+      { name: "Paperclip projects", url: `${apiUrl}/api/mcp/project-tools`, token: "real-run-jwt", connectionId: "project-tools" },
+      { name: "paperclip-assigned", url: `${apiUrl}/mcp/gateways/gw_1`, token: "gateway-token-canary", connectionId: "assignment:abc" },
+      // Same path, another credential: cannot be relayed, so it is withheld.
+      { name: "duplicate", url: `${apiUrl}/mcp/gateways/gw_1`, token: "withheld-token-canary", connectionId: "duplicate" },
+      { name: "external", url: "https://mcp.example.test/mcp", token: "external-token", connectionId: "external" },
+    ];
+    try {
+      const { runtimeOptions, result, logs } = await runExecutor(
+        { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+        { authToken: "real-run-jwt", executionTarget, runtimeMcp: { getServers: () => servers } },
+      );
+
+      const bridgeArgs = vi.mocked(startAdapterExecutionTargetPaperclipBridge).mock.calls[0]![0];
+      expect(bridgeArgs.runtimeMcpServers).toEqual(servers);
+      const bridge = await vi.mocked(startAdapterExecutionTargetPaperclipBridge).mock.results[0]!.value;
+      const bridgeUrl = bridge!.env.PAPERCLIP_API_URL;
+      const bridgeAuth = { name: "Authorization", value: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}` };
+      expect(runtimeOptions[0]?.mcpServers).toEqual([
+        { type: "http", name: "Paperclip projects", url: `${bridgeUrl}/api/mcp/project-tools`, headers: [bridgeAuth] },
+        { type: "http", name: "paperclip-assigned", url: `${bridgeUrl}/mcp/gateways/gw_1`, headers: [bridgeAuth] },
+        {
+          type: "http",
+          name: "external",
+          url: "https://mcp.example.test/mcp",
+          headers: [{ name: "Authorization", value: "Bearer external-token" }],
+        },
+      ]);
+      const handed = JSON.stringify(runtimeOptions[0]?.mcpServers);
+      for (const secret of ["real-run-jwt", "gateway-token-canary", "withheld-token-canary"]) {
+        expect(handed).not.toContain(secret);
+      }
+      // The session identity stays on the host-side list, so a resumed session
+      // still matches although every run gets its own bridge address.
+      expect(result.sessionParams?.mcpServers).toEqual(
+        servers.map(({ name, url, connectionId }) => ({ name, url, connectionId })),
+      );
+      expect(logs.map((entry) => entry.text).join("")).toContain(
+        "Withholding 1 managed MCP server(s) that the callback bridge cannot relay: duplicate",
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("test_remote_warm_handle_reused_after_cwd_change", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
     const ensureInputs: Array<Record<string, unknown>> = [];
