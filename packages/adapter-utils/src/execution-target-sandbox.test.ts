@@ -2655,6 +2655,140 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
+  it("relays the run's managed MCP servers with their own tokens under every route policy", async () => {
+    vi.stubEnv("PAPERCLIP_BRIDGE_DEBUG", "1");
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-mcp-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "claude");
+    await mkdir(runtimeRootDir, { recursive: true });
+
+    const received: Array<{ route: string; auth: string | null; body: string }> = [];
+    const apiServer = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        received.push({
+          route: `${req.method ?? "GET"} ${req.url ?? "/"}`,
+          auth: req.headers.authorization ?? null,
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [] } }));
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      apiServer.once("error", reject);
+      apiServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = apiServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected the bridge test API server to listen on a TCP port.");
+    }
+    const apiUrl = `http://127.0.0.1:${address.port}`;
+    // The server builds managed MCP URLs from its public API URL.
+    vi.stubEnv("PAPERCLIP_API_URL", apiUrl);
+    const servers = [
+      // This one authenticates with the run's own API token.
+      { name: "Paperclip projects", url: `${apiUrl}/api/mcp/project-tools`, token: "real-run-jwt", connectionId: "paperclip-project-tools" },
+      { name: "Paperclip connections", url: `${apiUrl}/mcp/runtime-tools`, token: "runtime-tools-token-canary", connectionId: "paperclip-runtime-tools" },
+      { name: "paperclip-assigned", url: `${apiUrl}/mcp/gateways/gw_1`, token: "gateway-token-canary", connectionId: "assignment:abc" },
+      { name: "external", url: "https://mcp.example.test/mcp", token: "external-token", connectionId: "external" },
+    ];
+    const baseTarget: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+      timeoutMs: 30_000,
+      streamRunLogs: false,
+    };
+    const initialize = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+
+    try {
+      for (const policy of [undefined, "agent", "steward"] as const) {
+        const logs: string[] = [];
+        const bridge = await startAdapterExecutionTargetPaperclipBridge({
+          runId: `run-bridge-mcp-${policy ?? "restricted"}`,
+          target: policy
+            ? { ...baseTarget, paperclipApiBridgePolicy: policy, paperclipApiBridgeCompanyId: "co-1" }
+            : baseTarget,
+          runtimeRootDir,
+          adapterKey: "claude",
+          hostApiToken: "real-run-jwt",
+          hostApiUrl: apiUrl,
+          runtimeMcpServers: servers,
+          onLog: async (_stream, chunk) => { logs.push(chunk); },
+        });
+        const statuses: number[] = [];
+        let targetServers: typeof servers = [];
+        try {
+          const bridgeUrl = bridge!.env.PAPERCLIP_API_URL!;
+          const bridgeToken = bridge!.env.PAPERCLIP_API_KEY!;
+          targetServers = bridge!.runtimeMcpServers ?? [];
+          expect(targetServers).toEqual([
+            { ...servers[0], url: `${bridgeUrl}/api/mcp/project-tools`, token: bridgeToken },
+            { ...servers[1], url: `${bridgeUrl}/mcp/runtime-tools`, token: bridgeToken },
+            { ...servers[2], url: `${bridgeUrl}/mcp/gateways/gw_1`, token: bridgeToken },
+            servers[3],
+          ]);
+          const send = async (method: string, url: string, body?: string) => {
+            const response = await fetch(url, {
+              method,
+              headers: {
+                authorization: `Bearer ${bridgeToken}`,
+                accept: "application/json, text/event-stream",
+                ...(body !== undefined ? { "content-type": "application/json" } : {}),
+              },
+              ...(body !== undefined ? { body } : {}),
+            });
+            statuses.push(response.status);
+            return response;
+          };
+          for (const server of targetServers.slice(0, 3)) {
+            const response = await send("POST", server.url, initialize);
+            expect(await response.json()).toMatchObject({ result: { tools: [] } });
+          }
+          // No event stream and no session: answered by the bridge itself.
+          const stream = await send("GET", targetServers[1]!.url);
+          expect(stream.headers.get("allow")).toBe("POST");
+          await stream.arrayBuffer();
+          await (await send("DELETE", targetServers[2]!.url)).arrayBuffer();
+          // Only the registered paths are relayed.
+          await (await send("POST", `${bridgeUrl}/mcp/gateways/gw_2`, initialize)).arrayBuffer();
+        } finally {
+          await bridge?.stop();
+        }
+        expect(statuses, policy ?? "restricted").toEqual([200, 200, 200, 405, 405, 403]);
+        expect(received).toEqual([
+          { route: "POST /api/mcp/project-tools", auth: "Bearer real-run-jwt", body: initialize },
+          { route: "POST /mcp/runtime-tools", auth: "Bearer runtime-tools-token-canary", body: initialize },
+          { route: "POST /mcp/gateways/gw_1", auth: "Bearer gateway-token-canary", body: initialize },
+        ]);
+        received.length = 0;
+        const logText = logs.join("");
+        expect(logText).toContain(
+          "Relaying 3 Paperclip-managed MCP server(s) through the callback bridge: Paperclip projects, Paperclip connections, paperclip-assigned.",
+        );
+        expect(logText).toContain("Not relaying 1 managed MCP server(s) that are not on the Paperclip API origin: external.");
+        // No server token reaches the target: not in what it is handed, not in
+        // the bridge's files or logs.
+        const handed = JSON.stringify(targetServers.slice(0, 3));
+        const queued = await readRuntimeTextFiles(path.join(runtimeRootDir, "paperclip-bridge"));
+        for (const secret of ["real-run-jwt", "runtime-tools-token-canary", "gateway-token-canary"]) {
+          expect(handed).not.toContain(secret);
+          expect(logText).not.toContain(secret);
+          for (const content of queued) expect(content).not.toContain(secret);
+        }
+      }
+    } finally {
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
   it("creates a sandbox run log tail factory when bridge streaming is enabled", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-stream-"));
     cleanupDirs.push(rootDir);
