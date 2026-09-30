@@ -18,6 +18,7 @@ import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversatio
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
+import { isSessionedLocalAdapter, runProcessIsOnHost } from "./run-host-process.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
@@ -1386,16 +1387,6 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "execution_approval_requested",
   "execution_changes_requested",
   "approval_approved",
-]);
-const SESSIONED_LOCAL_ADAPTERS = new Set([
-  "claude_local",
-  "codex_local",
-  "cursor",
-  "gemini_local",
-  "hermes_local",
-  "kimi_local",
-  "opencode_local",
-  "pi_local",
 ]);
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
@@ -8581,7 +8572,7 @@ function isSameTaskScope(left: string | null, right: string | null) {
 }
 
 function isTrackedLocalChildProcessAdapter(adapterType: string) {
-  return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
+  return isSessionedLocalAdapter(adapterType);
 }
 
 function isHeartbeatRunTerminalStatus(
@@ -19973,12 +19964,24 @@ export function heartbeatService(
         isTrackedLocalChildProcessAdapter(adapterType);
       const tracksLegacyLocalChild =
         run.runtimeMode !== "native" && currentAdapterTracksLocalChild;
+      // Any other adapter, such as one from an external plugin, can report its
+      // child through onSpawn too. When that child runs on this host (a local
+      // command, or the SSH client of a remote one) it gets the same liveness
+      // check, so a run that may resume its provider session is not continued
+      // while the old process still works on it. It gains no retry authority.
+      const reportedHostChild =
+        !currentAdapterTracksLocalChild &&
+        run.runtimeMode !== "native" &&
+        (!!run.processPid || !!run.processGroupId) &&
+        (await runProcessIsOnHost(db, run.id));
       // Native runner processes also persist child metadata, but they must not
       // inherit legacy retry or termination authority. Use their PID/group only
       // for a read-only liveness check so a lost in-memory handle cannot cause
       // overlapping provider/tool execution while that child is still alive.
       const checksPersistedChildLiveness =
-        currentAdapterTracksLocalChild || run.runtimeMode === "native";
+        currentAdapterTracksLocalChild ||
+        run.runtimeMode === "native" ||
+        reportedHostChild;
       const processPidAlive =
         checksPersistedChildLiveness &&
         run.processPid &&

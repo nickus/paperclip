@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { runningProcesses } from "../../../adapters/utils.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../../../services/local-service-supervisor.js";
@@ -34,6 +35,74 @@ describe("adapters", () => {
 
       expect(outcome).toEqual({ attempted: false, outcome: "skipped_non_local_adapter", adapterType: "hermes_gateway" });
       expect(mockedIsPidAlive).not.toHaveBeenCalled();
+    });
+
+    it("stops the recorded process of another adapter when it runs on this host", async () => {
+      mockedIsPidAlive.mockReturnValueOnce(true).mockReturnValueOnce(false);
+      mockedIsProcessGroupAlive.mockReturnValue(false);
+      mockedTerminateLocalService.mockResolvedValue(undefined);
+      const runProcessIsOnHost = vi.fn(async () => true);
+      const adapter = createProcessAdapter({ runProcessIsOnHost });
+
+      const outcome = await adapter.cleanupRunProcess({
+        runId: "run-1",
+        adapterType: "external_plugin_local",
+        fallbackPid: 4242,
+        fallbackProcessGroupId: null,
+      });
+
+      expect(runProcessIsOnHost).toHaveBeenCalledWith("run-1");
+      expect(outcome).toEqual({
+        attempted: true,
+        outcome: "terminated",
+        adapterType: "external_plugin_local",
+        pid: 4242,
+        processGroupId: null,
+      });
+      expect(mockedTerminateLocalService).toHaveBeenCalledWith({ pid: 4242, processGroupId: null }, undefined);
+    });
+
+    it("leaves the recorded process of another adapter alone when it ran in a sandbox", async () => {
+      const adapter = createProcessAdapter({ runProcessIsOnHost: async () => false });
+
+      const outcome = await adapter.cleanupRunProcess({
+        runId: "run-1",
+        adapterType: "external_plugin_local",
+        fallbackPid: 4242,
+        fallbackProcessGroupId: null,
+      });
+
+      expect(outcome).toEqual({ attempted: false, outcome: "skipped_non_local_adapter", adapterType: "external_plugin_local" });
+      expect(mockedIsPidAlive).not.toHaveBeenCalled();
+      expect(mockedTerminateLocalService).not.toHaveBeenCalled();
+    });
+
+    it("stops a child this server registered for any adapter", async () => {
+      mockedIsPidAlive.mockReturnValueOnce(true).mockReturnValueOnce(false);
+      mockedIsProcessGroupAlive.mockReturnValue(false);
+      mockedTerminateLocalService.mockResolvedValue(undefined);
+      runningProcesses.set("run-1", {
+        child: { pid: 5151 } as ChildProcess,
+        graceSec: 3,
+        processGroupId: null,
+      });
+      const runProcessIsOnHost = vi.fn(async () => false);
+      const adapter = createProcessAdapter({ runProcessIsOnHost });
+
+      const outcome = await adapter.cleanupRunProcess({
+        runId: "run-1",
+        adapterType: "external_plugin_local",
+        fallbackPid: null,
+        fallbackProcessGroupId: null,
+      });
+
+      expect(outcome).toMatchObject({ attempted: true, outcome: "terminated", pid: 5151 });
+      expect(runProcessIsOnHost).not.toHaveBeenCalled();
+      expect(mockedTerminateLocalService).toHaveBeenCalledWith(
+        { pid: 5151, processGroupId: null },
+        { forceAfterMs: 3000 },
+      );
+      expect(runningProcesses.has("run-1")).toBe(false);
     });
 
     it("reports no_process_metadata when no pid or process group is known", async () => {

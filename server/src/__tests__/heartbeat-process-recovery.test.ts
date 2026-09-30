@@ -86,7 +86,12 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { runningProcesses } from "../adapters/index.ts";
+import {
+  registerServerAdapter,
+  runningProcesses,
+  unregisterServerAdapter,
+  type ServerAdapterModule,
+} from "../adapters/index.ts";
 import {
   resolveDefaultAgentWorkspaceDir,
   resolvePaperclipInstanceRoot,
@@ -2067,6 +2072,180 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("claimed");
+  });
+
+  // An adapter from an external plugin reports its child process through
+  // onSpawn like a built-in does, and may resume its provider session on the
+  // next run. After an unplanned restart the reaper must not start that next
+  // run while the recorded process is still working on the same session.
+  describe("a lost run of an adapter outside the built-in process list", () => {
+    const EXTERNAL_ADAPTER_TYPE = "external_process_test";
+
+    function registerExternalAdapter() {
+      const adapter: ServerAdapterModule = {
+        type: EXTERNAL_ADAPTER_TYPE,
+        execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+        testEnvironment: async () => ({
+          adapterType: EXTERNAL_ADAPTER_TYPE,
+          status: "pass",
+          checks: [],
+          testedAt: new Date(0).toISOString(),
+        }),
+        supportsConversationContinuation: true,
+      };
+      registerServerAdapter(adapter);
+    }
+
+    async function continuationsOf(runId: string) {
+      return db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, runId));
+    }
+
+    afterEach(() => {
+      unregisterServerAdapter(EXTERNAL_ADAPTER_TYPE);
+    });
+
+    it("keeps the run adopted while its recorded process is alive and continues it once the process is gone", async () => {
+      registerExternalAdapter();
+      const child = spawnAliveProcess();
+      childProcesses.add(child);
+      expect(child.pid).toBeTypeOf("number");
+      const { runId, wakeupRequestId } = await seedRunFixture({
+        adapterType: EXTERNAL_ADAPTER_TYPE,
+        agentStatus: "idle",
+        processPid: child.pid ?? null,
+      });
+      const heartbeat = heartbeatService(db);
+
+      // Every sweep while the process lives leaves the run in place.
+      for (let sweep = 0; sweep < 2; sweep += 1) {
+        expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+      }
+      expect(await heartbeat.getRun(runId)).toMatchObject({
+        status: "running",
+        errorCode: "process_detached",
+        error: expect.stringContaining(String(child.pid)),
+      });
+      expect(await continuationsOf(runId)).toHaveLength(0);
+      expect(mockTerminateLocalService).not.toHaveBeenCalled();
+      expect(isPidAlive(child.pid!)).toBe(true);
+      const wakeup = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeup?.status).toBe("claimed");
+
+      child.kill("SIGKILL");
+      expect(await waitForPidExit(child.pid!)).toBe(true);
+
+      expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [runId] });
+      expect(await heartbeat.getRun(runId)).toMatchObject({
+        status: "failed",
+        errorCode: "process_lost",
+        resultJson: expect.objectContaining({
+          conversationContinuation: "continue_conversation_v1",
+        }),
+      });
+      expect(await continuationsOf(runId)).toHaveLength(1);
+    });
+
+    it("continues the run when its recorded process is already gone", async () => {
+      registerExternalAdapter();
+      const { runId } = await seedRunFixture({
+        adapterType: EXTERNAL_ADAPTER_TYPE,
+        agentStatus: "idle",
+        processPid: 999_999_999,
+      });
+
+      expect(await heartbeatService(db).reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [runId] });
+      expect(await heartbeatService(db).getRun(runId)).toMatchObject({
+        status: "failed",
+        errorCode: "process_lost",
+        error: "Process lost -- child pid 999999999 is no longer running",
+        resultJson: expect.objectContaining({
+          conversationContinuation: "continue_conversation_v1",
+        }),
+      });
+      expect(await continuationsOf(runId)).toHaveLength(1);
+    });
+
+    it("keeps treating a run without a recorded process as lost", async () => {
+      registerExternalAdapter();
+      const { runId } = await seedRunFixture({
+        adapterType: EXTERNAL_ADAPTER_TYPE,
+        agentStatus: "idle",
+      });
+
+      expect(await heartbeatService(db).reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [runId] });
+      expect(await heartbeatService(db).getRun(runId)).toMatchObject({
+        status: "failed",
+        errorCode: "process_lost",
+        error: "Process lost -- server may have restarted",
+      });
+      expect(await continuationsOf(runId)).toHaveLength(1);
+    });
+
+    it("does not probe a process identifier recorded inside a sandbox", async () => {
+      registerExternalAdapter();
+      // A live pid on this host that happens to match the sandbox's number.
+      const child = spawnAliveProcess();
+      childProcesses.add(child);
+      const { companyId, runId, issueId } = await seedRunFixture({
+        adapterType: EXTERNAL_ADAPTER_TYPE,
+        agentStatus: "idle",
+        processPid: child.pid ?? null,
+      });
+      const environmentId = randomUUID();
+      await db.insert(environments).values({
+        id: environmentId,
+        companyId,
+        name: "Sandbox test environment",
+        driver: "sandbox",
+        status: "active",
+        config: {},
+        metadata: null,
+      });
+      await db.insert(environmentLeases).values({
+        companyId,
+        environmentId,
+        issueId,
+        heartbeatRunId: runId,
+        status: "released",
+        releasedAt: new Date("2026-03-19T00:00:00.000Z"),
+        leasePolicy: "ephemeral",
+        provider: "fake",
+        metadata: { driver: "sandbox" },
+      });
+
+      expect(await heartbeatService(db).reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [runId] });
+      expect(await heartbeatService(db).getRun(runId)).toMatchObject({
+        status: "failed",
+        errorCode: "process_lost",
+      });
+      expect(isPidAlive(child.pid!)).toBe(true);
+    });
+
+    it("probes the SSH client recorded for a run on an SSH host", async () => {
+      registerExternalAdapter();
+      const child = spawnAliveProcess();
+      childProcesses.add(child);
+      const { companyId, runId, issueId } = await seedRunFixture({
+        adapterType: EXTERNAL_ADAPTER_TYPE,
+        agentStatus: "idle",
+        processPid: child.pid ?? null,
+      });
+      await seedEnvironmentLeaseFixture({ companyId, runId, issueId, provider: "ssh", driver: "ssh" });
+
+      expect(await heartbeatService(db).reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+      expect(await heartbeatService(db).getRun(runId)).toMatchObject({
+        status: "running",
+        errorCode: "process_detached",
+      });
+      expect(await continuationsOf(runId)).toHaveLength(0);
+    });
   });
 
   it("keeps a native run active without granting legacy retry or signal authority", async () => {

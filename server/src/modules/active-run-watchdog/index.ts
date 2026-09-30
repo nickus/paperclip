@@ -1,6 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import { createPostgresWatchdogAdapter } from "./adapters/postgres.js";
 import { createProcessAdapter } from "./adapters/process.js";
+import { runProcessIsOnHost } from "../../services/run-host-process.js";
 import {
   createBuildRunOutputSilence,
   createFoldSourceResolvedRun,
@@ -21,7 +22,9 @@ export type ActiveRunWatchdogConfig = {
  */
 export function createActiveRunWatchdog(db: Db, config: ActiveRunWatchdogConfig) {
   const postgresAdapter = createPostgresWatchdogAdapter(db);
-  const processController = createProcessAdapter();
+  const processController = createProcessAdapter({
+    runProcessIsOnHost: (runId) => runProcessIsOnHost(db, runId),
+  });
 
   const foldSourceResolvedRun = createFoldSourceResolvedRun({
     writer: postgresAdapter,
