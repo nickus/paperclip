@@ -54,7 +54,6 @@ function pendingRequest() {
       status: "pending",
       canonicalArgumentsHash: "hash-1",
       canonicalArgumentsSummary: {},
-      signedArguments: "signed",
       previewMarkdown: null,
       requestedByAgentId: "agent-1",
       requestedByUserId: null,

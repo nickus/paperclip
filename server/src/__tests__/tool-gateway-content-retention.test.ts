@@ -31,6 +31,7 @@ import {
   toolProfiles,
 } from "@paperclipai/db";
 import { createToolGatewayService } from "../services/tool-gateway.js";
+import { toolAccessService } from "../services/tool-access.js";
 import { toolActionDeliveryService } from "../services/tool-action-delivery.js";
 import { TOOL_CONTENT_RETENTION_DEFAULT_ENV } from "../services/tool-content-retention.js";
 import {
@@ -430,6 +431,68 @@ describeEmbeddedPostgres("tool gateway per-connection content retention", () => 
     expect(replay.status).toBe("replayed");
     expect(replay.result).toMatchObject({ contentRetained: false, resultSha256: executedInvocation.resultHash });
     expect(remote.calls).toEqual(["update_note"]);
+  });
+
+  it("never returns the signed argument envelope from action request reads or reviews", async () => {
+    // The envelope is signed, not encrypted: anyone who reads it reads the full
+    // arguments, including values the stored summary redacts. It applies to
+    // every connection, whatever it retains.
+    const secretCanary = "private-password-canary";
+    const originalSecret = process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = SIGNING_SECRET;
+    try {
+      for (const connectionConfig of [{}, { contentRetention: "none" }]) {
+        const fixture = await createFixture(db, connectionConfig);
+        const remote = notesServer();
+        const { gateway, session, toolNamed } = await openSession(db, fixture, remote);
+        const updateTool = toolNamed("update_note");
+        await db.insert(toolPolicies).values({
+          companyId: fixture.company.id,
+          name: "Ask before writing notes",
+          policyType: "require_approval",
+          selectors: { toolName: updateTool },
+        });
+        const call = (noteId: string) => gateway.executeTool({
+          sessionToken: session.token,
+          tool: updateTool,
+          parameters: { noteId, password: secretCanary },
+        });
+        await expect(call("n1")).rejects.toMatchObject({ reasonCode: "approval_required" });
+        await expect(call("n2")).rejects.toMatchObject({ reasonCode: "approval_required" });
+
+        // The row keeps the envelope, and it does carry the value.
+        const rows = await db.select().from(toolActionRequests)
+          .where(eq(toolActionRequests.companyId, fixture.company.id));
+        expect(rows).toHaveLength(2);
+        for (const row of rows) {
+          expect(Buffer.from(row.signedArguments!, "base64url").toString("utf8")).toContain(secretCanary);
+        }
+
+        const queue = await toolAccessService(db).listActionRequests(fixture.company.id);
+        expect(queue).toHaveLength(2);
+        for (const item of queue) expect(item.request).not.toHaveProperty("signedArguments");
+        expect(JSON.stringify(queue)).not.toContain(secretCanary);
+
+        const [first, second] = [...rows].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+        const approved = await gateway.approveActionRequest({
+          companyId: fixture.company.id,
+          actionRequestId: first!.id,
+          actor: { userId: "reviewer" },
+        });
+        const declined = await gateway.declineActionRequest({
+          companyId: fixture.company.id,
+          actionRequestId: second!.id,
+          actor: { userId: "reviewer" },
+        });
+        for (const reviewed of [approved, declined]) {
+          expect(reviewed).not.toHaveProperty("signedArguments");
+          expect(JSON.stringify(reviewed)).not.toContain(secretCanary);
+        }
+      }
+    } finally {
+      if (originalSecret === undefined) delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+      else process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = originalSecret;
+    }
   });
 
   it("tells the agent an approved action ran without handing it a stored result", async () => {

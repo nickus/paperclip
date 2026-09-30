@@ -261,7 +261,8 @@ receives the full result. With `"none"`:
   SHA-256 and size of the arguments, but not their values, so the approver
   decides without seeing them. The signed arguments that execution needs stay
   on the action request only until it settles (executed, failed, rejected,
-  expired or cancelled); then they are removed.
+  expired or cancelled); then they are removed. The API never returns them,
+  for any connection: they are signed, not encrypted.
 - When Paperclip runs an action a human approved, the result is not stored, so
   the agent's follow-up wake says the action ran without including its result.
   A retry of the same call does not run it again and returns a note that the

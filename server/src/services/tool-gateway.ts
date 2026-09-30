@@ -7743,6 +7743,17 @@ export function createToolGatewayService(
     }
   }
 
+  // An action request as a review returns it to its caller (the review routes
+  // and the issue interaction routes). The signed argument envelope stays in
+  // the table: it is signed, not encrypted, so returning it would hand every
+  // caller the call's full arguments, including values the summary redacts.
+  function reviewedActionRequest(
+    actionRequest: typeof toolActionRequests.$inferSelect,
+  ) {
+    const { signedArguments: _signedArguments, ...reviewed } = actionRequest;
+    return reviewed;
+  }
+
   async function actionRequestResolution(
     actionRequest: typeof toolActionRequests.$inferSelect,
   ) {
@@ -7750,14 +7761,14 @@ export function createToolGatewayService(
       actionRequest.status !== "executed" &&
       actionRequest.status !== "failed"
     )
-      return actionRequest;
+      return reviewedActionRequest(actionRequest);
     const [invocation] = await db
       .select()
       .from(toolInvocations)
       .where(eq(toolInvocations.id, actionRequest.invocationId))
       .limit(1);
     return {
-      ...actionRequest,
+      ...reviewedActionRequest(actionRequest),
       resultSummary: invocation?.resultSummary?.summary ?? null,
       error: invocation?.errorMessage ?? null,
       ...(isUnretainedSummary(actionRequest.canonicalArgumentsSummary)
@@ -9865,7 +9876,7 @@ export function createToolGatewayService(
             .limit(1);
           return actionRequestResolution(settled ?? actionRequest);
         }
-        return actionRequest;
+        return reviewedActionRequest(actionRequest);
       }
       if (actionRequest.expiresAt && actionRequest.expiresAt <= new Date())
         throw new ToolGatewayHttpError(
@@ -9994,7 +10005,7 @@ export function createToolGatewayService(
             "Tool review continuation will be retried",
           ),
         );
-      return updated;
+      return reviewedActionRequest(updated);
     },
 
     async executeTool(input: ExecuteGatewayToolInput) {

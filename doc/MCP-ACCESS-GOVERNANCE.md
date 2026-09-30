@@ -287,7 +287,7 @@ Decisions: `allow`, `deny`, `require_approval`, `rate_limited`, `defer_runtime`.
 When a call resolves to `require_approval`, the gateway opens an **Action Request** carrying:
 - the agent, run, and tool identity,
 - a canonical hash of the arguments (so we can match later trust rules),
-- a `signedArguments` payload the approver sees verbatim,
+- a signed copy of the arguments that the gateway replays on execution (kept on the server; API responses do not include it, because the signature protects it from tampering but does not hide it),
 - a linked issue-thread `request_confirmation` interaction for the in-app card,
 - an expiry.
 
@@ -356,7 +356,7 @@ Every tool invocation lands in the **call event log** (`tool_call_events`). Each
 
 ### What the audit keeps: content retention
 
-By default the invocation, the call events and the gateway audit carry a redacted, truncated summary of each call's arguments and result. A connection that reaches private material can keep metadata only by setting `config.contentRetention` to `"none"`: every record of its calls then keeps who, when, which tool, the decision, outcome, latency, error code and the SHA-256 hashes and sizes, but no argument text, result text or provider error text. That covers the audit table, the call event log, invocations, the activity log (and the live and plugin events it feeds), approval cards and action requests (whose signed arguments are removed once the request settles), and the recorded outcome of an approved action. The agent that made a call still receives the full result; an action a human approved and Paperclip ran is reported to the agent without its result. `PAPERCLIP_TOOL_CONTENT_RETENTION_DEFAULT=none` applies the same to every connection that does not choose. Details: [Content retention](./connections/GENERIC-REMOTE-MCP.md#content-retention).
+By default the invocation, the call events and the gateway audit carry a redacted, truncated summary of each call's arguments and result. A connection that reaches private material can keep metadata only by setting `config.contentRetention` to `"none"`: every record of its calls then keeps who, when, which tool, the decision, outcome, latency, error code and the SHA-256 hashes and sizes, but no argument text, result text or provider error text. That covers the audit table, the call event log, invocations, the activity log (and the live and plugin events it feeds), approval cards and action requests (whose signed arguments are never returned by the API and are removed once the request settles), and the recorded outcome of an approved action. The agent that made a call still receives the full result; an action a human approved and Paperclip ran is reported to the agent without its result. `PAPERCLIP_TOOL_CONTENT_RETENTION_DEFAULT=none` applies the same to every connection that does not choose. Details: [Content retention](./connections/GENERIC-REMOTE-MCP.md#content-retention).
 
 Approvers of a `"none"` connection see the action, its risk and the argument hash, not the argument values. Keep `"summary"` on connections whose ask-first actions need a reviewer to read the arguments.
 

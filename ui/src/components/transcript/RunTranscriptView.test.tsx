@@ -258,7 +258,6 @@ describe("RunTranscriptView", () => {
         status: "pending",
         canonicalArgumentsHash: "hash-1",
         canonicalArgumentsSummary: { summary: "{\"to\":\"redacted\"}" },
-        signedArguments: null,
         previewMarkdown: "Tool: `send_email`",
         requestedByAgentId: "agent-1",
         requestedByUserId: null,
