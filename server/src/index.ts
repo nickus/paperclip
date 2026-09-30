@@ -66,6 +66,10 @@ import {
 import { getOperatorSettingDefaults } from "./services/setting-defaults.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
+import { publishStreamJsonEvent, subscribeAllCompanyLiveEvents } from "./services/live-events.js";
+import { createRunSecretRedactionRegistry } from "./services/run-secret-redaction.js";
+import { createRunStreamJsonHub } from "./services/run-stream-json-hub.js";
+import { createStreamJsonStringRedactor, loadRunStreamJsonMeta } from "./services/run-stream-json.js";
 import { setupRunnerPrpWebSocketServer } from "./realtime/runner-prp-ws.js";
 import { cloudActorHeaderSourceFromHeaders, resolveCloudTenantActor } from "./middleware/auth.js";
 import {
@@ -131,7 +135,7 @@ import {
 } from "./shutdown.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
-import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
+import { flushInFlightRunLogMirrors, getRunLogStore } from "./services/run-log-store.js";
 import { restoreSavedTaskDrainOnStartup } from "./services/task-drain-store.js";
 import { createHeartbeatStartupRecoveryGate } from "./heartbeat-startup-recovery-gate.js";
 import {
@@ -975,7 +979,24 @@ async function startServerWithDatabaseTeardown(
   setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
     pluginWorkerManager,
   });
+  // Claude stream-json translation of run output for sockets that opt in.
+  // It reads the persisted run logs, like the log API, and publishes only to
+  // opted-in sockets of companies that have one.
+  const streamJsonRunRedactions = createRunSecretRedactionRegistry(db as any);
+  const runStreamJsonHub = createRunStreamJsonHub({
+    store: getRunLogStore(),
+    loadRunMeta: (runId) => loadRunStreamJsonMeta(db as any, runId),
+    registeredSecretValues: (companyId, runId) =>
+      streamJsonRunRedactions.valuesForLiveRun(companyId, runId),
+    getStringRedactor: async () =>
+      createStreamJsonStringRedactor({
+        enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
+      }),
+    publish: (companyId, payload) => publishStreamJsonEvent({ companyId, payload }),
+    subscribe: subscribeAllCompanyLiveEvents,
+  });
   setupLiveEventsWebSocketServer(server, db as any, {
+    streamJson: { hub: runStreamJsonHub },
     deploymentMode: config.deploymentMode,
     resolveSessionFromHeaders,
     // Cloud-proxied browsers carry trusted x-paperclip-cloud-* headers instead

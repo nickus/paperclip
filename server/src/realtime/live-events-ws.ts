@@ -6,10 +6,17 @@ import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
+import { STREAM_JSON_FORMAT, STREAM_JSON_FORMAT_VERSION } from "@paperclipai/adapter-utils/stream-json";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { boardAuthService } from "../services/board-auth.js";
-import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import {
+  createLiveEvent,
+  subscribeCompanyLiveEvents,
+  subscribeCompanyStreamJsonEvents,
+} from "../services/live-events.js";
+import type { RunStreamJsonHub } from "../services/run-stream-json-hub.js";
+import { isStreamJsonEnabled } from "../services/run-stream-json-flags.js";
 
 interface WsSocket {
   readyState: number;
@@ -45,6 +52,14 @@ interface UpgradeContext {
   companyId: string;
   actorType: "board" | "agent";
   actorId: string;
+  /** Set when the socket opted in to translated run output. */
+  streamJson?: StreamJsonOptIn | null;
+}
+
+/** Query options of `?format=claude-stream-json`. */
+interface StreamJsonOptIn {
+  /** Keep raw `heartbeat.run.log` events next to the translated ones. */
+  includeRawLogs: boolean;
 }
 
 /** Cloud-proxied browser identity resolved from trusted x-paperclip-cloud-* headers. */
@@ -111,6 +126,34 @@ function parseCompanyId(pathname: string) {
   } catch {
     return null;
   }
+}
+
+function parseQueryFlag(value: string | null): boolean | null {
+  if (value === null || value === "0" || value === "false") return false;
+  if (value === "1" || value === "true") return true;
+  return null;
+}
+
+/**
+ * Reads the stream-json opt-in. Without `format` the socket is a default
+ * socket and every other parameter is ignored, so its event stream stays
+ * exactly as before.
+ */
+function parseStreamJsonOptIn(
+  url: URL,
+  available: boolean,
+): { ok: true; value: StreamJsonOptIn | null } | { ok: false; message: string } {
+  const format = url.searchParams.get("format");
+  if (format === null) return { ok: true, value: null };
+  if (format !== STREAM_JSON_FORMAT || !available) return { ok: false, message: "unsupported format" };
+  const includeRawLogs = parseQueryFlag(url.searchParams.get("includeRawLogs"));
+  if (includeRawLogs === null) return { ok: false, message: "unsupported includeRawLogs value" };
+  // Partial (per-delta) stream events are not produced yet; the hello event
+  // reports `partial: false` so clients know.
+  if (parseQueryFlag(url.searchParams.get("partial")) === null) {
+    return { ok: false, message: "unsupported partial value" };
+  }
+  return { ok: true, value: { includeRawLogs } };
 }
 
 function parseBearerToken(rawAuth: string | string[] | undefined) {
@@ -275,6 +318,46 @@ async function authorizeUpgrade(
   };
 }
 
+/**
+ * Wires an opted-in socket: a hello event first, then every company event
+ * except raw run logs (unless `includeRawLogs`), plus the translated
+ * `heartbeat.run.stream_json` events. The company stays retained in the hub
+ * while the socket is open. Returns the cleanup.
+ */
+function attachStreamJsonSocket(
+  socket: WsSocket,
+  companyId: string,
+  optIn: StreamJsonOptIn,
+  hub: Pick<RunStreamJsonHub, "retainCompany">,
+) {
+  const send = (event: unknown) => {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify(event));
+  };
+  send(createLiveEvent({
+    companyId,
+    type: "heartbeat.run.stream_json",
+    payload: {
+      kind: "hello",
+      format: STREAM_JSON_FORMAT,
+      formatVersion: STREAM_JSON_FORMAT_VERSION,
+      includeRawLogs: optIn.includeRawLogs,
+      partial: false,
+    },
+  }));
+  const release = hub.retainCompany(companyId);
+  const unsubscribeTranslated = subscribeCompanyStreamJsonEvents(companyId, send);
+  const unsubscribeEvents = subscribeCompanyLiveEvents(companyId, (event) => {
+    if (!optIn.includeRawLogs && event.type === "heartbeat.run.log") return;
+    send(event);
+  });
+  return () => {
+    unsubscribeEvents();
+    unsubscribeTranslated();
+    release();
+  };
+}
+
 export function setupLiveEventsWebSocketServer(
   server: HttpServer,
   db: Db,
@@ -287,6 +370,11 @@ export function setupLiveEventsWebSocketServer(
      * deployments; self-hosted instances leave it unset.
      */
     resolveCloudActor?: (req: IncomingMessage) => Promise<CloudUpgradeActor | null>;
+    /**
+     * Translated run output for sockets that pass `format=claude-stream-json`.
+     * Without it such requests are rejected with 400.
+     */
+    streamJson?: { hub: Pick<RunStreamJsonHub, "retainCompany"> & Partial<Pick<RunStreamJsonHub, "dispose">> };
   },
 ) {
   const wss = new WebSocketServer({ noServer: true });
@@ -312,10 +400,13 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
-    const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
-      if (socket.readyState !== WebSocket.OPEN) return;
-      socket.send(JSON.stringify(event));
-    });
+    const streamJsonOptIn = context.streamJson ?? null;
+    const unsubscribe = streamJsonOptIn && opts.streamJson
+      ? attachStreamJsonSocket(socket, context.companyId, streamJsonOptIn, opts.streamJson.hub)
+      : subscribeCompanyLiveEvents(context.companyId, (event) => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        socket.send(JSON.stringify(event));
+      });
 
     cleanupByClient.set(socket, unsubscribe);
     aliveByClient.set(socket, true);
@@ -338,6 +429,7 @@ export function setupLiveEventsWebSocketServer(
 
   wss.on("close", () => {
     clearInterval(pingInterval);
+    opts.streamJson?.hub.dispose?.();
   });
 
   server.on("upgrade", (req, socket, head) => {
@@ -368,6 +460,12 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
+    const streamJsonOptIn = parseStreamJsonOptIn(url, Boolean(opts.streamJson) && isStreamJsonEnabled());
+    if (!streamJsonOptIn.ok) {
+      rejectUpgrade(socket, "400 Bad Request", streamJsonOptIn.message);
+      return;
+    }
+
     void authorizeUpgrade(db, req, companyId, url, {
       deploymentMode: opts.deploymentMode,
       boardAuth,
@@ -386,7 +484,7 @@ export function setupLiveEventsWebSocketServer(
         }
 
         const reqWithContext = req as IncomingMessageWithContext;
-        reqWithContext.paperclipUpgradeContext = context;
+        reqWithContext.paperclipUpgradeContext = { ...context, streamJson: streamJsonOptIn.value };
 
         cleanupRawSocketListeners();
         wss.handleUpgrade(req, socket, head, (ws: WsSocket) => {
