@@ -596,6 +596,7 @@ import {
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import {
+  contextSnapshotKeepingRedactionRegistry,
   createRunSecretRedactionRegistry,
   redactRegisteredSecretValues,
 } from "./run-secret-redaction.js";
@@ -25567,10 +25568,12 @@ export function heartbeatService(
             combinedRuntimeServices.find((service) =>
               readNonEmptyString(service.url),
             )?.url ?? null;
+          // The agent has run by now and may have registered secrets for
+          // redaction; this in-memory context predates those registrations.
           await db
             .update(heartbeatRuns)
             .set({
-              contextSnapshot: context,
+              contextSnapshot: contextSnapshotKeepingRedactionRegistry(context),
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));

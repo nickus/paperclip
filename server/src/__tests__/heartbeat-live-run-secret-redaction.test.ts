@@ -2,17 +2,20 @@ import { randomBytes, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { LiveEvent } from "@paperclipai/shared";
-import { agents, companies, createDb } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
-import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.ts";
+import {
+  contextSnapshotKeepingRedactionRegistry,
+  createRunSecretRedactionRegistry,
+} from "../services/run-secret-redaction.ts";
 import { REDACTED_EVENT_VALUE } from "../redaction.ts";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 
@@ -21,6 +24,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 const TEST_ADAPTER_TYPE = "live_secret_output_capture";
 // A value an agent obtained through the secrets API during its run.
 const SECRET = "live-output-secret-4d7e1b9a";
+let reportRuntimeService = false;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -89,6 +93,16 @@ describeEmbeddedPostgres("registered run secrets in live run output", () => {
           signal: null,
           timedOut: false,
           summary: `Finished. The token was ${SECRET}.`,
+          ...(reportRuntimeService
+            ? {
+                runtimeServices: [{
+                  id: randomUUID(),
+                  serviceName: "preview",
+                  status: "running" as const,
+                  scopeType: "run" as const,
+                }],
+              }
+            : {}),
         };
       },
       testEnvironment: async () => ({
@@ -101,9 +115,11 @@ describeEmbeddedPostgres("registered run secrets in live run output", () => {
   }, 20_000);
 
   afterEach(async () => {
+    reportRuntimeService = false;
     await new Promise((resolve) => setTimeout(resolve, 100));
     await db.execute(sql.raw(`
       TRUNCATE TABLE
+        "workspace_runtime_services",
         "activity_log",
         "environment_leases",
         "environments",
@@ -156,7 +172,8 @@ describeEmbeddedPostgres("registered run secrets in live run output", () => {
       const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
       expect(queued).not.toBeNull();
       const finished = await waitForRunToFinish(heartbeat, queued!.id);
-      expect(finished?.status).toBe("succeeded");
+      expect({ status: finished?.status, error: finished?.error ?? null })
+        .toEqual({ status: "succeeded", error: null });
       return { companyId, runId: queued!.id, heartbeat, events };
     } finally {
       unsubscribe();
@@ -223,5 +240,40 @@ describeEmbeddedPostgres("registered run secrets in live run output", () => {
 
     const run = await heartbeat.getRun(runId);
     expect(run?.stdoutExcerpt).toContain(`fetched token ${REDACTED_EVENT_VALUE}`);
+  });
+
+  it("keeps values registered during the run when the context snapshot is rewritten", async () => {
+    // Reporting adapter-managed runtime services rewrites the run context
+    // after the adapter returns, i.e. after the value was registered.
+    reportRuntimeService = true;
+    const { companyId, runId, heartbeat } = await runAgentThatPrintsSecret();
+    const readContext = async () =>
+      db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0]?.contextSnapshot as Record<string, unknown>);
+    const stored = await readContext();
+    expect(stored.paperclipRuntimeServices).toEqual([expect.objectContaining({ serviceName: "preview" })]);
+    const registry = stored.paperclipSecretRedactions;
+    expect(Array.isArray(registry) && registry.length).toBe(1);
+    // The read routes keep masking the value after the rewrite.
+    const detail = await createRunSecretRedactionRegistry(db).redactForRun(
+      companyId,
+      runId,
+      await heartbeat.getRun(runId),
+    );
+    expect(JSON.stringify(detail)).not.toContain(SECRET);
+    expect(detail?.resultJson).toMatchObject({ summary: `Finished. The token was ${REDACTED_EVENT_VALUE}.` });
+
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: contextSnapshotKeepingRedactionRegistry({ rewritten: true }) })
+      .where(eq(heartbeatRuns.id, runId));
+    expect(await readContext()).toEqual({ rewritten: true, paperclipSecretRedactions: registry });
+
+    await db.update(heartbeatRuns).set({ contextSnapshot: {} }).where(eq(heartbeatRuns.id, runId));
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: contextSnapshotKeepingRedactionRegistry({ rewritten: "again" }) })
+      .where(eq(heartbeatRuns.id, runId));
+    expect(await readContext()).toEqual({ rewritten: "again" });
   });
 });

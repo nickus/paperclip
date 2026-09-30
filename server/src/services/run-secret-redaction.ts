@@ -71,6 +71,19 @@ export function redactRegisteredSecretValues<T>(input: T, values: string[]): T {
   ) as T;
 }
 
+/**
+ * Rewrites a run's whole contextSnapshot from an in-memory copy without
+ * dropping values registered for redaction while the run executed. Those
+ * registrations exist only in the stored row, so the stored registry wins.
+ */
+export function contextSnapshotKeepingRedactionRegistry(context: Record<string, unknown>) {
+  return sql`${JSON.stringify(context)}::jsonb || case
+    when ${heartbeatRuns.contextSnapshot} -> ${REGISTRY_KEY}::text is not null
+      then jsonb_build_object(${REGISTRY_KEY}::text, ${heartbeatRuns.contextSnapshot} -> ${REGISTRY_KEY}::text)
+    else '{}'::jsonb
+  end`;
+}
+
 // Resolved values for runs that this process is executing, so that live
 // run-log and run-event publishing can redact every chunk without a database
 // round trip. An entry exists only while a run holds it (retainLiveRun), and a
