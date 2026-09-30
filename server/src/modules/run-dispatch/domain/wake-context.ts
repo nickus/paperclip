@@ -112,9 +112,17 @@ export function isIssueInteractionResponseWake(
  * starting the blocked work:
  * - a comment or mention wake (the interaction wake rule above);
  * - a response to a thread interaction;
- * - a queued run that still carries comment ids after a later automatic wake
- *   coalesced into it and replaced its wake reason.
+ * - any other wake that still carries comment ids.
  * Retries re-run earlier input and stay gated, as do all other wakes.
+ *
+ * The last rule ignores the wake reason on purpose, because the reason does
+ * not tell whether a comment is waiting: a later wake that coalesces into a
+ * queued comment wake replaces its reason, a new run adopts queued comments
+ * under its own reason, and an assignment made with a comment carries that
+ * comment. The comment ids are the only trace in all three cases. The price
+ * is that an automatic wake that copies comment ids from an earlier run also
+ * gets one bounded interaction run. Telling those apart would need a check
+ * that no earlier run of the agent has already received the comments.
  */
 export function allowsDependencyBlockedWake(
   contextSnapshot: Record<string, unknown> | null | undefined,

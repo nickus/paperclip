@@ -1556,6 +1556,69 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(again).toMatchObject({ healed: 0, blockerDecisionWakes: 0, existingWakeSkipped: 1 });
   });
 
+  it("asks a new assignee to decide through its assignment wake after the decision wake was spent", async () => {
+    const { companyId, agentId, dependentIssueId, blockerIssueIds } = await seedBlockedDependent([
+      { status: "cancelled" },
+    ]);
+
+    // The first assignee gets the one decision wake for this blocker set.
+    const first = await heartbeat.reconcileResolvedDependencyWakes({ companyId });
+    expect(first).toMatchObject({ healed: 1, blockerDecisionWakes: 1 });
+    const [decisionWake] = await db
+      .select({ runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    await waitForRunStatus(decisionWake!.runId!, "succeeded");
+
+    // The issue is handed to another agent before anyone decided.
+    const newAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: newAgentId,
+      companyId,
+      name: "Builder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: newAgentId, updatedAt: new Date() })
+      .where(eq(issues.id, dependentIssueId));
+
+    // The decision wake is not sent again in the same blocked cycle, so the
+    // new assignee's own assignment wake has to run and carry the decision.
+    const again = await heartbeat.reconcileResolvedDependencyWakes({ companyId });
+    expect(again).toMatchObject({ blockerDecisionWakes: 0, existingWakeSkipped: 1 });
+
+    const wake = await heartbeat.wakeup(newAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: dependentIssueId, mutation: "update" },
+      contextSnapshot: { issueId: dependentIssueId, source: "issue.update" },
+    });
+    expect(wake).not.toBeNull();
+    const run = await waitForRunStatus(wake!.id, "succeeded");
+    expect(run?.contextSnapshot).toMatchObject({
+      wakeReason: "issue_assigned",
+      dependencyBlockersCancelled: true,
+      cancelledBlockerIssueIds: blockerIssueIds,
+    });
+    const adapterInput = mockAdapterExecute.mock.calls
+      .map((args) => (args as unknown[])[0] as { runId?: string; context?: Record<string, unknown> })
+      .find((input) => input?.runId === wake!.id);
+    expect(adapterInput?.context?.paperclipWake).toMatchObject({
+      reason: "issue_assigned",
+      dependencyBlockersCancelled: true,
+      cancelledBlockerInstruction: expect.stringContaining(
+        "remove or replace the blocker relationship",
+      ),
+    });
+  });
+
   it("delivers comments and interaction responses on a blocked issue but keeps retries gated", async () => {
     const { companyId, agentId, dependentIssueId, blockerIssueIds } = await seedBlockedDependent([
       { status: "in_progress" },

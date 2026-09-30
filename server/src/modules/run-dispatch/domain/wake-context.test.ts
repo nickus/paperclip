@@ -85,6 +85,11 @@ describe("wake context", () => {
       wakeReason: "issue_blockers_resolved",
       wakeCommentIds: ["comment-1"],
     }, allowed)).toBe(true);
+    // An assignment made with a comment carries that comment.
+    expect(allowsDependencyBlockedWake({
+      wakeReason: "issue_assigned",
+      wakeCommentIds: ["comment-1"],
+    }, allowed)).toBe(true);
     // Automatic wakes and retries stay gated, even with a comment on record.
     expect(allowsDependencyBlockedWake({ wakeReason: "issue_assigned" }, allowed)).toBe(false);
     expect(allowsDependencyBlockedWake({

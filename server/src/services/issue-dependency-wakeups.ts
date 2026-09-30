@@ -23,7 +23,16 @@ type DependencyDecisionReadiness = {
 /**
  * True when an issue still has unresolved blockers and all of them are
  * cancelled. Waiting cannot resolve that state, so the dependency gate lets
- * the assignee's wakes run and asks for a decision instead of holding them.
+ * the issue's wakes run instead of holding them, and the assignee's wakes ask
+ * for a decision.
+ *
+ * Every wake type gets through, not only the issue_blockers_cancelled wake.
+ * That wake is sent once per cancelled blocker set and blocked cycle, whoever
+ * the assignee is, so it cannot be the only way in: the child-completion wake
+ * sent when a child blocker is cancelled, a new assignee's assignment wake, a
+ * retry or continuation of a decision run that did not finish, and a decision
+ * wake whose reason another wake replaced by coalescing into it all have to
+ * reach the assignee too. Each of those wakes keeps its own limits.
  */
 export function dependencyBlockersAwaitDecision(
   readiness: DependencyDecisionReadiness | null | undefined,
