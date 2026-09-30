@@ -210,7 +210,8 @@ export interface WakeQueueTransaction {
    * Moves the task messages still queued for the previous owner of a task
    * that `sourceRunId` handed over into the new owner's just-queued run,
    * once, and retires those queued wakes so the previous owner does not run
-   * for them. Returns the comment ids added to the new run.
+   * for them. Moves nothing while `sourceRunId` is still queued, running or
+   * waiting for a retry. Returns the comment ids added to the new run.
    */
   carryHandoffQueuedComments(input: CarryHandoffQueuedCommentsInput): Promise<string[]>;
   /** An open run already on this issue (optionally scoped to one agent) that would race a new recovery run. */

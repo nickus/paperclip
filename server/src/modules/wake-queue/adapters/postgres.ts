@@ -185,12 +185,16 @@ function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): 
  * and only the user comments the new owner has not received yet, as
  * admission does for a hand-off that stopped the previous owner's run. The
  * moved wakes become `coalesced` into the new run, so the previous owner
- * never runs for them and a later caller finds nothing left to move.
- * Returns the comment ids added to the new run.
+ * never runs for them and a later caller finds nothing left to move. It
+ * moves nothing while the handing-off run is still open, whichever caller
+ * asks. Returns the comment ids added to the new run.
  */
 export async function carryHandoffQueuedComments(tx: Db, input: CarryHandoffQueuedCommentsInput): Promise<string[]> {
   if (!isUuidLike(input.sourceRunId)) return [];
-  // Only the exact run that handed this task over, from another agent.
+  // Only the exact run that handed this task over, from another agent, and
+  // only once it has finished. While it is still queued, running or waiting
+  // for a retry it still holds the task, so its agent's queued messages stay
+  // where they are and a later call (after its release) moves them.
   const source = await tx
     .select({ agentId: heartbeatRuns.agentId })
     .from(heartbeatRuns)
@@ -198,6 +202,7 @@ export async function carryHandoffQueuedComments(tx: Db, input: CarryHandoffQueu
       eq(heartbeatRuns.id, input.sourceRunId),
       eq(heartbeatRuns.companyId, input.companyId),
       ne(heartbeatRuns.agentId, input.newOwnerAgentId),
+      notInArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
       sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
       or(isNull(heartbeatRuns.nativeIssueId), eq(heartbeatRuns.nativeIssueId, input.issueId)),
     ))

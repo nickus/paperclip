@@ -669,6 +669,45 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect(statuses.get(interactionWakeId)).toEqual({ status: "deferred_issue_execution", runId: null });
   });
 
+  it("moves no saved messages while the handing-off run is still open", async () => {
+    const companyId = await seedCompany();
+    const builderId = await seedAgent({ companyId, name: "Builder" });
+    const reviewerId = await seedAgent({ companyId, name: "Reviewer" });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: reviewerId });
+    const sourceRunId = await seedRun({ companyId, agentId: builderId, status: "running", contextSnapshot: { issueId } });
+    const [{ id: userCommentId }] = await db.insert(issueComments).values({
+      companyId, issueId, authorType: "user", authorUserId: "board-user", body: "Please also cover the empty-input case.",
+    }).returning();
+    const savedWakeId = await seedDeferredWake({
+      companyId, agentId: builderId, issueId, requestedByActorId: "board-user",
+      payload: { commentId: userCommentId, _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [userCommentId] } },
+    });
+    const newWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: newWakeId, companyId, agentId: reviewerId, source: "assignment", reason: "issue_assigned", status: "queued",
+      payload: { issueId },
+    });
+    const newRunId = await seedRun({ companyId, agentId: reviewerId, status: "queued", contextSnapshot: { issueId, wakeReason: "issue_assigned" } });
+    const carry = () => carryHandoffQueuedComments(db as unknown as Db, {
+      companyId, issueId, sourceRunId, newOwnerAgentId: reviewerId, wakeId: newWakeId, runId: newRunId, now: new Date(),
+    });
+    const savedWake = async () => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, savedWakeId)))[0]!;
+
+    // An open source run still holds the task; its agent's messages stay with it.
+    for (const status of ["running", "queued", "scheduled_retry"]) {
+      await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, sourceRunId));
+      expect(await carry()).toEqual([]);
+      expect(await savedWake()).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    }
+    const [openNewRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, newRunId));
+    expect(openNewRun.contextSnapshot).not.toHaveProperty("wakeCommentIds");
+
+    // Once it has finished, the same call moves them.
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, sourceRunId));
+    expect(await carry()).toEqual([userCommentId]);
+    expect(await savedWake()).toMatchObject({ status: "coalesced", runId: newRunId });
+  });
+
   it("keeps a paused agent's deferred wake queued through a release, and promotes it once the agent resumes", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent({ companyId });
