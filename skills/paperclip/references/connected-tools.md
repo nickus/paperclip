@@ -60,7 +60,7 @@ curl -sS -X POST \
 rm -rf "$TG_DIR"
 ```
 
-A successful call returns `{"invocationId": "...", "status": "completed", "tool": "...", "result": ...}`. A call may also set `"timeoutMs"` (default 10000, at most 60000); on SSH and sandbox runs the bridge gives up on a request after about 30 seconds, so stay below that there.
+A successful call returns `{"invocationId": "...", "status": "completed", "tool": "...", "result": ...}`. A call may also set `"timeoutMs"` (at most 300000). Without it, the call uses the timeout configured on the tool's connection, or 10000 if none is configured. Long calls are supported end to end, including on SSH and sandbox runs, so do not retry a slow tool call while it is still running.
 
 The session takes its task from your run. A run woken without a task that needs an approval-gated tool can name the task it checked out when it creates the session: `--data-binary '{"issueId": "<issue id>"}'`, using the issue's `id`, not its identifier.
 
