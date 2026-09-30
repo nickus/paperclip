@@ -308,6 +308,7 @@ const baseReleaseRecoveryFacts: ReleaseRecoveryFacts = {
   immediate: {
     applies: false,
     isDispositionRepairRetry: false,
+    finishingRunCancelled: false,
     hasExplicitBlockerPath: false,
     isWorkspaceValidationFailedRun: false,
     isConfigurationIncompleteFailedRun: false,
@@ -320,6 +321,7 @@ const baseReleaseRecoveryFacts: ReleaseRecoveryFacts = {
     isStrandedRecoveryOrigin: false,
     recoveryAgentPresent: true,
     recoveryAgentInvokable: true,
+    recoveryAgentPaused: false,
   },
 };
 
@@ -391,6 +393,33 @@ describe("decideReleaseRecovery", () => {
         ...baseReleaseRecoveryFacts,
         immediate: { ...baseReleaseRecoveryFacts.immediate, applies: true },
         shared: { ...baseReleaseRecoveryFacts.shared, recoveryAgentInvokable: false },
+      },
+      expected: { kind: "blocked", notice: "immediate_execution_path" },
+    },
+    {
+      name: "queue_recovery: immediate recovery applies to a failed run of an agent that is paused",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        immediate: { ...baseReleaseRecoveryFacts.immediate, applies: true },
+        shared: { ...baseReleaseRecoveryFacts.shared, recoveryAgentInvokable: false, recoveryAgentPaused: true },
+      },
+      expected: { kind: "queue_recovery" },
+    },
+    {
+      name: "blocked: immediate recovery applies to a cancelled run of an agent that is paused",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        immediate: { ...baseReleaseRecoveryFacts.immediate, applies: true, finishingRunCancelled: true },
+        shared: { ...baseReleaseRecoveryFacts.shared, recoveryAgentInvokable: false, recoveryAgentPaused: true },
+      },
+      expected: { kind: "blocked", notice: "immediate_execution_path" },
+    },
+    {
+      name: "blocked: a paused agent's failed run keeps the other block conditions",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        immediate: { ...baseReleaseRecoveryFacts.immediate, applies: true, automaticRecoveryAlreadyFailed: true },
+        shared: { ...baseReleaseRecoveryFacts.shared, recoveryAgentInvokable: false, recoveryAgentPaused: true },
       },
       expected: { kind: "blocked", notice: "immediate_execution_path" },
     },

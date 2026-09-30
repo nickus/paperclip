@@ -653,6 +653,7 @@ async function runReleaseRecoveryTail(
       isDispositionRepairRetry:
         readNonEmptyString(run.contextSnapshot.retryReason) ===
         ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
+      finishingRunCancelled: run.status === "cancelled",
       hasExplicitBlockerPath,
       isWorkspaceValidationFailedRun: isWorkspaceValidationFailedRun(run),
       isConfigurationIncompleteFailedRun:
@@ -670,6 +671,7 @@ async function runReleaseRecoveryTail(
       isStrandedRecoveryOrigin,
       recoveryAgentPresent: recoveryAgent !== null,
       recoveryAgentInvokable: recoveryAgent?.invokable ?? false,
+      recoveryAgentPaused: recoveryAgent?.paused === true,
     },
   });
 
@@ -700,7 +702,7 @@ async function runReleaseRecoveryTail(
     };
   }
 
-  // Unreachable: decideReleaseRecovery only reaches "queue_review_participant_recovery" or "queue_recovery" when the shared recovery-agent facts are both true.
+  // Unreachable: decideReleaseRecovery only reaches "queue_review_participant_recovery" or "queue_recovery" when the recovery agent is present (and invokable, or paused for "queue_recovery").
   if (!recoveryAgent)
     throw new Error(
       "wake-queue: queued a recovery run with no invokable recovery agent",
