@@ -106,6 +106,7 @@
               "adapters/http",
               "adapters/external-adapters",
               "adapters/adapter-ui-parser",
+              "adapters/stream-json-translation",
               "adapters/creating-an-adapter"
             ]
           }

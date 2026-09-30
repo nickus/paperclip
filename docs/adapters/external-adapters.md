@@ -384,6 +384,25 @@ async function detectModel() {
 return { type, execute, testEnvironment, detectModel: () => detectModel() };
 ```
 
+## Optional: Claude Stream-JSON Translator
+
+API clients can read run output as Claude Code stream-json (`format=claude-stream-json` on the run-log API and the live-events socket). Declare `streamJsonTranslator` on the server module to map your adapter's stdout lines to that format:
+
+```ts
+import { streamJsonTranslator } from "./stream-json.js";
+
+export function createServerAdapter(): ServerAdapterModule {
+  return {
+    type: "my_adapter",
+    execute,
+    testEnvironment,
+    streamJsonTranslator,
+  };
+}
+```
+
+The translator returns operations (init, streamed text, tool calls and results, usage, result) and the host encodes them into valid lines with stable ids. Without one, each stdout line is wrapped in a `system/paperclip_raw` line. See [Claude Stream-JSON Output](/adapters/stream-json-translation) for the contract.
+
 ## Publishing
 
 ```sh

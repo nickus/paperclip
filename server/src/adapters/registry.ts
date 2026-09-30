@@ -21,6 +21,7 @@ import {
   CLAUDE_SETUP_TOKEN_COMMAND,
   parseSetupTokenPrompt,
   parseSetupTokenCredential,
+  claudeStreamJsonTranslator,
 } from "@paperclipai/adapter-claude-local/server";
 import {
   agentConfigurationDoc as claudeAgentConfigurationDoc,
@@ -106,6 +107,7 @@ import {
   testEnvironment as openCodeTestEnvironment,
   sessionCodec as openCodeSessionCodec,
   listOpenCodeModels,
+  openCodeStreamJsonTranslator,
 } from "@paperclipai/adapter-opencode-local/server";
 import {
   agentConfigurationDoc as openCodeAgentConfigurationDoc,
@@ -281,6 +283,7 @@ const claudeLocalAdapter: ServerAdapterModule = {
   getConfigSchema: getClaudeConfigSchema,
   getQuotaWindows: claudeGetQuotaWindows,
   loginCapability: claudeLoginCapability,
+  streamJsonTranslator: claudeStreamJsonTranslator,
 };
 
 const acpxLocalAdapter: ServerAdapterModule = {
@@ -817,6 +820,7 @@ const openCodeLocalAdapter: ServerAdapterModule = {
   requiresMaterializedRuntimeSkills: true,
   getRuntimeCommandSpec: (config) => buildNpmRuntimeCommandSpec(config, "opencode", "opencode-ai"),
   agentConfigurationDoc: openCodeAgentConfigurationDoc,
+  streamJsonTranslator: openCodeStreamJsonTranslator,
 };
 
 const piLocalAdapter: ServerAdapterModule = {

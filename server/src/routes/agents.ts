@@ -85,6 +85,13 @@ import {
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
+import { getRunLogStore } from "../services/run-log-store.js";
+import {
+  createStreamJsonStringRedactor,
+  isStreamJsonEnabled,
+  loadRunStreamJsonMeta,
+  readRunStreamJsonPage,
+} from "../services/run-stream-json.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
@@ -288,6 +295,18 @@ function readRunLogLimitBytes(value: unknown) {
   const parsed = Number(value ?? RUN_LOG_DEFAULT_LIMIT_BYTES);
   if (!Number.isFinite(parsed)) return RUN_LOG_DEFAULT_LIMIT_BYTES;
   return Math.max(1, Math.min(RUN_LOG_MAX_LIMIT_BYTES, Math.trunc(parsed)));
+}
+
+function readOptionalQueryString(value: unknown, name: string): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== "string") throw badRequest(`${name} must be a single value`);
+  return value;
+}
+
+function readQueryFlag(value: unknown, name: string): boolean {
+  if (value === undefined || value === "0" || value === "false") return false;
+  if (value === "1" || value === "true") return true;
+  throw badRequest(`${name} must be 1 or 0`);
 }
 
 function readLiveRunsQueryInt(value: unknown, max: number, fallback = 0) {
@@ -7422,6 +7441,35 @@ export function agentRoutes(
     const run = await getAccessibleResource(req, res, heartbeat.getRunLogAccess(runId), "Heartbeat run not found");
     if (!run) return;
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+
+    if (req.query.format !== undefined) {
+      // Claude stream-json view of the same log, with the same access checks
+      // and the same read-time redaction as the raw content below.
+      if (req.query.format !== "claude-stream-json" || !isStreamJsonEnabled()) {
+        throw badRequest("Unsupported log format");
+      }
+      if (req.query.offset !== undefined) {
+        throw badRequest("offset cannot be combined with format; page with after, before or tail");
+      }
+      const meta = await loadRunStreamJsonMeta(db, run.id);
+      if (!meta || meta.companyId !== run.companyId) throw notFound("Heartbeat run not found");
+      const page = await readRunStreamJsonPage(
+        {
+          store: getRunLogStore(),
+          redactString: createStreamJsonStringRedactor(await getCurrentUserRedactionOptions()),
+        },
+        meta,
+        {
+          after: readOptionalQueryString(req.query.after, "after"),
+          before: readOptionalQueryString(req.query.before, "before"),
+          tail: readQueryFlag(req.query.tail, "tail"),
+          limitBytes: req.query.limitBytes === undefined ? undefined : Number(req.query.limitBytes),
+        },
+      );
+      res.set("Cache-Control", "no-cache, no-store");
+      res.json(await runRedactions.redactForRun(run.companyId, run.id, page));
+      return;
+    }
 
     const offset = Number(req.query.offset ?? 0);
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);

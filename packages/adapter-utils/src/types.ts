@@ -581,6 +581,16 @@ export interface ServerAdapterModule {
    * API-key-only vendor) omits it. The capability data holds no secret.
    */
   loginCapability?: import("./login-capability.js").AdapterLoginCapability;
+
+  /**
+   * Optional: translate this adapter's stdout into Claude Code stream-json
+   * for API clients (`format=claude-stream-json` on the run-log API and the
+   * live-events socket). The factory returns operations; the host encodes
+   * them. See `@paperclipai/adapter-utils/stream-json`. Without it the host
+   * wraps each stdout line in a `system/paperclip_raw` line. A value that
+   * fails validation is ignored with a warning.
+   */
+  streamJsonTranslator?: import("./stream-json/types.js").StreamJsonTranslator;
 }
 
 // ---------------------------------------------------------------------------

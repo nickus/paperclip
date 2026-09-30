@@ -14,6 +14,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ServerAdapterModule } from "./types.js";
 import { validateAdapterLoginCapability } from "@paperclipai/adapter-utils";
+import { describeInvalidStreamJsonTranslator } from "@paperclipai/adapter-utils/stream-json";
 import { logger } from "../middleware/logger.js";
 
 import {
@@ -173,6 +174,19 @@ export function validateAdapterModule(mod: unknown, packageName: string): Server
       `createServerAdapter() from "${packageName}" returned an invalid login capability: ` +
         `${err instanceof Error ? err.message : String(err)}`,
     );
+  }
+
+  // An invalid stream-json translator does not reject the adapter: the host
+  // drops it and falls back to raw lines for this adapter's runs.
+  if (adapterModule.streamJsonTranslator !== undefined) {
+    const problem = describeInvalidStreamJsonTranslator(adapterModule.streamJsonTranslator);
+    if (problem) {
+      logger.warn(
+        { packageName, type: adapterModule.type, problem },
+        "Adapter declares an invalid stream-json translator — ignoring it",
+      );
+      delete (adapterModule as { streamJsonTranslator?: unknown }).streamJsonTranslator;
+    }
   }
 
   return adapterModule;

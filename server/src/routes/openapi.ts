@@ -7091,13 +7091,74 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+const heartbeatRunStreamJsonItemSchema = z.object({
+  cursor: z.string().describe("`<translator>@<version>/<sid>/<offset>.<k>`: names the item's first line"),
+  prev: z.string().nullable().describe("Cursor of the previous item, for gap detection"),
+  offset: z.number().int().describe("Byte offset of the source record in the run log"),
+  k: z.number().int().describe("Index of the item's first line among the lines emitted at `offset`"),
+  lines: z.number().int(),
+  seq: z.number().int().nullable(),
+  ts: z.string(),
+  stream: z.enum(["stdout", "stderr", "system"]),
+  chunk: z.string().describe("Complete Claude stream-json lines ending in newlines; raw text for stderr and system items"),
+});
+
+const heartbeatRunStreamJsonPageSchema = registry.register(
+  "HeartbeatRunStreamJsonPage",
+  z.object({
+    runId: z.string(),
+    format: z.literal("claude-stream-json"),
+    translator: z.string(),
+    sid: z.string().describe("Source identity; a new value invalidates earlier cursors"),
+    items: z.array(heartbeatRunStreamJsonItemSchema),
+    nextCursor: z.string().nullable().describe(
+      "Continues in the request's direction: after `after`, the newest item's cursor (the request cursor while " +
+        "caught up), for the next `after`; after `before` or `tail`, the oldest item's cursor, for the next " +
+        "`before`, or null once the page starts at the beginning of the output",
+    ),
+    complete: z.boolean().describe("The run is terminal, its finish was emitted and no item follows this page"),
+    runStatus: z.string(),
+    reset: z.boolean().describe("The request cursor belonged to another translation; items start over"),
+  }),
+);
+
 registry.registerPath({
   method: "get",
   path: "/api/heartbeat-runs/{runId}/log",
   tags: ["runs"],
   summary: "Get log for a heartbeat run",
-  request: { params: z.object({ runId: heartbeatRunIdParamSchema }) },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  description:
+    "Without `format`, returns raw NDJSON run-log content from byte `offset`. With " +
+    "`format=claude-stream-json`, returns the run's output translated to Claude Code " +
+    "stream-json, paged by cursor (`after`, `before` or `tail=1`); `offset` is then " +
+    "rejected. Both formats apply the same access checks and redaction.",
+  request: {
+    params: z.object({ runId: heartbeatRunIdParamSchema }),
+    query: z.object({
+      offset: z.coerce.number().int().min(0).optional().describe("Raw format: byte offset to read from"),
+      limitBytes: z.coerce.number().int().min(1).optional()
+        .describe("Raw format: bytes to read (max 1 MiB). Stream-json: total chunk bytes per page (max 1 MiB, at least one item)"),
+      format: z.enum(["claude-stream-json"]).optional(),
+      after: z.string().max(256).optional().describe("Stream-json: items strictly after this cursor"),
+      before: z.string().max(256).optional().describe("Stream-json: the newest items strictly before this cursor"),
+      tail: z.enum(["0", "1", "true", "false"]).optional().describe("Stream-json: the newest items of the log"),
+    }),
+  },
+  responses: {
+    200: {
+      description: "Raw log content, or a stream-json page with `format=claude-stream-json`",
+      content: {
+        "application/json": {
+          schema: { oneOf: [{ type: "object", additionalProperties: true }, heartbeatRunStreamJsonPageSchema] },
+        },
+      },
+    },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    413: r.payloadTooLarge,
+  },
 });
 
 registry.registerPath({
