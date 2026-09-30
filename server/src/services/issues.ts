@@ -185,6 +185,10 @@ import {
 } from "./recovery/issue-graph-liveness.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { dependencyBlockersAwaitDecision } from "./issue-dependency-wakeups.js";
+import {
+  buildIssueChildrenCompletedWakeIdempotencyKey,
+  findDeliveredIssueChildrenCompletedWake,
+} from "./issue-children-completed-wake.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
@@ -9131,9 +9135,50 @@ export function issueService(db: Db) {
         }));
     },
 
+    /**
+     * The parent whose assignee gets an `issue_children_completed` wake now
+     * that `completedChild` reached `done` or `cancelled`, or null.
+     *
+     * The wake exists for delegation: when the last open direct child of an
+     * active parent becomes terminal, the parent's assignee resumes the parent
+     * (a manager that handed out subtasks picks up their results). It is sent
+     * only while the parent is actually waiting on its children, not on every
+     * child that happens to finish last:
+     *
+     * - The parent is `todo` or `in_progress`. An `in_review` parent waits on
+     *   a reviewer or a human, and a `blocked` parent on its blockers or a
+     *   human. Those paths have their own wakes (interaction and approval
+     *   resolution, review stages, `issue_blockers_resolved`,
+     *   `issue_blockers_cancelled`, unblock requests), and the run they start
+     *   reads the children's state.
+     * - No interaction on the parent is waiting for a human answer that wakes
+     *   the assignee (`continuationPolicy: "wake_assignee"`). That answer is
+     *   the parent's next wake.
+     * - The parent handed the child off: the child was created by the
+     *   parent's assignee, or the assignee has run on the parent since the
+     *   child was created. A child that appeared under an idle parent, such
+     *   as a routine execution under its standing parent issue, is not
+     *   something the parent waits on.
+     * - At most once per child and parent waiting cycle (see
+     *   `buildIssueChildrenCompletedWakeIdempotencyKey`). A child that is
+     *   closed, reopened and closed again before the assignee has run on the
+     *   parent again wakes it once.
+     *
+     * A queued or running run of the assignee on the parent needs no check
+     * here: heartbeat merges the wake into that run.
+     *
+     * When the completed child blocks the parent, the parent waits on it
+     * through the blocker relation and the result has
+     * `completedChildBlocksParent` set. The dependency wake
+     * (`issue_blockers_resolved`, or `issue_blockers_cancelled` for a
+     * cancelled blocker) already wakes the parent, so callers must not send a
+     * second wake; the native status committer folds the child summaries into
+     * that single dependency wake instead, keyed like the dependency wake
+     * (`buildIssueBlockersResolvedWakeStateKey`), not with `idempotencyKey`.
+     */
     getWakeableParentAfterChildCompletion: async (
       parentIssueId: string,
-      completedChildResult?: { issueId: string; summary: string | null } | null,
+      completedChild: { issueId: string; summary?: string | null },
     ) => {
       const parent = await db
         .select({
@@ -9149,6 +9194,7 @@ export function issueService(db: Db) {
       if (!parent || parent.conversationAgentId || !parent.assigneeAgentId || ["backlog", "done", "cancelled"].includes(parent.status)) {
         return null;
       }
+      const assigneeAgentId = parent.assigneeAgentId;
 
       const children = await db
         .select({
@@ -9176,6 +9222,97 @@ export function issueService(db: Db) {
         )
       ) {
         return null;
+      }
+
+      const completedChildBlocksParent = await db
+        .select({ issueId: issueRelations.issueId })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, parent.companyId),
+            eq(issueRelations.issueId, completedChild.issueId),
+            eq(issueRelations.relatedIssueId, parent.id),
+            eq(issueRelations.type, "blocks"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0);
+      if (
+        !completedChildBlocksParent &&
+        parent.status !== "todo" &&
+        parent.status !== "in_progress"
+      ) {
+        return null;
+      }
+
+      // The assignee's latest finished run on the parent. The parent's
+      // current waiting cycle starts when that run ends.
+      const lastParentRun = await db
+        .select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, parent.companyId),
+            eq(heartbeatRuns.agentId, assigneeAgentId),
+            isNotNull(heartbeatRuns.finishedAt),
+            sql`(
+              ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${parent.id}
+              or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${parent.id}
+            )`,
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      const idempotencyKey = buildIssueChildrenCompletedWakeIdempotencyKey({
+        parentIssueId: parent.id,
+        completedChildIssueId: completedChild.issueId,
+        parentWaitingCycle: lastParentRun?.id ?? null,
+      });
+
+      if (!completedChildBlocksParent) {
+        const pendingHumanAnswer = await db
+          .select({ id: issueThreadInteractions.id })
+          .from(issueThreadInteractions)
+          .where(
+            and(
+              eq(issueThreadInteractions.companyId, parent.companyId),
+              eq(issueThreadInteractions.issueId, parent.id),
+              eq(issueThreadInteractions.status, "pending"),
+              eq(issueThreadInteractions.continuationPolicy, "wake_assignee"),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (pendingHumanAnswer) return null;
+
+        const child = await db
+          .select({
+            createdAt: issues.createdAt,
+            createdByAgentId: issues.createdByAgentId,
+          })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, parent.companyId),
+              eq(issues.id, completedChild.issueId),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        const handedOff =
+          !!child &&
+          (child.createdByAgentId === assigneeAgentId ||
+            (!!lastParentRun?.finishedAt &&
+              lastParentRun.finishedAt.getTime() >= child.createdAt.getTime()));
+        if (!handedOff) return null;
+
+        const delivered = await findDeliveredIssueChildrenCompletedWake(db, {
+          companyId: parent.companyId,
+          parentIssueId: parent.id,
+          agentId: assigneeAgentId,
+          idempotencyKey,
+        });
+        if (delivered) return null;
       }
 
       const childIdsForSummaries = children
@@ -9210,8 +9347,8 @@ export function issueService(db: Db) {
         .map((child) => ({
           ...child,
           summary: truncateInlineSummary(
-            child.id === completedChildResult?.issueId
-              ? (completedChildResult.summary ??
+            child.id === completedChild.issueId
+              ? (completedChild.summary ??
                   latestCommentByIssueId.get(child.id))
               : latestCommentByIssueId.get(child.id),
           ),
@@ -9219,11 +9356,13 @@ export function issueService(db: Db) {
 
       return {
         id: parent.id,
-        assigneeAgentId: parent.assigneeAgentId,
+        assigneeAgentId,
         childIssueIds: children.map((child) => child.id),
         childIssueSummaries,
         childIssueSummaryTruncated:
           children.length > childIssueSummaries.length,
+        completedChildBlocksParent,
+        idempotencyKey,
       };
     },
 
