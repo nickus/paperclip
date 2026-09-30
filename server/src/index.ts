@@ -1823,6 +1823,7 @@ async function startServerWithDatabaseTeardown(
                 reconciled.assignmentDispatched > 0 ||
                 reconciled.dispatchRequeued > 0 ||
                 reconciled.continuationRequeued > 0 ||
+                reconciled.returnedToRest > 0 ||
                 reconciled.successfulRunHandoffEscalated > 0 ||
                 reconciled.successfulRunHandoffRetried > 0 ||
                 reconciled.escalated > 0

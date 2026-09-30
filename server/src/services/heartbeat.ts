@@ -578,6 +578,11 @@ import {
 } from "./recovery/stranded-notice.js";
 import { withRecoveryContext } from "./recovery/status-only-context.js";
 import {
+  HARNESS_CHECKOUT_FROM_STATUS_KEY,
+  HARNESS_CHECKOUT_STATUS_VERSION_KEY,
+  harnessCheckoutOrigin,
+} from "./recovery/legacy-continuation.js";
+import {
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
   recoveryService,
 } from "./recovery/service.js";
@@ -11172,6 +11177,7 @@ export function heartbeatService(
         title: issues.title,
         description: issues.description,
         status: issues.status,
+        statusVersion: issues.statusVersion,
         workMode: issues.workMode,
         reviewPolicy: issues.reviewPolicy,
         priority: issues.priority,
@@ -21389,13 +21395,20 @@ export function heartbeatService(
         })
       ) {
         try {
-          await issuesSvc.checkout(
+          const checkedOut = await issuesSvc.checkout(
             issueId,
             agent.id,
             ["todo", "backlog", "blocked"],
             run.id,
           );
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
+          // Record the status this checkout moved the issue out of, so a run
+          // that records no status of its own can return the issue there.
+          const origin = harnessCheckoutOrigin(issueContext, checkedOut);
+          if (origin) {
+            context[HARNESS_CHECKOUT_FROM_STATUS_KEY] = origin.fromStatus;
+            context[HARNESS_CHECKOUT_STATUS_VERSION_KEY] = origin.statusVersion;
+          }
         } catch (error) {
           if (!isCheckoutConflictError(error)) throw error;
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = false;

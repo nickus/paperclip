@@ -4,7 +4,8 @@ import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import {
   decideLegacyContinuation, legacyDispositionEpisode, legacyDispositionFingerprint,
-  LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
+  HARNESS_CHECKOUT_FROM_STATUS_KEY, HARNESS_CHECKOUT_STATUS_VERSION_KEY, HARNESS_REST_STATUSES,
+  LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type HarnessRestStatus, type LegacyDispositionEpisode,
 } from "./legacy-continuation.js";
 import { hasLiveLegacyController } from "../legacy-controller-lease.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -928,6 +929,8 @@ export function recoveryService(
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    /** Test seam: runs after a rest decision, before the locked rest write. */
+    beforeReturnToRestWrite?: (issueId: string) => Promise<void>;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -3690,6 +3693,45 @@ export function recoveryService(
     return updated;
   }
 
+  /**
+   * The resting status the harness checked this issue out of, when no status
+   * has been recorded since. Status and ownership changes both bump
+   * `statusVersion`, so an exact match with the version the checkout produced
+   * proves nothing has decided a status since, whichever of the agent's later
+   * runs on the issue is finishing now.
+   */
+  async function harnessCheckoutRestStatus(
+    issue: typeof issues.$inferSelect,
+    agentId: string,
+  ): Promise<HarnessRestStatus | null> {
+    if (issue.status !== "in_progress") return null;
+    const [origin] = await db
+      .select({ fromStatus: sql<string>`${heartbeatRuns.contextSnapshot} ->> ${sql.raw(`'${HARNESS_CHECKOUT_FROM_STATUS_KEY}'`)}` })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, issue.companyId),
+        eq(heartbeatRuns.agentId, agentId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+        sql`${heartbeatRuns.contextSnapshot} ->> ${sql.raw(`'${HARNESS_CHECKOUT_STATUS_VERSION_KEY}'`)} = ${String(issue.statusVersion)}`,
+      ))
+      .limit(1);
+    const fromStatus = origin?.fromStatus;
+    return HARNESS_REST_STATUSES.find((status) => status === fromStatus) ?? null;
+  }
+
+  /**
+   * The continuation gates stored on the issue row itself. Every writer of
+   * these columns updates the row, so a check made while holding the row lock
+   * sees the committed value (see returnIssueToRest).
+   */
+  function issueRowContinuationGates(issue: typeof issues.$inferSelect) {
+    return {
+      pendingWait: parseIssueExecutionState(issue.executionState)?.status === "pending" || Boolean(issue.monitorNextCheckAt),
+      ownedLifecycle: isPluginManagedIssueLifecycle(issue),
+      conversation: Boolean(issue.conversationAgentId) || isWaitingConversation(issue),
+    };
+  }
+
   async function decidePersistedLegacyContinuation(
     issue: typeof issues.$inferSelect,
     runId: string,
@@ -3705,7 +3747,7 @@ export function recoveryService(
     if ((readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId)) !== issue.id) {
       return { kind: "skip" as const, reason: "invalid_issue_binding" };
     }
-    const [agent, pause, budget, stop, active, routine, goal, latest, durableWait, workspaceChildren] = await Promise.all([
+    const [agent, pause, budget, stop, active, routine, goal, latest, durableWait, workspaceChildren, restStatus] = await Promise.all([
       getAgent(run.agentId),
       isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc),
       isInvocationBudgetBlocked(issue, run.agentId),
@@ -3716,20 +3758,22 @@ export function recoveryService(
       getLatestIssueRun(issue.companyId, issue.id),
       hasPersistedDurableWaitPath(issue, run),
       parseObject(context.paperclipWorkspace).mode === "shared_workspace" ? healthyOpenChildIssues(issue, true) : Promise.resolve([]),
+      harnessCheckoutRestStatus(issue, run.agentId),
     ]);
     const ownsRepair = active?.kind === "deliberate_wait_without_target" && active.ownerType === "agent";
+    const rowGates = issueRowContinuationGates(issue);
     return decideLegacyContinuation({
-      run, issue, agent, episode,
+      run, issue, agent, episode, restStatus,
       gates: {
         stopped: stop.kind !== "clear" || isOperatorCancelledRun(run, run.agentId),
         paused: pause, budgetBlocked: budget,
-        pendingWait: state.hasDurableWaitingPath || durableWait || parseIssueExecutionState(issue.executionState)?.status === "pending" || Boolean(issue.monitorNextCheckAt),
+        pendingWait: state.hasDurableWaitingPath || durableWait || rowGates.pendingWait,
         activeExecution: state.hasActiveExecutionPath || latest?.id !== (dispatchRunId ?? run.id),
         ownedLifecycle: run.issueCommentStatus === "retry_queued" || run.issueCommentStatus === "retry_exhausted" ||
           Boolean(readNonEmptyString(context.goalControlRequestId)) || context.resumeSessionGoalHeartbeat === true ||
-          isPluginManagedIssueLifecycle(issue) || routine.length > 0 || workspaceChildren.length > 0 ||
+          rowGates.ownedLifecycle || routine.length > 0 || workspaceChildren.length > 0 ||
           Boolean(goal[0]?.status && goal[0].status !== "complete") || Boolean(active && !ownsRepair),
-        conversation: Boolean(issue.conversationAgentId) || isWaitingConversation(issue),
+        conversation: rowGates.conversation,
         agentInvokable: Boolean(agent && await isAgentInvokable(agent) && isHeartbeatWakeOnDemandEnabled(agent)),
       },
     });
@@ -3754,7 +3798,9 @@ export function recoveryService(
     // This slot has already been reserved. Check admission for that slot rather
     // than allocating or charging another repair attempt during dispatch.
     const decision = await decidePersistedLegacyContinuation(issue, source.id, state, { ...episode, attempt: episode.attempt - 1 }, run.id);
-    return decision.kind === "enqueue" ? null : decision.kind === "skip" ? decision.reason : "repair_exhausted";
+    // A reserved repair slot predates any rest evidence; cancelling it here
+    // would leave the issue in_progress behind a cancelled run, so let it run.
+    return decision.kind === "enqueue" || decision.kind === "rest" ? null : decision.kind === "skip" ? decision.reason : "repair_exhausted";
   }
 
   async function reconcileLegacyContinuation(runId: string) {
@@ -3772,7 +3818,7 @@ export function recoveryService(
     issue: typeof issues.$inferSelect,
     latestRun: LatestIssueRun,
     options: { historicalAttemptCount?: number; legacyEpisode?: LegacyDispositionEpisode } = {},
-  ): Promise<"queued" | "escalated" | "covered" | "skipped"> {
+  ): Promise<"queued" | "escalated" | "covered" | "rested" | "skipped"> {
     const current = await db
       .select()
       .from(issues)
@@ -3805,6 +3851,7 @@ export function recoveryService(
       if (!latestRun) return "skipped";
       const decision = await decidePersistedLegacyContinuation(current, latestRun.id, state, episode);
       if (decision.kind === "skip") return "skipped";
+      if (decision.kind === "rest") return returnIssueToRest(current, latestRun, decision.status);
       state.fingerprint = legacyDispositionFingerprint(current.companyId, current.id, latestRun.agentId, episode.id);
     }
     if (state.hasActiveExecutionPath) return "skipped";
@@ -3907,6 +3954,85 @@ export function recoveryService(
       });
     }
     return scheduled ? "queued" : "skipped";
+  }
+
+  /**
+   * Return an issue the harness checked out of a resting status back to it.
+   *
+   * Rechecked under the issue row lock: a status or owner change, a live run
+   * or queued wake, a durable wait, or any gate stored on the issue row
+   * (monitor, pending execution stage, conversation) committed since the
+   * decision keeps the issue where it is.
+   *
+   * The gates kept in other tables (stop, pause hold, budget, agent
+   * invokability, routine/goal/child lifecycles) are evaluated once, by the
+   * decision just before this call, and are not re-derived here. Their
+   * writers do not take this row lock, so re-reading them would narrow the
+   * window without closing it. In this decision each of them only holds back
+   * a repair wake, and resting wakes no one: it restores the status the
+   * harness checkout moved the issue out of. The repair path rechecks the
+   * same gates again at dispatch because a repair can sit queued, or wait out
+   * a retry backoff, before it runs; resting has no such gap.
+   */
+  async function returnIssueToRest(
+    issue: typeof issues.$inferSelect,
+    latestRun: NonNullable<LatestIssueRun>,
+    status: HarnessRestStatus,
+  ): Promise<"rested" | "skipped"> {
+    await deps.beforeReturnToRestWrite?.(issue.id);
+    const publications: ActivityPublication[] = [];
+    const postCommitActions: IssuePostCommitAction[] = [];
+    const rested = await db.transaction(async (tx) => {
+      const locked = await tx
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)))
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (
+        !locked ||
+        locked.status !== "in_progress" ||
+        locked.statusVersion !== issue.statusVersion ||
+        locked.assigneeAgentId !== issue.assigneeAgentId ||
+        locked.assigneeUserId
+      )
+        return false;
+      const rowGates = issueRowContinuationGates(locked);
+      if (rowGates.pendingWait || rowGates.ownedLifecycle || rowGates.conversation) return false;
+      const paths = await collectDispositionRepairSourceState(tx as unknown as Db, { issue: locked });
+      if (paths.hasActiveExecutionPath || paths.hasDurableWaitingPath) return false;
+      const updated = await issuesSvc.update(locked.id, { status }, tx, publications, postCommitActions);
+      if (!updated) return false;
+      await logActivity(
+        tx as unknown as Db,
+        {
+          companyId: locked.companyId,
+          actorType: "system",
+          actorId: "recovery",
+          agentId: null,
+          runId: latestRun.id,
+          action: "issue.returned_to_rest",
+          entityType: "issue",
+          entityId: locked.id,
+          details: {
+            identifier: locked.identifier,
+            status,
+            previousStatus: locked.status,
+            reason: "harness_checkout_without_status_decision",
+            latestRunId: latestRun.id,
+            assigneeAgentId: locked.assigneeAgentId,
+          },
+        },
+        publications,
+      );
+      return true;
+    });
+    if (!rested) return "skipped";
+    for (const publication of publications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, postCommitActions);
+    await resolveDispositionRepairActionAsCovered(issue, "returned_to_rest");
+    return "rested";
   }
 
   async function escalateStrandedAssignedIssue(input: {
@@ -4373,6 +4499,7 @@ export function recoveryService(
       dispatchRequeued: 0,
       continuationRequeued: 0,
       dispositionRepairRequeued: 0,
+      returnedToRest: 0,
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
@@ -4489,6 +4616,9 @@ export function recoveryService(
             result.issueIds.push(issue.id);
           } else if (outcome === "escalated") {
             result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else if (outcome === "rested") {
+            result.returnedToRest += 1;
             result.issueIds.push(issue.id);
           } else result.skipped += 1;
           continue;
