@@ -13,6 +13,7 @@ import {
   createCommandManagedSandboxCallbackBridgeQueueClient,
   createFileSystemSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAsset,
+  createSandboxCallbackBridgeAuthorizer,
   createSandboxCallbackBridgeToken,
   getSandboxBridgeProcessBodyLedgerSource,
   getSandboxCallbackBridgeServerSource,
@@ -1007,11 +1008,11 @@ describe("sandbox callback bridge", () => {
     });
     expect(nonJsonResponse.status).toBe(415);
     await expect(nonJsonResponse.json()).resolves.toEqual({
-      error: "Bridge only accepts JSON request bodies.",
+      error: "Bridge only accepts JSON request bodies, or multipart/form-data for file uploads.",
     });
 
-    // The queue transport keeps its 415 gate for the attachment upload path
-    // too: it carries a string envelope only, so it never admits a binary body.
+    // A raw binary body is neither JSON nor multipart, so it gets the same
+    // 415 on the attachment upload path.
     const attachmentOctetStreamResponse = await fetch(
       `${bridge.baseUrl}/api/companies/co-1/issues/issue-1/attachments`,
       {
@@ -1025,7 +1026,7 @@ describe("sandbox callback bridge", () => {
     );
     expect(attachmentOctetStreamResponse.status).toBe(415);
     await expect(attachmentOctetStreamResponse.json()).resolves.toEqual({
-      error: "Bridge only accepts JSON request bodies.",
+      error: "Bridge only accepts JSON request bodies, or multipart/form-data for file uploads.",
     });
   });
 
@@ -3873,6 +3874,7 @@ describe("sandbox callback bridge", () => {
   async function startQueueGatewayForFileTest(options: {
     maxBodyBytes: number;
     client?: SandboxCallbackBridgeQueueClient;
+    authorizeRequest?: Parameters<typeof startSandboxCallbackBridgeWorker>[0]["authorizeRequest"];
     handleRequest: Parameters<typeof startSandboxCallbackBridgeWorker>[0]["handleRequest"];
   }) {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-file-codec-"));
@@ -3884,6 +3886,7 @@ describe("sandbox callback bridge", () => {
     const worker = await startSandboxCallbackBridgeWorker({
       client: options.client ?? createFileSystemSandboxCallbackBridgeQueueClient(), queueDir,
       maxBodyBytes: options.maxBodyBytes, handleRequest: options.handleRequest, pollIntervalMs: 10,
+      authorizeRequest: options.authorizeRequest,
     });
     cleanupFns.push(() => worker.stop());
     const gateway = await startSandboxCallbackBridgeServer({
@@ -3944,6 +3947,116 @@ describe("sandbox callback bridge", () => {
     expect(response.status).toBe(409);
     expect(response.headers.get("x-paperclip-bridge-outcome")).toBe("indeterminate");
     await expect(response.json()).resolves.toMatchObject({ retryable: false, outcome: "indeterminate" });
+    expect(handled).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes bodiless writes on the queue path to the route policy instead of rejecting them with 415", async () => {
+    const handled = vi.fn(async (_request: { method: string; path: string; body: string | Buffer }) => ({
+      status: 200, headers: { "content-type": "application/json" }, body: JSON.stringify({ ok: true }),
+    }));
+    const gateway = await startQueueGatewayForFileTest({
+      maxBodyBytes: 1024,
+      handleRequest: handled,
+      authorizeRequest: createSandboxCallbackBridgeAuthorizer({ policy: "agent", companyId: "co-1" }),
+    });
+    const authorization = `Bearer ${gateway.bridgeToken}`;
+
+    // fetch sends a body-less DELETE with neither Content-Length nor
+    // Transfer-Encoding, and a body-less POST with Content-Length: 0. Neither
+    // carries a content type.
+    const bareDelete = await fetch(`${gateway.baseUrl}/api/routines/routine-1`, {
+      method: "DELETE", headers: { authorization },
+    });
+    expect(bareDelete.status).toBe(200);
+    const emptyPost = await fetch(`${gateway.baseUrl}/api/issues/issue-1/checkout`, {
+      method: "POST", headers: { authorization },
+    });
+    expect(emptyPost.status).toBe(200);
+    expect(handled).toHaveBeenCalledTimes(2);
+    expect(handled.mock.calls.map(([request]) => [request.method, request.path, request.body])).toEqual([
+      ["DELETE", "/api/routines/routine-1", ""],
+      ["POST", "/api/issues/issue-1/checkout", ""],
+    ]);
+
+    // A bodiless request to a route the policy refuses gets the policy's own
+    // 403, so the caller learns the real reason.
+    const deniedDelete = await fetch(`${gateway.baseUrl}/api/issues/issue-1`, {
+      method: "DELETE", headers: { authorization },
+    });
+    expect(deniedDelete.status).toBe(403);
+    await expect(deniedDelete.json()).resolves.toMatchObject({
+      error: expect.stringContaining("Route not allowed"),
+    });
+    expect(handled).toHaveBeenCalledTimes(2);
+
+    // A body still needs a content type the queue transport can carry.
+    const textBody = await fetch(`${gateway.baseUrl}/api/issues/issue-1/checkout`, {
+      method: "POST", headers: { authorization, "content-type": "text/plain" }, body: "not json",
+    });
+    expect(textBody.status).toBe(415);
+    expect(handled).toHaveBeenCalledTimes(2);
+  });
+
+  it("forwards the steward policy's file deletes through the queue gateway", async () => {
+    const handled = vi.fn(async (_request: { method: string; path: string; query: string; body: string | Buffer }) => ({
+      status: 200, headers: { "content-type": "application/json" }, body: JSON.stringify({ ok: true }),
+    }));
+    const gateway = await startQueueGatewayForFileTest({
+      maxBodyBytes: 1024,
+      handleRequest: handled,
+      authorizeRequest: createSandboxCallbackBridgeAuthorizer({ policy: "steward", companyId: "co-1" }),
+    });
+    const authorization = `Bearer ${gateway.bridgeToken}`;
+
+    // The instruction file delete names its file in the query and has no body.
+    const instructionDelete = await fetch(
+      `${gateway.baseUrl}/api/agents/agent-2/instructions-bundle/file?path=notes.md`,
+      { method: "DELETE", headers: { authorization } },
+    );
+    expect(instructionDelete.status).toBe(200);
+    // The skill file delete names its file in a JSON body.
+    const skillDelete = await fetch(`${gateway.baseUrl}/api/companies/co-1/skills/skill-1/files`, {
+      method: "DELETE",
+      headers: { authorization, "content-type": "application/json" },
+      body: JSON.stringify({ path: "references/old.md" }),
+    });
+    expect(skillDelete.status).toBe(200);
+    expect(handled.mock.calls.map(([request]) => [request.method, request.path, request.query, request.body])).toEqual([
+      ["DELETE", "/api/agents/agent-2/instructions-bundle/file", "?path=notes.md", ""],
+      ["DELETE", "/api/companies/co-1/skills/skill-1/files", "", JSON.stringify({ path: "references/old.md" })],
+    ]);
+  });
+
+  it("carries multipart bodies to any route on the queue path and lets the route policy decide", async () => {
+    const handled = vi.fn(async (request: { body?: string | Buffer }) => ({
+      status: 201, headers: { "content-type": "application/octet-stream" }, body: Buffer.from(request.body ?? ""),
+    }));
+    const gateway = await startQueueGatewayForFileTest({
+      maxBodyBytes: 1024,
+      handleRequest: handled,
+      authorizeRequest: createSandboxCallbackBridgeAuthorizer({ policy: "agent", companyId: "co-1" }),
+    });
+    const bytes = Buffer.from([0x2d, 0x2d, 0x62, 0x0d, 0x0a, 0xff, 0x00, 0x89]);
+    const upload = (routePath: string) => fetch(`${gateway.baseUrl}${routePath}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${gateway.bridgeToken}`,
+        "content-type": "multipart/form-data; boundary=b",
+      },
+      body: new Uint8Array(bytes),
+    });
+
+    // A route the policy forwards receives the exact bytes.
+    const forwarded = await upload("/api/issues/issue-1/attachments");
+    expect(forwarded.status).toBe(201);
+    expect(Buffer.from(await forwarded.arrayBuffer())).toEqual(bytes);
+    expect(handled).toHaveBeenCalledTimes(1);
+    expect(handled.mock.calls[0]![0]).toMatchObject({ method: "POST", path: "/api/issues/issue-1/attachments" });
+
+    // A route the policy refuses answers with the policy's 403, not a 415.
+    const denied = await upload("/api/companies/co-1/imports/preview");
+    expect(denied.status).toBe(403);
+    await expect(denied.json()).resolves.toMatchObject({ error: expect.stringContaining("Route not allowed") });
     expect(handled).toHaveBeenCalledTimes(1);
   });
 

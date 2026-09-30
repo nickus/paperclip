@@ -1066,9 +1066,16 @@ const startAdapterLoginSessionSchema =
     adapterType: true,
   });
 
+// Environment, lease, custom image setup session and company keys are UUIDs,
+// and the environment routes answer any other id with 400. OpenAPI patterns
+// carry no RegExp flags, so spell out both cases.
+const environmentRouteUuidParamSchema = z.string()
+  .regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/)
+  .describe("UUID; malformed values return 400");
+
 const environmentCustomImageCompanyQuerySchema = z
   .object({
-    companyId: z.string().optional(),
+    companyId: environmentRouteUuidParamSchema.optional(),
   })
   .strict();
 
@@ -8165,7 +8172,7 @@ registry.registerPath({
   tags: ["environments"],
   summary: "Create an environment",
   request: {
-    params: z.object({ companyId: z.string() }),
+    params: z.object({ companyId: environmentRouteUuidParamSchema }),
     body: jsonBody(createEnvironmentSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
@@ -8176,8 +8183,8 @@ registry.registerPath({
   path: "/api/environments/{id}",
   tags: ["environments"],
   summary: "Get an environment",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+  request: { params: z.object({ id: environmentRouteUuidParamSchema }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
 });
 
 registry.registerPath({
@@ -8185,9 +8192,10 @@ registry.registerPath({
   path: "/api/environments/{id}/delete-blast-radius",
   tags: ["environments"],
   summary: "Get environment delete blast radius",
-  request: { params: z.object({ id: z.string() }) },
+  request: { params: z.object({ id: environmentRouteUuidParamSchema }) },
   responses: {
     200: r.ok(),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
@@ -8200,9 +8208,10 @@ registry.registerPath({
   tags: ["environments"],
   summary:
     "Describe an environment's config secret refs (name, status, owning company — never values)",
-  request: { params: z.object({ id: z.string() }) },
+  request: { params: z.object({ id: environmentRouteUuidParamSchema }) },
   responses: {
     200: r.ok(),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
@@ -8214,8 +8223,8 @@ registry.registerPath({
   path: "/api/environments/{id}/leases",
   tags: ["environments"],
   summary: "List leases for an environment",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  request: { params: z.object({ id: environmentRouteUuidParamSchema }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -8223,8 +8232,8 @@ registry.registerPath({
   path: "/api/environment-leases/{leaseId}",
   tags: ["environments"],
   summary: "Get an environment lease",
-  request: { params: z.object({ leaseId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+  request: { params: z.object({ leaseId: environmentRouteUuidParamSchema }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
 });
 
 registry.registerPath({
@@ -8233,7 +8242,7 @@ registry.registerPath({
   tags: ["environments"],
   summary: "Update an environment",
   request: {
-    params: z.object({ id: z.string() }),
+    params: z.object({ id: environmentRouteUuidParamSchema }),
     body: jsonBody(updateEnvironmentSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
@@ -8244,9 +8253,10 @@ registry.registerPath({
   path: "/api/environments/{id}",
   tags: ["environments"],
   summary: "Delete an environment",
-  request: { params: z.object({ id: z.string() }) },
+  request: { params: z.object({ id: environmentRouteUuidParamSchema }) },
   responses: {
     200: r.ok(),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
@@ -8259,8 +8269,8 @@ registry.registerPath({
   path: "/api/environments/{id}/probe",
   tags: ["environments"],
   summary: "Probe an environment",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  request: { params: z.object({ id: environmentRouteUuidParamSchema }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -8269,7 +8279,7 @@ registry.registerPath({
   tags: ["environments"],
   summary: "Probe environment config",
   request: {
-    params: z.object({ companyId: z.string() }),
+    params: z.object({ companyId: environmentRouteUuidParamSchema }),
     body: jsonBody(probeEnvironmentConfigSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
@@ -8282,11 +8292,12 @@ registry.registerPath({
   summary:
     "Get the active customImage template and setup status for an environment",
   request: {
-    params: z.object({ environmentId: z.string() }),
+    params: z.object({ environmentId: environmentRouteUuidParamSchema }),
     query: environmentCustomImageCompanyQuerySchema,
   },
   responses: {
     200: r.ok(environmentCustomImageOverviewSchema),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
   },
@@ -8298,7 +8309,7 @@ registry.registerPath({
   tags: ["environments"],
   summary: "Start an interactive environment customImage setup session",
   request: {
-    params: z.object({ environmentId: z.string() }),
+    params: z.object({ environmentId: environmentRouteUuidParamSchema }),
     query: environmentCustomImageCompanyQuerySchema,
     body: jsonBody(startEnvironmentCustomImageSetupSessionSchema),
   },
@@ -8316,9 +8327,10 @@ registry.registerPath({
   path: "/api/environment-custom-image-setup-sessions/{sessionId}",
   tags: ["environments"],
   summary: "Get and refresh an environment customImage setup session",
-  request: { params: z.object({ sessionId: z.string() }) },
+  request: { params: z.object({ sessionId: environmentRouteUuidParamSchema }) },
   responses: {
     200: r.ok(environmentCustomImageSetupSessionResultSchema),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
@@ -8332,7 +8344,7 @@ registry.registerPath({
   summary:
     "Mint a short-lived terminal websocket token for a customImage SSH setup session",
   request: {
-    params: z.object({ sessionId: z.string() }),
+    params: z.object({ sessionId: environmentRouteUuidParamSchema }),
     body: jsonBody(createEnvironmentCustomImageTerminalSessionTokenSchema),
   },
   responses: {
@@ -8352,7 +8364,7 @@ registry.registerPath({
   tags: ["environments"],
   summary: "Capture and promote an environment customImage setup session",
   request: {
-    params: z.object({ sessionId: z.string() }),
+    params: z.object({ sessionId: environmentRouteUuidParamSchema }),
     body: jsonBody(finishEnvironmentCustomImageSetupSessionSchema),
   },
   responses: {
@@ -8371,7 +8383,7 @@ registry.registerPath({
   tags: ["environments"],
   summary: "Cancel an environment customImage setup session",
   request: {
-    params: z.object({ sessionId: z.string() }),
+    params: z.object({ sessionId: environmentRouteUuidParamSchema }),
     body: jsonBody(cancelEnvironmentCustomImageSetupSessionSchema),
   },
   responses: {
@@ -8390,11 +8402,12 @@ registry.registerPath({
   summary:
     "Roll back an environment customImage template to the previous captured template",
   request: {
-    params: z.object({ environmentId: z.string() }),
+    params: z.object({ environmentId: environmentRouteUuidParamSchema }),
     query: environmentCustomImageCompanyQuerySchema,
   },
   responses: {
     200: r.ok(environmentCustomImageTemplateRollbackResultSchema),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
@@ -8408,7 +8421,7 @@ registry.registerPath({
   summary:
     "Relink a detached environment customImage template to the current config",
   request: {
-    params: z.object({ environmentId: z.string() }),
+    params: z.object({ environmentId: environmentRouteUuidParamSchema }),
     query: environmentCustomImageCompanyQuerySchema,
     body: jsonBody(relinkEnvironmentCustomImageTemplateSchema),
   },
@@ -8428,11 +8441,12 @@ registry.registerPath({
   tags: ["environments"],
   summary: "Disable the active environment customImage template",
   request: {
-    params: z.object({ environmentId: z.string() }),
+    params: z.object({ environmentId: environmentRouteUuidParamSchema }),
     query: disableEnvironmentCustomImageTemplateQuerySchema,
   },
   responses: {
     200: r.ok(environmentCustomImageTemplateSchema),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,

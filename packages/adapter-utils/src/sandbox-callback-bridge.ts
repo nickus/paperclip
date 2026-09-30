@@ -713,10 +713,10 @@ export const STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRou
 
 /**
  * The writes the `steward` policy forwards on top of the `agent` allow rules,
- * and nothing more: replacing another agent's instructions bundle settings or
- * one of its instruction files, creating a company skill, and editing a
- * company skill file. Assigning skills to an agent (`skills/sync`) is already
- * on the `agent` list. Deleting instruction files, skill imports, catalog
+ * and nothing more: replacing another agent's instructions bundle settings,
+ * writing or deleting one of its instruction files, creating a company skill,
+ * and editing or deleting a company skill file. Assigning skills to an agent
+ * (`skills/sync`) is already on the `agent` list. Skill imports, catalog
  * installs, skill deletes and skill metadata or sharing changes stay refused.
  *
  * The policy is meant for the environment of one dedicated reviewer agent.
@@ -728,9 +728,9 @@ export const STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES: readonly AgentBridgeRou
  */
 export const STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRouteRule[] = [
   { methods: ["PATCH"], path: /^\/api\/agents\/[^/]+\/instructions-bundle$/ },
-  { methods: ["PUT"], path: /^\/api\/agents\/[^/]+\/instructions-bundle\/file$/ },
+  { methods: ["PUT", "DELETE"], path: /^\/api\/agents\/[^/]+\/instructions-bundle\/file$/ },
   { methods: ["POST"], path: new RegExp(`${COMPANY}\\/skills$`) },
-  { methods: ["PATCH"], path: new RegExp(`${COMPANY}\\/skills\\/[^/]+\\/files$`) },
+  { methods: ["PATCH", "DELETE"], path: new RegExp(`${COMPANY}\\/skills\\/[^/]+\\/files$`) },
 ];
 
 function agentPolicyRouteMatches(rules: readonly AgentBridgeRouteRule[], method: string, path: string): boolean {
@@ -2953,11 +2953,24 @@ async function runFileGateway() {
 
       const url = new URL(req.url || "/", "http://127.0.0.1");
       const contentType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
-      const multipartAttachment = req.method === "POST"
-        && /^\\/api\\/companies\\/[^/]+\\/issues\\/[^/]+\\/attachments$/.test(url.pathname)
-        && /^multipart\\/form-data(?:;|$)/i.test(contentType);
-      if (req.method && req.method !== "GET" && req.method !== "HEAD" && !/json/i.test(contentType) && !multipartAttachment) {
-        writeJsonResponse(res, 415, { error: "Bridge only accepts JSON request bodies." });
+      // Multipart bodies travel as raw bytes, so a file upload reaches the
+      // host byte for byte. Which routes accept one is the host policy's and
+      // the API's decision, not this gateway's.
+      const multipart = /^multipart\\/form-data(?:;|$)/i.test(contentType);
+      // A request with neither Content-Length nor Transfer-Encoding has no
+      // body (RFC 9112, section 6.3), and neither has one with Content-Length
+      // 0. Such a request (a bare DELETE, or a POST action with no payload)
+      // needs no content type, so it goes on to the route policy and the API
+      // instead of failing here.
+      const declaresBody = req.headers["transfer-encoding"] !== undefined
+        || Number(req.headers["content-length"] || 0) > 0;
+      if (
+        req.method && req.method !== "GET" && req.method !== "HEAD"
+        && declaresBody && !/json/i.test(contentType) && !multipart
+      ) {
+        writeJsonResponse(res, 415, {
+          error: "Bridge only accepts JSON request bodies, or multipart/form-data for file uploads.",
+        });
         return;
       }
       const requestId = randomUUID();
@@ -2974,7 +2987,7 @@ async function runFileGateway() {
         path: url.pathname,
         query: url.search,
         headers: normalizeHeaders(req.headers),
-        ...encodeSandboxBridgeBody(multipartAttachment ? requestBody : requestBody.toString("utf8"), maxBodyBytes),
+        ...encodeSandboxBridgeBody(multipart ? requestBody : requestBody.toString("utf8"), maxBodyBytes),
         createdAt: new Date().toISOString(),
       };
       const requestPath = path.posix.join(requestsDir, \`\${requestId}.json\`);

@@ -91,8 +91,14 @@ async function handleMcpGatewayProtocol(
       });
       return;
     }
-    if (body.method === "notifications/initialized") {
+    // Notifications get no JSON-RPC response. The Streamable HTTP transport
+    // acknowledges an accepted one with 202 and no body.
+    if (typeof body.method === "string" && body.method.startsWith("notifications/")) {
       res.status(202).end();
+      return;
+    }
+    if (body.method === "ping") {
+      res.json({ jsonrpc: "2.0", id, result: {} });
       return;
     }
     if (body.method === "tools/list") {
@@ -200,7 +206,9 @@ async function handleMcpGatewayProtocol(
       res.json({ jsonrpc: "2.0", id, result });
       return;
     }
-    res.status(404).json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
+    // A JSON-RPC error travels in a 200 response: the HTTP request itself
+    // succeeded, and MCP clients probe optional methods at session start.
+    res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
   } catch (err) {
     if (err instanceof ToolGatewayHttpError) {
       const id = (req.body as { id?: unknown } | undefined)?.id ?? null;
