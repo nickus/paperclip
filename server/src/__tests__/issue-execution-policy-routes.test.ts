@@ -337,6 +337,15 @@ describe("issue execution policy routes", () => {
       code: "invalid_issue_disposition",
       missing: "review_path",
     });
+    // One worked body, not just the path names, so the agent does not have
+    // to guess the shape of a typed executionState.currentParticipant.
+    expect(res.body.details.example).toMatchObject({
+      reviewPath: "typed_execution_state_current_participant",
+      body: {
+        status: "in_review",
+        executionState: { status: "pending", currentParticipant: { type: "user" } },
+      },
+    });
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 

@@ -75,6 +75,19 @@ const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigne
 const MONITOR_BOUNDS_EXHAUSTED_MESSAGE = "Monitor bounds are already exhausted";
 const STAGE_DECISION_COMMENT_HINT = "Include the decision comment in the same PATCH request; prior comments are not considered.";
 export const REDACTED_ISSUE_MONITOR_EXTERNAL_REF = "[redacted]";
+export const EXECUTION_REVIEW_DECISION_MISSING_COMMENT_CODE = "execution_review_decision_missing_comment";
+
+// Names exactly what the 422 above is missing and one worked body, instead of
+// leaving the caller to infer the shape from prose. `status` is the value
+// this particular decision needs: "done" to approve, any other status
+// (normally "in_progress") to request changes.
+function missingDecisionCommentDetails(status: string) {
+  return {
+    code: EXECUTION_REVIEW_DECISION_MISSING_COMMENT_CODE,
+    missing: "comment",
+    expectedBody: { status, comment: "<your verdict>" },
+  };
+}
 
 function normalizeMonitorNotes(notes: string | null | undefined) {
   if (typeof notes !== "string") return null;
@@ -786,7 +799,10 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     if (principalsEqual(currentParticipant, actor)) {
       if (requestedStatus === "done") {
         if (!input.commentBody?.trim()) {
-          throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
+          throw unprocessable(
+            `Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`,
+            missingDecisionCommentDetails("done"),
+          );
         }
         const approvedState = buildCompletedState(existingState, activeStage);
         // Only stages after the stage being approved are advance candidates.
@@ -850,7 +866,10 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
       if (requestedStatus && requestedStatus !== "in_review") {
         if (!input.commentBody?.trim()) {
-          throw unprocessable(`Requesting changes requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
+          throw unprocessable(
+            `Requesting changes requires a comment. ${STAGE_DECISION_COMMENT_HINT}`,
+            missingDecisionCommentDetails(requestedStatus),
+          );
         }
         if (!existingState?.returnAssignee) {
           throw unprocessable("This execution stage has no return assignee");
