@@ -511,6 +511,14 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "workspace_git_scan_cancelled",
   "workspace_git_scan_output_limit",
   "workspace_git_scan_failed",
+  // Setup owns the shared durable retry budget for setup-stage execs (GitHub
+  // operation launcher install, remote PATH probe) and environmentSyncIn that
+  // time out through every retry attempt of their own. Generic continuation
+  // must not retry a budget-exhausted transient failure through a second,
+  // independent recovery budget, or re-stall indefinitely instead of
+  // escalating for a person once the bounded retry is spent.
+  "transient_setup_exec_timeout",
+  "transient_environment_sync_in_timeout",
   "low_trust_isolation_unavailable",
   "low_trust_requires_isolated_workspace",
   "low_trust_boundary_mismatch",

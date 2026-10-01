@@ -95,8 +95,10 @@ import {
 } from "@paperclipai/adapter-utils/env-payload";
 import {
   cleanupGitHubOperationLaunchers,
+  isTransientSetupExecTimeoutError,
   prepareGitHubExecutionEnvironment,
   startAdapterExecutionTargetPaperclipBridge,
+  TRANSIENT_SETUP_EXEC_TIMEOUT_ERROR_CODE,
 } from "@paperclipai/adapter-utils/execution-target";
 import { agentService } from "./agents.js";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
@@ -680,6 +682,8 @@ import { retryChatControlAdmission } from "./chat-control-admission-retry.js";
 import {
   EnvironmentDriverStepUnsupportedError,
   environmentRuntimeService,
+  isTransientEnvironmentSyncInTimeoutError,
+  TRANSIENT_ENVIRONMENT_SYNC_IN_TIMEOUT_ERROR_CODE,
   type ProviderResourceDisposition,
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
@@ -923,6 +927,19 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 function isTransientWorkspaceGitScanCode(code: string | null | undefined): boolean {
   return code === WORKSPACE_GIT_SCAN_ERROR_CODES.timeout || code === WORKSPACE_GIT_SCAN_ERROR_CODES.saturated;
+}
+// Covers the setup-stage execs that retry an idempotent operation on a bare
+// transport timeout (GitHub operation launcher install, remote PATH probe,
+// environmentSyncIn) before giving up: host/pod load right after a restart
+// can stall all of their retry budgets too, which is still a transient infra
+// condition, not a configuration problem. Treat it the same as a transient
+// workspace git scan failure below, so the issue gets a bounded automatic
+// retry instead of a stranded-issue hold on first occurrence.
+function isTransientSetupStageExecTimeoutCode(code: string | null | undefined): boolean {
+  return (
+    code === TRANSIENT_SETUP_EXEC_TIMEOUT_ERROR_CODE ||
+    code === TRANSIENT_ENVIRONMENT_SYNC_IN_TIMEOUT_ERROR_CODE
+  );
 }
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS =
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
@@ -28156,6 +28173,16 @@ export function heartbeatService(
         const nonRetryablePreflightCode =
           nonRetryablePreflightFailureCode(outerErr);
         const workspaceGitScanFailure = isWorkspaceGitScanError(outerErr) ? outerErr : null;
+        // A GitHub launcher install/PATH probe or environmentSyncIn that timed
+        // out through every retry budget above (see execution-target.ts /
+        // environment-runtime.ts) is the same kind of transient host/pod-load
+        // condition as a transient workspace git scan failure, just caught
+        // here instead because it throws from setup code rather than from
+        // readGitWorkspaceSnapshot.
+        const transientSetupExecTimeoutFailure = isTransientSetupExecTimeoutError(outerErr) ? outerErr : null;
+        const transientEnvironmentSyncInTimeoutFailure = isTransientEnvironmentSyncInTimeoutError(outerErr)
+          ? outerErr
+          : null;
         const setupFailureErrorCode =
           workspaceGitScanFailure?.code ??
           workspaceValidationSetupFailure?.code ??
@@ -28168,6 +28195,8 @@ export function heartbeatService(
           recordedResponsibleUserDenialCode ??
           nonRetryablePreflightCode ??
           adapterEnvTooLargeFailureCode(outerErr) ??
+          transientSetupExecTimeoutFailure?.code ??
+          transientEnvironmentSyncInTimeoutFailure?.code ??
           "setup_failed";
         logger.error(
           { err: outerErr, runId },
@@ -28293,10 +28322,14 @@ export function heartbeatService(
                 () => undefined,
               );
             }
-            // No provider work began. Retry temporary host scan failures with
-            // the existing durable failure budget, before releasing execution.
-            // Generic recovery must not grant a second budget on exhaustion.
-            await (isTransientWorkspaceGitScanCode(livenessRun.errorCode)
+            // No provider work began. Retry temporary host scan failures, and
+            // setup-stage execs that exhausted their own timeout retries
+            // (GitHub launcher install/PATH probe, environmentSyncIn — see
+            // isTransientSetupStageExecTimeoutCode), with the existing durable
+            // failure budget, before releasing execution. Generic recovery
+            // must not grant a second budget on exhaustion.
+            await (isTransientWorkspaceGitScanCode(livenessRun.errorCode) ||
+              isTransientSetupStageExecTimeoutCode(livenessRun.errorCode)
               ? scheduleBoundedRetryForRun(livenessRun, failedAgent)
               : scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent)
             ).catch((retryError) => {

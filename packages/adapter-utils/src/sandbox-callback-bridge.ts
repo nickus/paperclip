@@ -417,9 +417,30 @@ async function runShell(
   });
 }
 
+/**
+ * Thrown by {@link requireSuccessfulResult}. Carries `timedOut` so a caller
+ * can tell a transport-level timeout (no exit status arrived; the command's
+ * actual outcome is unknown) apart from every other failure, without
+ * pattern-matching the message. A caller that retries only idempotent execs
+ * on a timeout (see `withTransientSetupExecRetry` in execution-target.ts)
+ * relies on this distinction.
+ */
+export class RunnerActionFailedError extends Error {
+  readonly timedOut: boolean;
+  constructor(action: string, result: RunProcessResult) {
+    super(buildRunnerFailureMessage(action, result));
+    this.name = "RunnerActionFailedError";
+    this.timedOut = result.timedOut;
+  }
+}
+
+export function isRunnerActionTimedOutError(error: unknown): boolean {
+  return error instanceof RunnerActionFailedError && error.timedOut;
+}
+
 function requireSuccessfulResult(action: string, result: RunProcessResult): RunProcessResult {
   if (!result.timedOut && result.exitCode === 0) return result;
-  throw new Error(buildRunnerFailureMessage(action, result));
+  throw new RunnerActionFailedError(action, result);
 }
 
 function base64Chunks(body: string): string[] {

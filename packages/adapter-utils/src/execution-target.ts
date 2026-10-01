@@ -43,6 +43,7 @@ import {
   HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
   SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT,
   SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
+  isRunnerActionTimedOutError,
   sandboxCallbackBridgeDirectories,
   sanitizeSandboxCallbackBridgeHeaders,
   startSandboxCallbackBridgeServer,
@@ -1829,6 +1830,69 @@ export async function cleanupGitHubOperationLaunchers(input: GitHubLauncherLocat
   }
 }
 
+// Growing exec budgets (ms) for a setup-stage probe that may stall right
+// after the provider host or pod restarts, then answer in well under a
+// second a few seconds later. Each retry is idempotent (a read-only PATH
+// probe, or a hash-skip file sync/chmod that is safe to re-run after a
+// timeout where we never learned whether the previous attempt's command
+// ran) so a transport-level timeout — never a non-zero exit — is worth
+// retrying with more room, rather than stranding the run on the first stall.
+const TRANSIENT_SETUP_EXEC_RETRY_TIMEOUTS_MS = [15_000, 30_000, 60_000] as const;
+
+/** Stable code the heartbeat failure path (heartbeat.ts) recognizes to retry
+ * the run through its bounded transient-failure budget instead of opening a
+ * stranded-issue hold. Thrown only once every retry budget above has also
+ * timed out. */
+export const TRANSIENT_SETUP_EXEC_TIMEOUT_ERROR_CODE = "transient_setup_exec_timeout";
+
+export class TransientSetupExecTimeoutError extends Error {
+  readonly code = TRANSIENT_SETUP_EXEC_TIMEOUT_ERROR_CODE;
+  constructor(label: string, cause: unknown) {
+    super(
+      `${label} timed out on every retry attempt (${TRANSIENT_SETUP_EXEC_RETRY_TIMEOUTS_MS.join("ms, ")}ms budgets)` +
+        `${cause instanceof Error ? `: ${cause.message}` : ""}`,
+    );
+    this.name = "TransientSetupExecTimeoutError";
+    this.cause = cause;
+  }
+}
+
+export function isTransientSetupExecTimeoutError(error: unknown): error is TransientSetupExecTimeoutError {
+  return error instanceof TransientSetupExecTimeoutError;
+}
+
+/**
+ * Runs `attempt(timeoutMs)` once per budget in
+ * `TRANSIENT_SETUP_EXEC_RETRY_TIMEOUTS_MS`, stopping at the first attempt
+ * that does not time out. `isTimeout` tells a transport-level timeout
+ * (retry-safe here because the exec is idempotent and a timeout never tells
+ * us the command's actual outcome) apart from every other failure, which is
+ * rethrown immediately without consuming a retry. When every budget also
+ * times out, throws {@link TransientSetupExecTimeoutError} instead of the
+ * underlying error.
+ */
+async function withTransientSetupExecRetry<T>(
+  label: string,
+  attempt: (timeoutMs: number) => Promise<T>,
+  // Told apart from a thrown transport error so a result-returning exec
+  // (e.g. CommandManagedRuntimeRunner.execute, which reports a timeout via
+  // `result.timedOut` rather than throwing) can participate too.
+  isTimeoutResult: (result: T) => boolean,
+): Promise<T> {
+  let lastFailure: unknown;
+  for (const timeoutMs of TRANSIENT_SETUP_EXEC_RETRY_TIMEOUTS_MS) {
+    try {
+      const result = await attempt(timeoutMs);
+      if (!isTimeoutResult(result)) return result;
+      lastFailure = new Error(`${label} timed out after ${timeoutMs}ms`);
+    } catch (error) {
+      if (!isRunnerActionTimedOutError(error)) throw error;
+      lastFailure = error;
+    }
+  }
+  throw new TransientSetupExecTimeoutError(label, lastFailure);
+}
+
 async function githubOperationLauncherBasePath(
   target: AdapterCommandCapableExecutionTarget | null,
   env: Record<string, string>,
@@ -1840,12 +1904,21 @@ async function githubOperationLauncherBasePath(
   // The provider owns login/profile setup. Query its effective PATH before
   // staging BASH_ENV, rather than substituting the controller's toolchain or
   // a minimal PATH that hides legacy NVM/user-local agent installations.
-  const result = await adapterExecutionTargetCommandRunner(target).execute({
-    command: "sh",
-    args: ["-c", "printf '\\000%s\\000' \"$PATH\""],
-    cwd: target.remoteCwd,
-    timeoutMs: 15_000,
-  });
+  //
+  // This probe is read-only and idempotent, so a bare transport timeout
+  // (host/pod under load right after a restart, answering again in well
+  // under a second a moment later) is retried with a growing budget rather
+  // than failing the run outright on the first stall.
+  const result = await withTransientSetupExecRetry(
+    "Remote PATH probe for managed GitHub launchers",
+    (timeoutMs) => adapterExecutionTargetCommandRunner(target).execute({
+      command: "sh",
+      args: ["-c", "printf '\\000%s\\000' \"$PATH\""],
+      cwd: target.remoteCwd,
+      timeoutMs,
+    }),
+    (attemptResult) => attemptResult.timedOut,
+  );
   // Frame the value so login banners cannot become executable search paths.
   const remotePath = result.stdout.match(/\0([^\0]+)\0/)?.[1];
   if (result.timedOut || result.exitCode !== 0 || !remotePath) {
@@ -2077,15 +2150,31 @@ export async function prepareGitHubOperationLaunchers(input: {
   if (remote) {
     const runner = adapterExecutionTargetCommandRunner(remote);
     for (const [program, body] of Object.entries(files)) {
-      await syncRemoteTextFileWithHashSkip({
-        runner, remoteCwd: remote.remoteCwd, remoteDir: directory,
-        remotePath: path.posix.join(directory, program), body,
-        label: "GitHub operation launcher", action: "stage GitHub operation launcher",
-        lockDir: path.posix.join(directory, `.${program}.lock`),
-        timeoutMs: 15_000, shellCommand: adapterExecutionTargetShellCommand(remote),
-      });
+      // Hash-skip staging is idempotent (it no-ops once the remote file
+      // already hashes to `body`), so a transport timeout — as opposed to a
+      // real non-zero exit — is safe to retry with a growing budget instead
+      // of stranding the run on a stall right after a host/pod restart.
+      await withTransientSetupExecRetry(
+        "GitHub operation launcher staging",
+        (timeoutMs) => syncRemoteTextFileWithHashSkip({
+          runner, remoteCwd: remote.remoteCwd, remoteDir: directory,
+          remotePath: path.posix.join(directory, program), body,
+          label: "GitHub operation launcher", action: "stage GitHub operation launcher",
+          lockDir: path.posix.join(directory, `.${program}.lock`),
+          timeoutMs, shellCommand: adapterExecutionTargetShellCommand(remote),
+        }),
+        () => false, // success never indicates a timeout; failures throw and are checked below
+      );
     }
-    const permissions = await runner.execute({ command: "sh", args: ["-c", `chmod 700 ${shellQuote(directory)}/git ${shellQuote(directory)}/gh && mkdir -p ${shellQuote(configDirectory)}`], cwd: remote.remoteCwd, timeoutMs: 15_000 });
+    const permissions = await withTransientSetupExecRetry(
+      "GitHub operation launcher permissions",
+      (timeoutMs) => runner.execute({
+        command: "sh",
+        args: ["-c", `chmod 700 ${shellQuote(directory)}/git ${shellQuote(directory)}/gh && mkdir -p ${shellQuote(configDirectory)}`],
+        cwd: remote.remoteCwd, timeoutMs,
+      }),
+      (attemptResult) => attemptResult.timedOut,
+    );
     if (permissions.exitCode !== 0) throw new Error("Could not prepare managed GitHub launchers");
   } else {
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });

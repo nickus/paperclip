@@ -9,9 +9,11 @@ import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import { githubBrokerEnvironment } from "./github-launcher.js";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
+  isTransientSetupExecTimeoutError,
   prepareGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
   runAdapterExecutionTargetProcess,
+  TRANSIENT_SETUP_EXEC_TIMEOUT_ERROR_CODE,
 } from "./execution-target.js";
 
 const exec = promisify(execFile);
@@ -383,17 +385,82 @@ describe("managed GitHub launcher environment", () => {
 
   it.each([
     { exitCode: 1, timedOut: false, stdout: "" },
-    { exitCode: 0, timedOut: true, stdout: "" },
     { exitCode: 0, timedOut: false, stdout: "login banner only" },
     { exitCode: 0, timedOut: false, stdout: "\0\0" },
-  ])("fails before staging when remote PATH discovery fails: %j", async (failure) => {
+  ])("fails before staging when remote PATH discovery fails (non-timeout): %j", async (failure) => {
     const fixture = await sandbox("nvm/bin");
     fixture.runner.execute.mockResolvedValueOnce({ ...failure, signal: null, stderr: "private diagnostic",
       pid: null, startedAt: new Date().toISOString() });
     await expect(prepareGitHubOperationLaunchers({
       runId: "run-failure", target: fixture.target, cwd: fixture.root, env: {},
     })).rejects.toThrow("Could not resolve remote PATH for managed GitHub launchers");
+    // A real exit code or malformed output is not a transport timeout, so it
+    // is never worth retrying: the command ran and told us the real outcome.
     expect(fixture.runner.execute).toHaveBeenCalledTimes(1);
+  });
+
+  // Right after a provider host/pod restart, a transport-level timeout (as
+  // opposed to a real non-zero exit) on one of these idempotent probes is
+  // retried with a growing budget instead of failing the run outright.
+  describe("transient timeout retry", () => {
+    function timedOutResult() {
+      return { exitCode: null, timedOut: true, signal: null, stdout: "", stderr: "",
+        pid: null, startedAt: new Date().toISOString() };
+    }
+
+    it("retries the remote PATH probe once on a timeout and then stages successfully", async () => {
+      const fixture = await sandbox("nvm/bin");
+      // Only the first attempt times out; the retry falls through to the
+      // fixture's real shell and gets the fixture's own PATH back.
+      fixture.runner.execute.mockResolvedValueOnce(timedOutResult());
+      const env = await prepareGitHubOperationLaunchers({
+        runId: "run-path-probe-retry", target: fixture.target, cwd: fixture.root, env: {},
+      });
+      expect(env.PATH).toBe(`${env.PAPERCLIP_GITHUB_LAUNCHER_DIR}:${fixture.remotePath}`);
+    });
+
+    it("classifies an exhausted remote PATH probe retry as transient, not a setup failure", async () => {
+      const fixture = await sandbox("nvm/bin");
+      // Every attempt (the original plus both retries) times out.
+      fixture.runner.execute.mockResolvedValue(timedOutResult());
+      const error: unknown = await prepareGitHubOperationLaunchers({
+        runId: "run-path-probe-exhausted", target: fixture.target, cwd: fixture.root, env: {},
+      }).catch((e: unknown) => e);
+      expect(isTransientSetupExecTimeoutError(error)).toBe(true);
+      expect((error as { code: string }).code).toBe(TRANSIENT_SETUP_EXEC_TIMEOUT_ERROR_CODE);
+      // One call per retry budget (15s/30s/60s), no more.
+      expect(fixture.runner.execute).toHaveBeenCalledTimes(3);
+    });
+
+    it("retries GitHub launcher staging once on a timeout and then stages successfully", async () => {
+      const fixture = await sandbox("usr/bin");
+      // A configured PATH skips the probe entirely, isolating the retry under
+      // test to the staging execs below. Only the very first staging exec
+      // (package.json) times out once; the retry falls through to the
+      // fixture's real shell and the rest of staging proceeds normally.
+      fixture.runner.execute.mockResolvedValueOnce(timedOutResult());
+      const env = await prepareGitHubOperationLaunchers({
+        runId: "run-staging-retry", target: fixture.target, cwd: fixture.root, env: { PATH: fixture.remotePath },
+      });
+      const result = await fixture.runner.execute({
+        command: path.join(env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "git"), args: ["--version"], env,
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+    });
+
+    it("classifies an exhausted GitHub launcher staging retry as transient, not a setup failure", async () => {
+      const fixture = await sandbox("usr/bin");
+      // A configured PATH skips the probe; every staging exec then times out.
+      fixture.runner.execute.mockResolvedValue(timedOutResult());
+      const error: unknown = await prepareGitHubOperationLaunchers({
+        runId: "run-staging-exhausted", target: fixture.target, cwd: fixture.root, env: { PATH: fixture.remotePath },
+      }).catch((e: unknown) => e);
+      expect(isTransientSetupExecTimeoutError(error)).toBe(true);
+      expect((error as { code: string }).code).toBe(TRANSIENT_SETUP_EXEC_TIMEOUT_ERROR_CODE);
+      // The first staged file (package.json) exhausts its own retry budget
+      // (one call per 15s/30s/60s attempt) before any other file is staged.
+      expect(fixture.runner.execute).toHaveBeenCalledTimes(3);
+    });
   });
 
   describe("staged PATH rc (BASH_ENV / .profile / zsh dotfiles)", () => {
