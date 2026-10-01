@@ -26,6 +26,22 @@ export const PAPERCLIP_RUN_BRIEF_TEAM_MAX_MEMBERS = 40;
 export const PAPERCLIP_RUN_BRIEF_TEAM_MAX_CHARS = 6_000;
 /** Bound for a name or label: an assignee, an agent's name or title. */
 export const PAPERCLIP_RUN_BRIEF_LABEL_MAX_CHARS = 40;
+/** Most sibling runs the Live siblings section lists (one line each). */
+export const PAPERCLIP_RUN_BRIEF_SIBLINGS_MAX_LINES = 5;
+/**
+ * Bound for the rendered Live siblings section, fixed wording included. Like
+ * the Team section it has its own budget, so it never crowds out the issue
+ * orientation; runs that do not fit are counted in a "+N more" pointer.
+ */
+export const PAPERCLIP_RUN_BRIEF_SIBLINGS_MAX_CHARS = 900;
+/** Bound for the issue title shown on a sibling line. */
+export const PAPERCLIP_RUN_BRIEF_SIBLING_TITLE_MAX_CHARS = 60;
+/**
+ * Server switch for the Live siblings section. On by default; 0, false, off
+ * or no stops the server from attaching it, and the brief then renders
+ * exactly as it does without the section.
+ */
+export const PAPERCLIP_RUN_BRIEF_SIBLINGS_ENV = "PAPERCLIP_RUN_BRIEF_SIBLINGS";
 const PAPERCLIP_RUN_BRIEF_TOKEN_MAX_CHARS = 64;
 const PAPERCLIP_RUN_BRIEF_LIST_MAX_ITEMS = 10;
 // Upper bound for one quoted free-text value once escaped. Escaping can grow a
@@ -40,8 +56,20 @@ const PAPERCLIP_RUN_BRIEF_QUOTED_MAX_CHARS = PAPERCLIP_RUN_BRIEF_SUMMARY_MAX_CHA
 export function isPaperclipWakeRunBriefEnabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
-  const raw = env[PAPERCLIP_WAKE_RUN_BRIEF_ENV]?.trim().toLowerCase();
-  return !(raw === "0" || raw === "false" || raw === "off" || raw === "no");
+  return !isSwitchedOff(env[PAPERCLIP_WAKE_RUN_BRIEF_ENV]);
+}
+
+/** See PAPERCLIP_RUN_BRIEF_SIBLINGS_ENV; independent of the brief switch. */
+export function isPaperclipRunBriefSiblingsEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return !isSwitchedOff(env[PAPERCLIP_RUN_BRIEF_SIBLINGS_ENV]);
+}
+
+// Shared off-values for the brief's switches; anything else (or unset) is on.
+function isSwitchedOff(value: string | undefined): boolean {
+  const raw = value?.trim().toLowerCase();
+  return raw === "0" || raw === "false" || raw === "off" || raw === "no";
 }
 
 export const PAPERCLIP_RUN_BRIEF_AUTHORITIES = [
@@ -145,9 +173,47 @@ export type PaperclipRunBriefTeam = {
   members: PaperclipRunBriefTeamMember[];
 };
 
+/** Run statuses that count as live for the Live siblings section. */
+export const PAPERCLIP_RUN_BRIEF_SIBLING_STATUSES = [
+  "running",
+  "queued",
+  "scheduled_retry",
+] as const;
+export type PaperclipRunBriefSiblingStatus =
+  (typeof PAPERCLIP_RUN_BRIEF_SIBLING_STATUSES)[number];
+
+/** Another live run of the woken agent (the same agent row). */
+export type PaperclipRunBriefSibling = {
+  id: string;
+  status: PaperclipRunBriefSiblingStatus;
+  /** Both null for a run without an issue. */
+  issueId: string | null;
+  issueIdentifier: string | null;
+  /** Null without an issue; a fixed placeholder when the title is withheld. */
+  issueTitle: string | null;
+  /** ISO timestamps, second precision. */
+  queuedAt: string | null;
+  startedAt: string | null;
+  lastOutputAt: string | null;
+};
+
+/** The woken agent's other live runs at wake time. */
+export type PaperclipRunBriefSiblings = {
+  companyId: string | null;
+  /** When the server read the runs; ages are rendered relative to it. */
+  asOf: string | null;
+  /** Every live sibling run, listed or not. */
+  total: number;
+  /** In `comparePaperclipRunBriefSiblings` order; at most the line limit. */
+  runs: PaperclipRunBriefSibling[];
+};
+
 export type PaperclipRunBrief = {
   version: 1;
-  /** Both null for a run without an issue, whose brief carries only a team. */
+  /**
+   * Both null for a run without an issue, whose brief carries only a team
+   * and live siblings.
+   */
   issueId: string | null;
   issueIdentifier: string | null;
   authority: PaperclipRunBriefAuthority;
@@ -160,6 +226,9 @@ export type PaperclipRunBrief = {
   // Absent (not null) when the server attached no roster, which keeps the
   // serialized brief unchanged.
   team?: PaperclipRunBriefTeam;
+  // Absent (not null) when the agent has no other live run, for the same
+  // reason.
+  siblings?: PaperclipRunBriefSiblings;
 };
 
 // C0/C1 controls plus the Unicode line and paragraph separators, which some
@@ -272,6 +341,97 @@ function normalizeTeam(value: unknown): PaperclipRunBriefTeam | null {
   return { companyId: token(team.companyId), total, members };
 }
 
+// A timestamp at second precision, or null when it does not parse. The output
+// parses back to itself, so normalizing stays idempotent.
+function isoSeconds(value: unknown): string | null {
+  const ms = typeof value === "string" ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(ms)
+    ? new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z")
+    : null;
+}
+
+const SIBLING_STATUS_RANK: Record<PaperclipRunBriefSiblingStatus, number> = {
+  running: 0,
+  queued: 1,
+  scheduled_retry: 2,
+};
+
+/**
+ * The Live siblings order: running runs first, earliest start first; then
+ * queued runs, then scheduled retries, each earliest queued first. Ties (and
+ * missing times, which sort last) fall back to the run id, so the order never
+ * depends on the order the rows arrived in.
+ */
+export function comparePaperclipRunBriefSiblings(
+  left: PaperclipRunBriefSibling,
+  right: PaperclipRunBriefSibling,
+): number {
+  const since = (run: PaperclipRunBriefSibling) => {
+    const ms = Date.parse(
+      (run.status === "running" ? run.startedAt ?? run.queuedAt : run.queuedAt) ?? "",
+    );
+    return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+  };
+  const leftSince = since(left);
+  const rightSince = since(right);
+  return (
+    SIBLING_STATUS_RANK[left.status] - SIBLING_STATUS_RANK[right.status] ||
+    (leftSince === rightSince ? 0 : leftSince < rightSince ? -1 : 1) ||
+    (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+  );
+}
+
+/** Normalize one sibling entry; null when it lacks an id or a live status. */
+export function normalizePaperclipRunBriefSibling(
+  value: unknown,
+): PaperclipRunBriefSibling | null {
+  const entry = record(value);
+  const id = token(entry.id);
+  const status = oneOf(entry.status, PAPERCLIP_RUN_BRIEF_SIBLING_STATUSES);
+  if (!id || !status) return null;
+  const issueId = token(entry.issueId);
+  const issueIdentifier = token(entry.issueIdentifier);
+  return {
+    id,
+    status,
+    issueId,
+    issueIdentifier,
+    // A title only makes sense next to the issue it belongs to.
+    issueTitle:
+      issueId || issueIdentifier
+        ? paperclipRunBriefOneLine(
+            entry.issueTitle,
+            PAPERCLIP_RUN_BRIEF_SIBLING_TITLE_MAX_CHARS,
+          )
+        : null,
+    queuedAt: isoSeconds(entry.queuedAt),
+    startedAt: isoSeconds(entry.startedAt),
+    lastOutputAt: isoSeconds(entry.lastOutputAt),
+  };
+}
+
+function normalizeSiblings(value: unknown): PaperclipRunBriefSiblings | null {
+  if (value === null || value === undefined) return null;
+  const siblings = record(value);
+  const runs = (Array.isArray(siblings.runs) ? siblings.runs : [])
+    .slice(0, PAPERCLIP_RUN_BRIEF_LIST_MAX_ITEMS)
+    .flatMap((entry) => {
+      const run = normalizePaperclipRunBriefSibling(entry);
+      return run ? [run] : [];
+    })
+    .sort(comparePaperclipRunBriefSiblings)
+    .slice(0, PAPERCLIP_RUN_BRIEF_SIBLINGS_MAX_LINES);
+  const total = Math.max(count(siblings.total, 0), runs.length);
+  // No other live run: the section is left out entirely.
+  if (total === 0) return null;
+  return {
+    companyId: token(siblings.companyId),
+    asOf: isoSeconds(siblings.asOf),
+    total,
+    runs,
+  };
+}
+
 /** Accepts the server payload shape, and its own output (idempotent). */
 export function normalizePaperclipRunBrief(
   value: unknown,
@@ -281,10 +441,12 @@ export function normalizePaperclipRunBrief(
   const issueId = token(brief.issueId);
   const issueIdentifier = token(brief.issueIdentifier);
   const team = normalizeTeam(brief.team);
+  const siblings = normalizeSiblings(brief.siblings);
   const hasIssue = Boolean(issueId || issueIdentifier);
-  // A run without an issue gets a brief only for its team, and nothing
-  // issue-scoped (blockers, interactions, prior runs) is kept for it.
-  if (!hasIssue && !team) return null;
+  // A run without an issue gets a brief only for its team and its live
+  // siblings, and nothing issue-scoped (blockers, interactions, prior runs)
+  // is kept for it.
+  if (!hasIssue && !team && !siblings) return null;
   const list = (entries: unknown) =>
     (hasIssue && Array.isArray(entries) ? entries : [])
       .slice(0, PAPERCLIP_RUN_BRIEF_LIST_MAX_ITEMS)
@@ -361,6 +523,7 @@ export function normalizePaperclipRunBrief(
     pendingInteractions,
     priorRuns,
     ...(team ? { team } : {}),
+    ...(siblings ? { siblings } : {}),
   };
 }
 
@@ -471,27 +634,38 @@ const quoteLabel = (value: string) =>
 
 /**
  * Render a normalized brief as prompt text: the issue orientation, at most
- * `maxChars` characters, then the Team section, at most `teamMaxChars`
- * characters, on the next line. Keys always appear in the same order; list
- * entries that do not fit are dropped (whole lines only) and counted in a
- * trailing truncation note or, for the team, a pointer to the agents list.
+ * `maxChars` characters, then the Live siblings section, at most
+ * `siblingsMaxChars` characters, then the Team section, at most
+ * `teamMaxChars` characters, each on the next line. A section with nothing to
+ * show is left out, separator included. Keys always appear in the same order;
+ * list entries that do not fit are dropped (whole lines only) and counted in a
+ * trailing truncation note or pointer.
  */
 export function renderPaperclipRunBrief(
   brief: PaperclipRunBrief,
   options: {
     resumedSession?: boolean;
     maxChars?: number;
+    siblingsMaxChars?: number;
     teamMaxChars?: number;
   } = {},
 ): string {
   const orientation = renderOrientation(brief, options);
+  // The siblings come before the roster: they are what this run must not
+  // collide with right now, and the roster can be long.
+  const siblings = brief.siblings
+    ? renderSiblings(
+        brief.siblings,
+        options.siblingsMaxChars ?? PAPERCLIP_RUN_BRIEF_SIBLINGS_MAX_CHARS,
+      )
+    : "";
   const team = brief.team
     ? renderTeam(
         brief.team,
         options.teamMaxChars ?? PAPERCLIP_RUN_BRIEF_TEAM_MAX_CHARS,
       )
     : "";
-  return team ? `${orientation}\n${team}` : orientation;
+  return [orientation, siblings, team].filter(Boolean).join("\n");
 }
 
 function renderOrientation(
@@ -692,4 +866,105 @@ function renderTeam(team: PaperclipRunBriefTeam, maxChars: number): string {
   // fixed wording grows. Drops the roster rather than cutting a fence.
   const fallback = `${head}\n${pointer(team.total, 0)}`;
   return fallback.length <= maxChars ? fallback : "";
+}
+
+/** The fixed instruction under the Live siblings heading. */
+export const PAPERCLIP_RUN_BRIEF_SIBLINGS_HEAD =
+  "Other runs of you that are live right now. Each one owns its issue: do not edit its issue, branch, merge request or test rig. To coordinate, leave one comment on its issue (it is delivered to that run before it finishes).";
+
+// A compact, whole-unit age: 45s, 12m, 3h20m, 2d. Times after `asOf` (clock
+// skew between writers) read as 0s rather than as a negative age.
+function ageLabel(since: string | null, asOfMs: number): string {
+  if (since === null) return "none";
+  const sinceMs = Date.parse(since);
+  if (!Number.isFinite(sinceMs) || !Number.isFinite(asOfMs)) return "unknown";
+  const seconds = Math.max(0, Math.floor((asOfMs - sinceMs) / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h${minutes % 60 ? `${minutes % 60}m` : ""}`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+/**
+ * The Live siblings section: one data line per other live run of the woken
+ * agent, in `comparePaperclipRunBriefSiblings` order, at most
+ * PAPERCLIP_RUN_BRIEF_SIBLINGS_MAX_LINES lines and `maxChars` characters in
+ * all. Runs that are not listed, or that do not fit, are counted in a
+ * trailing "+N more" pointer. Lines are kept or dropped whole, and the fence
+ * is never cut: when not even the pointer fits, the section is left out.
+ */
+function renderSiblings(
+  siblings: PaperclipRunBriefSiblings,
+  maxChars: number,
+): string {
+  const head = [
+    "### Live siblings",
+    `- ${PAPERCLIP_RUN_BRIEF_SIBLINGS_HEAD}`,
+  ].join("\n");
+  const asOfMs = Date.parse(siblings.asOf ?? "");
+  // Sorting again keeps the order fixed even for a brief built by hand.
+  const runs = [...siblings.runs]
+    .sort(comparePaperclipRunBriefSiblings)
+    .slice(0, PAPERCLIP_RUN_BRIEF_SIBLINGS_MAX_LINES);
+  const lines = runs.map((run) =>
+    [
+      `sibling run=${run.id.slice(0, 8)}`,
+      `status=${run.status}`,
+      `issue=${run.issueIdentifier ?? run.issueId ?? "none"}`,
+      `started_ago=${ageLabel(run.startedAt, asOfMs)}`,
+      `last_output_ago=${ageLabel(run.lastOutputAt, asOfMs)}`,
+      // The title is free text: quoted, escaped and bounded like any other.
+      ...(run.issueTitle
+        ? [
+            `title=${quoteDataBounded(run.issueTitle, PAPERCLIP_RUN_BRIEF_SIBLING_TITLE_MAX_CHARS + 20)}`,
+          ]
+        : []),
+    ].join(" "),
+  );
+  // A hand-built brief may undercount; never claim fewer runs than it lists.
+  const total = Math.max(siblings.total, siblings.runs.length);
+  if (total === 0) return "";
+  const route = `GET /api/companies/${siblings.companyId ?? "{companyId}"}/live-runs`;
+  const pointer = (omitted: number) =>
+    `- +${omitted} more: ${route} lists them (match your agentId)`;
+
+  // Budget. With k kept lines L1..Lk and o = total - k omitted runs the
+  // section is
+  //   head [+ "\n```text\n" + Σ(Li + "\n") + "```"] [+ "\n" + pointer(o)]
+  // so its length is head + (k > 0 ? fenceCost + Σ lineCost(Li) : 0)
+  // + (o > 0 ? 1 + |pointer(o)| : 0). |pointer(o)| ≤ |pointer(total)| since
+  // o ≤ total, so reserving 1 + |pointer(total)| and keeping lines only while
+  // their cost fits the rest keeps the sum ≤ maxChars.
+  const fenceOpen = "```text";
+  const fenceClose = "```";
+  const fenceCost = fenceOpen.length + fenceClose.length + 2;
+  const lineCost = (line: string) => line.length + 1;
+  const linesCost = lines.reduce((sum, line) => sum + lineCost(line), 0);
+  let kept = lines.length;
+  if (
+    total > lines.length ||
+    head.length + (lines.length > 0 ? fenceCost + linesCost : 0) > maxChars
+  ) {
+    let budget = maxChars - head.length - fenceCost - (1 + pointer(total).length);
+    kept = 0;
+    // Stop at the first line that does not fit, so a later (lower-ranked)
+    // run is never shown in place of an earlier one.
+    for (const line of lines) {
+      if (lineCost(line) > budget) break;
+      budget -= lineCost(line);
+      kept += 1;
+    }
+  }
+  const sections = [head];
+  if (kept > 0) {
+    sections.push([fenceOpen, ...lines.slice(0, kept), fenceClose].join("\n"));
+  }
+  if (total > kept) sections.push(pointer(total - kept));
+  const text = sections.join("\n");
+  // Only a `maxChars` too small for the heading, the instruction and the
+  // pointer together gets past this; the section is then left out rather
+  // than cut.
+  return text.length <= maxChars ? text : "";
 }

@@ -64,6 +64,7 @@ export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import {
   isRunBriefEnabled,
+  isRunBriefSiblingsEnabled,
   loadRunBrief,
   loadTeamOnlyRunBrief,
   resolveRunBriefAuthority,
@@ -8703,6 +8704,9 @@ export async function buildPaperclipWakePayload(input: {
     !externalChatProvider &&
     !agentMessageText
   ) {
+    const mayReadOtherWork =
+      input.exposeLowTrustRaw !== true &&
+      issueSummary.workMode !== "skill_test";
     try {
       runBrief = await loadRunBrief({
         db: input.db,
@@ -8730,9 +8734,10 @@ export async function buildPaperclipWakePayload(input: {
         exposeLowTrustRaw: input.exposeLowTrustRaw,
         // The roster lists every agent in the company. Low-trust readers and
         // skill-test runs may not read other agents, so they get none.
-        includeTeam:
-          input.exposeLowTrustRaw !== true &&
-          issueSummary.workMode !== "skill_test",
+        includeTeam: mayReadOtherWork,
+        // The agent's other live runs name issues outside this one, so the
+        // same readers go without them.
+        includeSiblings: mayReadOtherWork && isRunBriefSiblingsEnabled(),
       });
     } catch (error) {
       logger.warn(
@@ -8946,9 +8951,10 @@ export async function buildPaperclipWakePayload(input: {
 /**
  * The wake payload of a run that has no issue (and so no other wake payload):
  * a Run Brief with only the company roster, so the agent knows who it can
- * hand work to. Null when the brief is off, for conversation turns, for
- * low-trust readers (their agent access does not cover the roster), and when
- * the lookup fails; a failed lookup never blocks the wake.
+ * hand work to, and the agent's other live runs. Null when the brief is off,
+ * for conversation turns, for low-trust readers (their agent access does not
+ * cover the roster), and when the lookup fails; a failed lookup never blocks
+ * the wake.
  */
 export async function buildTeamOnlyWakePayload(input: {
   db: Db;
@@ -8971,6 +8977,8 @@ export async function buildTeamOnlyWakePayload(input: {
       db: input.db,
       companyId: input.companyId,
       agentId: input.agentId,
+      runId: input.runId,
+      includeSiblings: isRunBriefSiblingsEnabled(),
     });
     return runBrief
       ? fitPaperclipWakePayloadToHardCap({
