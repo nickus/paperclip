@@ -26,6 +26,7 @@ import {
   invites,
   issueApprovals,
   issueAttachments,
+  issueComments,
   issueDocuments,
   issueRecoveryActions,
   issueRelations,
@@ -76,6 +77,7 @@ describeEmbeddedPostgres("attention service", () => {
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
     await db.delete(issueAttachments);
+    await db.delete(issueComments);
     await db.delete(issueDocuments);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
@@ -1025,6 +1027,279 @@ describeEmbeddedPostgres("attention service", () => {
     const feed = await attentionService(db).list(companyId, { userId: "board-user" });
 
     expect(feed.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
+  });
+
+  it("clears failed-run attention once a later run on the same issue succeeds under a different agent", async () => {
+    const { companyId, workerId, reviewerId } = await seedCompany("ATS");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATS-1",
+      title: "Reassigned task",
+      status: "in_progress",
+      assigneeAgentId: reviewerId,
+    });
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const failedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "adapter failed",
+        contextSnapshot: { issueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+      // The issue was handed to a different agent, who ran it to completion.
+      // The old item is for an agent+issue pair that no longer has any open
+      // work, not the same issue+agent pair the old exit rule checked.
+      {
+        id: randomUUID(),
+        companyId,
+        agentId: reviewerId,
+        invocationSource: "automation",
+        status: "succeeded",
+        contextSnapshot: { issueId },
+        createdAt: new Date("2026-07-09T12:05:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:05:00.000Z"),
+        finishedAt: new Date("2026-07-09T12:05:00.000Z"),
+      },
+    ]);
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: failedRunId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: new Date(failedAt.getTime() + 1_000),
+    });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
+  });
+
+  it("clears failed-run attention once the issue's status moves on after the run finished, but not before", async () => {
+    const { companyId, workerId } = await seedCompany("ATM");
+    const movedIssueId = await insertIssue({
+      companyId,
+      identifier: "ATM-1",
+      title: "Reassigned off in_progress after the failure",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const staleIssueId = await insertIssue({
+      companyId,
+      identifier: "ATM-2",
+      title: "Already off in_progress before the run even finished",
+      status: "blocked",
+      assigneeAgentId: workerId,
+      updatedAt: new Date("2026-07-09T11:00:00.000Z"),
+    });
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const [movedRunId, staleRunId] = [randomUUID(), randomUUID()];
+    await db.insert(heartbeatRuns).values([
+      {
+        id: movedRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "adapter failed",
+        contextSnapshot: { issueId: movedIssueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+      {
+        id: staleRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "adapter failed",
+        contextSnapshot: { issueId: staleIssueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+    ]);
+    await db.insert(heartbeatRunEvents).values([
+      {
+        companyId,
+        runId: movedRunId,
+        agentId: workerId,
+        seq: 1,
+        eventType: "lifecycle",
+        message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+        createdAt: new Date(failedAt.getTime() + 1_000),
+      },
+      {
+        companyId,
+        runId: staleRunId,
+        agentId: workerId,
+        seq: 1,
+        eventType: "lifecycle",
+        message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+        createdAt: new Date(failedAt.getTime() + 1_000),
+      },
+    ]);
+    // Moves off `in_progress` *after* the run settled: this is the failure
+    // moving on, so the row should clear.
+    await db.update(issues)
+      .set({ status: "blocked", updatedAt: new Date(failedAt.getTime() + 60_000) })
+      .where(eq(issues.id, movedIssueId));
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const failedRunIssueIds = feed.items
+      .filter((item) => item.sourceKind === "failed_run")
+      .map((item) => item.subject.metadata?.issueId);
+
+    expect(failedRunIssueIds).not.toContain(movedIssueId);
+    // staleIssueId's non-in_progress status predates the run itself, so it is
+    // not evidence that anything moved on *because of* this failure; the row
+    // must stay visible.
+    expect(failedRunIssueIds).toContain(staleIssueId);
+  });
+
+  it("clears failed-run attention once the issue reaches a terminal status", async () => {
+    const { companyId, workerId } = await seedCompany("ATD");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATD-1",
+      title: "Cancelled after the failure",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const failedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId,
+      companyId,
+      agentId: workerId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "adapter failed",
+      contextSnapshot: { issueId },
+      createdAt: failedAt,
+      updatedAt: failedAt,
+      finishedAt: failedAt,
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: failedRunId,
+      agentId: workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: new Date(failedAt.getTime() + 1_000),
+    });
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
+  });
+
+  it("clears failed-run attention once the failing agent comments on the issue afterward, but not on a stranger's comment", async () => {
+    const { companyId, workerId, reviewerId } = await seedCompany("ATC");
+    const recoveredIssueId = await insertIssue({
+      companyId,
+      identifier: "ATC-1",
+      title: "Recovered via a comment",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const untouchedIssueId = await insertIssue({
+      companyId,
+      identifier: "ATC-2",
+      title: "Only a bystander commented",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const [recoveredRunId, untouchedRunId] = [randomUUID(), randomUUID()];
+    await db.insert(heartbeatRuns).values([
+      {
+        id: recoveredRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "adapter failed",
+        contextSnapshot: { issueId: recoveredIssueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+      {
+        id: untouchedRunId,
+        companyId,
+        agentId: workerId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "adapter failed",
+        contextSnapshot: { issueId: untouchedIssueId },
+        createdAt: failedAt,
+        updatedAt: failedAt,
+        finishedAt: failedAt,
+      },
+    ]);
+    await db.insert(heartbeatRunEvents).values([
+      {
+        companyId,
+        runId: recoveredRunId,
+        agentId: workerId,
+        seq: 1,
+        eventType: "lifecycle",
+        message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+        createdAt: new Date(failedAt.getTime() + 1_000),
+      },
+      {
+        companyId,
+        runId: untouchedRunId,
+        agentId: workerId,
+        seq: 1,
+        eventType: "lifecycle",
+        message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+        createdAt: new Date(failedAt.getTime() + 1_000),
+      },
+    ]);
+    await db.insert(issueComments).values([
+      // The agent that failed comments its way past it.
+      {
+        id: randomUUID(),
+        companyId,
+        issueId: recoveredIssueId,
+        authorAgentId: workerId,
+        authorType: "agent",
+        body: "Picked this back up manually after the failure.",
+        createdAt: new Date(failedAt.getTime() + 60_000),
+      },
+      // A different agent commenting on the other issue is not the failing
+      // agent moving past its own failure.
+      {
+        id: randomUUID(),
+        companyId,
+        issueId: untouchedIssueId,
+        authorAgentId: reviewerId,
+        authorType: "agent",
+        body: "Noting this for visibility.",
+        createdAt: new Date(failedAt.getTime() + 60_000),
+      },
+    ]);
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const failedRunIssueIds = feed.items
+      .filter((item) => item.sourceKind === "failed_run")
+      .map((item) => item.subject.metadata?.issueId);
+
+    expect(failedRunIssueIds).not.toContain(recoveredIssueId);
+    expect(failedRunIssueIds).toContain(untouchedIssueId);
   });
 
   it("enriches interaction details with project, workspace, plan metadata, and images", async () => {

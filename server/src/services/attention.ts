@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -16,6 +16,7 @@ import {
   invites,
   issueApprovals,
   issueAttachments,
+  issueComments,
   issueDocuments,
   issueRecoveryActions,
   issueRelations,
@@ -1663,12 +1664,13 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
 
       const failedRows = await listAttentionExhaustedRuns(db, companyId);
       const failedIssueIds = failedRows.map((row) => readRunIssueId(row.contextSnapshot));
+      const uniqueFailedIssueIds = [...new Set(failedIssueIds.filter((value): value is string => Boolean(value)))];
       const failedAgentIds = [...new Set(failedRows.map((row) => row.agentId))];
       const oldestFailedRunCreatedAt = failedRows.reduce<Date | null>((oldest, row) => {
         if (!oldest || row.createdAt < oldest) return row.createdAt;
         return oldest;
       }, null);
-      const [failedIssueMap, failedImageMap, newerRuns] = await Promise.all([
+      const [failedIssueMap, failedImageMap, newerRuns, laterSucceededRuns, agentCommentRows] = await Promise.all([
         issueSummaryMap(
           db,
           companyId,
@@ -1692,6 +1694,45 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
               gt(heartbeatRuns.createdAt, oldestFailedRunCreatedAt),
             ))
           : Promise.resolve([]),
+        // A later run on the same issue can succeed under a different agent
+        // (reassignment, handoff) long before that agent ever shows up in
+        // `failedAgentIds` above, so this one is keyed by issue, not agent.
+        oldestFailedRunCreatedAt && uniqueFailedIssueIds.length > 0
+          ? db
+            .select({
+              createdAt: heartbeatRuns.createdAt,
+              runIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+              runTaskId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'taskId'`,
+            })
+            .from(heartbeatRuns)
+            .where(and(
+              eq(heartbeatRuns.companyId, companyId),
+              eq(heartbeatRuns.status, "succeeded"),
+              gt(heartbeatRuns.createdAt, oldestFailedRunCreatedAt),
+              or(
+                inArray(sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`, uniqueFailedIssueIds),
+                inArray(sql<string>`${heartbeatRuns.contextSnapshot} ->> 'taskId'`, uniqueFailedIssueIds),
+              ),
+            ))
+          : Promise.resolve([]),
+        // The failing agent can also comment its way past the failure (a
+        // manual recovery note, a status update) without ever starting
+        // another run at all.
+        uniqueFailedIssueIds.length > 0 && failedAgentIds.length > 0
+          ? db
+            .select({
+              issueId: issueComments.issueId,
+              authorAgentId: issueComments.authorAgentId,
+              createdAt: issueComments.createdAt,
+            })
+            .from(issueComments)
+            .where(and(
+              eq(issueComments.companyId, companyId),
+              isNull(issueComments.deletedAt),
+              inArray(issueComments.issueId, uniqueFailedIssueIds),
+              inArray(issueComments.authorAgentId, failedAgentIds),
+            ))
+          : Promise.resolve([]),
       ]);
       const latestRunCreatedAtByKey = new Map<string, Date>();
       for (const newerRun of newerRuns) {
@@ -1702,6 +1743,24 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           latestRunCreatedAtByKey.set(newerRunKey, newerRun.createdAt);
         }
       }
+      const latestSucceededRunCreatedAtByIssueId = new Map<string, Date>();
+      for (const succeededRun of laterSucceededRuns) {
+        const succeededIssueId = readRunIssueId({ issueId: succeededRun.runIssueId, taskId: succeededRun.runTaskId });
+        if (!succeededIssueId) continue;
+        const latestCreatedAt = latestSucceededRunCreatedAtByIssueId.get(succeededIssueId);
+        if (!latestCreatedAt || succeededRun.createdAt > latestCreatedAt) {
+          latestSucceededRunCreatedAtByIssueId.set(succeededIssueId, succeededRun.createdAt);
+        }
+      }
+      const latestCommentCreatedAtByKey = new Map<string, Date>();
+      for (const comment of agentCommentRows) {
+        if (!comment.authorAgentId) continue;
+        const commentKey = `${comment.authorAgentId}:${comment.issueId}`;
+        const latestCreatedAt = latestCommentCreatedAtByKey.get(commentKey);
+        if (!latestCreatedAt || comment.createdAt > latestCreatedAt) {
+          latestCommentCreatedAtByKey.set(commentKey, comment.createdAt);
+        }
+      }
       for (const run of failedRows) {
         const issueId = readRunIssueId(run.contextSnapshot);
         const runKey = `${run.agentId}:${issueId ?? ""}`;
@@ -1709,6 +1768,30 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         if (hasNewerRun) continue;
 
         const issue = issueId ? failedIssueMap.get(issueId) ?? null : null;
+
+        // The work this failure blocked can also move on without a newer run
+        // from this exact issue+agent pair: the issue got reassigned and the
+        // new owner succeeded, the issue reached a terminal status outright,
+        // its status moved on some other way, or the agent commented its way
+        // past the failure. Any of those means this row is stale, not a live
+        // failure that still needs a human.
+        const failureSettledAt = run.finishedAt ?? run.updatedAt ?? run.createdAt;
+        const hasLaterSucceededRun = issueId
+          ? (latestSucceededRunCreatedAtByIssueId.get(issueId)?.getTime() ?? 0) > failureSettledAt.getTime()
+          : false;
+        const issueReachedTerminalStatus = issue?.status === "done" || issue?.status === "cancelled";
+        // Exhausted retries fail while the issue is still `in_progress`, so a
+        // status that has since moved elsewhere (and did so after this run
+        // settled) is itself evidence the issue is no longer stuck here.
+        const issueStatusMovedOn = issue != null
+          && issue.status !== "in_progress"
+          && issue.updatedAt.getTime() > failureSettledAt.getTime();
+        const hasLaterCommentFromAgent =
+          (latestCommentCreatedAtByKey.get(runKey)?.getTime() ?? 0) > failureSettledAt.getTime();
+        if (hasLaterSucceededRun || issueReachedTerminalStatus || issueStatusMovedOn || hasLaterCommentFromAgent) {
+          continue;
+        }
+
         const dedupKey = `run:${run.id}`;
         add(createItem({
           companyId,
@@ -1738,7 +1821,9 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           ),
           inlineResolvable: true,
           entryRule: "latest failed/timed_out run has a Bounded retry exhausted lifecycle event.",
-          exitRule: "A newer run exists for the same issue/agent pair or the row is dismissed.",
+          exitRule: "A newer run exists for the same issue/agent pair, a later run on the issue "
+            + "succeeded, the issue's status moved on or reached done/cancelled, the agent commented "
+            + "on the issue afterward, or the row is dismissed.",
           dedupKey,
           severity: "high",
           activityAt: toIso(run.finishedAt ?? run.updatedAt ?? run.createdAt),
