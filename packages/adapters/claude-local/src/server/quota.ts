@@ -4,12 +4,27 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
+import type {
+  GetQuotaWindowsContext,
+  ProviderQuotaResult,
+  QuotaWindow,
+  QuotaWindowsCredential,
+} from "@paperclipai/adapter-utils";
+import type { ClaudeRateLimitSnapshot } from "./parse.js";
 
 const execFileAsync = promisify(execFile);
 
 const CLAUDE_USAGE_SOURCE_OAUTH = "anthropic-oauth";
 const CLAUDE_USAGE_SOURCE_CLI = "claude-cli";
+// Source label for a result built from a run's own passively-observed
+// rate_limit_event instead of a live poll — see pollClaudeQuotaForCredential.
+const CLAUDE_USAGE_SOURCE_RUN_TELEMETRY = "claude-run-telemetry";
+// A live read is reused for this long before the next poll bothers the
+// rate-limited oauth/usage endpoint again.
+const CLAUDE_QUOTA_FRESH_MS = 120_000;
+// After a live read fails (429 or otherwise), stop retrying it for this long
+// and serve the last good read instead, marked stale.
+const CLAUDE_QUOTA_BACKOFF_MS = 5 * 60_000;
 
 export function claudeConfigDir(): string {
   const fromEnv = process.env.CLAUDE_CONFIG_DIR;
@@ -540,13 +555,23 @@ function formatProviderError(source: string, error: unknown): string {
   return `${source}: ${message}`;
 }
 
-export async function getQuotaWindows(): Promise<ProviderQuotaResult> {
+/**
+ * The original, pre-company-aware probe: read whatever Claude login the
+ * Paperclip host itself has (its own `~/.claude/.credentials.json`, `claude
+ * auth status`, or a CLI `/usage` scrape) and report that one subscription's
+ * windows. Used as-is when the caller gives no company context, and as the
+ * fallback for any claude_local agent whose adapter config carries no
+ * `CLAUDE_CODE_OAUTH_TOKEN` binding of its own (see getQuotaWindows below).
+ */
+async function getHostLoginQuotaWindows(label: string | null): Promise<ProviderQuotaResult> {
+  const withLabel = (result: ProviderQuotaResult): ProviderQuotaResult =>
+    label ? { ...result, label } : result;
   if (
     process.env.CLAUDE_CODE_USE_BEDROCK === "1" ||
     process.env.CLAUDE_CODE_USE_BEDROCK === "true" ||
     hasNonEmptyProcessEnv("ANTHROPIC_BEDROCK_BASE_URL")
   ) {
-    return { provider: "anthropic", source: "bedrock", ok: true, windows: [] };
+    return withLabel({ provider: "anthropic", source: "bedrock", ok: true, windows: [] });
   }
 
   const authStatus = await readClaudeAuthStatus();
@@ -558,7 +583,7 @@ export async function getQuotaWindows(): Promise<ProviderQuotaResult> {
   if (token) {
     try {
       const windows = await fetchClaudeQuota(token);
-      return { provider: "anthropic", source: CLAUDE_USAGE_SOURCE_OAUTH, ok: true, windows };
+      return withLabel({ provider: "anthropic", source: CLAUDE_USAGE_SOURCE_OAUTH, ok: true, windows });
     } catch (error) {
       errors.push(formatProviderError("Anthropic OAuth usage", error));
     }
@@ -566,24 +591,24 @@ export async function getQuotaWindows(): Promise<ProviderQuotaResult> {
 
   try {
     const windows = await fetchClaudeCliQuota();
-    return { provider: "anthropic", source: CLAUDE_USAGE_SOURCE_CLI, ok: true, windows };
+    return withLabel({ provider: "anthropic", source: CLAUDE_USAGE_SOURCE_CLI, ok: true, windows });
   } catch (error) {
     errors.push(formatProviderError("Claude CLI /usage", error));
   }
 
   if (hasNonEmptyProcessEnv("ANTHROPIC_API_KEY") && !authDescription) {
-    return {
+    return withLabel({
       provider: "anthropic",
       ok: false,
       error:
         errors[0]
         ?? "ANTHROPIC_API_KEY is set and no local Claude subscription session is available for quota polling",
       windows: [],
-    };
+    });
   }
 
   if (authDescription) {
-    return {
+    return withLabel({
       provider: "anthropic",
       ok: false,
       error:
@@ -591,13 +616,221 @@ export async function getQuotaWindows(): Promise<ProviderQuotaResult> {
           ? `${authDescription}, but quota polling failed (${errors.join("; ")})`
           : `${authDescription}, but Paperclip could not load subscription quota data`,
       windows: [],
-    };
+    });
   }
 
-  return {
+  return withLabel({
     provider: "anthropic",
     ok: false,
     error: errors[0] ?? "no local claude auth token",
     windows: [],
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Company-aware polling: one credential per distinct bound token, each
+// cached and backed off independently, falling back to passively-observed
+// run telemetry (see parse.ts's claudeRateLimit) when a live read is not
+// available. See GetQuotaWindowsContext / QuotaWindowsCredential.
+// ---------------------------------------------------------------------------
+
+interface ClaudeQuotaCacheEntry {
+  /** The most recent successful live read, kept around (not evicted on a
+   *  later failure) so a 429 or outage can still serve something useful. */
+  lastGood: ProviderQuotaResult | null;
+  /** Epoch ms until which `lastGood` counts as fresh (no live retry needed). */
+  goodUntil: number;
+  /** Epoch ms before which a live retry is skipped after a failure. */
+  backoffUntil: number;
+}
+
+// Keyed by sha256(token) — never the token itself. Process-lifetime cache;
+// fine to lose on restart since the next poll just repopulates it.
+const claudeQuotaCacheByFingerprint = new Map<string, ClaudeQuotaCacheEntry>();
+
+/** sha256 fingerprint of a token, used only as a cache key. Never log the
+ *  input to this function; only ever log or compare its output. */
+function tokenFingerprint(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function claudeRateLimitWindows(snapshot: ClaudeRateLimitSnapshot): QuotaWindow[] {
+  const windows: QuotaWindow[] = [];
+  const toResetIso = (epochSeconds: number | null): string | null =>
+    typeof epochSeconds === "number" && Number.isFinite(epochSeconds)
+      ? new Date(epochSeconds * 1000).toISOString()
+      : null;
+  if (snapshot.windows.five_hour) {
+    windows.push({
+      label: "Current session",
+      usedPercent: toPercent(snapshot.windows.five_hour.utilization),
+      resetsAt: toResetIso(snapshot.windows.five_hour.resetsAt),
+      valueLabel: null,
+      detail: null,
+    });
+  }
+  if (snapshot.windows.seven_day) {
+    windows.push({
+      label: "Current week (all models)",
+      usedPercent: toPercent(snapshot.windows.seven_day.utilization),
+      resetsAt: toResetIso(snapshot.windows.seven_day.resetsAt),
+      valueLabel: null,
+      detail: null,
+      ...(snapshot.overageInUse || snapshot.isUsingOverage
+        ? { detail: "Extra usage in use — billed at API rates" }
+        : {}),
+    });
+  }
+  return windows;
+}
+
+/**
+ * Defensive read of a passively-observed rate-limit snapshot: the value
+ * crossed a DB jsonb column (and possibly an older server version's shape),
+ * so every field is re-checked rather than trusted. Returns null when the
+ * value is not a usable snapshot.
+ */
+function asClaudeRateLimitSnapshot(value: unknown): ClaudeRateLimitSnapshot | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  const windowsRecord =
+    typeof record.windows === "object" && record.windows !== null
+      ? (record.windows as Record<string, unknown>)
+      : {};
+  const readWindow = (raw: unknown): ClaudeRateLimitSnapshot["windows"]["five_hour"] | undefined => {
+    if (typeof raw !== "object" || raw === null) return undefined;
+    const w = raw as Record<string, unknown>;
+    const utilization = typeof w.utilization === "number" && Number.isFinite(w.utilization) ? w.utilization : null;
+    const resetsAt = typeof w.resetsAt === "number" && Number.isFinite(w.resetsAt) ? w.resetsAt : null;
+    if (utilization == null && resetsAt == null) return undefined;
+    return { utilization, resetsAt };
   };
+  const fiveHour = readWindow(windowsRecord.five_hour);
+  const sevenDay = readWindow(windowsRecord.seven_day);
+  if (!fiveHour && !sevenDay) return null;
+  return {
+    observedAt: typeof record.observedAt === "string" ? record.observedAt : new Date(0).toISOString(),
+    status: typeof record.status === "string" ? record.status : null,
+    rateLimitType: typeof record.rateLimitType === "string" ? record.rateLimitType : null,
+    resetsAt: typeof record.resetsAt === "number" ? record.resetsAt : null,
+    overageStatus: typeof record.overageStatus === "string" ? record.overageStatus : null,
+    overageResetsAt: typeof record.overageResetsAt === "number" ? record.overageResetsAt : null,
+    isUsingOverage: record.isUsingOverage === true,
+    overageInUse: record.overageInUse === true,
+    windows: {
+      ...(fiveHour ? { five_hour: fiveHour } : {}),
+      ...(sevenDay ? { seven_day: sevenDay } : {}),
+    },
+  };
+}
+
+function passiveResultFromSnapshot(label: string, raw: unknown): ProviderQuotaResult | null {
+  const snapshot = asClaudeRateLimitSnapshot(raw);
+  if (!snapshot) return null;
+  const windows = claudeRateLimitWindows(snapshot);
+  if (windows.length === 0) return null;
+  return {
+    provider: "anthropic",
+    source: CLAUDE_USAGE_SOURCE_RUN_TELEMETRY,
+    ok: true,
+    windows,
+    label,
+    observedAt: snapshot.observedAt,
+    stale: true,
+    overageInUse: snapshot.overageInUse || snapshot.isUsingOverage,
+  };
+}
+
+/**
+ * Poll (or serve from cache) one distinct bound credential. Never throws —
+ * every failure becomes an `ok: false` result — and never includes the token
+ * itself in anything returned, logged, or thrown.
+ */
+async function pollClaudeQuotaForCredential(credential: QuotaWindowsCredential): Promise<ProviderQuotaResult> {
+  const token = credential.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
+  if (!token) {
+    // This credential entry carries no token of its own (the "Server login"
+    // fallback entry for agents with no CLAUDE_CODE_OAUTH_TOKEN binding) —
+    // defer to the host-login probe, just labeled like the other panels.
+    return getHostLoginQuotaWindows(credential.label);
+  }
+
+  const fingerprint = tokenFingerprint(token);
+  const now = Date.now();
+  const entry = claudeQuotaCacheByFingerprint.get(fingerprint) ?? {
+    lastGood: null,
+    goodUntil: 0,
+    backoffUntil: 0,
+  };
+
+  if (entry.lastGood && now < entry.goodUntil) {
+    return { ...entry.lastGood, label: credential.label };
+  }
+
+  if (now >= entry.backoffUntil) {
+    try {
+      const windows = await fetchClaudeQuota(token);
+      const result: ProviderQuotaResult = {
+        provider: "anthropic",
+        source: CLAUDE_USAGE_SOURCE_OAUTH,
+        ok: true,
+        windows,
+        label: credential.label,
+        observedAt: new Date(now).toISOString(),
+        stale: false,
+      };
+      claudeQuotaCacheByFingerprint.set(fingerprint, {
+        lastGood: result,
+        goodUntil: now + CLAUDE_QUOTA_FRESH_MS,
+        backoffUntil: now,
+      });
+      return result;
+    } catch (error) {
+      claudeQuotaCacheByFingerprint.set(fingerprint, {
+        lastGood: entry.lastGood,
+        goodUntil: entry.goodUntil,
+        backoffUntil: now + CLAUDE_QUOTA_BACKOFF_MS,
+      });
+      // formatProviderError only ever stringifies the fetch's own error
+      // (e.g. an HTTP status), never the token — fall through below.
+      void formatProviderError("Anthropic OAuth usage", error);
+    }
+  }
+
+  if (entry.lastGood) {
+    return { ...entry.lastGood, label: credential.label, stale: true };
+  }
+
+  const passive = passiveResultFromSnapshot(credential.label, credential.passiveSnapshot);
+  if (passive) return passive;
+
+  return {
+    provider: "anthropic",
+    ok: false,
+    label: credential.label,
+    error: "Could not read live Claude usage right now, and no recent run data is available either.",
+    windows: [],
+  };
+}
+
+/**
+ * Fetch live provider quota/rate-limit windows. Without a company context
+ * (no `ctx`, or an empty credentials list) this keeps its original behavior:
+ * probe the Paperclip host's own Claude login and return one result.
+ *
+ * With `ctx.credentials`, each entry is a distinct bound
+ * `CLAUDE_CODE_OAUTH_TOKEN` the server resolved for the company (already
+ * resolved to an env var — this adapter never sees a secret reference), and
+ * this returns one ProviderQuotaResult per entry, labeled, so the UI can show
+ * one panel per distinct bound token instead of one shared panel that only
+ * ever reflects the host's own login.
+ */
+export async function getQuotaWindows(
+  ctx?: GetQuotaWindowsContext,
+): Promise<ProviderQuotaResult | ProviderQuotaResult[]> {
+  const credentials = ctx?.credentials;
+  if (!credentials || credentials.length === 0) {
+    return getHostLoginQuotaWindows(null);
+  }
+  return Promise.all(credentials.map((credential) => pollClaudeQuotaForCredential(credential)));
 }
