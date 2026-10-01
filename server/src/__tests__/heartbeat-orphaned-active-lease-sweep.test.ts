@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -69,6 +70,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
   });
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(environmentLeases);
     await db.delete(heartbeatRuns);
     await db.delete(environments);
@@ -187,7 +189,12 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
 
     await heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 0 });
 
-    expect(await leaseRow(leaseId)).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    // At startup the run's lease is released through its driver right away
+    // (for the local driver that is bookkeeping only). Without its environment
+    // the lease has no driver context, so the orphan sweep recovers it.
+    expect(await leaseRow(leaseId)).toMatchObject(deletedEnvironment
+      ? { status: "expired", cleanupStatus: "success" }
+      : { status: "released" });
     expect((await leaseRow(leaseId))?.releasedAt).toBeInstanceOf(Date);
   });
 

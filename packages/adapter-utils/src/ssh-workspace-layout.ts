@@ -10,6 +10,7 @@ import path from "node:path";
  *   │   ├── workspace/             the agent's working directory
  *   │   ├── .last-used             touched when a run stages it (GC clock)
  *   │   └── .last-run              run id that staged workspace/
+ *   ├── github/<runId>/            per run: managed GitHub operation launchers
  *   └── runs/<runId>/              per run
  *       ├── <adapterKey>/          runtime root: skills, config, bridge files
  *       ├── scratch/               run scratch and temp directory
@@ -75,6 +76,14 @@ export function sshRunDir(baseRemoteDir: string, runId: string): string {
 /** Per-run scratch directory; the server creates it and points the temp env vars at it. */
 export function sshRunScratchDir(baseRemoteDir: string, runId: string): string {
   return path.posix.join(sshRunDir(baseRemoteDir, runId), "scratch");
+}
+
+/**
+ * Per-run managed GitHub operation launchers on a remote target (SSH or
+ * sandbox). The run removes them once its operations settle.
+ */
+export function remoteRunGitHubLauncherDir(baseRemoteDir: string, runId: string): string {
+  return path.posix.join(sshRuntimeDir(baseRemoteDir), "github", requireRunIdSegment(runId));
 }
 
 export function sshReusableWorkspaceSlotDir(baseRemoteDir: string, key: string): string {

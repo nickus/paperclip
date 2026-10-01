@@ -6,6 +6,8 @@ import {
   type NativeWorkspaceFinalizationOwnership,
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
+import { interruptedRunBeforeResumedSandbox } from "./interrupted-sandbox-run.js";
+import { PENDING_CLEANUP_INTENT_METADATA_KEY, readPendingCleanupIntent } from "./pending-cleanup-intent.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
@@ -665,6 +667,7 @@ import {
   selectPaperclipTaskMarkdown,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+  withPaperclipWakeInterruptedPreviousRun,
   withPaperclipWakeSessionConfigChanges,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -772,6 +775,10 @@ const PENDING_CLEANUP_SWEEP_PAGE_SIZE = 20;
 const pendingCleanupAttemptsInFlight = new Set<string>();
 // Escalate and slow cleanup after this many attempts; never abandon a live lease.
 const PENDING_CLEANUP_SWEEP_ATTEMPT_CAP = 5;
+// A reusable sandbox parked for a release gets this many release attempts
+// before the sweep falls back to destroying it. Kept below the escalation cap,
+// so the destroy still gets attempts before the lease needs attention.
+const PENDING_CLEANUP_RELEASE_ATTEMPT_CAP = 3;
 // The reaper stores its retry state under these keys in the lease metadata.
 const PENDING_CLEANUP_ATTEMPTS_METADATA_KEY = "pendingCleanupRetryAttempts";
 const PENDING_CLEANUP_CAP_WARNED_METADATA_KEY = "pendingCleanupRetryCapWarned";
@@ -787,6 +794,8 @@ const STALE_TERMINAL_RUN_LEASE_PAGE_SIZE = 20;
 // periodic reaper tick passes its own, shorter staleness threshold so this
 // release reaches a legacy run's lease before the orphaned-active-lease sweep.
 export const STALE_TERMINAL_RUN_LEASE_GRACE_MS = 10 * 60 * 1000;
+// The startup reap releases at most this many pages of terminal runs' leases.
+const STARTUP_TERMINAL_RUN_LEASE_MAX_PAGES = 25;
 
 // A provider or plugin destroy rejection can carry a bearer credential, a
 // signed URL, or provider response detail in its name, code, message, cause, or
@@ -10969,6 +10978,10 @@ export function heartbeatService(
         agentId: input.agentId,
         status: leaseReleaseStatusForRunStatus(input.status),
         failureReason: input.failureReason ?? undefined,
+        // A cancelled run's work may still be running in its sandbox. The
+        // provider stops it before keeping the sandbox, and only a confirmed
+        // stop counts as a release.
+        ...(input.status === "cancelled" ? { cancelActiveWork: true } : {}),
         providerResourceDisposition: input.providerResourceDisposition,
         nativeLifecycleTelemetry: input.nativeLifecycleTelemetry,
       })
@@ -11051,6 +11064,49 @@ export function heartbeatService(
       return await reconcileStaleTerminalRunLeasePage(opts);
     } finally {
       staleTerminalRunLeaseReconciliationInFlight = false;
+    }
+  }
+
+  // At startup, release the leases of every legacy run that ended before the
+  // restart, with no grace: a fresh process has no executor left that could
+  // still release them itself. Released through the provider, a reusable
+  // sandbox is kept for the task's next run; the orphaned-lease sweep that
+  // follows would destroy it. One page at a time against a cutoff fixed at the
+  // start of the reap: each page's claim moves the handled leases past it, so
+  // the loop ends once a page releases nothing (or after a bounded number of
+  // pages; the periodic reaper continues from there).
+  async function reconcileTerminalRunLeasesAtStartup(
+    now: Date,
+  ): Promise<{ reconciled: number; runIds: string[] }> {
+    const runIds: string[] = [];
+    for (let page = 0; page < STARTUP_TERMINAL_RUN_LEASE_MAX_PAGES; page += 1) {
+      if (shutdownInProgress) break;
+      const result = await reconcileStaleTerminalRunLeases({ graceMs: 0, now });
+      runIds.push(...result.runIds);
+      if (result.reconciled === 0) break;
+    }
+    return { reconciled: runIds.length, runIds };
+  }
+
+  // Retry, right away, the release of this run's reusable sandbox leases that
+  // were parked because the release could not be confirmed, so the run's
+  // follow-up resumes the same sandbox. Leases parked for a destroy are left to
+  // the periodic sweep, and a provider worker that is not ready defers the
+  // retry without using up an attempt.
+  async function releaseParkedReusableLeasesForRun(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
+  ): Promise<void> {
+    try {
+      await sweepPendingCleanupLeases({
+        forRun: { companyId: run.companyId, runId: run.id, releaseOnly: true },
+      });
+    } catch {
+      // Log a constant errorKind only: the exception can carry a provider
+      // credential in its message, cause, or stack.
+      logger.warn(
+        { errorKind: PENDING_CLEANUP_SWEEP_ERROR_KIND, runId: run.id },
+        "could not retry the release of a parked sandbox lease",
+      );
     }
   }
 
@@ -19509,6 +19565,24 @@ export function heartbeatService(
     return claimed.length > 0;
   }
 
+  // Turn a parked "release" into a destroy for good, fenced to the cleanup
+  // attempt that decided it. Only the intent key is written, so a concurrent
+  // write to another metadata key survives.
+  async function markPendingCleanupIntentDestroy(leaseId: string, attemptId: string): Promise<void> {
+    await db
+      .update(environmentLeases)
+      .set({
+        metadata: sql`jsonb_set(${pendingCleanupMetadataObjectSql()}, array[${PENDING_CLEANUP_INTENT_METADATA_KEY}::text], to_jsonb('destroy'::text), true)`,
+      })
+      .where(
+        and(
+          eq(environmentLeases.id, leaseId),
+          eq(environmentLeases.status, "pending_cleanup"),
+          sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${attemptId}`,
+        ),
+      );
+  }
+
   // Defer a pending_cleanup lease whose provider plugin is not ready this tick.
   // The sweep reads one page of the oldest rows, ordered by `updatedAt`. A lease
   // that the sweep only skips keeps its old `updatedAt`, so it stays the oldest
@@ -19707,12 +19781,16 @@ export function heartbeatService(
      * but cannot take over an in-flight cleanup attempt.
      */
     explicitRetry?: { companyId: string; runId: string; actorId: string; reason?: "retry_failed_run" | "queued_comment_interrupt" };
+    /** Only this run's leases, and with `releaseOnly` only the ones parked
+     * for a release: the run's follow-up then resumes the kept sandbox. */
+    forRun?: { companyId: string; runId: string; releaseOnly?: boolean };
   }): Promise<{
     swept: number;
     destroyed: number;
     capped: number;
   }> {
     const backoffMs = opts?.backoffMs ?? 0;
+    const targetRun = opts?.explicitRetry ?? opts?.forRun;
     const now = new Date();
     const cutoff = new Date(now.getTime() - backoffMs);
 
@@ -19722,7 +19800,7 @@ export function heartbeatService(
     // `pending_cleanup` row lands once the database recovers. The flush runs
     // before the read below, so this same tick tears down a freshly-landed row.
     try {
-      const flushed = opts?.explicitRetry ? null : await environmentRuntime.flushDeferredOrphanCleanups?.();
+      const flushed = targetRun ? null : await environmentRuntime.flushDeferredOrphanCleanups?.();
       if (flushed && (flushed.recovered > 0 || flushed.pending > 0)) {
         logger.info(
           { recovered: flushed.recovered, pending: flushed.pending },
@@ -19745,8 +19823,11 @@ export function heartbeatService(
       .where(
         and(
           eq(environmentLeases.status, "pending_cleanup"),
-          opts?.explicitRetry ? eq(environmentLeases.companyId, opts.explicitRetry.companyId) : undefined,
-          opts?.explicitRetry ? eq(environmentLeases.heartbeatRunId, opts.explicitRetry.runId) : undefined,
+          targetRun ? eq(environmentLeases.companyId, targetRun.companyId) : undefined,
+          targetRun ? eq(environmentLeases.heartbeatRunId, targetRun.runId) : undefined,
+          opts?.forRun?.releaseOnly
+            ? sql`${environmentLeases.metadata}->>${PENDING_CLEANUP_INTENT_METADATA_KEY}::text = 'release'`
+            : undefined,
           pendingCleanupRetryDueSql(Boolean(opts?.explicitRetry)),
           backoffMs > 0 ? lte(environmentLeases.updatedAt, cutoff) : undefined,
         ),
@@ -19781,6 +19862,17 @@ export function heartbeatService(
       // the environment is lifecycle context and only a legacy fallback.
       const isOrphanEphemeralLease = lease.leasePolicy === "ephemeral";
       const useRecordedTeardown = isOrphanEphemeralLease || !environment || hasStopOnlyCleanup(lease);
+      // A reusable sandbox whose release could not be confirmed was parked with
+      // the "release" intent (see pending-cleanup-intent.ts). The sandbox may
+      // hold the task's agent session, so retry the release first and keep the
+      // sandbox for the next run; destroy only when the release keeps failing
+      // or can no longer apply. A lease without the marker, or parked for a
+      // destroy, is torn down as before.
+      const releaseIntent =
+        environment !== null &&
+        lease.leasePolicy === "reuse_by_environment" &&
+        !hasStopOnlyCleanup(lease) &&
+        readPendingCleanupIntent(lease.metadata) === "release";
 
       // Do not consume a finite cleanup attempt while the provider plugin is
       // briefly unavailable. A plugin worker restart, a plugin reload, or a
@@ -19835,13 +19927,59 @@ export function heartbeatService(
       }, 30_000);
       renewal.unref();
 
+      // The step in flight when an error was thrown; see the catch below.
+      let cleanupStep: "release" | "recorded_teardown" | "run_lease" | null = null;
       try {
         if (opts?.explicitRetry) await logActivity(db, {
           companyId: row.companyId, actorType: "user", actorId: opts.explicitRetry.actorId,
           action: "environment_lease.cleanup_retried", entityType: "environment_lease", entityId: row.id,
           runId: opts.explicitRetry.runId, details: { attempt: attempts + 1, reason: opts.explicitRetry.reason ?? "retry_failed_run" },
         });
-        if (useRecordedTeardown) {
+        let teardown: "recorded" | "run_lease" | null = useRecordedTeardown
+          ? "recorded"
+          : environment ? "run_lease" : null;
+        if (releaseIntent && environment) {
+          let settled = false;
+          if (attempts < PENDING_CLEANUP_RELEASE_ATTEMPT_CAP) {
+            cleanupStep = "release";
+            const result = environmentRuntime.retryPendingSandboxRelease
+              ? await environmentRuntime.retryPendingSandboxRelease({ environment, lease })
+              : { outcome: "not_releasable" as const, reason: "release_unsupported" as const };
+            if (result.outcome === "not_releasable") {
+              // The environment moved to another provider or plugin, or stopped
+              // reusing sandboxes, or the task has moved on to another sandbox:
+              // no later run should resume this one. Tear it down from the data
+              // recorded on the lease.
+              if (result.reason === "superseded") {
+                logger.info(
+                  { leaseId: row.id, environmentId: row.environmentId },
+                  "a newer sandbox of the same task replaced a parked reusable sandbox; tearing the parked one down",
+                );
+              }
+              teardown = "recorded";
+            } else {
+              settled = true;
+              if (result.lease && result.outcome === "released") {
+                logger.info(
+                  { leaseId: row.id, environmentId: row.environmentId, attempts: attempts + 1 },
+                  "released a parked reusable sandbox lease; the sandbox is kept for the next run",
+                );
+              } else if (result.lease) {
+                destroyed += 1;
+              }
+            }
+          }
+          if (!settled) {
+            // From here on this lease is a destroy, for good: a later attempt
+            // must not keep a sandbox the sweep already started tearing down.
+            await markPendingCleanupIntentDestroy(row.id, claimed);
+            lease.metadata = { ...lease.metadata, [PENDING_CLEANUP_INTENT_METADATA_KEY]: "destroy" };
+          } else {
+            teardown = null;
+          }
+        }
+        if (teardown === "recorded") {
+          cleanupStep = "recorded_teardown";
           // Tear the sandbox down from the recorded provider config and the
           // cleanup-authorized secret versions. Preserve any provider receipt;
           // a completed retry must grant the same evidence as initial cleanup.
@@ -19858,7 +19996,8 @@ export function heartbeatService(
             remoteExecutionTermination: remoteTerminationReceipt(lease, receipt),
           });
           if (released) destroyed += 1;
-        } else if (environment) {
+        } else if (teardown === "run_lease" && environment) {
+          cleanupStep = "run_lease";
           const result = await environmentRuntime.destroyRunLease({
             environment,
             lease,
@@ -19869,16 +20008,20 @@ export function heartbeatService(
           }
         }
       } catch (error) {
-        // The recorded-data teardown throws on failure, so revert the lease to
-        // pending_cleanup for a later sweep. The claimed attempt still counts
-        // for backoff, so requests stay bounded. The `destroyRunLease`
-        // path reverts the lease itself, so this revert only runs for the
-        // recorded-data teardown path.
-        if (useRecordedTeardown) {
+        // The release retry and the recorded-data teardown throw on failure, so
+        // revert the lease to pending_cleanup for a later sweep. The claimed
+        // attempt still counts for backoff, so requests stay bounded. The
+        // `destroyRunLease` path reverts the lease itself. The revert is fenced
+        // to this attempt and keeps the lease's cleanup intent.
+        if (
+          cleanupStep === "release" ||
+          cleanupStep === "recorded_teardown" ||
+          (cleanupStep === null && useRecordedTeardown)
+        ) {
           await environmentsSvc.releaseLease(lease.id, "pending_cleanup", {
             expectedPendingCleanupAttemptId: claimed,
             cleanupStatus: "failed",
-            failureReason: "pending_cleanup_retry",
+            failureReason: cleanupStep === "release" ? "pending_cleanup_release_retry" : "pending_cleanup_retry",
           });
         }
         // Log a constant errorKind only. The exception can carry a credential in
@@ -20513,6 +20656,12 @@ export function heartbeatService(
         status: finalizedRun.status,
         failureReason: finalizedRun.error ?? undefined,
       });
+      // A sandbox whose release could not be confirmed was parked for a retry
+      // of the release. Retry it now, before the follow-up below is queued and
+      // started, so the follow-up resumes the same sandbox (and the agent's
+      // session in it) instead of starting over in a new one. A provider
+      // worker that is not ready yet leaves the lease for the periodic sweep.
+      await releaseParkedReusableLeasesForRun(finalizedRun);
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       const retryAgent = await getAgent(run.agentId);
@@ -20573,15 +20722,17 @@ export function heartbeatService(
     // release runs first, and on the periodic tick with a grace no longer than
     // the tick's staleness threshold, so it handles a legacy run's lease once
     // it is stale for the sweep too; its claim moves `updatedAt`, so the sweep
-    // skips what it handled. The startup reap keeps the standalone grace: the
-    // sweep deliberately tears down leases of runs that ended just before the
-    // restart. Native runs are always left to the sweep.
+    // skips what it handled. The startup reap releases with no grace at all: a
+    // fresh process has no executor left to release them, and the sweep, which
+    // runs with no backoff at startup, would otherwise destroy the sandbox of
+    // every run that ended just before the restart. Native runs are always
+    // left to the sweep.
     try {
-      const staleLeases = await reconcileStaleTerminalRunLeases(
-        staleThresholdMs > 0
-          ? { graceMs: Math.min(STALE_TERMINAL_RUN_LEASE_GRACE_MS, staleThresholdMs) }
-          : undefined,
-      );
+      const staleLeases = staleThresholdMs > 0
+        ? await reconcileStaleTerminalRunLeases({
+            graceMs: Math.min(STALE_TERMINAL_RUN_LEASE_GRACE_MS, staleThresholdMs),
+          })
+        : await reconcileTerminalRunLeasesAtStartup(now);
       if (staleLeases.reconciled > 0) {
         logger.warn(
           { reconciled: staleLeases.reconciled, runIds: staleLeases.runIds },
@@ -24135,6 +24286,28 @@ export function heartbeatService(
           ...wakePayloadForWorkspace,
           executionWorkspace: { branchName: executionWorkspace.branchName },
         };
+      }
+      // This run resumed the sandbox of an interrupted run on the task, but a
+      // legacy adapter stages the workspace from the host copy again: what that
+      // run changed in the sandbox without syncing it back is gone, although
+      // the agent session kept in the sandbox remembers it. Set or clear the
+      // note on every run, since a retried run reuses its context.
+      if (context[PAPERCLIP_WAKE_PAYLOAD_KEY]) {
+        const interruptedRunId =
+          executionTarget?.kind === "remote" &&
+          executionTarget.transport === "sandbox" &&
+          agent.adapterType !== "paperclip_runner"
+            ? await interruptedRunBeforeResumedSandbox(db, {
+                companyId: agent.companyId,
+                runId: run.id,
+                issueId: issueId ?? null,
+                lease: activeEnvironmentLease.lease,
+              }).catch(() => null)
+            : null;
+        context[PAPERCLIP_WAKE_PAYLOAD_KEY] = withPaperclipWakeInterruptedPreviousRun(
+          context[PAPERCLIP_WAKE_PAYLOAD_KEY],
+          interruptedRunId,
+        );
       }
       const runtimeServiceIntents = (() => {
         const runtimeConfig = parseObject(

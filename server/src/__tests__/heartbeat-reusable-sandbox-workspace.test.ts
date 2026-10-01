@@ -3,13 +3,14 @@ import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
   companies,
   createDb,
+  environmentLeases,
   environments,
   executionWorkspaces,
   heartbeatRuns,
@@ -317,7 +318,8 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
      * sandbox lease, as between two real runs of a task.
      */
     async function wakeAndSettle(targetIssueId: string = issueId) {
-      const before = (await agentRuns()).length;
+      const earlierRunIds = new Set((await agentRuns()).map((entry) => entry.id));
+      const before = earlierRunIds.size;
       if (before > 0) {
         // A reply on the task since the last run, so the follow-up wake is new
         // input rather than a throttled rewake.
@@ -355,7 +357,8 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
       const runs = await agentRuns();
-      expect(runs.map((entry) => entry.status)).toEqual(runs.map(() => "succeeded"));
+      const newRuns = runs.filter((entry) => !earlierRunIds.has(entry.id));
+      expect(newRuns.map((entry) => entry.status)).toEqual(newRuns.map(() => "succeeded"));
       return runs.length;
     }
 
@@ -408,7 +411,20 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
         });
     }
 
-    return { issueId, wakeAndSettle, readIssue, addIssue, countExecutionWorkspaces, leaseCalls, worker, runSessions };
+    return {
+      companyId,
+      agentId,
+      issueId,
+      heartbeat,
+      agentRuns,
+      wakeAndSettle,
+      readIssue,
+      addIssue,
+      countExecutionWorkspaces,
+      leaseCalls,
+      worker,
+      runSessions,
+    };
   }
 
   it("pins the task to its execution workspace so later runs resume the same sandbox", async () => {
@@ -504,6 +520,165 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
         };
       });
     }
+  }, 90_000);
+
+  /** Restore the adapter's default turn: record a disposition and succeed. */
+  function restoreDefaultTurn() {
+    adapterExecute.mockReset();
+    adapterExecute.mockImplementation(async (input?: { context?: Record<string, unknown> }) => {
+      await recordDisposition.current?.(input?.context?.issueId);
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        provider: "test",
+        model: "test-model",
+      };
+    });
+  }
+
+  it("resumes the same sandbox and agent session after a board comment interrupts the run", async () => {
+    // The agent keeps whatever session it is handed and starts one only when
+    // it gets none, like a CLI agent resuming by session id. The first turn
+    // works until the run is interrupted and then ends through the agent's
+    // own protocol.
+    let sessionsStarted = 0;
+    let interruptFirstTurn = true;
+    adapterExecute.mockImplementation((async (input: {
+      context?: Record<string, unknown>;
+      runtime?: { sessionParams?: Record<string, unknown> | null };
+      signal?: AbortSignal;
+      onCancellationReady?: () => Promise<void>;
+    }) => {
+      const resumed = input?.runtime?.sessionParams?.sessionId;
+      const sessionId = typeof resumed === "string" ? resumed : `session-${++sessionsStarted}`;
+      const session = { sessionId, sessionParams: { sessionId }, sessionDisplayId: sessionId };
+      if (interruptFirstTurn) {
+        interruptFirstTurn = false;
+        await input.onCancellationReady?.();
+        await new Promise<void>((resolve) => {
+          if (input.signal?.aborted) return resolve();
+          input.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          errorCode: "cancelled",
+          errorMessage: "Turn cancelled",
+          ...session,
+          resultJson: { executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() } },
+        };
+      }
+      await recordDisposition.current?.(input?.context?.issueId);
+      return { exitCode: 0, signal: null, timedOut: false, provider: "test", model: "test-model", ...session };
+    }) as any);
+    try {
+      const { heartbeat, agentId, issueId, wakeAndSettle, leaseCalls, worker, runSessions } = await seed({
+        reuseLease: true,
+        runnerIdleTimeoutMs: 86_400_000,
+      });
+      const interrupted = await heartbeat.wakeup(agentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        contextSnapshot: { issueId },
+      });
+      expect(interrupted).not.toBeNull();
+      await vi.waitFor(() => expect(adapterExecute).toHaveBeenCalledTimes(1), { timeout: 30_000, interval: 50 });
+
+      // What a board comment posted with "interrupt" does to the active run.
+      await heartbeat.cancelRun(interrupted!.id, "Interrupted by board comment", {
+        errorCode: "operator_interrupted",
+        resultJson: { operatorInterrupted: true, interruptionSource: "issue_comment_interrupt", interruptedIssueId: issueId },
+      });
+      await vi.waitFor(async () => {
+        expect(await heartbeat.getRun(interrupted!.id)).toMatchObject({ status: "cancelled" });
+        expect(worker.call.mock.calls.filter(([, method]) => method === "environmentReleaseLease")).toHaveLength(1);
+      }, { timeout: 30_000, interval: 50 });
+
+      // The interrupted run's work was stopped and its sandbox kept.
+      expect(worker.call.mock.calls.find(([, method]) => method === "environmentReleaseLease")?.[2]).toMatchObject({
+        providerLeaseId: "pc-sandbox-1",
+        cancelActiveWork: true,
+      });
+
+      // The comment's wake resumes that sandbox and continues the session.
+      await wakeAndSettle();
+
+      expect(worker.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toEqual([]);
+      const calls = leaseCalls();
+      expect(calls.filter((call) => call.method === "environmentAcquireLease")).toHaveLength(1);
+      const resumes = calls.filter((call) => call.method === "environmentResumeLease");
+      expect(resumes.length).toBeGreaterThanOrEqual(1);
+      expect(resumes.map((call) => call.params.providerLeaseId)).toEqual(resumes.map(() => "pc-sandbox-1"));
+      expect(worker.sandboxes.size).toBe(1);
+      const sessions = await runSessions();
+      expect(sessions[0]).toMatchObject({ sessionIdBefore: null, sessionIdAfter: "session-1" });
+      for (const later of sessions.slice(1)) {
+        expect(later).toMatchObject({ sessionIdBefore: "session-1", sessionIdAfter: "session-1" });
+      }
+      expect(sessionsStarted).toBe(1);
+
+      // The workspace of the follow-up was staged from the host copy again, so
+      // its wake tells the agent that the interrupted run's unsynced changes
+      // in the sandbox are gone.
+      const wakes = adapterExecute.mock.calls.map(
+        ([input]) => ((input as { context?: Record<string, unknown> })?.context?.paperclipWake ?? {}) as Record<string, unknown>,
+      );
+      expect(wakes[0]).not.toHaveProperty("interruptedPreviousRun");
+      expect(wakes[1]).toMatchObject({ interruptedPreviousRun: { runId: interrupted!.id } });
+      for (const later of wakes.slice(2)) expect(later).not.toHaveProperty("interruptedPreviousRun");
+    } finally {
+      restoreDefaultTurn();
+    }
+  }, 90_000);
+
+  it("releases a failed run's parked sandbox before the Retry of that run starts", async () => {
+    const { agentId, issueId, heartbeat, agentRuns, wakeAndSettle, worker } = await seed({
+      reuseLease: true,
+      runnerIdleTimeoutMs: 86_400_000,
+    });
+    await wakeAndSettle();
+    const [failedRun] = await agentRuns();
+    // The run failed, and its release could not be confirmed: the lease is
+    // parked for a release retry while the sandbox still holds the session.
+    await db.update(heartbeatRuns).set({ status: "failed", error: "adapter failed", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, failedRun!.id));
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, failedRun!.id));
+    expect(lease).toMatchObject({ providerLeaseId: "pc-sandbox-1" });
+    await db.update(environmentLeases).set({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "release_cleanup_failed",
+      metadata: sql`(${environmentLeases.metadata} - 'remoteExecutionTermination') || '{"pendingCleanupIntent":"release","pendingCleanupReleaseRunStatus":"failed"}'::jsonb`,
+    }).where(eq(environmentLeases.id, lease!.id));
+    await db.update(issues).set({ status: "in_progress", updatedAt: new Date() }).where(eq(issues.id, issueId));
+    const callsBefore = worker.call.mock.calls.length;
+
+    const retry = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "retry_failed_run",
+      failedRunId: failedRun!.id,
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+      payload: { issueId },
+      contextSnapshot: { issueId },
+    });
+    expect(retry).not.toBeNull();
+    await vi.waitFor(async () => {
+      expect((await heartbeat.getRun(retry!.id))?.status).toBe("succeeded");
+    }, { timeout: 30_000, interval: 50 });
+    await heartbeat.drainActiveRunExecutions();
+
+    const later = worker.call.mock.calls.slice(callsBefore).map(([, method, params]) => [method, params.providerLeaseId]);
+    // The parked sandbox is released first, then the retry resumes it.
+    expect(later.slice(0, 2)).toEqual([
+      ["environmentReleaseLease", "pc-sandbox-1"],
+      ["environmentResumeLease", "pc-sandbox-1"],
+    ]);
+    expect(later.filter(([method]) => method === "environmentDestroyLease" || method === "environmentAcquireLease")).toEqual([]);
+    expect(worker.call.mock.calls[callsBefore]?.[2]).toMatchObject({ cancelActiveWork: true, runStatus: "failed" });
   }, 90_000);
 
   it("gives each task its own execution workspace and sandbox and never resumes another task's sandbox", async () => {

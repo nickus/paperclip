@@ -1,9 +1,11 @@
 import { hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { sandboxRunPrivatePaths } from "./sandbox-run-private-paths.js";
+import { readPendingCleanupIntent, readPendingCleanupParkedAt, readPendingCleanupReleaseRunStatus } from "./pending-cleanup-intent.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
-import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companySecrets, companySecretVersions, environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import type {
@@ -511,9 +513,22 @@ export interface EnvironmentDriverAcquireInput {
   assertCompanyBinding?: boolean;
 }
 
+/** Outcome of {@link EnvironmentRuntimeDriver.retryPendingSandboxRelease}. */
+export type PendingSandboxReleaseResult =
+  /** The provider confirmed the stop and kept the sandbox; the lease is resumable. */
+  | { outcome: "released"; lease: EnvironmentLease | null }
+  /** The provider tore the sandbox down instead of keeping it. */
+  | { outcome: "destroyed"; lease: EnvironmentLease | null }
+  /** The release must not run; tear the sandbox down from the recorded lease data. */
+  | { outcome: "not_releasable"; reason: "provider_changed" | "reuse_disabled" | "release_unsupported" | "superseded" };
+
 export interface EnvironmentDriverReleaseInput {
   resourceDisposition?: "stop_and_retain";
-  /** Explicit Stop may terminate in-flight setup rather than drain it. */
+  /**
+   * Stop the lease's in-flight work rather than drain it: an explicit Stop, or
+   * the release of a cancelled run. The release then counts only with a
+   * provider receipt that confirms the stop.
+   */
   cancelActiveWork?: boolean;
   environment: Environment;
   lease: EnvironmentLease;
@@ -682,6 +697,21 @@ export interface EnvironmentRuntimeDriver {
    * receipt must be validated and persisted by the caller at lease release.
    */
   retryPendingSandboxTeardown?(input: { environment: Environment | null; lease: EnvironmentLease }): Promise<unknown>;
+  /**
+   * Retry the provider release of a reusable sandbox lease parked with the
+   * "release" intent (see pending-cleanup-intent.ts): stop whatever the run
+   * left running and keep the sandbox for the next run of the task. The lease
+   * carries the cleanup sweep's attempt id, and the result is written only
+   * while that attempt still owns the lease, so a late result of an older
+   * attempt is ignored. Returns `not_releasable` when the release must not
+   * run: the environment no longer points at the lease's provider and plugin,
+   * no longer reuses sandboxes, or the plugin worker cannot release, or a run
+   * of the same task has used another sandbox since the lease was parked
+   * (`superseded`). The caller then tears the sandbox down from the recorded
+   * lease data. Throws when the release fails or the provider does not
+   * confirm the stop.
+   */
+  retryPendingSandboxRelease?(input: { environment: Environment; lease: EnvironmentLease }): Promise<PendingSandboxReleaseResult>;
   /**
    * Report whether the provider worker can run an orphan teardown now. A plugin
    * sandbox provider worker can be briefly down during its own restart window.
@@ -1190,6 +1220,12 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     async releaseRunLease(input) {
+      // A local lease owns no provider resource. Never close one that names a
+      // resource as bookkeeping only: it stays for the cleanup paths, which
+      // refuse it too (see retryPendingSandboxTeardown).
+      if (input.lease.providerLeaseId) {
+        throw new Error("Local lease release cannot release a provider resource.");
+      }
       return await environmentsSvc.releaseLease(input.lease.id, input.status);
     },
 
@@ -2104,6 +2140,12 @@ function createSandboxEnvironmentDriver(
                     config: workerConfig,
                     providerLeaseId: resumeProviderLeaseId,
                     leaseMetadata: reusableLease.metadata ?? undefined,
+                    // Nothing was kept running in a released sandbox (a warm
+                    // runner's sandbox is retained instead), so the provider
+                    // can stop what a release that never completed left.
+                    ...(reusableLease.status === "released" && reusableLease.releasedAt
+                      ? { releasedAt: new Date(reusableLease.releasedAt).toISOString() }
+                      : {}),
                   },
                   Math.min(
                     configuredResumeTimeoutMs,
@@ -2291,6 +2333,7 @@ function createSandboxEnvironmentDriver(
           sandboxLeaseAcquisition: providerLease
             ? {
                 outcome: "resumed",
+                ...previousRunOfResumedLease(reusableLease, input.heartbeatRunId),
               }
             : reusableLease?.providerLeaseId
               ? {
@@ -2533,6 +2576,7 @@ function createSandboxEnvironmentDriver(
           reusableLease && providerLease.providerLeaseId === reusableLease.providerLeaseId
             ? {
                 outcome: "resumed",
+                ...previousRunOfResumedLease(reusableLease, input.heartbeatRunId),
               }
             : reusableLease?.providerLeaseId
               ? {
@@ -2624,6 +2668,15 @@ function createSandboxEnvironmentDriver(
 
     async releaseRunLease(input) {
       if (input.status === "expired" && input.lease.leasePolicy === "reuse_by_environment") {
+        if (isPluginBackedReusableSandboxLease(input.lease)) {
+          // A cancelled run (Stop, a comment interrupt, a pause, a
+          // reassignment) ends a turn, not the task. The agent's session store
+          // and memory live in the sandbox, so stop the run's work and keep the
+          // sandbox for the next run, like any other release. A `stopped`
+          // receipt keeps the lease resumable; a release the provider could
+          // not confirm is parked for the cleanup sweep to retry.
+          return await releasePluginBackedSandboxLease({ ...input, cancelActiveWork: true });
+        }
         return await destroyReusableSandboxLease({
           environment: input.environment,
           lease: input.lease,
@@ -2748,17 +2801,27 @@ function createSandboxEnvironmentDriver(
         const workerConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
         if (exportResume) {
           const pluginId = pluginProvider.resolved.plugin.id;
-          if (!pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentStopLease")) {
+          const viaRelease = stopOnlyCleanupUsesRelease(input.lease, pluginId);
+          if (!viaRelease && !pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentStopLease")) {
             throw new Error("Workspace export recovery requires verified stop-only cleanup.");
           }
           await assertExportResumeOwnership();
-          const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () => pluginWorkerManager.call(pluginId, "environmentStopLease", {
+          const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () => pluginWorkerManager.call(pluginId, viaRelease ? "environmentReleaseLease" : "environmentStopLease", {
             driverKey: recordedProvider, companyId: input.lease.companyId,
             environmentId: input.lease.environmentId ?? "", issueId: input.lease.issueId,
             config: workerConfig, providerLeaseId: input.lease.providerLeaseId,
-            leaseMetadata: input.lease.metadata ?? {}, cancelActiveWork: true, resourceDisposition: "stop_and_retain",
+            leaseMetadata: input.lease.metadata ?? {}, cancelActiveWork: true,
+            // A provider without a stop method keeps a reusable sandbox on a
+            // verified release; the stop ends the run's work like a cancel.
+            ...(viaRelease ? { runStatus: "expired" as const } : { resourceDisposition: "stop_and_retain" as const }),
+            // The stopped run cannot remove its private files any more: the
+            // sandbox refuses commands once it is stopped.
+            ...runPrivatePathsParam(hasNativeWorkspaceExportResume(input.lease) ? [] : sandboxRunPrivatePaths(input.lease)),
           }, Math.min(resolvePluginSandboxRpcTimeoutMs(workerConfig) ?? 60_000, 60_000)));
-          if (remoteTerminationReceipt(input.lease, receipt)?.state !== "stopped") {
+          const state = remoteTerminationReceipt(input.lease, receipt)?.state;
+          // A stop may find the sandbox already gone, which ends the lease. A
+          // saved workspace export needs the sandbox it was stopped in.
+          if (state !== "stopped" && !(state === "destroyed" && !hasNativeWorkspaceExportResume(input.lease))) {
             throw new Error("Workspace export recovery did not confirm the retained sandbox stopped.");
           }
           return receipt;
@@ -2839,12 +2902,28 @@ function createSandboxEnvironmentDriver(
       // teardown runs, throws its own "no worker manager" error, and counts
       // toward the cap.
       if (!pluginWorkerManager) return true;
+      if (
+        !hasStopOnlyCleanup(input.lease) &&
+        readPendingCleanupIntent(input.lease.metadata) === "release" &&
+        isPluginBackedReusableSandboxLease(input.lease)
+      ) {
+        // A release goes to the exact plugin that acquired the sandbox, so wait
+        // for that plugin's worker. A plugin that is gone cannot release; the
+        // teardown below then applies, through whichever plugin serves the key.
+        const pinned = await resolvePluginSandboxProviderDriverById({
+          db,
+          pluginId: readString(input.lease.metadata?.pluginId)!,
+          driverKey: recordedProvider,
+        });
+        if (pinned) return pinned.plugin.status === "ready" && pluginWorkerManager.isRunning(pinned.plugin.id);
+      }
       if (hasStopOnlyCleanup(input.lease)) {
         const pinnedPluginId = readString(input.lease.metadata?.pluginId);
         if (!pinnedPluginId) return true; // Permanent invalid intent, never a by-key fallback.
         const pinned = await resolvePluginSandboxProviderDriverById({ db, pluginId: pinnedPluginId, driverKey: recordedProvider });
         return Boolean(pinned?.plugin.status === "ready" && pluginWorkerManager.isRunning(pinned.plugin.id)
-          && pluginWorkerVerifiesLifecycleMethod(pinned.plugin.id, "environmentStopLease"));
+          && (pluginWorkerVerifiesLifecycleMethod(pinned.plugin.id, "environmentStopLease")
+            || stopOnlyCleanupUsesRelease(input.lease, pinned.plugin.id)));
       }
       // Resolve the installed plugin without a wait. A plugin reload or a plugin
       // reinstall can remove the plugin row for a short window, so a missing
@@ -3215,6 +3294,10 @@ function createSandboxEnvironmentDriver(
         failureReason: input.failureReason ?? "lease_destroyed",
       });
     },
+
+    async retryPendingSandboxRelease(input) {
+      return await retryPendingPluginSandboxRelease(input);
+    },
   };
 
   /**
@@ -3334,6 +3417,43 @@ function createSandboxEnvironmentDriver(
     return advertised.includes(method);
   }
 
+  /**
+   * How the run that held `lease` ended, as a provider release reports it
+   * (`runStatus`). `status` is the lease's release status. A run the host
+   * interrupted (a server shutdown, a lost process) is reported `interrupted`
+   * whatever its status, so a provider that stops keeping a sandbox in which
+   * run after run fails does not count it: it says nothing about the sandbox.
+   */
+  async function providerReleaseRunStatus<S extends "released" | "expired" | "failed" | null>(
+    lease: Pick<EnvironmentLease, "companyId" | "heartbeatRunId">,
+    status: S,
+  ): Promise<S | "interrupted"> {
+    if (!lease.heartbeatRunId || status === "expired") return status;
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, lease.companyId)))
+      .limit(1);
+    return run?.status === "interrupted" || (run?.status === "failed" && run.errorCode === "process_lost")
+      ? "interrupted"
+      : status;
+  }
+
+  /**
+   * Whether a stop-and-retain of `lease` goes through the provider's release
+   * because its worker has no stop method. Only for a sandbox kept between
+   * runs: its release stops the run's work and keeps the sandbox for the next
+   * run, and a release the provider cannot verify ends in a teardown it
+   * reports. A saved workspace export, or a sandbox that is not kept between
+   * runs, waits for a provider that can stop without removing it.
+   */
+  function stopOnlyCleanupUsesRelease(lease: EnvironmentLease, pluginId: string): boolean {
+    return !hasNativeWorkspaceExportResume(lease) &&
+      isPluginBackedReusableSandboxLease(lease) &&
+      !pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentStopLease") &&
+      pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentReleaseLease");
+  }
+
   async function releasePluginBackedSandboxLease(
     input: EnvironmentDriverReleaseInput,
   ): Promise<EnvironmentLease | null> {
@@ -3358,6 +3478,7 @@ function createSandboxEnvironmentDriver(
           lease: input.lease,
           provider: providerKey,
         });
+        const runStatus = await providerReleaseRunStatus(input.lease, input.status);
         // The release error is swallowed into cleanupStatus below, so evict the
         // cached secret here: the reaper's retry then re-resolves it in full.
         const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () =>
@@ -3372,7 +3493,10 @@ function createSandboxEnvironmentDriver(
             ...(input.cancelActiveWork ? { cancelActiveWork: true } : {}),
             // How the run ended, so a provider that keeps sandboxes between
             // runs can stop keeping one in which run after run fails.
-            runStatus: input.status,
+            runStatus,
+            // A kept sandbox must not carry the run's private files into the
+            // next run, also when the run could not remove them itself.
+            ...runPrivatePathsParam(input.lease.leasePolicy === "reuse_by_environment" ? sandboxRunPrivatePaths(input.lease) : []),
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)))),
         );
         termination = remoteTerminationReceipt(input.lease, receipt);
@@ -3393,12 +3517,12 @@ function createSandboxEnvironmentDriver(
       input.lease.leasePolicy === "retain_on_failure" && input.status === "failed";
     // A reusable provider resource that the provider confirmed stopped (not
     // destroyed) stays eligible for resume whatever the run's outcome, so a
-    // follow-up run after a failed or timed-out run continues in the same
-    // sandbox. Only `released`/`retained` leases are resume candidates; the
-    // failure reason is still recorded below.
+    // follow-up run after a failed, timed-out or cancelled run continues in the
+    // same sandbox. Only `released`/`retained` leases are resume candidates;
+    // the failure reason is still recorded below.
     const stoppedReusable =
       input.lease.leasePolicy === "reuse_by_environment" &&
-      input.status === "failed" &&
+      (input.status === "failed" || input.status === "expired") &&
       cleanupStatus === "success" &&
       termination?.state === "stopped";
     const releaseStatus = retained
@@ -3418,6 +3542,161 @@ function createSandboxEnvironmentDriver(
       failureReason,
       cleanupStatus,
       ...(cleanupStatus === "success" && termination ? { remoteExecutionTermination: termination } : {}),
+      // The release could not be confirmed (the worker was down, the RPC timed
+      // out, or the provider sent no receipt). The sandbox may well still be
+      // there, holding the task's agent session, so a reusable lease asks the
+      // cleanup sweep to retry the release rather than destroy it.
+      ...(releaseStatus === "pending_cleanup"
+        ? input.lease.leasePolicy === "reuse_by_environment"
+          ? { pendingCleanupIntent: "release" as const, pendingCleanupReleaseRunStatus: input.status }
+          : { pendingCleanupIntent: "destroy" as const }
+        : {}),
+    });
+  }
+
+  /**
+   * Retry the release of a reusable plugin sandbox lease parked with the
+   * "release" intent. See {@link EnvironmentRuntimeDriver.retryPendingSandboxRelease}.
+   */
+  async function retryPendingPluginSandboxRelease(input: {
+    environment: Environment;
+    lease: EnvironmentLease;
+  }): Promise<PendingSandboxReleaseResult> {
+    const metadata = input.lease.metadata ?? {};
+    const attemptId = readString(metadata.pendingCleanupAttemptId);
+    if (!attemptId) throw new Error(`Pending-cleanup lease "${input.lease.id}" has no claimed cleanup attempt.`);
+    const pluginId = readString(metadata.pluginId);
+    const providerKey = readString(metadata.provider);
+    if (!isPluginBackedReusableSandboxLease(input.lease) || !pluginId || !providerKey ||
+        (input.lease.provider !== null && input.lease.provider !== providerKey)) {
+      return { outcome: "not_releasable", reason: "provider_changed" };
+    }
+    // Keep the sandbox only for the environment it was acquired for: a sandbox
+    // of a provider or plugin the environment no longer uses, or of an
+    // environment that stopped reusing sandboxes, could never be resumed. The
+    // next acquire would tear it down anyway, so do it now through the
+    // recorded teardown instead of keeping it idle.
+    let parsed: ReturnType<typeof parseEnvironmentDriverConfig>;
+    try {
+      parsed = parseEnvironmentDriverConfig(input.environment);
+    } catch {
+      return { outcome: "not_releasable", reason: "provider_changed" };
+    }
+    if (parsed.driver !== "sandbox" || parsed.config.provider !== providerKey) {
+      return { outcome: "not_releasable", reason: "provider_changed" };
+    }
+    if (!parsed.config.reuseLease) return { outcome: "not_releasable", reason: "reuse_disabled" };
+    if (!pluginWorkerManager) {
+      throw new Error(`Sandbox provider "${providerKey}" needs a plugin worker manager for the release.`);
+    }
+    const pinned = await resolvePluginSandboxProviderDriverById({ db, pluginId, driverKey: providerKey });
+    if (!pinned) return { outcome: "not_releasable", reason: "provider_changed" };
+    if (pinned.plugin.status !== "ready" || !pluginWorkerManager.isRunning(pluginId)) {
+      throw new Error(`The worker of the sandbox provider plugin for "${providerKey}" is not running.`);
+    }
+    // The plugin an acquire would use for this provider now. Another plugin
+    // serving the provider key means the next run would not resume this sandbox.
+    const current = await resolvePluginSandboxProviderDriverByKey({
+      db,
+      driverKey: providerKey,
+      workerManager: pluginWorkerManager,
+      requireRunning: true,
+    });
+    if (current?.plugin.id !== pluginId) {
+      return { outcome: "not_releasable", reason: "provider_changed" };
+    }
+    if (!pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentReleaseLease")) {
+      return { outcome: "not_releasable", reason: "release_unsupported" };
+    }
+    // When the run ended. Leases parked before the stamp existed fall back to
+    // their release time, which a failed retry may have moved later.
+    const parkedAt = readPendingCleanupParkedAt(metadata) ?? input.lease.releasedAt ?? input.lease.acquiredAt;
+    // Checked last, right before the release, to keep the window in which a
+    // new run could still take another sandbox as small as possible.
+    if (await taskUsedAnotherSandboxSince(input.environment.id, input.lease, parkedAt)) {
+      return { outcome: "not_releasable", reason: "superseded" };
+    }
+
+    const config = await resolvePluginSandboxRuntimeConfig({
+      environment: input.environment,
+      lease: input.lease,
+      provider: providerKey,
+    });
+    const workerConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
+    const runStatus = await providerReleaseRunStatus(input.lease, readPendingCleanupReleaseRunStatus(metadata));
+    const receipt = await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () =>
+      pluginWorkerManager.call(pluginId, "environmentReleaseLease", {
+        driverKey: providerKey,
+        companyId: input.lease.companyId,
+        environmentId: input.environment.id,
+        issueId: input.lease.issueId,
+        config: workerConfig,
+        providerLeaseId: input.lease.providerLeaseId,
+        leaseMetadata: metadata,
+        // The run that held the lease is over, but its work may still be
+        // running (a release that timed out, a host that went away), so the
+        // release must stop it before the sandbox is kept.
+        cancelActiveWork: true,
+        ...(runStatus ? { runStatus } : {}),
+        // The run whose release is retried could not remove its private files.
+        ...runPrivatePathsParam(sandboxRunPrivatePaths(input.lease)),
+      }, resolvePluginSandboxRpcTimeoutMs(workerConfig)),
+    );
+    const termination = remoteTerminationReceipt(input.lease, receipt);
+    if (!termination) {
+      throw new Error(`The provider did not confirm the release of sandbox lease "${input.lease.id}".`);
+    }
+    const kept = termination.state === "stopped";
+    const lease = await environmentsSvc.releaseLease(input.lease.id, kept ? "released" : "expired", {
+      expectedPendingCleanupAttemptId: attemptId,
+      cleanupStatus: "success",
+      failureReason: kept ? "pending_cleanup_release_retry" : "pending_cleanup_retry",
+      remoteExecutionTermination: termination,
+      // Rank the kept sandbox by when its run ended, not by when this retry
+      // finished, so it never outranks a sandbox the task used since.
+      lastUsedAt: parkedAt,
+    });
+    return kept ? { outcome: "released", lease } : { outcome: "destroyed", lease };
+  }
+
+  /**
+   * Whether a run of the same task (same company, environment, workspace or
+   * workspace-less issue, agent and adapter) has used another reusable sandbox
+   * since `since`. A parked lease is no resume candidate, so the task's next
+   * run starts or resumes another sandbox, and the agent session and memory
+   * of that run live there. Keeping the parked sandbox now would put the task
+   * back on the older state: the provider removes the idle sandboxes of the
+   * same task when it keeps one, and the next acquire resumes the most
+   * recently used lease.
+   */
+  async function taskUsedAnotherSandboxSince(
+    environmentId: string,
+    lease: EnvironmentLease,
+    since: Date,
+  ): Promise<boolean> {
+    const agentId = readString(lease.metadata?.agentId);
+    if (!agentId || (!lease.executionWorkspaceId && !lease.issueId)) return false;
+    const scope = lease.metadata?.reusableSandboxLease;
+    const adapterType = isRecord(scope) ? scope.adapterType ?? null : null;
+    const rows = await db
+      .select({ providerLeaseId: environmentLeases.providerLeaseId, metadata: environmentLeases.metadata })
+      .from(environmentLeases)
+      .where(and(
+        ne(environmentLeases.id, lease.id),
+        eq(environmentLeases.companyId, lease.companyId),
+        eq(environmentLeases.environmentId, environmentId),
+        eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+        inArray(environmentLeases.status, ["active", "released", "retained"]),
+        lease.executionWorkspaceId
+          ? eq(environmentLeases.executionWorkspaceId, lease.executionWorkspaceId)
+          : and(isNull(environmentLeases.executionWorkspaceId), eq(environmentLeases.issueId, lease.issueId!)),
+        sql`${environmentLeases.metadata}->>'agentId' = ${agentId}`,
+        or(gt(environmentLeases.acquiredAt, since), gt(environmentLeases.lastUsedAt, since)),
+      ));
+    return rows.some((row) => {
+      if (row.providerLeaseId === lease.providerLeaseId) return false;
+      const otherScope = (row.metadata as Record<string, unknown> | null)?.reusableSandboxLease;
+      return isRecord(otherScope) && (otherScope.adapterType ?? null) === adapterType;
     });
   }
 
@@ -3492,6 +3771,9 @@ function createSandboxEnvironmentDriver(
         failureReason: input.failureReason,
         cleanupStatus,
         ...(cleanupStatus === "success" && termination ? { remoteExecutionTermination: termination } : {}),
+        // A destroy that could not finish stays a destroy: the sweep must never
+        // keep a sandbox someone asked to tear down.
+        ...(cleanupStatus === "success" ? {} : { pendingCleanupIntent: "destroy" as const }),
       },
     );
   }
@@ -3547,6 +3829,41 @@ function pluginDriverProviderKey(config: PluginEnvironmentConfig): string {
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * The run that last held a sandbox this run resumes (`previousRunId` on the
+ * resumed lease's acquisition record), so the run can tell what the previous
+ * run in the sandbox left behind. Left out when the run takes its own lease
+ * back.
+ */
+function previousRunOfResumedLease(
+  lease: Pick<EnvironmentLease, "heartbeatRunId"> | null | undefined,
+  heartbeatRunId: string | null,
+): { previousRunId?: string } {
+  return lease?.heartbeatRunId && lease.heartbeatRunId !== heartbeatRunId
+    ? { previousRunId: lease.heartbeatRunId }
+    : {};
+}
+
+/** The `runPrivatePaths` release parameter, left out when there is nothing to remove. */
+function runPrivatePathsParam(paths: string[]): { runPrivatePaths?: string[] } {
+  return paths.length > 0 ? { runPrivatePaths: paths } : {};
+}
+
+/**
+ * A reusable sandbox lease acquired through a sandbox provider plugin, with the
+ * plugin and provider it was acquired from recorded on the lease. Only such a
+ * lease can be released back to the same plugin and resumed later.
+ */
+function isPluginBackedReusableSandboxLease(
+  lease: Pick<EnvironmentLease, "leasePolicy" | "metadata">,
+): boolean {
+  const metadata = lease.metadata ?? {};
+  return lease.leasePolicy === "reuse_by_environment" &&
+    Boolean(metadata.sandboxProviderPlugin) &&
+    readString(metadata.pluginId) !== null &&
+    readString(metadata.provider) !== null;
 }
 
 // Keys the runtime stores in the lease metadata that are not part of the
@@ -4272,6 +4589,20 @@ export function environmentRuntimeService(
       return await driver.retryPendingSandboxTeardown(input);
     },
 
+    // Retry the release of a reusable sandbox lease parked with the "release"
+    // intent. A driver without the step cannot keep the sandbox, so the caller
+    // tears it down from the recorded lease data instead.
+    async retryPendingSandboxRelease(input: {
+      environment: Environment;
+      lease: EnvironmentLease;
+    }): Promise<PendingSandboxReleaseResult> {
+      const driver = getDriver(getLeaseDriverKey(input.lease, input.environment));
+      if (!driver?.retryPendingSandboxRelease) {
+        return { outcome: "not_releasable", reason: "release_unsupported" };
+      }
+      return await driver.retryPendingSandboxRelease(input);
+    },
+
     // Report whether the provider worker can run an orphan teardown now. The
     // cleanup sweep calls this before it claims a finite retry attempt, so a
     // briefly-down plugin worker never burns an attempt. This dispatcher never
@@ -4350,10 +4681,9 @@ export function environmentRuntimeService(
 
       const destroyed: EnvironmentRuntimeLeaseRecord[] = [];
       for (const leaseRow of leaseRows) {
-        // An issue may become terminal inside its provider turn. Do not tear
-        // down the sandbox while that run is still exporting its workspace or
-        // polling the callback bridge. The heartbeat finalizer observes the
-        // terminal issue and destroys the resource after those boundaries.
+        // The scope may close while one of its runs is still inside its
+        // provider turn. Do not tear down the sandbox while that run is still
+        // exporting its workspace or polling the callback bridge.
         if (
           leaseRow.heartbeatRunId &&
           liveRunIds.has(leaseRow.heartbeatRunId)
@@ -4375,6 +4705,7 @@ export function environmentRuntimeService(
           : await environmentsSvc.releaseLease(leaseSnapshot.id, "pending_cleanup", {
               failureReason: input.failureReason ?? "reusable_lease_destroyed",
               cleanupStatus: "failed",
+              pendingCleanupIntent: "destroy",
             });
         if (!lease) continue;
         destroyed.push({
@@ -4388,6 +4719,95 @@ export function environmentRuntimeService(
         });
       }
       return destroyed;
+    },
+
+    /**
+     * Leave the reusable sandboxes of a closed task idle instead of destroying
+     * them. A done or cancelled task can be reopened, or answered, and its
+     * agent should continue the same conversation; the agent CLI's session
+     * store and memory live in the sandbox. So closing the task does not decide
+     * the sandbox's lifetime: the provider's idle lifetime and capacity limits
+     * do. A lease that is already released is idle; a lease kept running for a
+     * warm runner (`retained`) is released through the provider, which stops
+     * the runner and keeps the sandbox. Leases of a live run, parked leases
+     * (the cleanup sweep owns them) and native runner leases (their warm
+     * session has its own retention cleanup) are left alone.
+     */
+    async releaseIdleReusableSandboxLeases(input: {
+      companyId: string;
+      issueId?: string | null;
+      executionWorkspaceId?: string | null;
+    }): Promise<EnvironmentRuntimeLeaseRecord[]> {
+      const scopeConditions = [
+        input.issueId ? eq(environmentLeases.issueId, input.issueId) : undefined,
+        input.executionWorkspaceId ? eq(environmentLeases.executionWorkspaceId, input.executionWorkspaceId) : undefined,
+      ].filter((condition): condition is NonNullable<typeof condition> => Boolean(condition));
+      if (scopeConditions.length === 0) return [];
+
+      const leaseRows = await db
+        .select()
+        .from(environmentLeases)
+        .where(
+          and(
+            eq(environmentLeases.companyId, input.companyId),
+            eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+            eq(environmentLeases.status, "retained"),
+            ...scopeConditions,
+          ),
+        );
+      const holdingRunIds = leaseRows
+        .map((row) => row.heartbeatRunId)
+        .filter((runId): runId is string => Boolean(runId));
+      const liveRunIds = new Set(
+        holdingRunIds.length === 0
+          ? []
+          : (await db
+              .select({ id: heartbeatRuns.id })
+              .from(heartbeatRuns)
+              .where(and(
+                inArray(heartbeatRuns.id, holdingRunIds),
+                inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
+              ))).map((run) => run.id),
+      );
+
+      const released: EnvironmentRuntimeLeaseRecord[] = [];
+      for (const leaseRow of leaseRows) {
+        if (leaseRow.heartbeatRunId && liveRunIds.has(leaseRow.heartbeatRunId)) continue;
+        const scope = leaseRow.metadata?.reusableSandboxLease;
+        if (isRecord(scope) && scope.adapterType === "paperclip_runner") continue;
+        const environment = leaseRow.environmentId
+          ? await environmentsSvc.getById(leaseRow.environmentId)
+          : null;
+        if (!environment) continue;
+        const leaseSnapshot = toEnvironmentLeaseSnapshot(leaseRow);
+        const driver = getDriver(getLeaseDriverKey(leaseSnapshot, environment));
+        if (!driver) continue;
+        let lease: EnvironmentLease | null;
+        try {
+          lease = await driver.releaseRunLease({
+            environment,
+            lease: leaseSnapshot,
+            status: "released",
+            cancelActiveWork: true,
+          });
+        } catch {
+          // The provider error can carry credentials; log the lease only. The
+          // lease stays retained, so a later run still resumes the sandbox.
+          logger.warn({ leaseId: leaseRow.id }, "could not release a kept sandbox of a closed task");
+          continue;
+        }
+        if (!lease) continue;
+        released.push({
+          environment,
+          lease,
+          leaseContext: {
+            executionWorkspaceId: lease.executionWorkspaceId,
+            executionWorkspaceMode:
+              (lease.metadata?.executionWorkspaceMode as ExecutionWorkspace["mode"] | null | undefined) ?? null,
+          },
+        });
+      }
+      return released;
     },
 
     /**

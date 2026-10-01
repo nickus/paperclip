@@ -68,6 +68,26 @@ describe("checkReusableLeaseResumable", () => {
       resumable: true,
       podName: "pc-1",
       podUid: "uid-1",
+      busySince: null,
+    });
+  });
+
+  it("reports since when a sandbox is still marked busy", async () => {
+    const busy = sandboxCr({
+      [REUSE_ANNOTATIONS.leaseState]: "busy",
+      [REUSE_ANNOTATIONS.busySince]: new Date(NOW - 60_000).toISOString(),
+    });
+    await expect(checkReusableLeaseResumable(clients(busy, async () => pod()), INPUT)).resolves.toMatchObject({
+      resumable: true,
+      busySince: NOW - 60_000,
+    });
+    const busyWithoutTime = sandboxCr({ [REUSE_ANNOTATIONS.leaseState]: "busy" });
+    await expect(checkReusableLeaseResumable(clients(busyWithoutTime, async () => pod()), INPUT)).resolves.toMatchObject({
+      busySince: 0,
+    });
+    const idle = sandboxCr({ [REUSE_ANNOTATIONS.leaseState]: "idle" });
+    await expect(checkReusableLeaseResumable(clients(idle, async () => pod()), INPUT)).resolves.toMatchObject({
+      busySince: null,
     });
   });
 

@@ -63,7 +63,7 @@ function reusableProviderWorker() {
     backend: "sandbox-cr",
     remoteCwd: "/workspace",
   });
-  const releaseReceipt = vi.fn((id: string): { providerLeaseId: string; state: "stopped" | "destroyed" } => ({
+  const releaseReceipt = vi.fn((id: string): { providerLeaseId: string; state: "stopped" | "destroyed" } | undefined => ({
     providerLeaseId: id,
     state: "stopped",
   }));
@@ -87,8 +87,8 @@ function reusableProviderWorker() {
       }
       case "environmentReleaseLease": {
         const receipt = releaseReceipt(params.providerLeaseId);
-        if (receipt.state === "destroyed") sandboxes.delete(params.providerLeaseId);
-        else sandboxes.set(params.providerLeaseId, "idle");
+        if (receipt?.state === "destroyed") sandboxes.delete(params.providerLeaseId);
+        else if (receipt) sandboxes.set(params.providerLeaseId, "idle");
         return receipt;
       }
       case "environmentDestroyLease":
@@ -302,7 +302,7 @@ describeEmbeddedPostgres("reusable sandbox leases carry the harness session to t
     // A new lease row for the new run, on the same provider sandbox.
     expect(second.lease.id).not.toBe(first.lease.id);
     expect(second.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
-    expect(second.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+    expect(second.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", previousRunId: first.runId });
     expect(second.target).toMatchObject({ remoteCwd: "/workspace", leaseId: second.lease.id });
     expect(worker.call.mock.calls.filter(([, method]) => method === "environmentAcquireLease")).toHaveLength(1);
 
@@ -363,7 +363,7 @@ describeEmbeddedPostgres("reusable sandbox leases carry the harness session to t
 
     const second = await startRun();
     expect(second.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
-    expect(second.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+    expect(second.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", previousRunId: first.runId });
   });
 
   it("records a failed run as failed when the provider destroyed the sandbox", async () => {
@@ -379,19 +379,85 @@ describeEmbeddedPostgres("reusable sandbox leases carry the harness session to t
     });
   });
 
-  it("destroys the sandbox of a cancelled run", async () => {
+  it("keeps the sandbox of a cancelled run for the task's next run", async () => {
+    const { companyId, runtime, worker, startRun } = await seed();
+    const first = await startRun();
+    const claudeSession = persistedSession(
+      claudeSessionCodec,
+      "11111111-1111-4111-8111-111111111111",
+      first.target,
+    );
+
+    // A cancelled run (Stop, or a comment that interrupts the run) releases
+    // its lease as "expired" and asks the provider to stop its work.
+    await runtime.releaseRunLeases(first.runId, "expired", undefined, undefined, true);
+
+    const releases = worker.call.mock.calls.filter(([, method]) => method === "environmentReleaseLease");
+    expect(releases.map(([, , params]) => params)).toEqual([
+      expect.objectContaining({ providerLeaseId: first.lease.providerLeaseId, cancelActiveWork: true, runStatus: "expired" }),
+    ]);
+    expect(worker.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toEqual([]);
+    expect(worker.sandboxes.get(first.lease.providerLeaseId!)).toBe("idle");
+    await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
+      status: "released",
+      cleanupStatus: "success",
+    });
+    expect(await remoteExecutionHasStopped(db, companyId, first.runId)).toBe(true);
+
+    // The follow-up resumes the same sandbox, and the agent's saved session
+    // still matches it, so the agent CLI continues that session.
+    const second = await startRun();
+    expect(second.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
+    expect(second.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", previousRunId: first.runId });
+    expect(adapterExecutionTargetSessionMatches(claudeSession.remoteExecution, second.target)).toBe(true);
+  });
+
+  it("keeps the sandbox of a cancelled run without being told to cancel", async () => {
     const { runtime, worker, startRun } = await seed();
     const first = await startRun();
 
     await runtime.releaseRunLeases(first.runId, "expired");
 
-    expect(worker.sandboxes.has(first.lease.providerLeaseId!)).toBe(false);
     expect(
-      worker.call.mock.calls.filter(
-        ([, method, params]) =>
-          method === "environmentDestroyLease" && params.providerLeaseId === first.lease.providerLeaseId,
-      ),
-    ).toHaveLength(1);
-    await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "expired" });
+      worker.call.mock.calls.find(([, method]) => method === "environmentReleaseLease")?.[2],
+    ).toMatchObject({ cancelActiveWork: true });
+    expect(worker.sandboxes.get(first.lease.providerLeaseId!)).toBe("idle");
+    await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "released" });
+  });
+
+  it("parks a cancelled run's lease for a release retry when the provider does not confirm the stop", async () => {
+    const { runtime, worker, startRun } = await seed();
+    const first = await startRun();
+    worker.releaseReceipt.mockImplementationOnce(() => undefined);
+
+    await runtime.releaseRunLeases(first.runId, "expired", undefined, undefined, true);
+
+    // Nothing proves the run's work stopped, so the lease is not resumable;
+    // the sandbox is not destroyed either: the sweep retries the release.
+    expect(worker.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toEqual([]);
+    expect(worker.sandboxes.has(first.lease.providerLeaseId!)).toBe(true);
+    await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "release_cleanup_failed",
+      metadata: expect.objectContaining({
+        pendingCleanupIntent: "release",
+        pendingCleanupReleaseRunStatus: "expired",
+      }),
+    });
+  });
+
+  it("records a cancelled run's lease as expired when the provider destroyed the sandbox", async () => {
+    const { runtime, worker, startRun } = await seed();
+    const first = await startRun();
+    worker.releaseReceipt.mockImplementationOnce((id) => ({ providerLeaseId: id, state: "destroyed" }));
+
+    await runtime.releaseRunLeases(first.runId, "expired", undefined, undefined, true);
+
+    expect(worker.sandboxes.has(first.lease.providerLeaseId!)).toBe(false);
+    await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+    });
   });
 });
