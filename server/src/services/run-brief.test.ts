@@ -10,15 +10,24 @@ import {
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
-import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import {
+  isPaperclipRunBriefOnlyWake,
+  renderPaperclipWakePrompt,
+} from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter-utils/execution-target";
+import { PAPERCLIP_RUN_BRIEF_TEAM_MAX_CHARS } from "@paperclipai/adapter-utils/wake-run-brief";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
-import { buildPaperclipWakePayload } from "./heartbeat.js";
+import { buildPaperclipWakePayload, buildTeamOnlyWakePayload } from "./heartbeat.js";
 import {
+  PAPERCLIP_WAKE_PAYLOAD_TARGET_BYTES,
+  paperclipWakePayloadBytes,
+} from "./wake-payload-bounds.js";
+import {
+  buildRunBriefTeam,
   digestPriorRuns,
   finalLineSummary,
   resolveRunBriefAuthority,
@@ -170,6 +179,104 @@ describe("run brief helpers", () => {
   });
 });
 
+describe("run brief team roster", () => {
+  const row = (
+    id: string,
+    name: string,
+    extra: Partial<Parameters<typeof buildRunBriefTeam>[0][number]> = {},
+  ) => ({ id, name, role: "engineer", title: null, status: "idle", reportsTo: null, ...extra });
+  const company = { companyId: "company-1" };
+
+  it("orders by reporting line, then name, and marks the woken agent", () => {
+    const rows = [
+      row("e1", "eve", { reportsTo: "c1" }),
+      row("c1", "Cato", { role: "cto", title: "CTO", reportsTo: "a1" }),
+      row("a1", "Ada", { role: "ceo" }),
+      row("p1", "Pat", { role: "pm", title: "Product Manager", reportsTo: "a1", status: "paused" }),
+      row("b1", "Bob", { reportsTo: "c1" }),
+      row("t1", "Tom", { reportsTo: "p1", status: "terminated" }),
+      // Reports to a terminated agent, so it sits at the top level.
+      row("d1", "Dan", { reportsTo: "t1", status: "pending_approval" }),
+    ];
+    const team = buildRunBriefTeam(rows, { ...company, agentId: "p1" })!;
+    expect(team.total).toBe(6);
+    expect(team.members).toEqual([
+      { id: "a1", name: "Ada", role: "ceo", title: null, status: "idle", reportsTo: null, you: false },
+      { id: "c1", name: "Cato", role: "cto", title: "CTO", status: "idle", reportsTo: "Ada", you: false },
+      { id: "b1", name: "Bob", role: "engineer", title: null, status: "idle", reportsTo: "Cato", you: false },
+      { id: "e1", name: "eve", role: "engineer", title: null, status: "idle", reportsTo: "Cato", you: false },
+      { id: "p1", name: "Pat", role: "pm", title: "Product Manager", status: "paused", reportsTo: "Ada", you: true },
+      { id: "d1", name: "Dan", role: "engineer", title: null, status: "pending_approval", reportsTo: null, you: false },
+    ]);
+    // The same roster in any order gives the same team.
+    expect(buildRunBriefTeam([...rows].reverse(), { ...company, agentId: "p1" })).toEqual(team);
+    expect(buildRunBriefTeam([rows[3]!, rows[0]!, rows[5]!, rows[2]!, rows[6]!, rows[1]!, rows[4]!], { ...company, agentId: "p1" })).toEqual(team);
+    // Nobody left: no team.
+    expect(buildRunBriefTeam([rows[5]!], company)).toBeNull();
+  });
+
+  it("lists agents in a reporting cycle after everyone else", () => {
+    const team = buildRunBriefTeam(
+      [row("y1", "Yan", { reportsTo: "x1" }), row("x1", "Xia", { reportsTo: "y1" }), row("z1", "Zed"), row("s1", "Sol", { reportsTo: "s1" })],
+      company,
+    )!;
+    expect(team.members.map((member) => [member.name, member.reportsTo])).toEqual([
+      ["Sol", null],
+      ["Zed", null],
+      ["Xia", "Yan"],
+      ["Yan", "Xia"],
+    ]);
+  });
+
+  it("keeps the woken agent's own line of reports when the roster is capped", () => {
+    const rows = [
+      row("ceo", "Chief", { role: "ceo" }),
+      ...Array.from({ length: 53 }, (_, index) =>
+        row(`eng-${index}`, `Engineer ${String(index).padStart(2, "0")}`, { reportsTo: "ceo" })),
+      row("mgr", "Manager", { role: "pm", reportsTo: "ceo" }),
+      ...Array.from({ length: 5 }, (_, index) => row(`rep-${index}`, `Report ${index}`, { reportsTo: "mgr" })),
+    ];
+    const team = buildRunBriefTeam(rows, { ...company, agentId: "mgr" })!;
+    expect(team.total).toBe(60);
+    expect(team.members).toHaveLength(40);
+    const names = team.members.map((member) => member.name);
+    // Still in reporting-line order, with the manager and their reports kept.
+    expect(names.slice(0, 2)).toEqual(["Chief", "Engineer 00"]);
+    expect(names.slice(-6)).toEqual(["Manager", "Report 0", "Report 1", "Report 2", "Report 3", "Report 4"]);
+    expect(names).toContain("Engineer 32");
+    expect(names).not.toContain("Engineer 33");
+    // Without a woken agent the first forty in order are kept.
+    const plain = buildRunBriefTeam(rows, company)!;
+    expect(plain.members.at(-1)!.name).toBe("Engineer 38");
+    expect(plain.members.some((member) => member.you)).toBe(false);
+  });
+
+  it("bounds free text so a full roster stays far below the wake payload target", () => {
+    const long = "L".repeat(500);
+    const rows = Array.from({ length: 80 }, (_, index) =>
+      row(randomUUID(), `${long}${index}`, { role: long, title: `${long}\nline two`, status: long, reportsTo: index > 0 ? undefined : null }));
+    const team = buildRunBriefTeam(rows, company)!;
+    expect(team.members).toHaveLength(40);
+    for (const member of team.members) {
+      for (const value of [member.name, member.role, member.title, member.status]) {
+        expect(value!.length).toBeLessThanOrEqual(40);
+      }
+    }
+    const payload = {
+      reason: "heartbeat_timer",
+      runBrief: { version: 1, issueId: null, issueIdentifier: null, team },
+    };
+    expect(paperclipWakePayloadBytes(payload)).toBeLessThan(PAPERCLIP_WAKE_PAYLOAD_TARGET_BYTES / 2);
+    // The rendered section keeps to its own bound and counts what it drops.
+    const prompt = renderPaperclipWakePrompt(payload);
+    const section = prompt.slice(prompt.indexOf("### Team"));
+    expect(section.length).toBeLessThanOrEqual(PAPERCLIP_RUN_BRIEF_TEAM_MAX_CHARS);
+    const listed = section.split("\n").filter((line) => line.startsWith("agent id=")).length;
+    expect(listed).toBeGreaterThan(0);
+    expect(section.endsWith(`\n- ... and ${80 - listed} more: GET /api/companies/company-1/agents`)).toBe(true);
+  });
+});
+
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("run brief in the wake payload", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -177,6 +284,7 @@ const support = await getEmbeddedPostgresTestSupport();
   const companyId = randomUUID();
   const agentId = randomUUID();
   const reviewerId = randomUUID();
+  const pausedId = randomUUID();
   const issueId = randomUUID();
   const openBlockerId = randomUUID();
   const doneBlockerId = randomUUID();
@@ -200,6 +308,8 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(agents).values([
       { id: agentId, companyId, name: "Builder", role: "engineer", adapterType: "claude_local" },
       { id: reviewerId, companyId, name: "Reviewer", role: "engineer", adapterType: "claude_local" },
+      { id: pausedId, companyId, name: "Sleeper", role: "qa", title: "QA Lead", status: "paused", reportsTo: agentId, adapterType: "claude_local" },
+      { id: randomUUID(), companyId, name: "Retired", role: "engineer", status: "terminated", reportsTo: agentId, adapterType: "claude_local" },
     ]);
     await db.insert(issues).values([
       { ...issueSummary, companyId, assigneeAgentId: agentId },
@@ -340,6 +450,15 @@ const support = await getEmbeddedPostgresTestSupport();
         },
       ],
       priorRuns: envelope.priorRuns,
+      team: {
+        companyId,
+        total: 3,
+        members: [
+          { id: agentId, name: "Builder", role: "engineer", title: null, status: "idle", reportsTo: null, you: true },
+          { id: pausedId, name: "Sleeper", role: "qa", title: "QA Lead", status: "paused", reportsTo: "Builder", you: false },
+          { id: reviewerId, name: "Reviewer", role: "engineer", title: null, status: "idle", reportsTo: null, you: false },
+        ],
+      },
     });
 
     // Without a continuation envelope (e.g. a reviewer wake) the same prior
@@ -349,10 +468,91 @@ const support = await getEmbeddedPostgresTestSupport();
 
     const prompt = renderPaperclipWakePrompt(payload, { resumedSession: true });
     expect(prompt.startsWith("## Run Brief\n")).toBe(true);
-    const brief = prompt.slice(0, prompt.indexOf("## Paperclip Resume Delta")).trimEnd();
+    const brief = prompt.slice(0, prompt.indexOf("\n### Team\n"));
     expect(brief.length).toBeLessThanOrEqual(1500);
     expect(brief).toContain("blocker issue=BRF-2 status=in_progress assignee=\"agent Reviewer\"");
     expect(brief).toContain(`run id=${priorRunIds[3]!.slice(0, 8)} status=succeeded liveness=completed summary="Next: wire the UI button."`);
+    // The team follows the issue orientation, before the wake delta.
+    const team = prompt.slice(brief.length + 1, prompt.indexOf("## Paperclip Resume Delta")).trimEnd();
+    expect(team.split("\n").filter((line) => line.startsWith("agent "))).toEqual([
+      `agent id=${agentId} name="Builder" role=engineer status=idle [you]`,
+      `agent id=${pausedId} name="Sleeper" role=qa title="QA Lead" status=paused reports_to="Builder"`,
+      `agent id=${reviewerId} name="Reviewer" role=engineer status=idle`,
+    ]);
+    expect(team).toContain("- 3 agents in this company, in reporting-line order; [you] marks you");
+    expect(team).not.toContain("Retired");
+    // The reviewer sees the same roster, with itself marked.
+    const reviewerPayload = await buildPaperclipWakePayload({
+      db,
+      companyId,
+      agentId: reviewerId,
+      runId: currentRunId,
+      contextSnapshot: { issueId, wakeReason: "issue_comment_mentioned" },
+    });
+    expect(reviewerPayload?.runBrief?.team?.members.filter((member) => member.you).map((member) => member.id)).toEqual([reviewerId]);
+  });
+
+  it("leaves the roster out for readers that may not list other agents", async () => {
+    const lowTrust = await buildPaperclipWakePayload({
+      db,
+      companyId,
+      agentId,
+      runId: currentRunId,
+      contextSnapshot: { issueId, wakeReason: "issue_commented" },
+      issueSummary,
+      exposeLowTrustRaw: true,
+    });
+    expect(lowTrust?.runBrief).toBeDefined();
+    expect(lowTrust?.runBrief).not.toHaveProperty("team");
+    const skillTest = await buildPaperclipWakePayload({
+      db,
+      companyId,
+      agentId,
+      runId: currentRunId,
+      contextSnapshot: { issueId, wakeReason: "issue_commented" },
+      issueSummary: { ...issueSummary, workMode: "skill_test" },
+    });
+    expect(skillTest?.runBrief).toBeDefined();
+    expect(skillTest?.runBrief).not.toHaveProperty("team");
+  });
+
+  it("gives a run without an issue a brief with only the team", async () => {
+    const context = { wakeReason: "heartbeat_timer", wakeSource: "timer" };
+    // Nothing else to put in a wake payload for this run.
+    expect(await buildPaperclipWakePayload({ db, companyId, agentId, runId: currentRunId, contextSnapshot: context })).toBeNull();
+    const payload = await buildTeamOnlyWakePayload({ db, companyId, agentId, runId: currentRunId, contextSnapshot: context });
+    expect(payload).toEqual({
+      reason: "heartbeat_timer",
+      runBrief: {
+        version: 1,
+        issueId: null,
+        issueIdentifier: null,
+        authority: "execute",
+        environment: null,
+        blockerCount: 0,
+        blockers: [],
+        pendingInteractionCount: 0,
+        pendingInteractions: [],
+        priorRuns: [],
+        team: expect.objectContaining({ companyId, total: 3 }),
+      },
+    });
+    expect(isPaperclipRunBriefOnlyWake(payload)).toBe(true);
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt.startsWith("## Run Brief\n")).toBe(true);
+    expect(prompt).not.toContain("- authority:");
+    expect(prompt).toContain(`agent id=${agentId} name="Builder" role=engineer status=idle [you]`);
+    expect(prompt).not.toContain("## Paperclip Wake Payload");
+
+    // Issue runs, conversation turns, low-trust readers and the switch get none.
+    const none = (overrides: Partial<Parameters<typeof buildTeamOnlyWakePayload>[0]>) =>
+      buildTeamOnlyWakePayload({ db, companyId, agentId, contextSnapshot: context, ...overrides });
+    expect(await none({ contextSnapshot: { ...context, issueId } })).toBeNull();
+    expect(await none({ contextSnapshot: { ...context, conversationMode: true } })).toBeNull();
+    expect(await none({ exposeLowTrustRaw: true })).toBeNull();
+    expect(await none({ companyId: randomUUID() })).toBeNull();
+    vi.stubEnv("PAPERCLIP_WAKE_RUN_BRIEF", "0");
+    expect(await none({})).toBeNull();
   });
 
   it("tells a mentioned non-assignee to respond in comments", async () => {

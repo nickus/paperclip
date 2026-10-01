@@ -13,8 +13,10 @@ import {
   type AdapterExecutionTarget,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
+  PAPERCLIP_RUN_BRIEF_LABEL_MAX_CHARS,
   PAPERCLIP_RUN_BRIEF_PROMPT_MAX_CHARS,
   PAPERCLIP_RUN_BRIEF_SUMMARY_MAX_CHARS,
+  PAPERCLIP_RUN_BRIEF_TEAM_MAX_MEMBERS,
   paperclipRunBriefOneLine,
   paperclipRunBriefRecoveryAuthority,
   type PaperclipRunBrief,
@@ -22,6 +24,7 @@ import {
   type PaperclipRunBriefEnvironment,
   type PaperclipRunBriefPriorRun,
   type PaperclipRunBriefSessionReason,
+  type PaperclipRunBriefTeam,
 } from "@paperclipai/adapter-utils/wake-run-brief";
 
 export {
@@ -206,6 +209,167 @@ function readPriorRuns(value: unknown): PaperclipRunBriefPriorRun[] | null {
   });
 }
 
+export type RunBriefTeamRow = {
+  id: string;
+  name: string;
+  role: string;
+  title: string | null;
+  status: string;
+  reportsTo: string | null;
+};
+
+// Code-unit comparison: the order must not depend on the host's locale.
+const compareText = (left: string, right: string) =>
+  left < right ? -1 : left > right ? 1 : 0;
+const byName = (left: RunBriefTeamRow, right: RunBriefTeamRow) =>
+  compareText(left.name.toLowerCase(), right.name.toLowerCase()) ||
+  compareText(left.name, right.name) ||
+  compareText(left.id, right.id);
+
+/**
+ * The company roster for the Run Brief: every agent except terminated ones, in
+ * reporting-line order (each manager followed by their reports, siblings by
+ * name). The order depends only on the roster, so the rendered section stays
+ * byte-identical from run to run while the roster does. When there are more
+ * agents than `limit`, the woken agent, their manager, their direct reports
+ * and their peers are kept first; the others fill the rest in the same order.
+ */
+export function buildRunBriefTeam(
+  rows: RunBriefTeamRow[],
+  options: {
+    companyId: string;
+    agentId?: string | null;
+    limit?: number;
+  },
+): PaperclipRunBriefTeam | null {
+  const limit = options.limit ?? PAPERCLIP_RUN_BRIEF_TEAM_MAX_MEMBERS;
+  const roster = rows.filter((row) => row.status !== "terminated");
+  if (roster.length === 0) return null;
+  const byId = new Map(roster.map((row) => [row.id, row]));
+  // A manager who is not on the roster (terminated, or missing) leaves the
+  // agent at the top level.
+  const managerOf = (row: RunBriefTeamRow) =>
+    row.reportsTo && row.reportsTo !== row.id
+      ? (byId.get(row.reportsTo) ?? null)
+      : null;
+  const reportsOf = new Map<string | null, RunBriefTeamRow[]>();
+  for (const row of roster) {
+    const key = managerOf(row)?.id ?? null;
+    const reports = reportsOf.get(key);
+    if (reports) reports.push(row);
+    else reportsOf.set(key, [row]);
+  }
+  for (const reports of reportsOf.values()) reports.sort(byName);
+
+  const ordered: RunBriefTeamRow[] = [];
+  const seen = new Set<string>();
+  const visit = (start: RunBriefTeamRow) => {
+    // Iterative depth-first walk; `seen` also breaks reporting cycles.
+    const stack = [start];
+    while (stack.length > 0) {
+      const row = stack.pop()!;
+      if (seen.has(row.id)) continue;
+      seen.add(row.id);
+      ordered.push(row);
+      const reports = reportsOf.get(row.id) ?? [];
+      for (let index = reports.length - 1; index >= 0; index -= 1) {
+        stack.push(reports[index]!);
+      }
+    }
+  };
+  for (const root of reportsOf.get(null) ?? []) visit(root);
+  // Agents in a reporting cycle have no top-level ancestor; they come last.
+  for (const row of [...roster].sort(byName)) visit(row);
+
+  let listed = ordered;
+  if (ordered.length > limit) {
+    const self = options.agentId ? byId.get(options.agentId) : undefined;
+    const manager = self ? managerOf(self) : null;
+    const nearest = self
+      ? [
+          self,
+          ...(manager ? [manager] : []),
+          ...(reportsOf.get(self.id) ?? []),
+          ...(reportsOf.get(manager?.id ?? null) ?? []),
+        ]
+      : [];
+    const keep = new Set<string>();
+    for (const row of [...nearest, ...ordered]) {
+      if (keep.size >= limit) break;
+      keep.add(row.id);
+    }
+    listed = ordered.filter((row) => keep.has(row.id));
+  }
+  // Names and titles are free text of any length; bound them here so the
+  // stored wake payload stays small, as the renderer would anyway.
+  const label = (value: string | null | undefined) =>
+    paperclipRunBriefOneLine(value, PAPERCLIP_RUN_BRIEF_LABEL_MAX_CHARS);
+  return {
+    companyId: options.companyId,
+    total: roster.length,
+    members: listed.map((row) => ({
+      id: row.id,
+      name: label(row.name),
+      role: label(row.role),
+      title: label(row.title),
+      status: label(row.status),
+      reportsTo: label(managerOf(row)?.name),
+      you: row.id === options.agentId,
+    })),
+  };
+}
+
+/** Read the company roster for the Run Brief (see `buildRunBriefTeam`). */
+export async function loadRunBriefTeam(input: {
+  db: Db;
+  companyId: string;
+  agentId?: string | null;
+}): Promise<PaperclipRunBriefTeam | null> {
+  const rows = await input.db
+    .select({
+      id: agents.id,
+      name: agents.name,
+      role: agents.role,
+      title: agents.title,
+      status: agents.status,
+      reportsTo: agents.reportsTo,
+    })
+    .from(agents)
+    .where(
+      and(eq(agents.companyId, input.companyId), ne(agents.status, "terminated")),
+    );
+  return buildRunBriefTeam(rows, {
+    companyId: input.companyId,
+    agentId: input.agentId,
+  });
+}
+
+/**
+ * The Run Brief of a run without an issue: only the environment (filled in at
+ * dispatch) and the company roster.
+ */
+export async function loadTeamOnlyRunBrief(input: {
+  db: Db;
+  companyId: string;
+  agentId?: string | null;
+}): Promise<PaperclipRunBrief | null> {
+  const team = await loadRunBriefTeam(input);
+  if (!team) return null;
+  return {
+    version: 1,
+    issueId: null,
+    issueIdentifier: null,
+    authority: "execute",
+    environment: null,
+    blockerCount: 0,
+    blockers: [],
+    pendingInteractionCount: 0,
+    pendingInteractions: [],
+    priorRuns: [],
+    team,
+  };
+}
+
 /**
  * Collect the Run Brief for an issue-scoped wake. Environment details are not
  * known yet at this point; heartbeat attaches them once the session and the
@@ -222,6 +386,8 @@ export async function loadRunBrief(input: {
   priorRuns?: unknown;
   /** True when the reader itself is a low-trust review run. */
   exposeLowTrustRaw?: boolean;
+  /** Attach the company roster (see `loadRunBriefTeam`). */
+  includeTeam?: boolean;
 }): Promise<PaperclipRunBrief> {
   const { db, companyId } = input;
   const issueId = input.issue.id;
@@ -316,6 +482,9 @@ export async function loadRunBrief(input: {
       ).reverse(),
       { withholdLowTrust: input.exposeLowTrustRaw !== true },
     );
+  const team = input.includeTeam
+    ? await loadRunBriefTeam({ db, companyId, agentId: input.agentId })
+    : null;
   return {
     version: 1,
     issueId,
@@ -339,6 +508,8 @@ export async function loadRunBrief(input: {
         answerBy: interactionAnswerBy(row, input.agentId),
       })),
     priorRuns: priorRuns.slice(0, RUN_BRIEF_PRIOR_RUN_LIMIT),
+    // After the issue orientation; absent when not requested or empty.
+    ...(team ? { team } : {}),
   };
 }
 

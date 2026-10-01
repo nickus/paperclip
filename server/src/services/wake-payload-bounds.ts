@@ -71,6 +71,14 @@ const steps: Array<(payload: Json) => Json> = [
     if (!isRecord(context) || !Array.isArray(context.threads) || context.threads.length === 0) return payload;
     return { ...payload, planReviewContext: { ...context, threads: [], truncated: true } };
   },
+  // The Run Brief's team roster: keep the agent count, drop the entries. The
+  // rendered brief then points at the agents list route for all of them.
+  (payload) => {
+    const brief = payload.runBrief;
+    const team = isRecord(brief) ? brief.team : null;
+    if (!isRecord(brief) || !isRecord(team) || !Array.isArray(team.members) || team.members.length === 0) return payload;
+    return { ...payload, runBrief: { ...brief, team: { ...team, members: [] } } };
+  },
   // Free text: shorten comment and annotation bodies, then the brief.
   (payload) => ({
     ...payload,

@@ -63,6 +63,7 @@ import { buildExecutionContinuation, StaleExecutionContinuationError } from "./e
 import {
   isRunBriefEnabled,
   loadRunBrief,
+  loadTeamOnlyRunBrief,
   resolveRunBriefAuthority,
   resolveRunBriefSessionReason,
   runBriefTimeout,
@@ -8353,6 +8354,11 @@ export async function buildPaperclipWakePayload(input: {
         priorRuns: parseObject(input.contextSnapshot.executionContinuation)
           .priorRuns,
         exposeLowTrustRaw: input.exposeLowTrustRaw,
+        // The roster lists every agent in the company. Low-trust readers and
+        // skill-test runs may not read other agents, so they get none.
+        includeTeam:
+          input.exposeLowTrustRaw !== true &&
+          issueSummary.workMode !== "skill_test",
       });
     } catch (error) {
       logger.warn(
@@ -8559,6 +8565,50 @@ export async function buildPaperclipWakePayload(input: {
         boundedPayload,
       )
     : boundedPayload;
+}
+
+/**
+ * The wake payload of a run that has no issue (and so no other wake payload):
+ * a Run Brief with only the company roster, so the agent knows who it can
+ * hand work to. Null when the brief is off, for conversation turns, for
+ * low-trust readers (their agent access does not cover the roster), and when
+ * the lookup fails; a failed lookup never blocks the wake.
+ */
+export async function buildTeamOnlyWakePayload(input: {
+  db: Db;
+  companyId: string;
+  agentId?: string | null;
+  runId?: string | null;
+  contextSnapshot: Record<string, unknown>;
+  exposeLowTrustRaw?: boolean;
+}) {
+  if (
+    !isRunBriefEnabled() ||
+    readNonEmptyString(input.contextSnapshot.issueId) ||
+    input.contextSnapshot.conversationMode === true ||
+    input.exposeLowTrustRaw === true
+  ) {
+    return null;
+  }
+  try {
+    const runBrief = await loadTeamOnlyRunBrief({
+      db: input.db,
+      companyId: input.companyId,
+      agentId: input.agentId,
+    });
+    return runBrief
+      ? fitPaperclipWakePayloadToHardCap({
+          reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+          runBrief,
+        })
+      : null;
+  } catch (error) {
+    logger.warn(
+      { err: error, companyId: input.companyId, runId: input.runId },
+      "run brief unavailable; continuing without it",
+    );
+    return null;
+  }
 }
 
 function runTaskKey(run: typeof heartbeatRuns.$inferSelect) {
@@ -21843,8 +21893,19 @@ export function heartbeatService(
           experimentalInstanceSettings.enableSimplifiedEnglishInteractions ===
           true,
       });
-      if (paperclipWakePayload) {
-        context[PAPERCLIP_WAKE_PAYLOAD_KEY] = paperclipWakePayload;
+      // A run with no issue gets no wake payload, except the company roster.
+      const wakePayloadForRun =
+        paperclipWakePayload ??
+        (await buildTeamOnlyWakePayload({
+          db,
+          companyId: agent.companyId,
+          agentId: agent.id,
+          runId: run.id,
+          contextSnapshot: context,
+          exposeLowTrustRaw,
+        }));
+      if (wakePayloadForRun) {
+        context[PAPERCLIP_WAKE_PAYLOAD_KEY] = wakePayloadForRun;
       } else {
         delete context[PAPERCLIP_WAKE_PAYLOAD_KEY];
       }

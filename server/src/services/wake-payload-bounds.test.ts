@@ -1,9 +1,39 @@
 import { describe, expect, it } from "vitest";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { PAPERCLIP_RUN_BRIEF_TEAM_MAX_MEMBERS } from "@paperclipai/adapter-utils/wake-run-brief";
 import {
   PAPERCLIP_WAKE_PAYLOAD_HARD_CAP_BYTES,
   fitPaperclipWakePayloadToHardCap,
   paperclipWakePayloadBytes,
 } from "./wake-payload-bounds.js";
+
+// A full roster with oversized free-text fields.
+const fullTeam = () => ({
+  companyId: "0e5c1c9e-2f4b-4c3d-8e7f-1a2b3c4d5e6f",
+  total: 64,
+  members: Array.from({ length: PAPERCLIP_RUN_BRIEF_TEAM_MAX_MEMBERS }, (_, index) => ({
+    id: `7d1e2f3a-4b5c-4d6e-8f7a-${String(index).padStart(12, "0")}`,
+    name: "n".repeat(200),
+    role: "engineer",
+    title: "t".repeat(200),
+    status: "pending_approval",
+    reportsTo: "r".repeat(200),
+    you: index === 0,
+  })),
+});
+const briefWithTeam = () => ({
+  version: 1,
+  issueId: "issue-1",
+  issueIdentifier: "PAP-1",
+  authority: "execute",
+  environment: null,
+  blockerCount: 0,
+  blockers: [],
+  pendingInteractionCount: 0,
+  pendingInteractions: [],
+  priorRuns: [],
+  team: fullTeam(),
+});
 
 const thread = (index: number) => ({
   id: `thread-${index}`,
@@ -98,5 +128,27 @@ describe("fitPaperclipWakePayloadToHardCap", () => {
     expect(continuation.completedWork).toMatch(/^w{1000}\n\[truncated: 4000 more characters\]$/);
     expect(continuation.coverage).toEqual(payload.executionContinuation.coverage);
     expect(fitted.comments[0]!.body).toBe("short");
+  });
+
+  it("drops the team roster before shortening comments, keeping its count", () => {
+    const payload = {
+      reason: "issue_commented",
+      issue: { id: "issue-1", identifier: "PAP-1", title: "Roster", status: "in_progress", priority: "medium", workMode: "standard" },
+      commentIds: Array.from({ length: 15 }, (_, index) => `c${index}`),
+      comments: Array.from({ length: 15 }, (_, index) => ({ id: `c${index}`, body: "c".repeat(4_000) })),
+      runBrief: briefWithTeam(),
+      truncated: false,
+      fallbackFetchNeeded: false,
+    };
+    expect(paperclipWakePayloadBytes(payload)).toBeGreaterThan(PAPERCLIP_WAKE_PAYLOAD_HARD_CAP_BYTES);
+    const fitted = fitPaperclipWakePayloadToHardCap(payload);
+    expect(paperclipWakePayloadBytes(fitted)).toBeLessThanOrEqual(PAPERCLIP_WAKE_PAYLOAD_HARD_CAP_BYTES);
+    expect(fitted.runBrief.team).toEqual({ ...fullTeam(), members: [] });
+    expect(fitted.comments[0]!.body).toHaveLength(4_000);
+    expect(fitted).toMatchObject({ truncated: true, fallbackFetchNeeded: true });
+    // The rendered brief still says how many agents there are and where to list them.
+    expect(renderPaperclipWakePrompt(fitted)).toContain(
+      "- 64 agents not listed: GET /api/companies/0e5c1c9e-2f4b-4c3d-8e7f-1a2b3c4d5e6f/agents",
+    );
   });
 });

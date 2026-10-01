@@ -66,6 +66,7 @@ import {
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   renderPaperclipWakePrompt,
+  isPaperclipRunBriefOnlyWake,
   renderTemplate,
   resolvePaperclipInstanceRootForAdapter,
   selectPaperclipTaskMarkdown,
@@ -3040,7 +3041,10 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
     // the wake prompt's description copy out so the prompt carries it once.
     suppressIssueDescription: taskContextNote.length > 0,
   });
-  const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
+  const shouldUseResumeDeltaPrompt =
+    resumedSession && wakePrompt.length > 0 &&
+    // A brief-only wake (no issue) orients but keeps the heartbeat prompt.
+    !isPaperclipRunBriefOnlyWake(context.paperclipWake);
   const promptInstructionsPrefix = shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
   const renderedPrompt =
     shouldUseResumeDeltaPrompt || (externalChatTurn && !hasCustomPromptTemplate)

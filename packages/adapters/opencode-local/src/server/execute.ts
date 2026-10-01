@@ -43,6 +43,7 @@ import {
   refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
   renderPaperclipWakePrompt,
+  isPaperclipRunBriefOnlyWake,
   selectPaperclipTaskMarkdown,
   selectInitialCommunicationGuidance,
   isPaperclipRecoveryWakePayload,
@@ -652,7 +653,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       resumedSession: Boolean(sessionId),
       suppressIssueDescription: taskContextNote.length > 0,
     });
-    const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
+    const shouldUseResumeDeltaPrompt =
+      Boolean(sessionId) && wakePrompt.length > 0 &&
+      // A brief-only wake (no issue) orients but keeps the heartbeat prompt.
+      !isPaperclipRunBriefOnlyWake(context.paperclipWake);
     const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
       ? ""
       : renderTemplate(promptTemplate, templateData);

@@ -46,6 +46,7 @@ import {
   readPaperclipIssueWorkModeFromContext,
   renderTemplate,
   renderPaperclipWakePrompt,
+  isPaperclipRunBriefOnlyWake,
   selectPaperclipTaskMarkdown,
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -1126,7 +1127,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       conversationMode: context.conversationMode === true,
       suppressIssueDescription: taskContextNote.length > 0,
     });
-    const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
+    const shouldUseResumeDeltaPrompt =
+      Boolean(sessionId) && wakePrompt.length > 0 &&
+      // A brief-only wake (no issue) orients but keeps the heartbeat prompt.
+      !isPaperclipRunBriefOnlyWake(context.paperclipWake);
     const promptInstructionsPrefix = shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
     instructionsChars = promptInstructionsPrefix.length;
     const continuationSummary = parseObject(context.paperclipContinuationSummary);

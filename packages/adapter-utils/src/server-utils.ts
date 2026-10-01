@@ -2267,6 +2267,40 @@ export function selectPaperclipTaskMarkdown(
   return compact || full;
 }
 
+// The brief of a run without an issue (it carries only the company's team).
+// There is no wake delta to go with it, so it renders on its own.
+function readStandalonePaperclipRunBrief(value: unknown) {
+  if (normalizePaperclipWakePayload(value)) return null;
+  const brief = normalizePaperclipRunBrief(parseObject(value).runBrief);
+  return brief && !brief.issueId && !brief.issueIdentifier ? brief : null;
+}
+
+function renderStandalonePaperclipRunBrief(
+  value: unknown,
+  options: { resumedSession?: boolean; conversationMode?: boolean },
+): string {
+  if (options.conversationMode === true || !isPaperclipWakeRunBriefEnabled()) {
+    return "";
+  }
+  const brief = readStandalonePaperclipRunBrief(value);
+  return brief
+    ? renderPaperclipRunBrief(brief, { resumedSession: options.resumedSession })
+    : "";
+}
+
+/**
+ * True when the wake payload carries only a Run Brief (a run without an
+ * issue). Its wake prompt orients but carries no wake delta, so a resumed
+ * session still gets the heartbeat prompt template: adapters that replace the
+ * template with the wake prompt on resume must not do so for this payload.
+ */
+export function isPaperclipRunBriefOnlyWake(value: unknown): boolean {
+  return (
+    isPaperclipWakeRunBriefEnabled() &&
+    readStandalonePaperclipRunBrief(value) !== null
+  );
+}
+
 // Runtime-only connector skills are supplied by the server after assignment resolution.
 // Shared-home adapters consume them here on fresh and resumed runs without installing
 // files into a user-wide skills directory. They are not part of serialized wake data.
@@ -2297,7 +2331,7 @@ function renderPaperclipWakePromptBody(
   } = {},
 ): string {
   const normalized = normalizePaperclipWakePayload(value);
-  if (!normalized) return "";
+  if (!normalized) return renderStandalonePaperclipRunBrief(value, options);
   const resumedSession = options.resumedSession === true;
   const externalChatTurn = isNormalizedPaperclipExternalChatTurn(normalized);
   const externalChatReaderTurn =
