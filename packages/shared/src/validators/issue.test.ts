@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
+  ISSUE_COMMENT_MAX_BODY_LENGTH,
   addIssueCommentSchema,
+  editIssueCommentSchema,
   issueCommentMetadataSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
@@ -392,6 +394,18 @@ describe("issue validators", () => {
     });
 
     expect(parsed.body).toBe("Progress update\n\nNext action.");
+  });
+
+  it("caps comment create and edit bodies at the same, documented length", () => {
+    const atLimit = "a".repeat(ISSUE_COMMENT_MAX_BODY_LENGTH);
+    const overLimit = "a".repeat(ISSUE_COMMENT_MAX_BODY_LENGTH + 1);
+
+    // Edit never needs a lower ceiling than creation: a body that fits one
+    // fits the other.
+    expect(addIssueCommentSchema.safeParse({ body: atLimit }).success).toBe(true);
+    expect(editIssueCommentSchema.safeParse({ body: atLimit }).success).toBe(true);
+    expect(addIssueCommentSchema.safeParse({ body: overLimit }).success).toBe(false);
+    expect(editIssueCommentSchema.safeParse({ body: overLimit }).success).toBe(false);
   });
 
   it("accepts structured issue comment presentation and metadata", () => {

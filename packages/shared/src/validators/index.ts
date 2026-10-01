@@ -445,6 +445,7 @@ export {
   issueCommentMetadataRowSchema,
   issueCommentMetadataSectionSchema,
   issueCommentMetadataSchema,
+  ISSUE_COMMENT_MAX_BODY_LENGTH,
   addIssueCommentSchema,
   editIssueCommentSchema,
   issueThreadInteractionStatusSchema,
@@ -988,5 +989,6 @@ export * from "./provider-trace.js";
 export * from "./app-definition.js";
 export * from "./chat-channels.js";
 export * from "./chat-github.js";
+export { normalizeEscapedLineBreaks } from "./text.js";
 
 export * from "./email.js";

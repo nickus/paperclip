@@ -1065,9 +1065,19 @@ export const issueCommentMetadataSchema = z
 
 export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
 
+// Shared by both comment creation and comment editing so the two routes
+// never drift into a stricter-on-one-side limit that an agent would only
+// discover by trial and error. Matches the limit already used for the most
+// comparable free-text body in this codebase (chat channel messages, in
+// `./chat-channels.js`); long enough for normal use, bounded against a
+// single comment growing without limit.
+export const ISSUE_COMMENT_MAX_BODY_LENGTH = 100_000;
+
 export const addIssueCommentSchema = z.object({
   clientRequestId: z.string().uuid().optional(),
-  body: multilineTextSchema.pipe(z.string().min(1)),
+  body: multilineTextSchema.pipe(
+    z.string().min(1).max(ISSUE_COMMENT_MAX_BODY_LENGTH),
+  ),
   attachmentIds: issueCommentAttachmentIdsSchema.optional(),
   onBehalfOfUserId: z.string().trim().min(1).optional().nullable(),
   authorType: issueCommentAuthorTypeSchema.optional(),
@@ -1083,8 +1093,12 @@ export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;
 // Editing a comment only ever replaces its text. Presentation, metadata and
 // attachments are set once at creation time and are not revisited here, so
 // the accepted shape is intentionally narrower than `addIssueCommentSchema`.
+// The body limit is the same `ISSUE_COMMENT_MAX_BODY_LENGTH` as creation --
+// an edit never needs a lower ceiling than the original post did.
 export const editIssueCommentSchema = z.object({
-  body: multilineTextSchema.pipe(z.string().min(1)),
+  body: multilineTextSchema.pipe(
+    z.string().min(1).max(ISSUE_COMMENT_MAX_BODY_LENGTH),
+  ),
 });
 
 export type EditIssueComment = z.infer<typeof editIssueCommentSchema>;
