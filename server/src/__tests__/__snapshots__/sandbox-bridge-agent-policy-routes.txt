@@ -771,6 +771,7 @@ DENY POST /runtime-tools/connections/request
 DENY POST /runtime-tools/connections/search
 ALLOW PATCH /api/agents/:id/instructions-path
 ALLOW PATCH /api/issues/:id
+ALLOW PATCH /api/issues/:id/comments/:commentId
 ALLOW PATCH /api/issues/:id/documents/:key/annotations/:threadId
 ALLOW PATCH /api/issues/:id/queued-comments/:commentId
 ALLOW PATCH /api/routine-triggers/:id
