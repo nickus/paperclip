@@ -1,4 +1,5 @@
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
+import type { IssueRecoveryAction } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { executionRetryAccounting } from "../execution-recovery-attempt.js";
@@ -233,6 +234,7 @@ type LatestIssueRun =
       | "livenessState"
       | "startedAt"
       | "createdAt"
+      | "finishedAt"
     > & {
       resultJson?: unknown;
     })
@@ -977,6 +979,7 @@ export function recoveryService(
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
         createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -1007,6 +1010,7 @@ export function recoveryService(
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
         createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -1838,6 +1842,7 @@ export function recoveryService(
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
         createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -2494,11 +2499,47 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
-  }) {
+  }): Promise<IssueRecoveryAction | null> {
     const recoveryCause = resolveStrandedRecoveryCause(
       input.latestRun,
       input.recoveryCause,
     );
+    const fingerprint = strandedRecoveryActionFingerprint({
+      issue: input.issue,
+      recoveryCause,
+      latestRun: input.latestRun,
+    });
+    // A board operator's resolution is the current state of this problem
+    // until something new happens. If nothing has retried the run that
+    // triggered the hold since that resolution, this same stale run must not
+    // reopen an identical hold on the next sweep — that would recreate the
+    // exact notice the operator just resolved, forever, because nothing
+    // short of an actual retry changes what this run reports. A distinct new
+    // failure (this run started after the resolution, or a later run exists)
+    // is unaffected: this only guards opening a *new* hold, never refreshing
+    // one that is still active.
+    if (input.latestRun?.finishedAt) {
+      const existingActive = await recoveryActionsSvc.getActiveForIssue(
+        input.issue.companyId,
+        input.issue.id,
+      );
+      if (!existingActive) {
+        const lastResolution =
+          await recoveryActionsSvc.getLatestResolutionForIdentity({
+            companyId: input.issue.companyId,
+            sourceIssueId: input.issue.id,
+            cause: recoveryCause,
+            fingerprint,
+          });
+        if (
+          lastResolution?.resolvedAt &&
+          lastResolution.resolvedAt.getTime() >=
+            input.latestRun.finishedAt.getTime()
+        ) {
+          return null;
+        }
+      }
+    }
     const routing = resolveStrandedRecoveryRouting({
       issue: input.issue,
       latestRun: input.latestRun,
@@ -2521,11 +2562,7 @@ export function recoveryService(
       previousOwnerAgentId: input.issue.assigneeAgentId,
       returnOwnerAgentId: routing.returnOwnerAgentId,
       cause: recoveryCause,
-      fingerprint: strandedRecoveryActionFingerprint({
-        issue: input.issue,
-        recoveryCause,
-        latestRun: input.latestRun,
-      }),
+      fingerprint,
       evidence: {
         ...buildStrandedRecoveryActionEvidence({
           issue: input.issue,
@@ -4071,6 +4108,10 @@ export function recoveryService(
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
+    // A stale reopen: a board resolution for this exact identity already
+    // supersedes the run that triggered this call. Leave the issue and its
+    // resolved hold alone instead of recreating an identical notice.
+    if (!recoveryAction) return null;
     const isProviderQuotaWait =
       recoveryCause === "provider_quota" &&
       !recoveryAction.ownerAgentId &&

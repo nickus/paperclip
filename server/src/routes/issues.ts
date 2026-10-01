@@ -9464,6 +9464,20 @@ export function issueRoutes(
     });
   });
 
+  // The reconciler escalates a stalled execution-review participant to a
+  // board hold either because its adapter run failed with
+  // `configuration_incomplete` or because the participant agent itself
+  // became non-invokable. Both record the failed participant run's id and,
+  // when the issue was `in_review` at escalation time, `latestIssueStatus:
+  // "in_review"` in evidence (see `buildStrandedRecoveryActionEvidence` /
+  // `escalateStrandedAssignedIssue` in recovery/service.ts).
+  function isExecutionReviewParticipantRecoveryCause(cause: string) {
+    return (
+      cause === "configuration_incomplete" ||
+      cause === "execution_review_participant_recovery"
+    );
+  }
+
   router.post("/issues/:id/recovery-actions/retry-workspace-export", validate(retryWorkspaceExportSchema), async (req, res) => {
     assertBoard(req);
     const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
@@ -10043,6 +10057,77 @@ export function issueRoutes(
             },
             "failed to wake agent after recovery action restored issue",
           );
+        }
+      } else if (
+        !executionReconciliation &&
+        outcome === "restored" &&
+        sourceIssueStatus === "in_review" &&
+        result.issue.status === "in_review" &&
+        req.actor.type === "board" &&
+        isExecutionReviewParticipantRecoveryCause(result.recoveryAction.cause) &&
+        readNonEmptyString(result.recoveryAction.evidence?.latestIssueStatus) ===
+          "in_review"
+      ) {
+        // Restoring this hold hands the task back to `in_review`, but nothing
+        // else re-dispatches the review participant: the hold exists only
+        // because that participant's run already failed, so the task would
+        // otherwise sit in_review with no live run until the next sweep
+        // reopens the identical hold from the same stale run. Retry the
+        // exact failed run through the same board-only machinery
+        // `POST /agents/:id/wakeup` uses for `retry_failed_run`.
+        const failedRunId = readNonEmptyString(
+          result.recoveryAction.evidence?.latestRunId,
+        );
+        if (failedRunId) {
+          try {
+            const failedRun = await heartbeat.getRun(failedRunId);
+            if (
+              failedRun &&
+              failedRun.companyId === result.issue.companyId &&
+              ["failed", "timed_out"].includes(failedRun.status)
+            ) {
+              const failedContext = failedRun.contextSnapshot ?? {};
+              await enqueueRecoveryActionWakeup(failedRun.agentId, {
+                failedRunId: failedRun.id,
+                source: "on_demand",
+                triggerDetail: "manual",
+                reason: "retry_failed_run",
+                payload: Object.fromEntries(
+                  ["issueId", "taskId", "taskKey"].flatMap((key) =>
+                    typeof failedContext[key] === "string"
+                      ? [[key, failedContext[key]]]
+                      : [],
+                  ),
+                ),
+                requestedByActorType: "user",
+                requestedByActorId: actor.actorId,
+                contextSnapshot: {
+                  triggeredBy: "board",
+                  source: "issue.recovery_action_resolution",
+                  recoveryActionId: result.recoveryAction.id,
+                },
+              });
+            } else {
+              logger.warn(
+                {
+                  issueId: result.issue.id,
+                  recoveryActionId: result.recoveryAction.id,
+                  failedRunId,
+                },
+                "execution-review participant retry skipped: failed run is no longer retryable",
+              );
+            }
+          } catch (err) {
+            logger.warn(
+              {
+                err,
+                issueId: result.issue.id,
+                recoveryActionId: result.recoveryAction.id,
+                failedRunId,
+              },
+              "failed to retry execution-review participant run after recovery action restored issue",
+            );
+          }
         }
       }
 

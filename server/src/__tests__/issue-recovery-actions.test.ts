@@ -1338,6 +1338,185 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  // Shared fixture for the stale-reopen / participant-retry pair below: a
+  // review stage whose participant's only run already failed with a
+  // configuration gap, exactly as the first sweep leaves it right before a
+  // board operator would resolve the hold.
+  async function seedBlockedReviewParticipantConfigurationHold() {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const stageId = randomUUID();
+    await db.update(issues).set({
+      status: "in_review",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: managerId, userId: null }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: managerId, userId: null },
+        returnAssignee: { type: "agent", agentId: coderId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, sourceIssueId));
+    const participantRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: participantRunId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      error: "model_not_found: requested review model does not exist",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() } as never));
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const firstSweep = await recovery.reconcileStrandedAssignedIssues();
+    expect(firstSweep).toMatchObject({ escalated: 1 });
+    const [blocked] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(blocked).toMatchObject({ status: "blocked", assigneeAgentId: coderId });
+    const [action] = await db.select().from(issueRecoveryActions);
+    expect(action).toMatchObject({ cause: "configuration_incomplete", status: "active" });
+
+    return { companyId, managerId, coderId, sourceIssueId, participantRunId, action: action!, recovery, enqueueWakeup };
+  }
+
+  it("retries the stalled review participant's exact failed run when the board restores the hold to in_review", async () => {
+    const { managerId, sourceIssueId, participantRunId, action } =
+      await seedBlockedReviewParticipantConfigurationHold();
+
+    const enqueueRecoveryActionWakeup = vi.fn(async () => null);
+    const resolved = await request(
+      createApp(undefined, { recoveryActionEnqueueWakeup: enqueueRecoveryActionWakeup }),
+    )
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "in_review",
+        resolutionNote: "Reconnected the review model; restoring review.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({ id: sourceIssueId, status: "in_review" });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "restored",
+    });
+    // The exact failed participant run is retried through the board-only
+    // `retry_failed_run` machinery, not a generic wake: nothing else
+    // re-dispatches the participant after a restore.
+    expect(enqueueRecoveryActionWakeup).toHaveBeenCalledExactlyOnceWith(
+      managerId,
+      expect.objectContaining({
+        failedRunId: participantRunId,
+        reason: "retry_failed_run",
+        source: "on_demand",
+        triggerDetail: "manual",
+        requestedByActorType: "user",
+      }),
+    );
+  });
+
+  it("does not reopen an identical hold from the same stale run after the board restores it", async () => {
+    const { sourceIssueId, action, recovery } =
+      await seedBlockedReviewParticipantConfigurationHold();
+
+    // Board restores the hold without anything actually retrying the run
+    // (this test's injected wake is a no-op stub, so no new run is created),
+    // so the next sweep still sees the exact same stale failed run.
+    const resolved = await request(
+      createApp(undefined, { recoveryActionEnqueueWakeup: vi.fn(async () => null) }),
+    )
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "in_review",
+        resolutionNote: "Reconnected the review model; restoring review.",
+      })
+      .expect(200);
+    expect(resolved.body.issue).toMatchObject({ id: sourceIssueId, status: "in_review" });
+
+    const secondSweep = await recovery.reconcileStrandedAssignedIssues();
+
+    // Without the fix this reopens an identical hold from the same stale
+    // run; with it, the resolved hold stands and the issue stays in review.
+    expect(secondSweep).toMatchObject({ escalated: 0 });
+    const [stillInReview] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(stillInReview?.status).toBe("in_review");
+    const allActions = await db.select().from(issueRecoveryActions);
+    expect(allActions).toHaveLength(1);
+    expect(allActions[0]).toMatchObject({ id: action.id, status: "resolved" });
+  });
+
+  it("reopens a hold for a genuinely new failure of the same shape after a restore", async () => {
+    const { companyId, managerId, sourceIssueId, action, recovery } =
+      await seedBlockedReviewParticipantConfigurationHold();
+
+    await request(
+      createApp(undefined, { recoveryActionEnqueueWakeup: vi.fn(async () => null) }),
+    )
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "in_review",
+        resolutionNote: "Reconnected the review model; restoring review.",
+      })
+      .expect(200);
+
+    // A genuinely new attempt (started after the resolution) that fails the
+    // same way must still open a fresh hold: the guard only blocks the stale
+    // run from the first failure, never a later, distinct one.
+    const retryRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: retryRunId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      error: "model_not_found: requested review model does not exist",
+      errorCode: "adapter_failed",
+      startedAt: new Date(),
+      finishedAt: new Date(),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+
+    const thirdSweep = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(thirdSweep).toMatchObject({ escalated: 1 });
+    const [reblocked] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(reblocked?.status).toBe("blocked");
+    const activeActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.sourceIssueId, sourceIssueId), eq(issueRecoveryActions.status, "active")));
+    expect(activeActions).toHaveLength(1);
+    expect(activeActions[0]).toMatchObject({
+      cause: "configuration_incomplete",
+      evidence: expect.objectContaining({ latestRunId: retryRunId }),
+    });
+  });
+
   it("uses the default quota backoff when the provider does not state a reset time", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     await db.insert(heartbeatRuns).values({
