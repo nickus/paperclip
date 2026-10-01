@@ -47,6 +47,7 @@ import {
   updateIssueSchema,
   stalledReviewDecisionSchema,
   createIssueLabelSchema,
+  ISSUE_COMMENT_MAX_BODY_LENGTH,
   addIssueCommentSchema,
   editIssueCommentSchema,
   checkoutIssueSchema,
@@ -4140,6 +4141,10 @@ registry.registerPath({
   path: "/api/issues/{id}/comments",
   tags: ["issues"],
   summary: "Add a comment to an issue",
+  description:
+    `\`body\` is capped at ${ISSUE_COMMENT_MAX_BODY_LENGTH} characters, the same limit PATCH ` +
+    "(comment edit) uses. Exceeding it returns 400 " +
+    '`{"error":"Comment body is too long","field":"body","maxLength":<limit>,"actualLength":<sent>}`.',
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(addIssueCommentSchema),
@@ -4152,6 +4157,10 @@ registry.registerPath({
   path: "/api/issues/{id}/comments/{commentId}",
   tags: ["issues"],
   summary: "Edit an issue comment's body (author or board only; does not wake anyone)",
+  description:
+    `\`body\` is capped at ${ISSUE_COMMENT_MAX_BODY_LENGTH} characters, the same limit POST ` +
+    "(comment creation) uses. Exceeding it returns 400 " +
+    '`{"error":"Comment edit body is too long","field":"body","maxLength":<limit>,"actualLength":<sent>}`.',
   request: {
     params: z.object({ id: z.string(), commentId: z.string() }),
     body: jsonBody(editIssueCommentSchema),
