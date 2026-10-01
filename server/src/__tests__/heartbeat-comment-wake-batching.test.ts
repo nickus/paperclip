@@ -4,6 +4,7 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import { WebSocketServer } from "ws";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
   agents,
   agentWakeupRequests,
   chatActions,
@@ -39,6 +40,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.ts";
 import { parseWakePayloadFromMessage } from "./helpers/wake-message.ts";
+import { RUN_QUEUED_COMMENTS_DELIVERED_ACTION } from "../services/run-queued-comments.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
@@ -1202,11 +1204,14 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
   }, 120_000);
 
   it.each([
-    { caseName: "allows a non-assignee mention on completed work", targetAssignee: false, terminalStatus: "done", explicitResume: false },
-    { caseName: "delivers explicit agent feedback after completion", targetAssignee: true, terminalStatus: "done", explicitResume: true },
-    { caseName: "cancels an assignee continuation without resume intent on completed work", targetAssignee: true, terminalStatus: "done", explicitResume: false },
-    { caseName: "cancels an assignee continuation on cancelled work", targetAssignee: true, terminalStatus: "cancelled", explicitResume: true },
-  ] as const)("$caseName", async ({ targetAssignee, terminalStatus, explicitResume }) => {
+    { caseName: "allows a non-assignee mention on completed work", targetAssignee: false, terminalStatus: "done", explicitResume: false, shownToRun: false },
+    { caseName: "delivers explicit agent feedback after completion", targetAssignee: true, terminalStatus: "done", explicitResume: true, shownToRun: false },
+    // The run completed the task without seeing this comment, so it may have
+    // finished work the comment asked it to hold: deliver it like a resume.
+    { caseName: "delivers agent feedback that the completing run never saw", targetAssignee: true, terminalStatus: "done", explicitResume: false, shownToRun: false },
+    { caseName: "cancels an assignee continuation without resume intent that the run saw before completing", targetAssignee: true, terminalStatus: "done", explicitResume: false, shownToRun: true },
+    { caseName: "cancels an assignee continuation on cancelled work", targetAssignee: true, terminalStatus: "cancelled", explicitResume: true, shownToRun: false },
+  ] as const)("$caseName", async ({ targetAssignee, terminalStatus, explicitResume, shownToRun }) => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -1215,7 +1220,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const heartbeat = heartbeatService(db);
     const targetAgentId = targetAssignee ? assigneeAgentId : mentionedAgentId;
-    const shouldReopen = targetAssignee && terminalStatus === "done" && explicitResume;
+    const shouldReopen = targetAssignee && terminalStatus === "done" && (explicitResume || !shownToRun);
     const commentingAgentId = targetAssignee ? mentionedAgentId : assigneeAgentId;
     const wakeReason = targetAssignee ? "issue_commented" : "issue_comment_mentioned";
 
@@ -1355,6 +1360,22 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         return Boolean(deferred);
       });
 
+      if (shownToRun) {
+        // What a status-change conflict records when it shows the run the
+        // comment before the run completes the task.
+        await db.insert(activityLog).values({
+          companyId,
+          actorType: "agent",
+          actorId: assigneeAgentId,
+          agentId: assigneeAgentId,
+          runId: firstRun!.id,
+          action: RUN_QUEUED_COMMENTS_DELIVERED_ACTION,
+          entityType: "issue",
+          entityId: issueId,
+          details: { runId: firstRun!.id, commentIds: [comment.id], via: "status_change_conflict" },
+        });
+      }
+
       // Running records admission. Wait for provider acceptance before
       // simulating completion by that provider, or startup correctly rejects
       // the already-closed task before this scenario reaches its follow-up.
@@ -1390,6 +1411,15 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         expect(closedIssue.completedAt).not.toBeNull();
         const [retainedComment] = await db.select().from(issueComments).where(eq(issueComments.id, comment.id));
         expect(retainedComment.body).toContain("please review after I finish");
+        // A comment the run never saw is not retired silently with a
+        // cancelled task: the issue activity names it.
+        const undelivered = await db.select().from(activityLog).where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "issue.queued_comments_undelivered"),
+        ));
+        expect(undelivered.map((row) => row.details)).toEqual(
+          shownToRun ? [] : [expect.objectContaining({ commentIds: [comment.id] })],
+        );
         return;
       }
 
@@ -1446,6 +1476,15 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       expect(String(secondPayload.message ?? "")).toContain(
         "please review after I finish",
       );
+      // The assignee's next run is told the comment arrived during the run
+      // that completed the task, which never saw it.
+      if (targetAssignee) {
+        expect(secondWake).toMatchObject({
+          queuedDuringPreviousRun: { runId: firstRun!.id, commentIds: [comment.id] },
+        });
+      } else {
+        expect(secondWake).not.toHaveProperty("queuedDuringPreviousRun");
+      }
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();
