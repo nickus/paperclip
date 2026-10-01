@@ -1,6 +1,7 @@
 import { hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { readPendingCleanupIntent, readPendingCleanupReleaseRunStatus } from "./pending-cleanup-intent.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
@@ -511,6 +512,15 @@ export interface EnvironmentDriverAcquireInput {
   assertCompanyBinding?: boolean;
 }
 
+/** Outcome of {@link EnvironmentRuntimeDriver.retryPendingSandboxRelease}. */
+export type PendingSandboxReleaseResult =
+  /** The provider confirmed the stop and kept the sandbox; the lease is resumable. */
+  | { outcome: "released"; lease: EnvironmentLease | null }
+  /** The provider tore the sandbox down instead of keeping it. */
+  | { outcome: "destroyed"; lease: EnvironmentLease | null }
+  /** The release must not run; tear the sandbox down from the recorded lease data. */
+  | { outcome: "not_releasable"; reason: "provider_changed" | "reuse_disabled" | "release_unsupported" };
+
 export interface EnvironmentDriverReleaseInput {
   resourceDisposition?: "stop_and_retain";
   /**
@@ -686,6 +696,19 @@ export interface EnvironmentRuntimeDriver {
    * receipt must be validated and persisted by the caller at lease release.
    */
   retryPendingSandboxTeardown?(input: { environment: Environment | null; lease: EnvironmentLease }): Promise<unknown>;
+  /**
+   * Retry the provider release of a reusable sandbox lease parked with the
+   * "release" intent (see pending-cleanup-intent.ts): stop whatever the run
+   * left running and keep the sandbox for the next run of the task. The lease
+   * carries the cleanup sweep's attempt id, and the result is written only
+   * while that attempt still owns the lease, so a late result of an older
+   * attempt is ignored. Returns `not_releasable` when the release must not
+   * run: the environment no longer points at the lease's provider and plugin,
+   * no longer reuses sandboxes, or the plugin worker cannot release. The
+   * caller then tears the sandbox down from the recorded lease data. Throws
+   * when the release fails or the provider does not confirm the stop.
+   */
+  retryPendingSandboxRelease?(input: { environment: Environment; lease: EnvironmentLease }): Promise<PendingSandboxReleaseResult>;
   /**
    * Report whether the provider worker can run an orphan teardown now. A plugin
    * sandbox provider worker can be briefly down during its own restart window.
@@ -2852,6 +2875,21 @@ function createSandboxEnvironmentDriver(
       // teardown runs, throws its own "no worker manager" error, and counts
       // toward the cap.
       if (!pluginWorkerManager) return true;
+      if (
+        !hasStopOnlyCleanup(input.lease) &&
+        readPendingCleanupIntent(input.lease.metadata) === "release" &&
+        isPluginBackedReusableSandboxLease(input.lease)
+      ) {
+        // A release goes to the exact plugin that acquired the sandbox, so wait
+        // for that plugin's worker. A plugin that is gone cannot release; the
+        // teardown below then applies, through whichever plugin serves the key.
+        const pinned = await resolvePluginSandboxProviderDriverById({
+          db,
+          pluginId: readString(input.lease.metadata?.pluginId)!,
+          driverKey: recordedProvider,
+        });
+        if (pinned) return pinned.plugin.status === "ready" && pluginWorkerManager.isRunning(pinned.plugin.id);
+      }
       if (hasStopOnlyCleanup(input.lease)) {
         const pinnedPluginId = readString(input.lease.metadata?.pluginId);
         if (!pinnedPluginId) return true; // Permanent invalid intent, never a by-key fallback.
@@ -3228,6 +3266,10 @@ function createSandboxEnvironmentDriver(
         failureReason: input.failureReason ?? "lease_destroyed",
       });
     },
+
+    async retryPendingSandboxRelease(input) {
+      return await retryPendingPluginSandboxRelease(input);
+    },
   };
 
   /**
@@ -3431,7 +3473,108 @@ function createSandboxEnvironmentDriver(
       failureReason,
       cleanupStatus,
       ...(cleanupStatus === "success" && termination ? { remoteExecutionTermination: termination } : {}),
+      // The release could not be confirmed (the worker was down, the RPC timed
+      // out, or the provider sent no receipt). The sandbox may well still be
+      // there, holding the task's agent session, so a reusable lease asks the
+      // cleanup sweep to retry the release rather than destroy it.
+      ...(releaseStatus === "pending_cleanup"
+        ? input.lease.leasePolicy === "reuse_by_environment"
+          ? { pendingCleanupIntent: "release" as const, pendingCleanupReleaseRunStatus: input.status }
+          : { pendingCleanupIntent: "destroy" as const }
+        : {}),
     });
+  }
+
+  /**
+   * Retry the release of a reusable plugin sandbox lease parked with the
+   * "release" intent. See {@link EnvironmentRuntimeDriver.retryPendingSandboxRelease}.
+   */
+  async function retryPendingPluginSandboxRelease(input: {
+    environment: Environment;
+    lease: EnvironmentLease;
+  }): Promise<PendingSandboxReleaseResult> {
+    const metadata = input.lease.metadata ?? {};
+    const attemptId = readString(metadata.pendingCleanupAttemptId);
+    if (!attemptId) throw new Error(`Pending-cleanup lease "${input.lease.id}" has no claimed cleanup attempt.`);
+    const pluginId = readString(metadata.pluginId);
+    const providerKey = readString(metadata.provider);
+    if (!isPluginBackedReusableSandboxLease(input.lease) || !pluginId || !providerKey ||
+        (input.lease.provider !== null && input.lease.provider !== providerKey)) {
+      return { outcome: "not_releasable", reason: "provider_changed" };
+    }
+    // Keep the sandbox only for the environment it was acquired for: a sandbox
+    // of a provider or plugin the environment no longer uses, or of an
+    // environment that stopped reusing sandboxes, could never be resumed. The
+    // next acquire would tear it down anyway, so do it now through the
+    // recorded teardown instead of keeping it idle.
+    let parsed: ReturnType<typeof parseEnvironmentDriverConfig>;
+    try {
+      parsed = parseEnvironmentDriverConfig(input.environment);
+    } catch {
+      return { outcome: "not_releasable", reason: "provider_changed" };
+    }
+    if (parsed.driver !== "sandbox" || parsed.config.provider !== providerKey) {
+      return { outcome: "not_releasable", reason: "provider_changed" };
+    }
+    if (!parsed.config.reuseLease) return { outcome: "not_releasable", reason: "reuse_disabled" };
+    if (!pluginWorkerManager) {
+      throw new Error(`Sandbox provider "${providerKey}" needs a plugin worker manager for the release.`);
+    }
+    const pinned = await resolvePluginSandboxProviderDriverById({ db, pluginId, driverKey: providerKey });
+    if (!pinned) return { outcome: "not_releasable", reason: "provider_changed" };
+    if (pinned.plugin.status !== "ready" || !pluginWorkerManager.isRunning(pluginId)) {
+      throw new Error(`The worker of the sandbox provider plugin for "${providerKey}" is not running.`);
+    }
+    // The plugin an acquire would use for this provider now. Another plugin
+    // serving the provider key means the next run would not resume this sandbox.
+    const current = await resolvePluginSandboxProviderDriverByKey({
+      db,
+      driverKey: providerKey,
+      workerManager: pluginWorkerManager,
+      requireRunning: true,
+    });
+    if (current?.plugin.id !== pluginId) {
+      return { outcome: "not_releasable", reason: "provider_changed" };
+    }
+    if (!pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentReleaseLease")) {
+      return { outcome: "not_releasable", reason: "release_unsupported" };
+    }
+
+    const config = await resolvePluginSandboxRuntimeConfig({
+      environment: input.environment,
+      lease: input.lease,
+      provider: providerKey,
+    });
+    const workerConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
+    const runStatus = readPendingCleanupReleaseRunStatus(metadata);
+    const receipt = await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () =>
+      pluginWorkerManager.call(pluginId, "environmentReleaseLease", {
+        driverKey: providerKey,
+        companyId: input.lease.companyId,
+        environmentId: input.environment.id,
+        issueId: input.lease.issueId,
+        config: workerConfig,
+        providerLeaseId: input.lease.providerLeaseId,
+        leaseMetadata: metadata,
+        // The run that held the lease is over, but its work may still be
+        // running (a release that timed out, a host that went away), so the
+        // release must stop it before the sandbox is kept.
+        cancelActiveWork: true,
+        ...(runStatus ? { runStatus } : {}),
+      }, resolvePluginSandboxRpcTimeoutMs(workerConfig)),
+    );
+    const termination = remoteTerminationReceipt(input.lease, receipt);
+    if (!termination) {
+      throw new Error(`The provider did not confirm the release of sandbox lease "${input.lease.id}".`);
+    }
+    const kept = termination.state === "stopped";
+    const lease = await environmentsSvc.releaseLease(input.lease.id, kept ? "released" : "expired", {
+      expectedPendingCleanupAttemptId: attemptId,
+      cleanupStatus: "success",
+      failureReason: kept ? "pending_cleanup_release_retry" : "pending_cleanup_retry",
+      remoteExecutionTermination: termination,
+    });
+    return kept ? { outcome: "released", lease } : { outcome: "destroyed", lease };
   }
 
   async function destroyReusableSandboxLease(input: {
@@ -3505,6 +3648,9 @@ function createSandboxEnvironmentDriver(
         failureReason: input.failureReason,
         cleanupStatus,
         ...(cleanupStatus === "success" && termination ? { remoteExecutionTermination: termination } : {}),
+        // A destroy that could not finish stays a destroy: the sweep must never
+        // keep a sandbox someone asked to tear down.
+        ...(cleanupStatus === "success" ? {} : { pendingCleanupIntent: "destroy" as const }),
       },
     );
   }
@@ -4300,6 +4446,20 @@ export function environmentRuntimeService(
       return await driver.retryPendingSandboxTeardown(input);
     },
 
+    // Retry the release of a reusable sandbox lease parked with the "release"
+    // intent. A driver without the step cannot keep the sandbox, so the caller
+    // tears it down from the recorded lease data instead.
+    async retryPendingSandboxRelease(input: {
+      environment: Environment;
+      lease: EnvironmentLease;
+    }): Promise<PendingSandboxReleaseResult> {
+      const driver = getDriver(getLeaseDriverKey(input.lease, input.environment));
+      if (!driver?.retryPendingSandboxRelease) {
+        return { outcome: "not_releasable", reason: "release_unsupported" };
+      }
+      return await driver.retryPendingSandboxRelease(input);
+    },
+
     // Report whether the provider worker can run an orphan teardown now. The
     // cleanup sweep calls this before it claims a finite retry attempt, so a
     // briefly-down plugin worker never burns an attempt. This dispatcher never
@@ -4403,6 +4563,7 @@ export function environmentRuntimeService(
           : await environmentsSvc.releaseLease(leaseSnapshot.id, "pending_cleanup", {
               failureReason: input.failureReason ?? "reusable_lease_destroyed",
               cleanupStatus: "failed",
+              pendingCleanupIntent: "destroy",
             });
         if (!lease) continue;
         destroyed.push({

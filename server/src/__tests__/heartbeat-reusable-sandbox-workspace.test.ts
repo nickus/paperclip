@@ -3,13 +3,14 @@ import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
   companies,
   createDb,
+  environmentLeases,
   environments,
   executionWorkspaces,
   heartbeatRuns,
@@ -620,6 +621,54 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
     } finally {
       restoreDefaultTurn();
     }
+  }, 90_000);
+
+  it("releases a failed run's parked sandbox before the Retry of that run starts", async () => {
+    const { agentId, issueId, heartbeat, agentRuns, wakeAndSettle, worker } = await seed({
+      reuseLease: true,
+      runnerIdleTimeoutMs: 86_400_000,
+    });
+    await wakeAndSettle();
+    const [failedRun] = await agentRuns();
+    // The run failed, and its release could not be confirmed: the lease is
+    // parked for a release retry while the sandbox still holds the session.
+    await db.update(heartbeatRuns).set({ status: "failed", error: "adapter failed", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, failedRun!.id));
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, failedRun!.id));
+    expect(lease).toMatchObject({ providerLeaseId: "pc-sandbox-1" });
+    await db.update(environmentLeases).set({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "release_cleanup_failed",
+      metadata: sql`(${environmentLeases.metadata} - 'remoteExecutionTermination') || '{"pendingCleanupIntent":"release","pendingCleanupReleaseRunStatus":"failed"}'::jsonb`,
+    }).where(eq(environmentLeases.id, lease!.id));
+    await db.update(issues).set({ status: "in_progress", updatedAt: new Date() }).where(eq(issues.id, issueId));
+    const callsBefore = worker.call.mock.calls.length;
+
+    const retry = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "retry_failed_run",
+      failedRunId: failedRun!.id,
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+      payload: { issueId },
+      contextSnapshot: { issueId },
+    });
+    expect(retry).not.toBeNull();
+    await vi.waitFor(async () => {
+      expect((await heartbeat.getRun(retry!.id))?.status).toBe("succeeded");
+    }, { timeout: 30_000, interval: 50 });
+    await heartbeat.drainActiveRunExecutions();
+
+    const later = worker.call.mock.calls.slice(callsBefore).map(([, method, params]) => [method, params.providerLeaseId]);
+    // The parked sandbox is released first, then the retry resumes it.
+    expect(later.slice(0, 2)).toEqual([
+      ["environmentReleaseLease", "pc-sandbox-1"],
+      ["environmentResumeLease", "pc-sandbox-1"],
+    ]);
+    expect(later.filter(([method]) => method === "environmentDestroyLease" || method === "environmentAcquireLease")).toEqual([]);
+    expect(worker.call.mock.calls[callsBefore]?.[2]).toMatchObject({ cancelActiveWork: true, runStatus: "failed" });
   }, 90_000);
 
   it("gives each task its own execution workspace and sandbox and never resumes another task's sandbox", async () => {

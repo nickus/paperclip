@@ -18,6 +18,7 @@ import { admitExplicitNativeContinuation } from "./explicit-native-continuation.
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
+import { environmentService } from "./environments.js";
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("explicit native conversation continuation", () => {
@@ -201,6 +202,64 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(untouched).toMatchObject({ status: scenario === "shared" ? "active" : "pending_cleanup", metadata: { pendingCleanupRetryAttempts: 5 } });
     } finally {
       for (const identity of identities) await db.delete(environmentLeases).where(eq(environmentLeases.id, identity.id));
+    }
+  });
+  it("an explicit queued interrupt releases a parked reusable sandbox before it queues the successor", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", nativeIssueId: null, processPid: null })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    // Occupy the agent slot: admission is real, but no provider should launch.
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const queueId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId,
+      source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "system", payload: { issueId: f.issueId, commentId: f.commentId,
+        _paperclipWakeContext: { wakeCommentIds: [f.commentId] },
+        queuedCommentInterrupt: { actorId: "board", requestedAt: new Date().toISOString() } },
+    });
+    // The stopped run's sandbox holds the agent's session; its release could
+    // not be confirmed, so the lease is parked for a release retry.
+    const environmentId = randomUUID(), leaseId = randomUUID();
+    await db.insert(environments).values({ id: environmentId,
+      name: `Reusable sandbox ${environmentId.slice(0, 8)}`, driver: "sandbox", status: "active",
+      config: { provider: "kubernetes", reuseLease: true } });
+    await db.insert(environmentLeases).values({ id: leaseId, companyId: f.companyId, environmentId,
+      heartbeatRunId: f.sourceRunId, provider: "kubernetes", providerLeaseId: `kept-${leaseId}`,
+      status: "pending_cleanup", leasePolicy: "reuse_by_environment", releasedAt: new Date(), cleanupStatus: "failed",
+      metadata: { pendingCleanupIntent: "release", pendingCleanupReleaseRunStatus: "failed" } });
+    const events: string[] = [];
+    const queuedSuccessors = async () => (await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")))).length;
+    const heartbeat = heartbeatService(db, { environmentRuntime: {
+      isPendingCleanupWorkerReady: async () => true,
+      retryPendingSandboxTeardown: async () => { events.push("teardown"); },
+      destroyRunLease: async () => { events.push("destroy"); return null; },
+      retryPendingSandboxRelease: async ({ lease }: { lease: { id: string; companyId: string; heartbeatRunId: string;
+        provider: string; providerLeaseId: string; metadata: Record<string, unknown> } }) => {
+        events.push(`release with ${await queuedSuccessors()} queued`);
+        const released = await environmentService(db).releaseLease(lease.id, "released", {
+          expectedPendingCleanupAttemptId: lease.metadata.pendingCleanupAttemptId as string,
+          cleanupStatus: "success",
+          remoteExecutionTermination: remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "stopped" }),
+        });
+        return { outcome: "released", lease: released };
+      },
+    } as unknown as HeartbeatEnvironmentRuntime });
+    try {
+      await heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true });
+      // Released (not destroyed) before the successor was queued.
+      expect(events).toEqual(["release with 0 queued"]);
+      expect(await queuedSuccessors()).toBe(1);
+      const [queue] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+      expect(queue).toMatchObject({ status: "coalesced", runId: expect.any(String) });
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+      expect(lease).toMatchObject({ status: "released", cleanupStatus: "success" });
+    } finally {
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId));
     }
   });
   it("a durable queue interrupt authorizes older legacy messages but still requires the provider to stop", async () => {

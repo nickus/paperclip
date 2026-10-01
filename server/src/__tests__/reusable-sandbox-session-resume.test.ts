@@ -425,7 +425,7 @@ describeEmbeddedPostgres("reusable sandbox leases carry the harness session to t
     await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "released" });
   });
 
-  it("parks a cancelled run's lease when the provider does not confirm the stop", async () => {
+  it("parks a cancelled run's lease for a release retry when the provider does not confirm the stop", async () => {
     const { runtime, worker, startRun } = await seed();
     const first = await startRun();
     worker.releaseReceipt.mockImplementationOnce(() => undefined);
@@ -433,13 +433,17 @@ describeEmbeddedPostgres("reusable sandbox leases carry the harness session to t
     await runtime.releaseRunLeases(first.runId, "expired", undefined, undefined, true);
 
     // Nothing proves the run's work stopped, so the lease is not resumable;
-    // the sandbox is not destroyed either.
+    // the sandbox is not destroyed either: the sweep retries the release.
     expect(worker.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toEqual([]);
     expect(worker.sandboxes.has(first.lease.providerLeaseId!)).toBe(true);
     await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
       status: "pending_cleanup",
       cleanupStatus: "failed",
       failureReason: "release_cleanup_failed",
+      metadata: expect.objectContaining({
+        pendingCleanupIntent: "release",
+        pendingCleanupReleaseRunStatus: "expired",
+      }),
     });
   });
 

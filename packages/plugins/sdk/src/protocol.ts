@@ -673,17 +673,21 @@ export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDr
   /** Stop the exact allocation while preserving its files, regardless of its
    * ordinary release policy. A failed stop must throw, never fall back to delete. */
   resourceDisposition?: "stop_and_retain";
-  /** Explicit operator cancellation: terminate active work instead of waiting
-   * for command/sync activity to drain. Still requires a provider receipt. */
+  /** Terminate active work instead of waiting for command/sync activity to
+   * drain: an explicit operator cancellation, the release of a cancelled run,
+   * or the retry of a release the host could not confirm. Still requires a
+   * provider receipt; a provider that keeps sandboxes between runs answers a
+   * verified stop with `stopped` and keeps the sandbox. */
   cancelActiveWork?: boolean;
   providerLeaseId: string | null;
   leaseMetadata?: Record<string, unknown>;
   /**
    * How the run that held the lease ended (`released` for a completed run,
-   * `failed` for a failed one), when the host releases a lease at the end of
-   * a run. A provider that keeps sandboxes between runs can use it to stop
-   * keeping a sandbox in which run after run fails. Omitted otherwise, and by
-   * hosts that predate this field.
+   * `failed` for a failed one, `expired` for a cancelled one), when the host
+   * releases a lease at the end of a run or retries that release. A provider
+   * that keeps sandboxes between runs can use it to stop keeping a sandbox in
+   * which run after run fails. Omitted otherwise, and by hosts that predate
+   * this field.
    */
   runStatus?: "released" | "failed" | "expired";
 }

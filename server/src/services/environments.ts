@@ -34,6 +34,11 @@ import { conflict, forbidden } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import {
+  PENDING_CLEANUP_INTENT_METADATA_KEY,
+  PENDING_CLEANUP_RELEASE_RUN_STATUS_METADATA_KEY,
+  type PendingCleanupIntent,
+} from "./pending-cleanup-intent.js";
+import {
   resourceStatus,
   stockHash,
   type ManagedResourceStockStatus,
@@ -1642,9 +1647,42 @@ export function environmentService(db: Db) {
         failureReason?: string;
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
         remoteExecutionTermination?: Record<string, unknown>;
+        /**
+         * Why a lease is parked in `pending_cleanup`: the cleanup sweep retries
+         * a "release" (keep the provider resource for the next run) or a
+         * "destroy". Only a parked lease carries the marker; any other status
+         * drops it, and a parked lease written without one keeps its marker.
+         */
+        pendingCleanupIntent?: PendingCleanupIntent;
+        /** The run status a retried "release" reports to the provider. */
+        pendingCleanupReleaseRunStatus?: string;
       },
     ) => {
       const now = new Date();
+      const patch: Record<string, unknown> = {
+        ...(options?.remoteExecutionTermination
+          ? { remoteExecutionTermination: options.remoteExecutionTermination }
+          : {}),
+        ...(options?.pendingCleanupIntent
+          ? {
+              [PENDING_CLEANUP_INTENT_METADATA_KEY]: options.pendingCleanupIntent,
+              ...(options.pendingCleanupIntent === "release" && options.pendingCleanupReleaseRunStatus
+                ? { [PENDING_CLEANUP_RELEASE_RUN_STATUS_METADATA_KEY]: options.pendingCleanupReleaseRunStatus }
+                : {}),
+            }
+          : {}),
+      };
+      // A later release without a receipt cannot reuse an earlier stop's
+      // authority (for example after a same-run lease resume).
+      let metadata = options?.remoteExecutionTermination
+        ? sql`${environmentLeases.metadata}`
+        : sql`(${environmentLeases.metadata} - 'remoteExecutionTermination')`;
+      if (options?.pendingCleanupIntent || status !== "pending_cleanup") {
+        metadata = sql`(${metadata} - ${PENDING_CLEANUP_INTENT_METADATA_KEY}::text - ${PENDING_CLEANUP_RELEASE_RUN_STATUS_METADATA_KEY}::text)`;
+      }
+      if (Object.keys(patch).length > 0) {
+        metadata = sql`coalesce(${metadata}, '{}'::jsonb) || ${JSON.stringify(patch)}::jsonb`;
+      }
       const row = await db
         .update(environmentLeases)
         .set({
@@ -1654,11 +1692,7 @@ export function environmentService(db: Db) {
           updatedAt: now,
           ...(options?.failureReason !== undefined ? { failureReason: options.failureReason } : {}),
           ...(options?.cleanupStatus !== undefined ? { cleanupStatus: options.cleanupStatus } : {}),
-          // A later release without a receipt cannot reuse an earlier stop's
-          // authority (for example after a same-run lease resume).
-          metadata: options?.remoteExecutionTermination
-            ? sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`
-            : sql`${environmentLeases.metadata} - 'remoteExecutionTermination'`,
+          metadata,
         })
         .where(and(eq(environmentLeases.id, id), options?.expectedPendingCleanupAttemptId
           ? and(eq(environmentLeases.status, "pending_cleanup"),

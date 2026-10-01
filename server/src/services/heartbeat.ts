@@ -6,6 +6,7 @@ import {
   type NativeWorkspaceFinalizationOwnership,
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
+import { PENDING_CLEANUP_INTENT_METADATA_KEY, readPendingCleanupIntent } from "./pending-cleanup-intent.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
@@ -772,6 +773,10 @@ const PENDING_CLEANUP_SWEEP_PAGE_SIZE = 20;
 const pendingCleanupAttemptsInFlight = new Set<string>();
 // Escalate and slow cleanup after this many attempts; never abandon a live lease.
 const PENDING_CLEANUP_SWEEP_ATTEMPT_CAP = 5;
+// A reusable sandbox parked for a release gets this many release attempts
+// before the sweep falls back to destroying it. Kept below the escalation cap,
+// so the destroy still gets attempts before the lease needs attention.
+const PENDING_CLEANUP_RELEASE_ATTEMPT_CAP = 3;
 // The reaper stores its retry state under these keys in the lease metadata.
 const PENDING_CLEANUP_ATTEMPTS_METADATA_KEY = "pendingCleanupRetryAttempts";
 const PENDING_CLEANUP_CAP_WARNED_METADATA_KEY = "pendingCleanupRetryCapWarned";
@@ -19513,6 +19518,24 @@ export function heartbeatService(
     return claimed.length > 0;
   }
 
+  // Turn a parked "release" into a destroy for good, fenced to the cleanup
+  // attempt that decided it. Only the intent key is written, so a concurrent
+  // write to another metadata key survives.
+  async function markPendingCleanupIntentDestroy(leaseId: string, attemptId: string): Promise<void> {
+    await db
+      .update(environmentLeases)
+      .set({
+        metadata: sql`jsonb_set(${pendingCleanupMetadataObjectSql()}, array[${PENDING_CLEANUP_INTENT_METADATA_KEY}::text], to_jsonb('destroy'::text), true)`,
+      })
+      .where(
+        and(
+          eq(environmentLeases.id, leaseId),
+          eq(environmentLeases.status, "pending_cleanup"),
+          sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${attemptId}`,
+        ),
+      );
+  }
+
   // Defer a pending_cleanup lease whose provider plugin is not ready this tick.
   // The sweep reads one page of the oldest rows, ordered by `updatedAt`. A lease
   // that the sweep only skips keeps its old `updatedAt`, so it stays the oldest
@@ -19785,6 +19808,17 @@ export function heartbeatService(
       // the environment is lifecycle context and only a legacy fallback.
       const isOrphanEphemeralLease = lease.leasePolicy === "ephemeral";
       const useRecordedTeardown = isOrphanEphemeralLease || !environment || hasStopOnlyCleanup(lease);
+      // A reusable sandbox whose release could not be confirmed was parked with
+      // the "release" intent (see pending-cleanup-intent.ts). The sandbox may
+      // hold the task's agent session, so retry the release first and keep the
+      // sandbox for the next run; destroy only when the release keeps failing
+      // or can no longer apply. A lease without the marker, or parked for a
+      // destroy, is torn down as before.
+      const releaseIntent =
+        environment !== null &&
+        lease.leasePolicy === "reuse_by_environment" &&
+        !hasStopOnlyCleanup(lease) &&
+        readPendingCleanupIntent(lease.metadata) === "release";
 
       // Do not consume a finite cleanup attempt while the provider plugin is
       // briefly unavailable. A plugin worker restart, a plugin reload, or a
@@ -19839,13 +19873,52 @@ export function heartbeatService(
       }, 30_000);
       renewal.unref();
 
+      // The step in flight when an error was thrown; see the catch below.
+      let cleanupStep: "release" | "recorded_teardown" | "run_lease" | null = null;
       try {
         if (opts?.explicitRetry) await logActivity(db, {
           companyId: row.companyId, actorType: "user", actorId: opts.explicitRetry.actorId,
           action: "environment_lease.cleanup_retried", entityType: "environment_lease", entityId: row.id,
           runId: opts.explicitRetry.runId, details: { attempt: attempts + 1, reason: opts.explicitRetry.reason ?? "retry_failed_run" },
         });
-        if (useRecordedTeardown) {
+        let teardown: "recorded" | "run_lease" | null = useRecordedTeardown
+          ? "recorded"
+          : environment ? "run_lease" : null;
+        if (releaseIntent && environment) {
+          let settled = false;
+          if (attempts < PENDING_CLEANUP_RELEASE_ATTEMPT_CAP) {
+            cleanupStep = "release";
+            const result = environmentRuntime.retryPendingSandboxRelease
+              ? await environmentRuntime.retryPendingSandboxRelease({ environment, lease })
+              : { outcome: "not_releasable" as const, reason: "release_unsupported" as const };
+            if (result.outcome === "not_releasable") {
+              // The environment moved to another provider or plugin, or stopped
+              // reusing sandboxes: no later run can resume this one. Tear it
+              // down from the data recorded on the lease.
+              teardown = "recorded";
+            } else {
+              settled = true;
+              if (result.lease && result.outcome === "released") {
+                logger.info(
+                  { leaseId: row.id, environmentId: row.environmentId, attempts: attempts + 1 },
+                  "released a parked reusable sandbox lease; the sandbox is kept for the next run",
+                );
+              } else if (result.lease) {
+                destroyed += 1;
+              }
+            }
+          }
+          if (!settled) {
+            // From here on this lease is a destroy, for good: a later attempt
+            // must not keep a sandbox the sweep already started tearing down.
+            await markPendingCleanupIntentDestroy(row.id, claimed);
+            lease.metadata = { ...lease.metadata, [PENDING_CLEANUP_INTENT_METADATA_KEY]: "destroy" };
+          } else {
+            teardown = null;
+          }
+        }
+        if (teardown === "recorded") {
+          cleanupStep = "recorded_teardown";
           // Tear the sandbox down from the recorded provider config and the
           // cleanup-authorized secret versions. Preserve any provider receipt;
           // a completed retry must grant the same evidence as initial cleanup.
@@ -19862,7 +19935,8 @@ export function heartbeatService(
             remoteExecutionTermination: remoteTerminationReceipt(lease, receipt),
           });
           if (released) destroyed += 1;
-        } else if (environment) {
+        } else if (teardown === "run_lease" && environment) {
+          cleanupStep = "run_lease";
           const result = await environmentRuntime.destroyRunLease({
             environment,
             lease,
@@ -19873,16 +19947,20 @@ export function heartbeatService(
           }
         }
       } catch (error) {
-        // The recorded-data teardown throws on failure, so revert the lease to
-        // pending_cleanup for a later sweep. The claimed attempt still counts
-        // for backoff, so requests stay bounded. The `destroyRunLease`
-        // path reverts the lease itself, so this revert only runs for the
-        // recorded-data teardown path.
-        if (useRecordedTeardown) {
+        // The release retry and the recorded-data teardown throw on failure, so
+        // revert the lease to pending_cleanup for a later sweep. The claimed
+        // attempt still counts for backoff, so requests stay bounded. The
+        // `destroyRunLease` path reverts the lease itself. The revert is fenced
+        // to this attempt and keeps the lease's cleanup intent.
+        if (
+          cleanupStep === "release" ||
+          cleanupStep === "recorded_teardown" ||
+          (cleanupStep === null && useRecordedTeardown)
+        ) {
           await environmentsSvc.releaseLease(lease.id, "pending_cleanup", {
             expectedPendingCleanupAttemptId: claimed,
             cleanupStatus: "failed",
-            failureReason: "pending_cleanup_retry",
+            failureReason: cleanupStep === "release" ? "pending_cleanup_release_retry" : "pending_cleanup_retry",
           });
         }
         // Log a constant errorKind only. The exception can carry a credential in
