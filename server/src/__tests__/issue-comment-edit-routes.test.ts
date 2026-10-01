@@ -358,6 +358,48 @@ describe.sequential("issue comment edit routes", () => {
     expect(mockIssueService.editComment).not.toHaveBeenCalled();
   });
 
+  it("lets an agent edit its own comment on an issue assigned to a different agent", async () => {
+    // This is the main reason to edit rather than just post a correction:
+    // the agent commented (as a reviewer, through a mention grant, or
+    // because it used to be the assignee) and the issue is now someone
+    // else's. `assertAgentIssueMutationAllowed` (issue:mutate) would deny
+    // this actor outright with "Agent cannot mutate another agent's issue",
+    // because it is not the assignee and holds no checkout-management
+    // override. Editing your own comment's text does not need that
+    // issue-ownership boundary — it never gives the agent anything it could
+    // not already get by posting a brand-new comment — so the route gates
+    // on the broader issue:comment boundary instead, same as POST /comments.
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "open", assigneeAgentId: ASSIGNEE_AGENT_ID }),
+    );
+    mockIssueService.getComment.mockResolvedValue(
+      makeComment({ authorAgentId: OTHER_AGENT_ID }),
+    );
+
+    const res = await request(
+      installActor(createApp(), agentActor(OTHER_AGENT_ID)),
+    )
+      .patch(`/api/issues/${ISSUE_ID}/comments/comment-1`)
+      .send({ body: "Fixing my own earlier comment on someone else's issue" });
+
+    expect(res.status, describeResponse(res)).toBe(200);
+    expect(mockIssueService.editComment).toHaveBeenCalledWith(
+      "comment-1",
+      "Fixing my own earlier comment on someone else's issue",
+      expect.anything(),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.comment_edited",
+        details: expect.objectContaining({
+          editedByType: "agent",
+          editedByAgentId: OTHER_AGENT_ID,
+        }),
+      }),
+    );
+  });
+
   it("lets a board user edit a comment it authored", async () => {
     // Ownership is strictly by comment author, the same as the DELETE route:
     // a board/user actor is not a blanket override for every agent's

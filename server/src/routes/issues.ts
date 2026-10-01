@@ -17430,14 +17430,19 @@ export function issueRoutes(
     res.json(deleted);
   });
 
-  // Authorization mirrors DELETE /issues/:id/comments/:commentId exactly:
-  // the same assertAgentIssueMutationAllowed issue-mutation boundary, then
-  // the same own-comment-only check (an agent may act on its own comments;
-  // a board/user actor may act on comments it posted itself). Whoever may
-  // delete a comment may edit it instead. This intentionally
-  // skips the queued-comment cancel/legacy-queue branch above, which governs
-  // withdrawing an undelivered comment before it wakes anyone — editing only
-  // ever applies to an already-posted comment.
+  // Authorization is deliberately NOT the same boundary DELETE uses. DELETE
+  // gates on assertAgentIssueMutationAllowed (issue:mutate), which denies an
+  // agent that does not own/hold the issue. Replacing the text of a comment
+  // you already authored never grants more than posting a new comment
+  // already would, so PATCH instead gates on assertAgentIssueCommentAllowed
+  // (issue:comment, the same boundary POST /comments uses), plus the
+  // own-comment-only check below (an agent may edit its own comments; a
+  // board/user actor may edit a comment it posted itself). This keeps
+  // "edit a comment you posted via a mention grant, a default-open write, or
+  // as a reviewer on someone else's issue" working instead of 403ing. This
+  // intentionally skips the queued-comment cancel/legacy-queue branch above,
+  // which governs withdrawing an undelivered comment before it wakes anyone
+  // — editing only ever applies to an already-posted comment.
   //
   // An edit never wakes anyone: it does not re-run assignee wakes or
   // @-mention wakes, even for mentions that are newly added by the edit.
@@ -17461,7 +17466,7 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (!(await assertAgentIssueCommentAllowed(req, res, issue))) return;
 
       const comment = await svc.getComment(commentId);
       if (!comment || comment.issueId !== id) {
