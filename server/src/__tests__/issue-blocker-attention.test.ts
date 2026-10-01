@@ -411,6 +411,42 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it("covers a blocker whose queued run was promoted from a past-due scheduled retry", async () => {
+    // promoteDueRetryInTx flips status from "scheduled_retry" to "queued"
+    // without clearing scheduledRetryAt, so a genuinely queued run can carry
+    // a scheduledRetryAt that is now in the past. That must not be confused
+    // with a "scheduled_retry" row whose due time has passed without being
+    // promoted (the case the next test covers).
+    const { companyId, agentId } = await createCompany("PBJ");
+    const parentId = await insertIssue({ companyId, identifier: "PBJ-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PBJ-2",
+      title: "Promoted retry blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+    await activeRun({
+      companyId,
+      agentId,
+      issueId: blockerId,
+      status: "queued",
+      scheduledRetryAt: new Date(Date.now() - 60 * 1000),
+      current: false,
+    });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+    });
+  });
+
   it("flags a chain whose leaf is in_review without an action path as stalled", async () => {
     const { companyId, agentId } = await createCompany("PBV");
     const parentId = await insertIssue({ companyId, identifier: "PBV-1", title: "Parent", status: "blocked" });

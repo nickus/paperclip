@@ -4026,6 +4026,12 @@ async function listIssueBlockerAttentionMap(
     // that was supposed to happen at that time didn't, so it reads as stuck
     // rather than live (see "does not treat an expired scheduled retry as
     // actively covered work").
+    //
+    // The scheduledRetryAt guard only applies while the run is still
+    // "scheduled_retry": once promoteDueRetryInTx flips it to "queued" it
+    // leaves the old (now-past) scheduledRetryAt value in place rather than
+    // clearing it, so applying this guard to "queued" rows too would wrongly
+    // exclude a run that has already been promoted and is genuinely queued.
     const unstartedRunRowsPromise: Promise<IssueBlockerAttentionActivePathRow[]> =
       dbOrTx
         .select({
@@ -4042,6 +4048,7 @@ async function listIssueBlockerAttentionMap(
               BLOCKER_ATTENTION_ACTIVE_UNSTARTED_RUN_STATUSES,
             ),
             or(
+              eq(heartbeatRuns.status, "queued"),
               isNull(heartbeatRuns.scheduledRetryAt),
               gt(heartbeatRuns.scheduledRetryAt, new Date()),
             ),
