@@ -52,6 +52,11 @@ import {
   type ActivityPublication,
 } from "../activity-log.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
+import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
+import {
+  filterQueuedCommentIdsUnseenByFinishedRun,
+  recordUndeliveredQueuedComments,
+} from "../run-queued-comments.js";
 
 export class NativeStatusRaceError extends Error {
   readonly code = "native_status_race" as const;
@@ -514,6 +519,60 @@ async function validateGovernanceGate(
     .then((rows) => rows[0] ?? null);
   if (!approval) throw new Error("native_governance_gate_resolved");
   return approval.id;
+}
+
+/**
+ * Writes the issue activity entry for each deferred wake of the cancelled
+ * run's agent that holds comments the run never saw, before the caller
+ * retires those wakes. Returns what it recorded.
+ */
+async function recordQueuedCommentsUndeliveredByCancellation(input: {
+  tx: Db;
+  companyId: string;
+  issueId: string;
+  runId: string;
+  wakes: Array<{ id: string; agentId: string; status: string; payload: unknown }>;
+}): Promise<Array<{ wakeId: string; commentIds: string[] }>> {
+  const run = await input.tx
+    .select({
+      id: heartbeatRuns.id,
+      agentId: heartbeatRuns.agentId,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+      startedAt: heartbeatRuns.startedAt,
+    })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
+  if (!run) return [];
+  const recorded: Array<{ wakeId: string; commentIds: string[] }> = [];
+  for (const wake of input.wakes) {
+    // Queued and claimed wakes already carry their comments into a run.
+    if (wake.status !== "deferred_issue_execution" || wake.agentId !== run.agentId) continue;
+    const commentIds = queuedCommentIdsFromWakePayload(wake.payload);
+    if (commentIds.length === 0) continue;
+    const unseen = await filterQueuedCommentIdsUnseenByFinishedRun(input.tx, {
+      companyId: input.companyId,
+      issueId: input.issueId,
+      run,
+      commentIds,
+    });
+    if (unseen.length === 0) continue;
+    await recordUndeliveredQueuedComments(input.tx, {
+      companyId: input.companyId,
+      issueId: input.issueId,
+      wakeId: wake.id,
+      runId: run.id,
+      commentIds: unseen,
+      reason: "The task was cancelled before its run saw these comments",
+    });
+    recorded.push({ wakeId: wake.id, commentIds: unseen });
+  }
+  return recorded;
 }
 
 async function materializeDecisionEffect(input: {
@@ -981,7 +1040,12 @@ async function materializeDecisionEffect(input: {
   }
   if (effect.kind === "cancel_continuations") {
     const wakeRows = await input.tx
-      .select({ id: agentWakeupRequests.id })
+      .select({
+        id: agentWakeupRequests.id,
+        agentId: agentWakeupRequests.agentId,
+        status: agentWakeupRequests.status,
+        payload: agentWakeupRequests.payload,
+      })
       .from(agentWakeupRequests)
       .where(
         and(
@@ -999,6 +1063,17 @@ async function materializeDecisionEffect(input: {
         ) = ${input.issue.id}`,
         ),
       );
+    // Comments other actors posted while this run worked wait in deferred
+    // wakes of its agent. Cancelling the task retires those wakes, so the
+    // comments the run never saw are named in the issue activity instead of
+    // disappearing with them, as the wake queue does for a cancelled task.
+    const undeliveredQueuedComments = await recordQueuedCommentsUndeliveredByCancellation({
+      tx: input.tx,
+      companyId: input.companyId,
+      issueId: input.issue.id,
+      runId: input.runId,
+      wakes: wakeRows,
+    });
     if (wakeRows.length > 0) {
       await input.tx
         .update(agentWakeupRequests)
@@ -1063,6 +1138,7 @@ async function materializeDecisionEffect(input: {
       payload: {
         cancelledWakeIds: wakeRows.map((row) => row.id),
         cancelledInteractionIds: interactionRows.map((row) => row.id),
+        ...(undeliveredQueuedComments.length > 0 ? { undeliveredQueuedComments } : {}),
       },
     };
   }
@@ -1876,6 +1952,12 @@ export async function commitNativeStatusDecision(input: {
         .then((rows) => rows[0] ?? null)) as typeof issues.$inferSelect;
       if (!updated) throw new NativeStatusRaceError();
     } else {
+      // The decision comes from the run's final report after the run has
+      // stopped, so the issue routes' 409 for comments queued during a run
+      // has no request to refuse here. Those comments are handled after the
+      // commit instead: the executor's release of the task reopens a task
+      // this run completed without seeing them (wake-queue release drain),
+      // and `cancel_continuations` names them in the issue activity.
       failAt("status_projection", input.failpoint);
       const projected = await issueService(tx as unknown as Db).update(
         input.issueId,

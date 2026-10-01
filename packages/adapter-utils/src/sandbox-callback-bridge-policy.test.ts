@@ -128,6 +128,7 @@ const RESTRICTED_ALLOWED: RouteCase[] = [
   { method: "GET", path: "/api/issues/issue-1/comments" },
   { method: "GET", path: "/api/issues/issue-1/comments/c-1" },
   { method: "POST", path: "/api/issues/issue-1/comments" },
+  { method: "GET", path: "/api/issues/issue-1/queued-comments" },
   { method: "GET", path: "/api/issues/issue-1/documents" },
   { method: "GET", path: "/api/issues/issue-1/documents/plan" },
   { method: "GET", path: "/api/issues/issue-1/documents/plan/revisions" },

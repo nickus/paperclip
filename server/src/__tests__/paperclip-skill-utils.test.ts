@@ -587,6 +587,24 @@ describe("paperclip skill utils", () => {
     expect(reference).not.toMatch(/localhost:\d+|127\.0\.0\.1/);
   });
 
+  it("tells agents to check comments posted during their run and what the completion conflict means", async () => {
+    const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
+    const reference = await fs.readFile(path.resolve("skills/paperclip/references/comments-during-a-run.md"), "utf8");
+    const normalizedSkillBody = skillBody.replace(/\s+/g, " ");
+    const normalizedReference = reference.replace(/\s+/g, " ");
+
+    expect(skillBody).toContain("references/comments-during-a-run.md");
+    expect(normalizedSkillBody).toContain("GET /api/issues/{issueId}/queued-comments");
+    expect(normalizedSkillBody).toContain("issue_comments_queued_during_run");
+    expect(reference).toContain('"$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/queued-comments"');
+    expect(normalizedReference).toContain("before you commit, push, or open a merge request");
+    expect(normalizedReference).toContain("every 10 minutes");
+    expect(normalizedReference).toContain("overrides your current plan");
+    expect(normalizedReference).toContain("`409 issue_comments_queued_during_run`");
+    expect(normalizedReference).toContain("Retrying after re-checking is expected");
+    expect(reference).not.toMatch(/localhost:\d+|127\.0\.0\.1/);
+  });
+
   it("documents the exact request payloads of the issue routes", async () => {
     const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
     const cookbook = await fs.readFile(path.resolve("skills/paperclip/references/payload-cookbook.md"), "utf8");

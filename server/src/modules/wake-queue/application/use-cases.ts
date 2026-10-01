@@ -11,6 +11,7 @@ import {
   HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY,
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
+  QUEUED_DURING_PREVIOUS_RUN_CONTEXT_KEY,
   readNonEmptyString,
   parseObject,
 } from "../domain/values.js";
@@ -394,6 +395,21 @@ async function promoteDeferredWake(
   input: ReleaseIssueExecutionInput,
 ): Promise<ReleaseTransactionResult | null> {
   let currentIssue = issue;
+  // Comments other actors posted while the finishing run worked on this task
+  // and that the run never saw. That run may have finished or reported work
+  // these comments asked it to hold, so the run that receives them is told
+  // to re-check it (see `queuedDuringPreviousRun` below).
+  const unseenByFinishingRun =
+    !workingCandidate.authorizedFailedChatRetry &&
+    workingCandidate.agentId === run.agentId &&
+    workingCandidate.queuedCommentIds.length > 0
+      ? await ports.transaction.getCommentsUnseenByFinishingRun({
+          companyId: run.companyId,
+          issueId: currentIssue.id,
+          finishingRunId: run.id,
+          commentIds: workingCandidate.queuedCommentIds,
+        })
+      : [];
   let shouldReopen = false;
   if (
     !workingCandidate.authorizedFailedChatRetry &&
@@ -416,23 +432,63 @@ async function promoteDeferredWake(
           workingCandidate.deferredContextSeed.resumeIntent === true &&
           workingCandidate.queuedCommentIds.length > 0));
   }
+  // A task that the finishing run itself completed without seeing comments
+  // posted during it (a hold from a reviewer or another agent, for example)
+  // is reopened for its assignee like an explicit resume: the completion may
+  // contradict them, and only a run that reads them can tell. The comments
+  // stay queued, so the reopened run receives them. Comments the run was
+  // shown before it completed the task do not reopen it, and neither does a
+  // task that someone else closed (a board user, or a reviewer approving it
+  // while the run still worked): an agent comment must not override whoever
+  // closed it.
+  if (
+    !shouldReopen &&
+    currentIssue.status === "done" &&
+    workingCandidate.agentId === currentIssue.assigneeAgentId &&
+    unseenByFinishingRun.length > 0 &&
+    await ports.transaction.isIssueCompletedByFinishingRun({
+      companyId: run.companyId,
+      issueId: currentIssue.id,
+      finishingRunId: run.id,
+    })
+  ) {
+    shouldReopen = true;
+  }
 
   // Agent continuations can outlive the work they addressed. Live,
-  // non-self feedback with an explicit resume intent must still be read
-  // after completion; it cannot revive a cancelled task. Other stale
-  // continuations cannot revive assignee execution. Cancel before claiming promotion so
-  // the compare-and-set still sees the deferred wake.
+  // non-self feedback with an explicit resume intent, or that the finishing
+  // run never saw, must still be read after completion; it cannot revive a
+  // cancelled task. Other stale continuations cannot revive assignee
+  // execution. Cancel before claiming promotion so the compare-and-set still
+  // sees the deferred wake.
   if (
     !shouldReopen &&
     (currentIssue.status === "done" || currentIssue.status === "cancelled") &&
     workingCandidate.agentId === currentIssue.assigneeAgentId
   ) {
-    await ports.transaction.cancelDeferredWake({
+    const cancelled = await ports.transaction.cancelDeferredWake({
       companyId: run.companyId,
       wakeId: workingCandidate.id,
       reason: "Deferred execution wake no longer applies to a terminal task",
       now: input.now,
     });
+    if (cancelled && unseenByFinishingRun.length > 0) {
+      // A cancelled task, or a completed one that someone other than the
+      // finishing run closed (one the run completed is reopened above). It
+      // stays closed: an agent comment must not override whoever closed it.
+      // The comments are not dropped silently: the issue activity names them
+      // for the board.
+      await ports.transaction.recordUndeliveredQueuedComments({
+        companyId: run.companyId,
+        issueId: currentIssue.id,
+        wakeId: workingCandidate.id,
+        finishingRunId: run.id,
+        commentIds: unseenByFinishingRun,
+        reason: currentIssue.status === "cancelled"
+          ? "The task was cancelled before its run saw these comments"
+          : "Someone other than its run closed the task before the run saw these comments",
+      });
+    }
     return null;
   }
 
@@ -474,6 +530,14 @@ async function promoteDeferredWake(
   delete promotedPayload[HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY];
 
   const promotedContextSeed: Record<string, unknown> = { ...workingCandidate.deferredContextSeed };
+  // Stamped only when it applies; the wake prompt then adds one line about it.
+  delete promotedContextSeed[QUEUED_DURING_PREVIOUS_RUN_CONTEXT_KEY];
+  if (unseenByFinishingRun.length > 0) {
+    promotedContextSeed[QUEUED_DURING_PREVIOUS_RUN_CONTEXT_KEY] = {
+      runId: run.id,
+      commentIds: unseenByFinishingRun,
+    };
+  }
   if (pauseHold.activePauseHold) {
     promotedContextSeed.treeHoldInteraction = true;
     promotedContextSeed.activeTreeHold = {

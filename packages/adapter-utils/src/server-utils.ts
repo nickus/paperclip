@@ -886,7 +886,28 @@ type PaperclipWakePayload = {
   // Present only when the server attached a Run Brief; absent (not null) keeps
   // the serialized payload unchanged when the brief is disabled.
   runBrief?: PaperclipRunBrief;
+  // Present only when some of this wake's comments arrived while the previous
+  // run on the task was working and that run never saw them.
+  queuedDuringPreviousRun?: PaperclipWakeQueuedDuringPreviousRun;
 };
+
+type PaperclipWakeQueuedDuringPreviousRun = {
+  runId: string;
+  commentIds: string[];
+};
+
+function normalizePaperclipWakeQueuedDuringPreviousRun(
+  value: unknown,
+): PaperclipWakeQueuedDuringPreviousRun | null {
+  const record = parseObject(value);
+  const runId = asString(record.runId, "").trim();
+  const commentIds = Array.isArray(record.commentIds)
+    ? record.commentIds
+        .map((entry) => asString(entry, "").trim())
+        .filter(Boolean)
+    : [];
+  return runId && commentIds.length > 0 ? { runId, commentIds } : null;
+}
 
 function normalizePaperclipWakeRecovery(
   value: unknown,
@@ -1868,6 +1889,9 @@ export function normalizePaperclipWakePayload(
   const agentMessage = normalizePaperclipWakeAgentMessage(payload.agentMessage);
   const issue = normalizePaperclipWakeIssue(payload.issue);
   const runBrief = normalizePaperclipRunBrief(payload.runBrief);
+  const queuedDuringPreviousRun = normalizePaperclipWakeQueuedDuringPreviousRun(
+    payload.queuedDuringPreviousRun,
+  );
   const skillTest =
     issue?.workMode === "skill_test" ||
     payload.skillTest === true ||
@@ -1972,6 +1996,7 @@ export function normalizePaperclipWakePayload(
     truncated: asBoolean(payload.truncated, false),
     fallbackFetchNeeded: asBoolean(payload.fallbackFetchNeeded, false),
     ...(runBrief ? { runBrief } : {}),
+    ...(queuedDuringPreviousRun ? { queuedDuringPreviousRun } : {}),
   };
 }
 
@@ -2348,6 +2373,15 @@ export function renderPaperclipWakeSessionConfigChanges(value: unknown): string 
   return `Changed since your previous turn on this task: ${changes.join(", ")}. This turn runs with the updated versions; where they differ from earlier in this conversation, follow the updated ones.`;
 }
 
+// One bounded line: the comment count and run id, never comment text.
+function renderQueuedDuringPreviousRunLine(
+  value: PaperclipWakeQueuedDuringPreviousRun,
+): string {
+  const count = value.commentIds.length;
+  const subject = count === 1 ? "1 of these comments" : `${count} of these comments`;
+  return `- comments your previous run did not see: ${subject} arrived while your previous run on this task (${value.runId}) was working, and it did not see them. Re-check what that run did, and pause or revert it if they ask for that.`;
+}
+
 // Runtime-only connector skills are supplied by the server after assignment resolution.
 // Shared-home adapters consume them here on fresh and resumed runs without installing
 // files into a user-wide skills directory. They are not part of serialized wake data.
@@ -2548,6 +2582,9 @@ function renderPaperclipWakePromptBody(
           `- pending comments: ${normalized.includedCount}/${normalized.requestedCount}`,
           `- latest comment id: ${normalized.latestCommentId ?? "unknown"}`,
         ]
+      : []),
+    ...(normalized.queuedDuringPreviousRun
+      ? [renderQueuedDuringPreviousRunLine(normalized.queuedDuringPreviousRun)]
       : []),
     `- fallback fetch needed: ${normalized.fallbackFetchNeeded ? "yes" : "no"}`,
     ...(recoveryScoped

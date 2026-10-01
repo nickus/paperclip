@@ -164,6 +164,26 @@ describe("paperclip issue update helper", () => {
     expect(requests).toHaveLength(1);
   });
 
+  it("explains a status change stopped by comments queued during the run, and shows them", async () => {
+    const conflict = {
+      error: "These comments arrived while you were working and you have not seen them.",
+      code: "issue_comments_queued_during_run",
+      details: { comments: [{ id: "comment-1", authorName: "Reviewer", body: "Please hold the release." }] },
+    };
+    const { baseUrl, requests } = await startServer((_request, _attempt, res) => {
+      res.writeHead(409, { "content-type": "application/json" });
+      res.end(JSON.stringify(conflict));
+    });
+
+    const result = await runHelper(baseUrl, doneArgs);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("NOT saved yet (HTTP 409 issue_comments_queued_during_run)");
+    expect(result.stderr).toContain("then run this command again");
+    expect(result.stderr).toContain("Please hold the release.");
+    expect(requests).toHaveLength(1);
+  });
+
   it("retries a 5xx once and succeeds when the retry lands", async () => {
     const { baseUrl, requests } = await startServer((request, attempt, res) => {
       if (attempt === 1) {

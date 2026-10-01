@@ -358,8 +358,21 @@ import {
   queuedCommentIdsFromWakePayload,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
+import {
+  findQueuedCommentsUnseenByRun,
+  ISSUE_COMMENTS_QUEUED_DURING_RUN_CODE,
+  ISSUE_COMMENTS_QUEUED_DURING_RUN_MESSAGE,
+  recordQueuedCommentsDeliveredToRun,
+  resolveQueuedCommentAuthorNames,
+  RUN_COMPLETION_STATUSES,
+  type QueuedCommentForRun,
+} from "../services/run-queued-comments.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+// Bounds for the comments a status-change conflict returns inline. Comments
+// past the count limit are shown by the next conflict.
+const MAX_QUEUED_COMMENTS_PER_CONFLICT = 20;
+const MAX_QUEUED_COMMENT_BODY_CHARS_PER_CONFLICT = 8_000;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -7233,6 +7246,155 @@ export function issueRoutes(
     return queue;
   }
 
+  type RunQueuedCommentsIssue = {
+    id: string;
+    companyId: string;
+    status: string;
+    projectId?: string | null;
+    executionPolicy?: unknown;
+    executionRunId?: string | null;
+    checkoutRunId?: string | null;
+    conversationAgentId?: string | null;
+  };
+
+  /**
+   * The agent run that currently holds `issue` for the calling agent, or null
+   * when the caller is not an agent acting from that run. Comments other
+   * actors post on the task while this run works wait for its next run.
+   */
+  async function readCallerRunHoldingIssue(
+    req: Request,
+    issue: RunQueuedCommentsIssue,
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.runId) return null;
+    // Conversation turns deliver queued messages in order at turn boundaries.
+    if (issue.conversationAgentId) return null;
+    const runId = req.actor.runId;
+    if (runId !== issue.executionRunId && runId !== issue.checkoutRunId) return null;
+    const run = await db
+      .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, issue.companyId)))
+      .then((rows) => rows[0] ?? null);
+    return run && run.agentId === req.actor.agentId ? run : null;
+  }
+
+  /** The agent-facing copy of queued comments: low-trust and secret redaction as for the run's own wake comments. */
+  async function presentQueuedCommentsToAgent(
+    req: Request,
+    issue: RunQueuedCommentsIssue,
+    comments: QueuedCommentForRun[],
+  ) {
+    const redactLowTrust = await shouldRedactLowTrustForHeartbeatContext(issue, getActorInfo(req));
+    const names = await resolveQueuedCommentAuthorNames(db, { companyId: issue.companyId, comments });
+    const entries = comments.map((comment) => {
+      const safe = redactLowTrust ? sanitizeQuarantinedCommentForHigherTrust(comment) : comment;
+      const bodyTruncated = safe.body.length > MAX_QUEUED_COMMENT_BODY_CHARS_PER_CONFLICT;
+      return {
+        id: comment.id,
+        authorType: comment.authorType,
+        authorAgentId: comment.authorAgentId,
+        authorUserId: comment.authorUserId,
+        authorName:
+          (comment.authorAgentId ? names.agents.get(comment.authorAgentId) : null) ??
+          (comment.authorUserId ? names.users.get(comment.authorUserId) : null) ??
+          null,
+        createdAt: comment.createdAt.toISOString(),
+        body: bodyTruncated ? safe.body.slice(0, MAX_QUEUED_COMMENT_BODY_CHARS_PER_CONFLICT) : safe.body,
+        ...(bodyTruncated ? { bodyTruncated: true } : {}),
+      };
+    });
+    return runRedactions.redactForIssue(issue.companyId, issue.id, entries);
+  }
+
+  /**
+   * Before an agent run reports an outcome on the task it holds (`done`,
+   * `in_review` or `cancelled`), it must have seen the comments other actors
+   * posted while it worked: those comments wait for its next run, so without
+   * this check a long run could finish a plan another actor asked it to hold.
+   * Throws a 409 that carries the unseen comments and records them as shown,
+   * so the same request succeeds once the run has re-checked its work. The
+   * queued wake itself stays as it is, so no input is lost. Board users and
+   * other runs are not affected, and `blocked` is always allowed.
+   */
+  async function assertRunSawCommentsQueuedDuringRun(
+    req: Request,
+    issue: RunQueuedCommentsIssue,
+    nextStatus: unknown,
+  ) {
+    if (
+      typeof nextStatus !== "string" ||
+      nextStatus === issue.status ||
+      !RUN_COMPLETION_STATUSES.has(nextStatus)
+    ) {
+      return;
+    }
+    const run = await readCallerRunHoldingIssue(req, issue);
+    if (!run) return;
+    const unseen = await findQueuedCommentsUnseenByRun(db, {
+      companyId: issue.companyId,
+      issueId: issue.id,
+      run,
+    });
+    if (unseen.length === 0) return;
+    const shown = unseen.slice(0, MAX_QUEUED_COMMENTS_PER_CONFLICT);
+    const comments = await presentQueuedCommentsToAgent(req, issue, shown);
+    await recordQueuedCommentsDeliveredToRun(db, {
+      companyId: issue.companyId,
+      issueId: issue.id,
+      agentId: run.agentId,
+      runId: run.id,
+      commentIds: shown.map((comment) => comment.id),
+      via: "status_change_conflict",
+      attemptedStatus: nextStatus,
+    });
+    throw conflict(ISSUE_COMMENTS_QUEUED_DURING_RUN_MESSAGE, {
+      code: ISSUE_COMMENTS_QUEUED_DURING_RUN_CODE,
+      issueId: issue.id,
+      runId: run.id,
+      attemptedStatus: nextStatus,
+      comments,
+      remainingCount: unseen.length - shown.length,
+      nextStep:
+        "Act on these comments first. If they ask you to hold, pause or revert, do that (use `blocked` with a blocker or a self-owned unblock descriptor if you must wait). Then send the status change again: these comments do not block it a second time.",
+    });
+  }
+
+  /**
+   * Records the queued comments an agent run just read through the queue
+   * route as shown to it, so its next status change is not stopped for the
+   * same comments. Best effort: a failed write only means the status change
+   * returns them once more.
+   */
+  async function recordQueuedCommentsReadByRun(
+    req: Request,
+    issue: RunQueuedCommentsIssue,
+    queue: IssueQueuedCommentQueue,
+  ) {
+    try {
+      const run = await readCallerRunHoldingIssue(req, issue);
+      if (!run || queue.entries.length === 0) return;
+      const unseenIds = new Set(
+        (await findQueuedCommentsUnseenByRun(db, { companyId: issue.companyId, issueId: issue.id, run }))
+          .map((comment) => comment.id),
+      );
+      const shownIds = queue.entries
+        .filter((entry) => entry.source?.kind !== "interaction")
+        .map((entry) => entry.comment.id)
+        .filter((id) => unseenIds.has(id));
+      await recordQueuedCommentsDeliveredToRun(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        agentId: run.agentId,
+        runId: run.id,
+        commentIds: shownIds,
+        via: "queue_read",
+      });
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "failed to record queued comments read by the run");
+    }
+  }
+
   function assertQueueMutationTarget(input: {
     queue: IssueQueuedCommentQueue;
     queueId: string;
@@ -9625,6 +9787,13 @@ export function issueRoutes(
               actor: { type: actor.actorType, id: actor.actorId },
             });
           }
+
+          // Resolving a recovery to `done` or `in_review` reports an outcome
+          // like a status update does, so the run holding the task must have
+          // seen the comments posted during it first. A 409 here rolls back
+          // every write of this transaction; the record of the comments it
+          // shows is written outside it and survives, so a retry goes through.
+          await assertRunSawCommentsQueuedDuringRun(req, lockedIssue, sourceIssueStatus);
 
           const updateFields: Record<string, unknown> = {
             status: sourceIssueStatus,
@@ -13661,6 +13830,9 @@ export function issueRoutes(
           code: "interaction_response_queued",
         });
       }
+      // Runs before any side effect below (stopping a goal or a run,
+      // reopening a workspace), so a rejected update changes nothing.
+      await assertRunSawCommentsQueuedDuringRun(req, existing, updateFields.status);
       if (assigneeWillChange && !transition.workflowControlledAssignment) {
         if (!isAgentReturningIssueToCreator) {
           await assertCanAssignTasks(req, existing.companyId, {
@@ -15672,6 +15844,7 @@ export function issueRoutes(
       activeRun: await resolveActiveIssueRun(issue),
       actor: getActorInfo(req),
     });
+    await recordQueuedCommentsReadByRun(req, issue, queue);
     res.json(
       await runRedactions.redactForIssue(issue.companyId, issue.id, queue),
     );
@@ -18080,6 +18253,9 @@ export function issueRoutes(
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
         };
+        // An approving comment completes the task like a status update does,
+        // so the same unseen-comment check applies before anything is written.
+        await assertRunSawCommentsQueuedDuringRun(req, currentIssue, updatePatch.status);
 
         const sourceTrust = await sourceTrustForActorWrite(currentIssue, actor);
         const commentOptions = {
