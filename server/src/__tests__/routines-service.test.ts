@@ -1675,6 +1675,69 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(notes[0]?.body).toMatch(/feature\/b/);
   });
 
+  it("does not coalesce a run requested for a different project into another project's still-open issue", async () => {
+    const { companyId, projectId, routine, svc } = await seedFixture();
+    const otherProjectId = randomUUID();
+    await db.insert(projects).values({
+      id: otherProjectId,
+      companyId,
+      name: "Other project",
+      status: "in_progress",
+    });
+
+    // A run explicitly targeting projectId opens an issue there, then a
+    // later run explicitly targeting a different project must not be
+    // folded into it just because they share the same coalescing routine.
+    const first = await svc.runRoutine(routine.id, { source: "manual", projectId });
+    const second = await svc.runRoutine(routine.id, { source: "manual", projectId: otherProjectId });
+
+    expect(first.status).toBe("issue_created");
+    expect(second.status).toBe("issue_created");
+    expect(second.linkedIssueId).not.toBe(first.linkedIssueId);
+
+    const routineIssues = await db
+      .select({ id: issues.id, projectId: issues.projectId })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toHaveLength(2);
+    expect(routineIssues.map((issue) => issue.projectId).sort()).toEqual(
+      [projectId, otherProjectId].sort(),
+    );
+  });
+
+  it("does not coalesce a run requested for a different assignee into another assignee's still-open issue", async () => {
+    const { agentId, companyId, routine, svc } = await seedFixture();
+    const [otherAgent] = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "Other Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      })
+      .returning();
+
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    const second = await svc.runRoutine(routine.id, { source: "manual", assigneeAgentId: otherAgent!.id });
+
+    expect(first.status).toBe("issue_created");
+    expect(second.status).toBe("issue_created");
+    expect(second.linkedIssueId).not.toBe(first.linkedIssueId);
+
+    const routineIssues = await db
+      .select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toHaveLength(2);
+    expect(routineIssues.map((issue) => issue.assigneeAgentId).sort()).toEqual(
+      [agentId, otherAgent!.id].sort(),
+    );
+  });
+
   it("skips (without a note) into an open but idle routine issue when the policy is skip_if_active", async () => {
     const { companyId, issueSvc, routine, svc } = await seedFixture();
     await db
@@ -2650,6 +2713,38 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(run.source).toBe("webhook");
     expect(run.status).toBe("issue_created");
+  });
+
+  it("gives each webhook delivery its own execution issue instead of merging a later delivery into an earlier one that is still open", async () => {
+    const { routine, svc } = await seedFixture();
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      {
+        kind: "webhook",
+        signingMode: "none",
+      },
+      {},
+    );
+
+    // The first delivery's issue is left open (the default "todo" status),
+    // so a naive "any open issue at this origin" match would otherwise fold
+    // the second, differently-shaped delivery into it and drop its payload.
+    const first = await svc.firePublicTrigger(trigger.publicId!, {
+      payload: { event: "meeting.one" },
+    });
+    const second = await svc.firePublicTrigger(trigger.publicId!, {
+      payload: { event: "meeting.two" },
+    });
+
+    expect(first.status).toBe("issue_created");
+    expect(second.status).toBe("issue_created");
+    expect(second.linkedIssueId).not.toBe(first.linkedIssueId);
+
+    const routineIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toHaveLength(2);
   });
 
   it("records suppressed automatic runs when worktree execution is disabled while allowing manual runs", async () => {

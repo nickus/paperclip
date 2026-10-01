@@ -1377,6 +1377,90 @@ describeEmbeddedPostgres("pipelineService", () => {
     expect(crashLinks).toHaveLength(1);
   });
 
+  it("gives two cases entering the same coalesce_if_active stage automation their own execution issues", async () => {
+    const { company, pipeline, byKey } = await seedPipeline();
+    const routineSeed = await seedRoutine(company.id, "Stage automation seed");
+
+    // updateStage's own stage-automation routine (unlike this file's
+    // always_enqueue seedRoutine helper) defaults to coalesce_if_active,
+    // which is the policy this is guarding.
+    await svc.updateStage({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      stageId: byKey.get("in_progress")!.id,
+      patch: {
+        config: {
+          automation: {
+            assigneeAgentId: routineSeed.assigneeAgentId,
+            instructionsBody: "Draft the deliverable for this case.",
+          },
+        },
+      },
+      actor: userActor,
+    });
+
+    const caseA = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "stage-automation-a",
+      title: "Case A",
+      actor: userActor,
+    });
+    const caseB = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "stage-automation-b",
+      title: "Case B",
+      actor: userActor,
+    });
+
+    // Case A's execution issue stays open (the default "todo" status) while
+    // case B enters the same stage behind it.
+    const movedA = await svc.transitionCase({
+      companyId: company.id,
+      caseId: caseA.case.id,
+      toStageKey: "in_progress",
+      expectedVersion: 1,
+      actor: userActor,
+    });
+    const movedB = await svc.transitionCase({
+      companyId: company.id,
+      caseId: caseB.case.id,
+      toStageKey: "in_progress",
+      expectedVersion: 1,
+      actor: userActor,
+    });
+
+    expect(movedA.automationExecution.status).toBe("succeeded");
+    expect(movedB.automationExecution.status).toBe("succeeded");
+    const issueIdA = movedA.automationExecution.status === "succeeded"
+      ? movedA.automationExecution.execution.executionIssueId
+      : null;
+    const issueIdB = movedB.automationExecution.status === "succeeded"
+      ? movedB.automationExecution.execution.executionIssueId
+      : null;
+    expect(issueIdA).toBeTruthy();
+    expect(issueIdB).toBeTruthy();
+    // Case B's dispatch must not be coalesced into case A's still-open
+    // issue: that would both hide case B from its assignee and discard its
+    // per-case context (the description appendix built from case B's own
+    // fields), which the "fired again" note never repeats.
+    expect(issueIdB).not.toBe(issueIdA);
+
+    const automationLinks = await db
+      .select()
+      .from(pipelineCaseIssueLinks)
+      .where(eq(pipelineCaseIssueLinks.role, "automation"));
+    expect(automationLinks).toHaveLength(2);
+
+    const [issueB] = await db
+      .select({ description: issues.description })
+      .from(issues)
+      .where(eq(issues.id, issueIdB!));
+    expect(issueB?.description).toContain("Case B");
+    expect(issueB?.description).not.toContain("Case A");
+  });
+
   it("carries saved stage automation workspace context into the execution issue", async () => {
     const { company, pipeline, byKey } = await seedPipeline();
     const routineSeed = await seedRoutine(company.id, "Workspace automation seed");
