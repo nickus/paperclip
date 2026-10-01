@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, like, lt, ne, notInArray, notLike, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, like, lt, ne, notInArray, notLike, or, sql, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import {
@@ -349,6 +349,93 @@ export function claudeOAuthClaimRejectedError(): HttpError {
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type SecretBindingDb = Pick<Db | DbTransaction, "select" | "delete" | "insert">;
+
+type SecretBindingRowInput = {
+  companyId: string;
+  secretId: string;
+  targetType: SecretBindingTargetType;
+  targetId: string;
+  configPath: string;
+  versionSelector: string;
+  required: boolean;
+  label: string | null;
+  projectionClass: SecretProjectionClass;
+  projectionAllowlistKey: string | null;
+};
+
+/**
+ * Everything a binding row says about how a secret is consumed. Two rows with
+ * the same identity are interchangeable; the row id and timestamps are not
+ * part of it.
+ */
+function secretBindingRowIdentity(row: {
+  companyId: string;
+  secretId: string;
+  configPath: string;
+  versionSelector: string;
+  required: boolean;
+  label: string | null;
+  projectionClass: string;
+  projectionAllowlistKey: string | null;
+}) {
+  return JSON.stringify([
+    row.companyId,
+    row.configPath,
+    row.secretId,
+    row.versionSelector,
+    row.required,
+    row.label ?? null,
+    row.projectionClass,
+    row.projectionAllowlistKey ?? null,
+  ]);
+}
+
+/**
+ * Make the binding rows matched by `scope` equal to `desired` while keeping
+ * every existing row that already says the same thing. Only rows that
+ * disappeared or changed are deleted, and only new or changed refs are
+ * inserted, so saving a config whose secret refs did not change leaves the
+ * binding rows (and their ids, which runs record in their secret manifest)
+ * untouched. Callers run this inside their transaction; deletes go first so a
+ * changed ref can take over its config path under the unique index.
+ */
+async function reconcileSecretBindingRows(
+  executor: SecretBindingDb,
+  scope: SQL | undefined,
+  desired: readonly SecretBindingRowInput[],
+) {
+  const existing = await executor
+    .select()
+    .from(companySecretBindings)
+    .where(scope)
+    .for("update");
+  // Existing rows grouped by identity; each desired ref claims at most one.
+  const unclaimed = new Map<string, string[]>();
+  for (const row of existing) {
+    const identity = secretBindingRowIdentity(row);
+    const ids = unclaimed.get(identity) ?? [];
+    ids.push(row.id);
+    unclaimed.set(identity, ids);
+  }
+  const toInsert: SecretBindingRowInput[] = [];
+  for (const ref of desired) {
+    const ids = unclaimed.get(secretBindingRowIdentity(ref));
+    if (ids && ids.length > 0) {
+      ids.shift(); // unchanged: keep the existing row as it is
+      continue;
+    }
+    toInsert.push(ref);
+  }
+  const staleIds = [...unclaimed.values()].flat();
+  if (staleIds.length > 0) {
+    await executor
+      .delete(companySecretBindings)
+      .where(inArray(companySecretBindings.id, staleIds));
+  }
+  if (toInsert.length > 0) {
+    await executor.insert(companySecretBindings).values(toInsert);
+  }
+}
 
 function isUniqueConstraintViolation(error: unknown, constraintName: string) {
   const seen = new Set<unknown>();
@@ -4957,47 +5044,31 @@ export function secretService(db: Db | DbTransaction) {
       }
 
       const pathPrefixes = [...new Set(normalizedRefs.map((ref) => ref.configPath.split(".")[0]))];
+      const targetScope = and(
+        eq(companySecretBindings.companyId, companyId),
+        eq(companySecretBindings.targetType, target.targetType),
+        eq(companySecretBindings.targetId, target.targetId),
+      );
+      // The rows this sync owns: the whole target for replaceAll (or when no
+      // refs name a path), otherwise only the top-level paths the refs use.
+      const scope = !options?.replaceAll && pathPrefixes.length > 0
+        ? and(
+            targetScope,
+            or(
+              ...pathPrefixes.map((pathPrefix) =>
+                or(
+                  eq(companySecretBindings.configPath, pathPrefix),
+                  like(companySecretBindings.configPath, `${pathPrefix}.%`),
+                ),
+              ),
+            ),
+          )
+        : targetScope;
 
       await db.transaction(async (tx) => {
-        if (options?.replaceAll) {
-          await tx
-            .delete(companySecretBindings)
-            .where(
-              and(
-                eq(companySecretBindings.companyId, companyId),
-                eq(companySecretBindings.targetType, target.targetType),
-                eq(companySecretBindings.targetId, target.targetId),
-              ),
-            );
-        } else if (pathPrefixes.length > 0) {
-          for (const pathPrefix of pathPrefixes) {
-            await tx
-              .delete(companySecretBindings)
-              .where(
-                and(
-                  eq(companySecretBindings.companyId, companyId),
-                  eq(companySecretBindings.targetType, target.targetType),
-                  eq(companySecretBindings.targetId, target.targetId),
-                  or(
-                    eq(companySecretBindings.configPath, pathPrefix),
-                    like(companySecretBindings.configPath, `${pathPrefix}.%`),
-                  ),
-                ),
-              );
-          }
-        } else {
-          await tx
-            .delete(companySecretBindings)
-            .where(
-              and(
-                eq(companySecretBindings.companyId, companyId),
-                eq(companySecretBindings.targetType, target.targetType),
-                eq(companySecretBindings.targetId, target.targetId),
-              ),
-            );
-        }
-        if (normalizedRefs.length === 0) return;
-        await tx.insert(companySecretBindings).values(
+        await reconcileSecretBindingRows(
+          tx,
+          scope,
           normalizedRefs.map((ref) => ({
             companyId,
             secretId: ref.secretId,
@@ -5084,17 +5155,13 @@ export function secretService(db: Db | DbTransaction) {
       }
 
       const writeBindings = async (executor: SecretBindingDb) => {
-        await executor
-          .delete(companySecretBindings)
-          .where(
-            and(
-              eq(companySecretBindings.targetType, target.targetType),
-              eq(companySecretBindings.targetId, target.targetId),
-              notLike(companySecretBindings.configPath, "env.%"),
-            ),
-          );
-        if (normalizedRefs.length === 0) return;
-        await executor.insert(companySecretBindings).values(
+        await reconcileSecretBindingRows(
+          executor,
+          and(
+            eq(companySecretBindings.targetType, target.targetType),
+            eq(companySecretBindings.targetId, target.targetId),
+            notLike(companySecretBindings.configPath, "env.%"),
+          ),
           normalizedRefs.map((ref) => ({
             companyId: ref.companyId,
             secretId: ref.secretId,
@@ -5243,18 +5310,14 @@ export function secretService(db: Db | DbTransaction) {
       }
 
       const writeBindings = async (targetDb: SecretBindingDb) => {
-        await targetDb
-          .delete(companySecretBindings)
-          .where(
-            and(
-              eq(companySecretBindings.companyId, companyId),
-              eq(companySecretBindings.targetType, target.targetType),
-              eq(companySecretBindings.targetId, target.targetId),
-              like(companySecretBindings.configPath, `${pathPrefix}.%`),
-            ),
-          );
-        if (refs.length === 0) return;
-        await targetDb.insert(companySecretBindings).values(
+        await reconcileSecretBindingRows(
+          targetDb,
+          and(
+            eq(companySecretBindings.companyId, companyId),
+            eq(companySecretBindings.targetType, target.targetType),
+            eq(companySecretBindings.targetId, target.targetId),
+            like(companySecretBindings.configPath, `${pathPrefix}.%`),
+          ),
           refs.map((ref) => ({
             companyId,
             secretId: ref.secretId,
@@ -5263,10 +5326,11 @@ export function secretService(db: Db | DbTransaction) {
             configPath: ref.configPath,
             versionSelector: String(ref.versionSelector),
             required: true,
+            label: null,
             projectionClass: ref.projectionClass,
             projectionAllowlistKey: ref.projectionAllowlistKey,
           })),
-          );
+        );
       };
 
       const writeUserDeclarations = async (targetDb: SecretBindingDb) => {

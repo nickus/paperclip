@@ -1432,6 +1432,165 @@ describeEmbeddedPostgres("secretService", () => {
     });
   });
 
+  it("keeps unchanged binding rows when a target's secret refs are synced again", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const createSecret = (label: string) =>
+      svc.create(companyId, {
+        name: `${label}-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: label,
+      });
+    const apiSecret = await createSecret("api");
+    const tokenSecret = await createSecret("token");
+    const rotatedSecret = await createSecret("rotated");
+    const target = { targetType: "agent" as const, targetId: randomUUID() };
+    const bindingRows = async () =>
+      db
+        .select()
+        .from(companySecretBindings)
+        .where(eq(companySecretBindings.targetId, target.targetId));
+    const idsByPath = async () =>
+      Object.fromEntries((await bindingRows()).map((row) => [row.configPath, row.id]));
+
+    const refs = [
+      { secretId: apiSecret.id, configPath: "env.API_KEY" },
+      { secretId: tokenSecret.id, configPath: "env.TOKEN", versionSelector: 1 as const },
+    ];
+    await svc.syncSecretRefsForTarget(companyId, target, refs, { replaceAll: true });
+    const original = await idsByPath();
+    expect(Object.keys(original).sort()).toEqual(["env.API_KEY", "env.TOKEN"]);
+
+    // Saving the same refs again (an unrelated config edit) keeps every row.
+    await svc.syncSecretRefsForTarget(companyId, target, refs, { replaceAll: true });
+    expect(await idsByPath()).toEqual(original);
+
+    // Changing one ref replaces only that row.
+    await svc.syncSecretRefsForTarget(
+      companyId,
+      target,
+      [refs[0]!, { secretId: rotatedSecret.id, configPath: "env.TOKEN", versionSelector: 1 }],
+      { replaceAll: true },
+    );
+    const afterChange = await idsByPath();
+    expect(afterChange["env.API_KEY"]).toBe(original["env.API_KEY"]);
+    expect(afterChange["env.TOKEN"]).not.toBe(original["env.TOKEN"]);
+    expect((await bindingRows()).find((row) => row.configPath === "env.TOKEN")?.secretId).toBe(
+      rotatedSecret.id,
+    );
+
+    // A changed version selector or required flag is a changed row too.
+    await svc.syncSecretRefsForTarget(
+      companyId,
+      target,
+      [{ ...refs[0]!, versionSelector: 1 }, { secretId: rotatedSecret.id, configPath: "env.TOKEN", versionSelector: 1, required: false }],
+      { replaceAll: true },
+    );
+    const afterFlags = await idsByPath();
+    expect(afterFlags["env.API_KEY"]).not.toBe(afterChange["env.API_KEY"]);
+    expect(afterFlags["env.TOKEN"]).not.toBe(afterChange["env.TOKEN"]);
+
+    // Removed refs are deleted.
+    await svc.syncSecretRefsForTarget(companyId, target, [], { replaceAll: true });
+    expect(await bindingRows()).toHaveLength(0);
+  });
+
+  it("keeps unchanged env binding rows and only replaces changed ones", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const first = await svc.create(companyId, {
+      name: `env-first-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "first",
+    });
+    const second = await svc.create(companyId, {
+      name: `env-second-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "second",
+    });
+    const target = { targetType: "project" as const, targetId: randomUUID() };
+    const idsByPath = async () =>
+      Object.fromEntries(
+        (
+          await db
+            .select()
+            .from(companySecretBindings)
+            .where(eq(companySecretBindings.targetId, target.targetId))
+        ).map((row) => [row.configPath, row.id]),
+      );
+    const env = {
+      FIRST: { type: "secret_ref", secretId: first.id, version: "latest" },
+      SECOND: { type: "secret_ref", secretId: second.id, version: "latest" },
+      PLAIN: { type: "plain", value: "not a secret" },
+    };
+
+    await svc.syncEnvBindingsForTarget(companyId, target, env);
+    const original = await idsByPath();
+    expect(Object.keys(original).sort()).toEqual(["env.FIRST", "env.SECOND"]);
+
+    await svc.syncEnvBindingsForTarget(companyId, target, { ...env, PLAIN: { type: "plain", value: "edited" } });
+    expect(await idsByPath()).toEqual(original);
+
+    await svc.syncEnvBindingsForTarget(companyId, target, {
+      FIRST: env.FIRST,
+      SECOND: { type: "secret_ref", secretId: first.id, version: "latest" },
+    });
+    const afterChange = await idsByPath();
+    expect(afterChange["env.FIRST"]).toBe(original["env.FIRST"]);
+    expect(afterChange["env.SECOND"]).not.toBe(original["env.SECOND"]);
+  });
+
+  it("replaceSecretRefsForInstanceTarget keeps unchanged rows and moves only changed ones", async () => {
+    const companyA = await seedCompany("A");
+    const companyB = await seedCompany("B");
+    const svc = secretService(db);
+    const secretA = await svc.create(companyA, {
+      name: `instance-a-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "a",
+    });
+    const secretB = await svc.create(companyB, {
+      name: `instance-b-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "b",
+    });
+    const environmentId = randomUUID();
+    const rowsByPath = async () =>
+      Object.fromEntries(
+        (
+          await db
+            .select()
+            .from(companySecretBindings)
+            .where(
+              and(
+                eq(companySecretBindings.targetType, "environment"),
+                eq(companySecretBindings.targetId, environmentId),
+              ),
+            )
+        ).map((row) => [row.configPath, row]),
+      );
+    const refs = [
+      { secretId: secretA.id, configPath: "apiKey" },
+      { secretId: secretA.id, configPath: "privateKeySecretRef" },
+    ];
+
+    await svc.replaceSecretRefsForInstanceTarget({ targetType: "environment", targetId: environmentId }, refs);
+    const original = await rowsByPath();
+    await svc.replaceSecretRefsForInstanceTarget({ targetType: "environment", targetId: environmentId }, refs);
+    const resaved = await rowsByPath();
+    expect(resaved.apiKey?.id).toBe(original.apiKey?.id);
+    expect(resaved.privateKeySecretRef?.id).toBe(original.privateKeySecretRef?.id);
+
+    await svc.replaceSecretRefsForInstanceTarget(
+      { targetType: "environment", targetId: environmentId },
+      [refs[0]!, { secretId: secretB.id, configPath: "privateKeySecretRef" }],
+    );
+    const moved = await rowsByPath();
+    expect(moved.apiKey?.id).toBe(original.apiKey?.id);
+    expect(moved.privateKeySecretRef?.id).not.toBe(original.privateKeySecretRef?.id);
+    expect(moved.privateKeySecretRef?.companyId).toBe(companyB);
+  });
+
   it("reports reference counts and resolves binding target labels", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);
