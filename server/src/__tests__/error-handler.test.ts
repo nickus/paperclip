@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { logger } from "../middleware/logger.js";
 
 const recordResponsibleUserDenialOnActiveRunMock = vi.hoisted(() => vi.fn());
 const captureExceptionMock = vi.hoisted(() => vi.fn());
@@ -259,12 +260,17 @@ describe("errorHandler", () => {
     // A malformed id in a path parameter (e.g. a truncated UUID) that a
     // route forwarded straight into a query without validating first.
     // Drizzle wraps the driver failure, so the code/message live on `cause`.
-    const req = makeReq();
+    const req = {
+      ...makeReq(),
+      route: { path: "/issues/:id/comments/:commentId" },
+      body: { secret: "must-never-be-logged" },
+    } as unknown as Request;
     const res = makeRes() as any;
     const next = vi.fn() as unknown as NextFunction;
     const err = Object.assign(new Error('Failed query: select * from "issue_comments" where "id" = $1'), {
       cause: { code: "22P02", message: 'invalid input syntax for type uuid: "trunc-1234"' },
     });
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => logger);
 
     errorHandler(err, req, res, next);
 
@@ -274,6 +280,21 @@ describe("errorHandler", () => {
     expect(res.__errorContext).toBeUndefined();
     expect(captureExceptionMock).not.toHaveBeenCalled();
     expect(telemetryMocks.trackErrorHandlerCrash).not.toHaveBeenCalled();
+
+    // The data problem stays visible even though the response is a plain
+    // 400 -- but never the request body or the bad id value itself.
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const [fields, message] = warnSpy.mock.calls[0]!;
+    expect(fields).toEqual({
+      method: "GET",
+      route: "/issues/:id/comments/:commentId",
+      code: "22P02",
+    });
+    expect(message).toBe("rejected a malformed UUID in a path/query parameter with 400");
+    expect(JSON.stringify(fields)).not.toContain("must-never-be-logged");
+    expect(JSON.stringify(fields)).not.toContain("trunc-1234");
+
+    warnSpy.mockRestore();
   });
 
   it("keeps a Postgres invalid-input error for a non-uuid cast as a 500", () => {

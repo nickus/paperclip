@@ -255,7 +255,20 @@ export function errorHandler(
   // respond 400 with a clear message instead of letting it fall through to
   // the generic 500 below, and keep it out of crash reporting the same way
   // the Zod/JSON-parse client-error branches above do.
+  //
+  // Still log it at warn level -- unlike Zod/JSON-parse errors, this one
+  // means a server-side route is casting an unvalidated id straight into a
+  // query, which is worth tracking down even though the response is a
+  // correct 400. Never log the request body or the offending value itself.
   if (isInvalidUuidInput(err)) {
+    logger.warn(
+      {
+        method: req.method,
+        route: req.route?.path ?? null,
+        code: "22P02",
+      },
+      "rejected a malformed UUID in a path/query parameter with 400",
+    );
     res.status(400).json({ error: "Invalid id: expected a UUID" });
     return;
   }

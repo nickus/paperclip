@@ -109,6 +109,57 @@ describe("plugin UI static route", () => {
     expect(mockRegistry.getConfig).not.toHaveBeenCalled();
   });
 
+  it("falls back to a plugin-key lookup when :pluginId is not a well-formed UUID", async () => {
+    // getById() runs a raw `eq(plugins.id, id)` query against a uuid
+    // column, so a plugin key like "acme.linear" fails the Postgres cast.
+    // Drizzle wraps the driver failure in its own error, so the 22P02 code
+    // lives on `.cause`, not on the thrown error itself.
+    const packageRoot = createPluginPackage("export const marker = 'by-key-fallback';\n");
+    const pluginKey = "acme.linear";
+    mockRegistry.getById.mockRejectedValue(
+      Object.assign(new Error(`Failed query: select * from "plugins" where "id" = $1`), {
+        cause: {
+          code: "22P02",
+          message: `invalid input syntax for type uuid: "${pluginKey}"`,
+        },
+      }),
+    );
+    mockRegistry.getByKey.mockResolvedValue({
+      id: pluginId,
+      pluginKey,
+      packageName: "paperclip-plugin-example",
+      packagePath: packageRoot,
+      version: "1.0.0",
+      status: "ready",
+      manifestJson: {
+        id: pluginKey,
+        entrypoints: { ui: "./dist/ui" },
+      },
+    });
+    const app = await createApp({ type: "none", source: "none" });
+
+    const res = await request(app).get(`/_plugins/${pluginKey}/ui/index.js`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.text).toContain("by-key-fallback");
+    expect(mockRegistry.getById).toHaveBeenCalledWith(pluginKey);
+    expect(mockRegistry.getByKey).toHaveBeenCalledWith(pluginKey);
+  });
+
+  it("does not swallow a getById failure unrelated to a malformed UUID", async () => {
+    mockRegistry.getById.mockRejectedValue(
+      Object.assign(new Error("connection terminated unexpectedly"), {
+        cause: { code: "ECONNRESET" },
+      }),
+    );
+    const app = await createApp({ type: "none", source: "none" });
+
+    const res = await request(app).get(`/_plugins/${pluginId}/ui/index.js`);
+
+    expect(res.status).toBe(500);
+    expect(mockRegistry.getByKey).not.toHaveBeenCalled();
+  });
+
   it("requires authentication before reading company-scoped devUiUrl config", async () => {
     readyPlugin(createPluginPackage());
     const app = await createApp({ type: "none", source: "none" });
