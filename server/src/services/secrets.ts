@@ -404,6 +404,8 @@ async function reconcileSecretBindingRows(
   scope: SQL | undefined,
   desired: readonly SecretBindingRowInput[],
 ) {
+  // An empty scope would match every binding row of every target.
+  if (!scope) throw new Error("Secret binding sync requires a target scope");
   const existing = await executor
     .select()
     .from(companySecretBindings)
