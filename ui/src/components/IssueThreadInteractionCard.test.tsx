@@ -513,6 +513,35 @@ describe("IssueThreadInteractionCard", () => {
     expect(host.textContent).toContain("Child task");
   });
 
+  it("shows acceptance criteria and a proposed owner on a suggested task", () => {
+    const host = renderCard({
+      interaction: {
+        ...pendingSuggestedTasksInteraction,
+        payload: {
+          ...pendingSuggestedTasksInteraction.payload,
+          tasks: [
+            {
+              ...pendingSuggestedTasksInteraction.payload.tasks[0],
+              assigneeAgentId: null,
+              acceptanceCriteria: [
+                "Renders without an explicit assignee",
+                "Lists every criterion as its own item",
+              ],
+              proposedOwner: "automation-owner",
+            },
+            ...pendingSuggestedTasksInteraction.payload.tasks.slice(1),
+          ],
+        },
+      },
+    });
+
+    expect(host.textContent).toContain("Acceptance criteria");
+    expect(host.textContent).toContain("Renders without an explicit assignee");
+    expect(host.textContent).toContain("Lists every criterion as its own item");
+    expect(host.textContent).toContain("Proposed owner");
+    expect(host.textContent).toContain("automation-owner");
+  });
+
   it("shows an explicit placeholder when a rejected interaction has no reason", () => {
     const host = renderCard({
       interaction: {

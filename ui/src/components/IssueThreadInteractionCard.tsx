@@ -591,8 +591,14 @@ function TaskTreeNode({
   const hasExplicitAssignee = Boolean(
     node.task.assigneeAgentId || node.task.assigneeUserId,
   );
+  // proposedOwner is only a hint until accepted (it may not resolve to an
+  // assignable agent or user), so it is shown separately from a real
+  // "Responsible" assignment rather than folded into assigneeLabel.
+  const showProposedOwner = !hasExplicitAssignee && Boolean(node.task.proposedOwner);
   const labels = node.task.labels ?? [];
+  const acceptanceCriteria = node.task.acceptanceCriteria ?? [];
   const hasMetadata = hasExplicitAssignee
+    || showProposedOwner
     || Boolean(node.task.billingCode)
     || Boolean(node.task.projectId)
     || labels.length > 0;
@@ -640,6 +646,18 @@ function TaskTreeNode({
                     {node.task.description}
                   </p>
                 ) : null}
+                {acceptanceCriteria.length > 0 ? (
+                  <div className="mt-1.5">
+                    <div className="text-(length:--text-nano) font-medium uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
+                      Acceptance criteria
+                    </div>
+                    <ul className="mt-0.5 list-disc space-y-0.5 pl-4 text-sm leading-5 text-muted-foreground">
+                      {acceptanceCriteria.map((criterion, index) => (
+                        <li key={index}>{criterion}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
               </div>
             </div>
           </div>
@@ -663,6 +681,12 @@ function TaskTreeNode({
           <div className="mt-2 flex flex-wrap gap-1.5">
             {hasExplicitAssignee ? (
               <TaskField label="Responsible" value={assigneeLabel} />
+            ) : showProposedOwner ? (
+              <TaskField
+                label="Proposed owner"
+                value={node.task.proposedOwner as string}
+                tone="subtle"
+              />
             ) : null}
             {node.task.billingCode ? (
               <TaskField label="Billing" value={node.task.billingCode} />
