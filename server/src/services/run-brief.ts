@@ -5,9 +5,13 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  projects,
   type Db,
 } from "@paperclipai/db";
-import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
+import {
+  LOW_TRUST_REVIEW_PRESET,
+  type SourceTrustMetadata,
+} from "@paperclipai/shared";
 import {
   resolveAdapterExecutionTargetTimeout,
   type AdapterExecutionTarget,
@@ -32,6 +36,8 @@ import {
   type PaperclipRunBriefSiblings,
   type PaperclipRunBriefTeam,
 } from "@paperclipai/adapter-utils/wake-run-brief";
+import { isLowTrustQuarantined } from "./source-trust.js";
+import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 
 export {
   isPaperclipWakeRunBriefEnabled as isRunBriefEnabled,
@@ -364,9 +370,50 @@ export type RunBriefSiblingRow = {
   lastOutputAt: Date | null;
   /** The run's retained trust preset (`executionPolicy.trustPreset`). */
   trustPreset?: string | null;
+  /**
+   * True when the run is low-trust by any of its policy sources, not only by
+   * a retained preset (see `isRunBriefSiblingLowTrust`).
+   */
+  lowTrust?: boolean;
 };
 
 export const RUN_BRIEF_WITHHELD_SIBLING_TITLE = "[low-trust run; title withheld]";
+
+/**
+ * Whether a sibling run on `issue` is low-trust, so that the issue's title
+ * stays out of a higher-trust reader's brief. Dispatch retains a run's preset
+ * only once the run starts, so a queued run carries none yet; its trust is
+ * resolved here the way dispatch will resolve it, from the agent, project,
+ * issue and run policies. A quarantined issue is low-trust whatever its
+ * policy says. Anything but a standard resolution counts as low-trust, and so
+ * does a policy source that could not be read (`undefined`).
+ */
+export function isRunBriefSiblingLowTrust(input: {
+  companyId: string;
+  /** The run's `contextSnapshot.executionPolicy`, if any. */
+  runExecutionPolicy: unknown;
+  /** `undefined` when the agent could not be read. */
+  agent: { permissions: unknown } | undefined;
+  issue: { executionPolicy: unknown; sourceTrust: SourceTrustMetadata | null };
+  /** null when the run has no project; `undefined` when it could not be read. */
+  project: { executionWorkspacePolicy: unknown } | null | undefined;
+}): boolean {
+  const { companyId, agent, issue, project } = input;
+  // Fail closed: an unreadable source cannot prove the run is standard.
+  if (agent === undefined || project === undefined) return true;
+  if (isLowTrustQuarantined(issue.sourceTrust)) return true;
+  // Every source was read within the company, so each one carries its id.
+  const resolution = resolveCoreTrustPreset({
+    companyId,
+    agent: { companyId, permissions: agent.permissions },
+    project: project
+      ? { companyId, executionWorkspacePolicy: project.executionWorkspacePolicy }
+      : null,
+    issue: { companyId, executionPolicy: issue.executionPolicy },
+    run: { companyId, executionPolicy: input.runExecutionPolicy },
+  });
+  return resolution.kind !== "standard";
+}
 
 /**
  * The woken agent's other live runs for the Run Brief, in the order the
@@ -376,7 +423,8 @@ export const RUN_BRIEF_WITHHELD_SIBLING_TITLE = "[low-trust run; title withheld]
  * follow-up queued on that issue continues this run's own work, and telling
  * the run to keep off its own issue would contradict its authority line. The
  * issue title of a low-trust run is withheld, as that run's output is withheld
- * from higher-trust readers.
+ * from higher-trust readers: a row is low-trust when `lowTrust` is set or its
+ * retained preset is the low-trust one.
  */
 export function buildRunBriefSiblings(
   rows: RunBriefSiblingRow[],
@@ -402,7 +450,7 @@ export function buildRunBriefSiblings(
         issueId: row.issueId,
         issueIdentifier: row.issueIdentifier,
         issueTitle:
-          row.trustPreset === LOW_TRUST_REVIEW_PRESET
+          row.lowTrust === true || row.trustPreset === LOW_TRUST_REVIEW_PRESET
             ? RUN_BRIEF_WITHHELD_SIBLING_TITLE
             : row.issueTitle,
         queuedAt: iso(row.createdAt),
@@ -427,8 +475,10 @@ const uuidPattern =
 /**
  * Read the woken agent's other live runs (queued, running or waiting on a
  * scheduled retry), with the same run fields the company live-runs route
- * serves, plus each run's issue identifier and title. See
- * `buildRunBriefSiblings`.
+ * serves, plus each run's issue identifier and title. A run's title is
+ * withheld when the run is low-trust by its agent, project, issue or run
+ * policy, or by its issue's quarantine flag (see `isRunBriefSiblingLowTrust`).
+ * See `buildRunBriefSiblings`.
  */
 export async function loadRunBriefSiblings(input: {
   db: Db;
@@ -445,10 +495,13 @@ export async function loadRunBriefSiblings(input: {
       id: heartbeatRuns.id,
       status: heartbeatRuns.status,
       issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+      // Dispatch falls back to the context's project when the issue has none.
+      contextProjectId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'projectId'`,
       createdAt: heartbeatRuns.createdAt,
       startedAt: heartbeatRuns.startedAt,
       lastOutputAt: heartbeatRuns.lastOutputAt,
       trustPreset: heartbeatRunTrustPresetSql,
+      executionPolicy: sql<unknown>`${heartbeatRuns.contextSnapshot} -> 'executionPolicy'`,
     })
     .from(heartbeatRuns)
     .where(
@@ -464,33 +517,70 @@ export async function loadRunBriefSiblings(input: {
     .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
     .limit(RUN_BRIEF_ROW_LIMIT);
   if (runRows.length === 0) return null;
-  // A context issue id is plain JSON text; only well-formed ids reach the
-  // uuid column, and only issues of this company are read.
-  const issueIds = [
+  // Context ids are plain JSON text; only well-formed ids reach a uuid
+  // column, and only rows of this company are read.
+  const wellFormed = (ids: Array<string | null | undefined>) => [
     ...new Set(
-      runRows.flatMap((row) =>
-        row.issueId && uuidPattern.test(row.issueId) ? [row.issueId] : [],
-      ),
+      ids.flatMap((id) => (id && uuidPattern.test(id) ? [id] : [])),
     ),
   ];
-  const issueRows = issueIds.length
+  const issueIds = wellFormed(runRows.map((row) => row.issueId));
+  const [issueRows, [agent]] = await Promise.all([
+    issueIds.length
+      ? db
+          .select({
+            id: issues.id,
+            identifier: issues.identifier,
+            title: issues.title,
+            projectId: issues.projectId,
+            executionPolicy: issues.executionPolicy,
+            sourceTrust: issues.sourceTrust,
+          })
+          .from(issues)
+          .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds)))
+      : Promise.resolve([]),
+    db
+      .select({ permissions: agents.permissions })
+      .from(agents)
+      .where(and(eq(agents.id, input.agentId), eq(agents.companyId, companyId))),
+  ]);
+  const issueById = new Map(issueRows.map((row) => [row.id, row]));
+  // The project whose policy dispatch applies to each run that has a title.
+  const projectIdOf = (row: (typeof runRows)[number]) => {
+    const issue = row.issueId ? issueById.get(row.issueId) : undefined;
+    return issue ? (issue.projectId ?? row.contextProjectId ?? null) : null;
+  };
+  const projectIds = wellFormed(runRows.map(projectIdOf));
+  const projectRows = projectIds.length
     ? await db
         .select({
-          id: issues.id,
-          identifier: issues.identifier,
-          title: issues.title,
+          id: projects.id,
+          executionWorkspacePolicy: projects.executionWorkspacePolicy,
         })
-        .from(issues)
-        .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds)))
+        .from(projects)
+        .where(and(eq(projects.companyId, companyId), inArray(projects.id, projectIds)))
     : [];
-  const issueById = new Map(issueRows.map((row) => [row.id, row]));
+  const projectById = new Map(projectRows.map((row) => [row.id, row]));
   return buildRunBriefSiblings(
     runRows.map((row) => {
       const issue = row.issueId ? issueById.get(row.issueId) : undefined;
+      const projectId = projectIdOf(row);
       return {
         ...row,
         issueIdentifier: issue?.identifier ?? null,
         issueTitle: issue?.title ?? null,
+        // The title comes from the issue row, so a run whose issue was not
+        // found has no title to withhold.
+        lowTrust: issue
+          ? isRunBriefSiblingLowTrust({
+              companyId,
+              runExecutionPolicy: row.executionPolicy,
+              agent,
+              issue,
+              // A project that is not found (or a malformed id) is unreadable.
+              project: projectId ? projectById.get(projectId) : null,
+            })
+          : false,
       };
     }),
     {

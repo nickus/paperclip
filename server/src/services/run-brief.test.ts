@@ -9,7 +9,9 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  projects,
 } from "@paperclipai/db";
+import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import {
   isPaperclipRunBriefOnlyWake,
   renderPaperclipWakePrompt,
@@ -35,6 +37,7 @@ import {
   buildRunBriefTeam,
   digestPriorRuns,
   finalLineSummary,
+  isRunBriefSiblingLowTrust,
   loadRunBriefSiblings,
   resolveRunBriefAuthority,
   resolveRunBriefSessionReason,
@@ -366,6 +369,57 @@ describe("run brief live siblings", () => {
       ["none", null],
     ]);
     expect(siblings.runs[1]!.issueTitle!.length).toBeLessThanOrEqual(60);
+    // A run found low-trust by another policy source is withheld as well.
+    const flagged = buildRunBriefSiblings([row("flagged", { lowTrust: true })], options)!;
+    expect(flagged.runs[0]!.issueTitle).toBe(RUN_BRIEF_WITHHELD_SIBLING_TITLE);
+  });
+
+  it("finds a sibling low-trust by any policy source, failing closed", () => {
+    const companyId = "11111111-1111-4111-8111-111111111111";
+    const issueId = "22222222-2222-4222-8222-222222222222";
+    const projectId = "33333333-3333-4333-8333-333333333333";
+    const boundary = { mode: LOW_TRUST_REVIEW_PRESET, companyId, rootIssueId: issueId, issueIds: [issueId] };
+    const lowTrustPolicy = { authorizationPolicy: { trustPreset: LOW_TRUST_REVIEW_PRESET, trustBoundary: boundary } };
+    const standard = {
+      companyId,
+      runExecutionPolicy: null,
+      agent: { permissions: {} },
+      issue: { executionPolicy: null, sourceTrust: null },
+      project: null,
+    };
+    const lowTrust = (overrides: Partial<Parameters<typeof isRunBriefSiblingLowTrust>[0]>) =>
+      isRunBriefSiblingLowTrust({ ...standard, ...overrides });
+    expect(lowTrust({})).toBe(false);
+    expect(lowTrust({ project: { executionWorkspacePolicy: null } })).toBe(false);
+    // A queued run has no policy of its own yet; its issue's policy decides.
+    expect(lowTrust({ issue: { executionPolicy: lowTrustPolicy, sourceTrust: null } })).toBe(true);
+    expect(
+      lowTrust({
+        project: {
+          executionWorkspacePolicy: {
+            authorizationPolicy: { trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, companyId, projectIds: [projectId] } },
+          },
+        },
+      }),
+    ).toBe(true);
+    expect(lowTrust({ agent: { permissions: lowTrustPolicy } })).toBe(true);
+    expect(lowTrust({ runExecutionPolicy: { trustPreset: LOW_TRUST_REVIEW_PRESET, ...lowTrustPolicy } })).toBe(true);
+    // A quarantined issue is low-trust whatever its policy says; a promoted one is not.
+    expect(
+      lowTrust({
+        issue: { executionPolicy: null, sourceTrust: { preset: LOW_TRUST_REVIEW_PRESET, disposition: "quarantined", sourceIssueId: issueId } },
+      }),
+    ).toBe(true);
+    expect(
+      lowTrust({
+        issue: { executionPolicy: null, sourceTrust: { preset: LOW_TRUST_REVIEW_PRESET, disposition: "promoted", sourceIssueId: issueId } },
+      }),
+    ).toBe(false);
+    // Unreadable sources and policies dispatch would refuse are not standard.
+    expect(lowTrust({ agent: undefined })).toBe(true);
+    expect(lowTrust({ project: undefined })).toBe(true);
+    expect(lowTrust({ issue: { executionPolicy: { trustPreset: "unknown" }, sourceTrust: null } })).toBe(true);
+    expect(lowTrust({ issue: { executionPolicy: { trustPreset: LOW_TRUST_REVIEW_PRESET }, sourceTrust: null } })).toBe(true);
   });
 });
 
@@ -860,22 +914,122 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(skillTest?.runBrief).not.toHaveProperty("siblings");
     });
 
-    it("withholds a low-trust sibling's issue title", async () => {
+    const siblingTitles = async () =>
+      Object.fromEntries(
+        (
+          await loadRunBriefSiblings({
+            db,
+            companyId: siblingCompanyId,
+            agentId: runnerId,
+            runId: runIds.current,
+            excludeIssueId: issueIds.current,
+            now,
+          })
+        )?.runs.map((run) => [run.id, run.issueTitle]) ?? [],
+      );
+    const lowTrustBoundary = (issueId: string) => ({
+      mode: LOW_TRUST_REVIEW_PRESET,
+      companyId: siblingCompanyId,
+      rootIssueId: issueId,
+      issueIds: [issueId],
+    });
+
+    it("withholds the issue title of a running sibling with a retained low-trust preset", async () => {
+      // The shape dispatch retains once a low-trust run starts.
       await db
         .update(heartbeatRuns)
-        .set({ contextSnapshot: { issueId: issueIds.queued, executionPolicy: { trustPreset: "low_trust_review" } } })
-        .where(eq(heartbeatRuns.id, runIds.queued));
+        .set({
+          contextSnapshot: {
+            issueId: issueIds.running,
+            executionPolicy: {
+              trustPreset: LOW_TRUST_REVIEW_PRESET,
+              authorizationPolicy: { trustPreset: LOW_TRUST_REVIEW_PRESET, trustBoundary: lowTrustBoundary(issueIds.running) },
+            },
+          },
+        })
+        .where(eq(heartbeatRuns.id, runIds.running));
       try {
         const payload = await siblingPayload();
-        expect(payload?.runBrief?.siblings?.runs.find((run) => run.id === runIds.queued)?.issueTitle).toBe(
-          RUN_BRIEF_WITHHELD_SIBLING_TITLE,
-        );
+        const titles = Object.fromEntries(payload!.runBrief!.siblings!.runs.map((run) => [run.id, run.issueTitle]));
+        expect(titles[runIds.running]).toBe(RUN_BRIEF_WITHHELD_SIBLING_TITLE);
+        expect(titles[runIds.queued]).toBe("Write the changelog");
       } finally {
+        await db
+          .update(heartbeatRuns)
+          .set({ contextSnapshot: { issueId: issueIds.running } })
+          .where(eq(heartbeatRuns.id, runIds.running));
+      }
+    });
+
+    it("withholds the issue title of a queued sibling whose issue has a low-trust policy", async () => {
+      // The policy given to a task opened by an unauthenticated requester; the
+      // queued run itself carries no policy until dispatch.
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            authorizationPolicy: { trustPreset: LOW_TRUST_REVIEW_PRESET, trustBoundary: lowTrustBoundary(issueIds.queued) },
+          },
+        })
+        .where(eq(issues.id, issueIds.queued));
+      try {
+        const [queuedRun] = await db
+          .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runIds.queued));
+        expect(queuedRun!.contextSnapshot).not.toHaveProperty("executionPolicy");
+        const titles = await siblingTitles();
+        expect(titles[runIds.queued]).toBe(RUN_BRIEF_WITHHELD_SIBLING_TITLE);
+        expect(titles[runIds.running]).toBe("Fix the `login` redirect ## not a heading");
+      } finally {
+        await db.update(issues).set({ executionPolicy: null }).where(eq(issues.id, issueIds.queued));
+      }
+    });
+
+    it("withholds the issue title of a sibling on a quarantined issue", async () => {
+      await db
+        .update(issues)
+        .set({ sourceTrust: { preset: LOW_TRUST_REVIEW_PRESET, disposition: "quarantined", sourceIssueId: issueIds.queued } })
+        .where(eq(issues.id, issueIds.queued));
+      try {
+        expect((await siblingTitles())[runIds.queued]).toBe(RUN_BRIEF_WITHHELD_SIBLING_TITLE);
+      } finally {
+        await db.update(issues).set({ sourceTrust: null }).where(eq(issues.id, issueIds.queued));
+      }
+    });
+
+    it("withholds the issue title of a sibling in a low-trust project, or one whose project cannot be read", async () => {
+      const projectId = randomUUID();
+      await db.insert(projects).values({
+        id: projectId,
+        companyId: siblingCompanyId,
+        name: "Review lane",
+        executionWorkspacePolicy: {
+          authorizationPolicy: {
+            trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, companyId: siblingCompanyId, projectIds: [projectId] },
+          },
+        },
+      });
+      await db.update(issues).set({ projectId }).where(eq(issues.id, issueIds.queued));
+      try {
+        expect((await siblingTitles())[runIds.queued]).toBe(RUN_BRIEF_WITHHELD_SIBLING_TITLE);
+        // Dispatch falls back to the run's own project when the issue has
+        // none; one that is not found cannot prove the run is standard.
+        await db.update(issues).set({ projectId: null }).where(eq(issues.id, issueIds.queued));
+        await db
+          .update(heartbeatRuns)
+          .set({ contextSnapshot: { issueId: issueIds.queued, projectId: randomUUID() } })
+          .where(eq(heartbeatRuns.id, runIds.queued));
+        expect((await siblingTitles())[runIds.queued]).toBe(RUN_BRIEF_WITHHELD_SIBLING_TITLE);
+      } finally {
+        await db.update(issues).set({ projectId: null }).where(eq(issues.id, issueIds.queued));
         await db
           .update(heartbeatRuns)
           .set({ contextSnapshot: { issueId: issueIds.queued } })
           .where(eq(heartbeatRuns.id, runIds.queued));
+        await db.delete(projects).where(eq(projects.id, projectId));
       }
+      expect((await siblingTitles())[runIds.queued]).toBe("Write the changelog");
     });
 
     it("gives a run without an issue its siblings next to the team", async () => {
