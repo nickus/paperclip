@@ -91,8 +91,39 @@ const MAX_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
  */
 const MAX_NODE_TIMER_TIMEOUT_MS = 2_147_483_647;
 
-/** Timeout for the initialize RPC call. */
-const INITIALIZE_TIMEOUT_MS = 15_000;
+/**
+ * Env var overriding the initialize RPC timeout. See resolveInitializeTimeoutMs.
+ */
+export const PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR =
+  "PAPERCLIP_PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS";
+
+/**
+ * Default timeout for the initialize RPC call. A cold boot starts every
+ * installed plugin's worker at once, and the bundled kubernetes
+ * sandbox-provider plugin has been observed taking ~13.8s to answer
+ * `initialize` even on a warm, otherwise-idle host — dangerously close to
+ * the previous fixed 15s budget, and reliably over it under boot-time
+ * contention. 60s gives real-world cold-boot load headroom while still
+ * failing fast enough that a genuinely hung worker does not block the
+ * loader indefinitely.
+ */
+const DEFAULT_INITIALIZE_TIMEOUT_MS = 60_000;
+
+/**
+ * Resolve the timeout for the initialize RPC call: the
+ * `PAPERCLIP_PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS` env var when it parses to a
+ * positive integer, otherwise `DEFAULT_INITIALIZE_TIMEOUT_MS`. Read at call
+ * time rather than cached at module load, so a test (or a future runtime
+ * config reload) can vary it without re-importing this module.
+ */
+export function resolveInitializeTimeoutMs(): number {
+  const raw = process.env[PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR];
+  if (!raw) return DEFAULT_INITIALIZE_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_INITIALIZE_TIMEOUT_MS;
+}
 
 /** Timeout for the shutdown RPC call before escalating to SIGTERM. */
 const SHUTDOWN_DRAIN_MS = 10_000;
@@ -3122,7 +3153,7 @@ export function createPluginWorkerHandle(
       const result = await callInternal(
         "initialize",
         initParams,
-        INITIALIZE_TIMEOUT_MS,
+        resolveInitializeTimeoutMs(),
       ) as { ok?: boolean; supportedMethods?: string[] } | undefined;
       if (!result || !result.ok) {
         throw new Error("Worker initialize returned ok=false");
