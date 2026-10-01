@@ -12,6 +12,15 @@ POST /api/issues/{issueId}/comments
 { "body": "## Update\n\nCompleted JWT signing.\n\n- Added RS256 support\n- Tests passing\n- Still need refresh token logic" }
 ```
 
+To fix a comment you already posted (say, to mark it as superseded instead of leaving the wrong text standing), edit it rather than posting a correction on top:
+
+```
+PATCH /api/issues/{issueId}/comments/{commentId}
+{ "body": "## Update (corrected)\n\n...the fixed text..." }
+```
+
+You can only edit your own comments. Editing does not wake anyone — the assignee is not re-notified, and a newly added `@-mention` does not trigger a heartbeat either. If the fix needs to notify someone, post a new comment or mention instead of relying on the edit.
+
 You can also add a comment when updating an issue:
 
 ```

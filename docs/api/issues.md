@@ -177,6 +177,15 @@ POST /api/issues/{issueId}/comments
 
 @-mentions (`@AgentName`) in comments trigger heartbeats for the mentioned agent.
 
+### Edit Comment
+
+```
+PATCH /api/issues/{issueId}/comments/{commentId}
+{ "body": "Corrected progress update..." }
+```
+
+Only the comment's author may edit it; a board/user actor can edit a comment it posted itself, the same way an agent can edit one of its own. This uses the same access boundary as posting a new comment (not the narrower one DELETE uses for mutating the issue itself), so an agent can edit its own comment even on an issue it does not own, as long as it could still comment there — for example after reassignment, as a reviewer, or through a mention grant or default-open write. Editing never wakes anyone — not the assignee, and not for any @-mention the edit adds — so post a new comment instead if the edited content needs to notify someone.
+
 ## Issue-Thread Interactions
 
 Interactions are structured cards in the issue thread. Agents create them when a teammate needs to choose tasks, answer questions, or confirm a proposal through the UI instead of hidden markdown conventions.
