@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
+import { DEFAULT_JSON_BODY_LIMIT } from "../http/body-limits.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -254,7 +255,11 @@ describe.sequential("issue comment edit routes", () => {
 
   function createApp() {
     const app = express();
-    app.use(express.json());
+    // Matches the production app's JSON body-parser limit (server/src/app.ts),
+    // not express's small 100kb default -- a few of the oversized-body tests
+    // below send bodies that, once JSON-escaped on the wire, are well inside
+    // the real server's limit but would overflow the bare default.
+    app.use(express.json({ limit: DEFAULT_JSON_BODY_LIMIT }));
     return app;
   }
 
@@ -527,6 +532,30 @@ describe.sequential("issue comment edit routes", () => {
       actualLength: 100_001,
     });
     expect(mockIssueService.editComment).not.toHaveBeenCalled();
+  });
+
+  it("accepts a body whose raw length is over the limit but whose normalized length is not", async () => {
+    // Regression for the oversized-body check running on the wrong value:
+    // `editIssueCommentSchema.body` normalizes escaped line breaks
+    // (`\\n` -> an actual newline) before its own `.max()` runs, which only
+    // ever shortens the string. A raw body of 100_002 chars built almost
+    // entirely from the 2-char escape sequence `\n` normalizes down to far
+    // under the 100_000 limit, so it must succeed end to end -- the
+    // oversized-body middleware has to measure the same, post-normalize
+    // value the schema (and the persisted comment) will, not the raw wire
+    // length, or it would reject a request the schema accepts.
+    const raw = "\\n".repeat(50_001); // 100_002 raw chars, normalizes to 50_001.
+
+    const res = await request(installActor(createApp(), agentActor(ASSIGNEE_AGENT_ID)))
+      .patch(`/api/issues/${ISSUE_ID}/comments/comment-1`)
+      .send({ body: raw });
+
+    expect(res.status, describeResponse(res)).toBe(200);
+    expect(mockIssueService.editComment).toHaveBeenCalledWith(
+      "comment-1",
+      "\n".repeat(50_001),
+      expect.objectContaining({ afterEdit: expect.any(Function) }),
+    );
   });
 
   it("rejects an empty body", async () => {

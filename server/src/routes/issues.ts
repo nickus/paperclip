@@ -62,6 +62,7 @@ import {
 } from "@paperclipai/db";
 import {
   ISSUE_COMMENT_MAX_BODY_LENGTH,
+  normalizeEscapedLineBreaks,
   addIssueCommentSchema,
   editIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
@@ -443,16 +444,24 @@ const rejectUnknownIssueCommentEditFields = rejectUnknownBodyFields({
 // already been normalized onto `body`) so an oversized comment gets a 400
 // that names the field and the limit instead of a generic Zod "Validation
 // error" issues array. Both routes share the same `maxLength`: see
-// `ISSUE_COMMENT_MAX_BODY_LENGTH`.
+// `ISSUE_COMMENT_MAX_BODY_LENGTH`. `normalize` mirrors the schema's own
+// `multilineTextSchema` pre-processing: both `addIssueCommentSchema.body`
+// and `editIssueCommentSchema.body` run this same normalization before
+// their `.max()` check, and it only ever shortens the string (collapsing
+// escaped line breaks), so a client that sends those sequences must be
+// measured the same way here or this middleware would reject requests the
+// schema -- and the eventual stored comment -- would accept.
 const rejectOversizedIssueCommentBody = rejectOversizedBodyField({
   payloadName: "Comment",
   field: "body",
   maxLength: ISSUE_COMMENT_MAX_BODY_LENGTH,
+  normalize: normalizeEscapedLineBreaks,
 });
 const rejectOversizedIssueCommentEditBody = rejectOversizedBodyField({
   payloadName: "Comment edit",
   field: "body",
   maxLength: ISSUE_COMMENT_MAX_BODY_LENGTH,
+  normalize: normalizeEscapedLineBreaks,
 });
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),

@@ -12,6 +12,16 @@ export interface BodyFieldLengthPolicy {
   payloadName: string;
   field: string;
   maxLength: number;
+  /**
+   * Applied to the raw string before measuring it, when the route's schema
+   * transforms the value before its own `.max()` check runs (for example
+   * `multilineTextSchema`'s escaped-newline normalization). Omit it when the
+   * field is validated as-is. Getting this wrong in either direction is a
+   * real bug: skipping a shrinking transform rejects requests the schema
+   * would accept (see `body-field-length.test.ts`), and applying a transform
+   * the schema does not also apply would let oversized requests through.
+   */
+  normalize?: (value: string) => string;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -39,14 +49,21 @@ export function rejectOversizedBodyField(policy: BodyFieldLengthPolicy) {
       return;
     }
     const value = req.body[policy.field];
-    if (typeof value === "string" && value.length > policy.maxLength) {
-      res.status(400).json({
-        error: `${policy.payloadName} ${policy.field} is too long`,
-        field: policy.field,
-        maxLength: policy.maxLength,
-        actualLength: value.length,
-      });
-      return;
+    if (typeof value === "string") {
+      // Measure what the schema will actually validate (and what gets
+      // persisted), not the raw wire value, so this never rejects a request
+      // the schema would accept -- or reports a length nothing downstream
+      // will see.
+      const measured = policy.normalize ? policy.normalize(value) : value;
+      if (measured.length > policy.maxLength) {
+        res.status(400).json({
+          error: `${policy.payloadName} ${policy.field} is too long`,
+          field: policy.field,
+          maxLength: policy.maxLength,
+          actualLength: measured.length,
+        });
+        return;
+      }
     }
     next();
   };

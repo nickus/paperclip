@@ -1983,6 +1983,7 @@ export {
   ISSUE_COMMENT_MAX_BODY_LENGTH,
   addIssueCommentSchema,
   editIssueCommentSchema,
+  normalizeEscapedLineBreaks,
   issueThreadInteractionStatusSchema,
   issueThreadInteractionKindSchema,
   issueThreadInteractionContinuationPolicySchema,
