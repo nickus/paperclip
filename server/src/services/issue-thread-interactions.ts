@@ -814,6 +814,34 @@ function interactionTerminalError(row: { status: string; result?: unknown }) {
   );
 }
 
+// A withdraw request's intent is "this card should stop being pending", which
+// a terminal status already satisfies unless that terminal status is itself
+// a recorded decision. `answered`/`accepted`/`rejected` are decisions that
+// withdrawal would contradict, so those keep conflicting with 409. Every
+// other terminal status (`expired`, `cancelled` — covering already withdrawn,
+// superseded, stale-target, issue-closed, skipped, and addressee-deleted) is
+// not a decision, so re-withdrawing it is idempotent, whether or not the
+// issue itself has since been closed (withdrawInteraction checks this status
+// before the issue-open guard for exactly that reason). A card that is still
+// `pending` on a closed issue is the one case this does not cover; that
+// legacy state still 409s via assertIssueOpenForInteractionResolution.
+function isDecidedInteractionStatus(status: string) {
+  return status === "answered" || status === "accepted" || status === "rejected";
+}
+
+function interactionWithdrawalConflictError(row: { status: string }) {
+  const nextStep =
+    row.status === "answered"
+      ? "The submitted answers already stand; create a new interaction if more input is needed."
+      : "That decision already stands; create a new interaction if a different decision is needed.";
+  return issueThreadInteractionResolutionError(
+    409,
+    "interaction_already_decided",
+    `Cannot withdraw: this interaction was already resolved with status "${row.status}". ${nextStep}`,
+    { status: row.status },
+  );
+}
+
 function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
   issue: IssueResolutionContext;
   current: IssueThreadInteractionRow;
@@ -4647,13 +4675,12 @@ export function issueThreadInteractionService(
     },
 
     withdrawInteraction: async (
-      issue: { id: string; companyId: string },
+      issue: { id: string; companyId: string; status?: string },
       interactionId: string,
       input: WithdrawIssueThreadInteraction,
       actor: InteractionActor,
       mutationOptions: InteractionResolutionMutationOptions = {},
     ) => {
-      assertIssueOpenForInteractionResolution(issue);
       const data = withdrawIssueThreadInteractionSchema.parse(input);
       const current = await db
         .select()
@@ -4667,7 +4694,25 @@ export function issueThreadInteractionService(
       ) {
         throw interactionNotFoundError();
       }
-      if (current.status !== "pending") throw interactionTerminalError(current);
+      if (current.status !== "pending") {
+        if (isDecidedInteractionStatus(current.status)) {
+          throw interactionWithdrawalConflictError(current);
+        }
+        // Already withdrawn/expired/superseded/etc: the caller's intent is
+        // already satisfied. Report that instead of a surprise 409, and skip
+        // straight back out without touching the row, any linked tool
+        // action/secret proposal, or activity — there is nothing left to do.
+        // This also covers the most common case of all: closing an issue
+        // sweeps every pending card to exactly this status (expired,
+        // outcome issue_closed) via expirePendingInteractionsForTerminalIssue,
+        // so a closed issue must not stop this no-op from reporting success.
+        return { ...hydrateInteraction(current), alreadyClosed: true as const };
+      }
+      // The row is still pending, so a closed issue blocks withdrawal same
+      // as any other resolution. In the normal flow this is unreachable —
+      // closing an issue expires every pending card first — but a legacy
+      // row created before that sweep existed can still land here.
+      assertIssueOpenForInteractionResolution(issue);
 
       const reason = data.reason?.trim() || null;
       const now = new Date();
@@ -4745,7 +4790,7 @@ export function issueThreadInteractionService(
       await touchIssue(db, issue.id);
       const withdrawn = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, withdrawn);
-      return withdrawn;
+      return { ...withdrawn, alreadyClosed: false as const };
     },
 
     answerQuestions: async (

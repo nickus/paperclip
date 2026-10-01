@@ -144,6 +144,17 @@ describe("describeInteractionResolutionFailure", () => {
     expect(failure.message).not.toMatch(/try again/i);
   });
 
+  it("does not ask for a retry when a withdrawal conflicts with a decision already made", () => {
+    const failure = describeInteractionResolutionFailure(
+      denial(409, "interaction_already_decided", "Cannot withdraw: this interaction was already resolved with status \"accepted\""),
+      humanOnlyAudience,
+    );
+
+    expect(failure.kind).toBe("settled");
+    expect(failure.message).toBe("Cannot withdraw: this interaction was already resolved with status \"accepted\".");
+    expect(failure.message).not.toMatch(/try again/i);
+  });
+
   it("keeps the retry prompt for a genuinely transient failure", () => {
     expect(
       describeInteractionResolutionFailure(new ApiError("Request failed: 503", 503, null), humanOnlyAudience),

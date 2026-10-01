@@ -36,6 +36,7 @@ export const INTERACTION_AUDIENCE_DENIAL_CODES = [
 const INTERACTION_SETTLED_CODES = [
   "interaction_not_found",
   "interaction_already_resolved",
+  "interaction_already_decided",
   "interaction_superseded",
   "interaction_stale_target",
   "interaction_issue_closed",

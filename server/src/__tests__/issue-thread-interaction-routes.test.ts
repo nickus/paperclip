@@ -932,6 +932,53 @@ describe.sequential("issue thread interaction routes", () => {
     }));
   });
 
+  it("returns 200 with alreadyClosed and skips the activity log and wakeup when the card is already closed", async () => {
+    mockInteractionService.withdrawInteraction.mockImplementationOnce(async () => ({
+      id: "interaction-withdraw",
+      companyId: "company-1",
+      issueId: ISSUE_ID,
+      kind: "request_confirmation",
+      createdByAgentId: CREATED_AGENT_ID,
+      status: "expired",
+      continuationPolicy: "wake_assignee",
+      payload: { version: 1, prompt: "Proceed?" },
+      result: { version: 1, outcome: "stale_target", staleTarget: { revisionId: "rev-2" } },
+      alreadyClosed: true,
+    }));
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-withdraw/withdraw`)
+      .send({ reason: "Already gone" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ id: "interaction-withdraw", status: "expired", alreadyClosed: true });
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it("surfaces the service's already-decided conflict as a 409", async () => {
+    // Imported dynamically, after this test's vi.resetModules(), so this is
+    // the same HttpError class the dynamically-loaded error handler checks
+    // with `instanceof` — a statically-imported copy would be a stale class
+    // from a previous module registry and would fail that check silently.
+    const { conflict } = await import("../errors.js");
+    mockInteractionService.withdrawInteraction.mockImplementationOnce(async () => {
+      throw conflict(
+        'Cannot withdraw: this interaction was already resolved with status "accepted". That decision already stands; create a new interaction if a different decision is needed.',
+        { code: "interaction_already_decided", status: "accepted" },
+      );
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-withdraw/withdraw`)
+      .send({ reason: "Trying again" });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ code: "interaction_already_decided" });
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
   it("cancels the bound native run when its question is withdrawn", async () => {
     mockInteractionService.withdrawInteraction.mockImplementationOnce((...args) => resolveMockInteraction(args, {
       id: "interaction-withdraw",

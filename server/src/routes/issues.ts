@@ -16969,6 +16969,14 @@ export function issueRoutes(
           },
         },
       );
+      if (interaction.alreadyClosed) {
+        // Idempotent re-withdrawal of an already-terminal (non-decision)
+        // interaction: nothing changed on this call (no new activity entry,
+        // no repeat continuation wakeup, no native-run cancellation), so
+        // just hand back the existing interaction.
+        res.json(interaction);
+        return;
+      }
       if (nativeRunId) {
         try {
           await heartbeat.cancelRun(

@@ -15,6 +15,7 @@ export const ISSUE_THREAD_INTERACTION_RESOLUTION_DENIAL_CODES = [
   "interaction_stale_target",
   "interaction_superseded",
   "interaction_already_resolved",
+  "interaction_already_decided",
   "interaction_issue_closed",
   "interaction_governed_action_denied",
   "review_policy_denied",

@@ -260,6 +260,8 @@ Resolving a card records the response only. Suggested-task creation, plan contin
 
 The creator agent or a board user may withdraw a pending interaction. Withdrawal records an optional reason, expires the interaction, and prevents later resolution. Low-trust and task-watchdog agent runs cannot withdraw interactions.
 
+Withdrawing is idempotent for an interaction that is already in a terminal state for a reason other than a recorded decision — already withdrawn, expired, superseded, or stale-target. That call returns `200` with the current interaction and `alreadyClosed: true`, and does not create a new activity entry. Withdrawing an interaction that already carries a decision (`answered`, `accepted`, or `rejected`) still returns `409`, with the interaction's status and what to do next (create a new interaction if more input or a different decision is needed) in the error body.
+
 ## Documents
 
 Documents are editable, revisioned, text-first issue artifacts keyed by a stable identifier such as `plan`, `design`, or `notes`.
