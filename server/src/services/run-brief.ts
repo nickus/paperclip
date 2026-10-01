@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import {
   agents,
   heartbeatRuns,
@@ -15,8 +15,12 @@ import {
 import {
   PAPERCLIP_RUN_BRIEF_LABEL_MAX_CHARS,
   PAPERCLIP_RUN_BRIEF_PROMPT_MAX_CHARS,
+  PAPERCLIP_RUN_BRIEF_SIBLING_STATUSES,
+  PAPERCLIP_RUN_BRIEF_SIBLINGS_MAX_LINES,
   PAPERCLIP_RUN_BRIEF_SUMMARY_MAX_CHARS,
   PAPERCLIP_RUN_BRIEF_TEAM_MAX_MEMBERS,
+  comparePaperclipRunBriefSiblings,
+  normalizePaperclipRunBriefSibling,
   paperclipRunBriefOneLine,
   paperclipRunBriefRecoveryAuthority,
   type PaperclipRunBrief,
@@ -24,11 +28,14 @@ import {
   type PaperclipRunBriefEnvironment,
   type PaperclipRunBriefPriorRun,
   type PaperclipRunBriefSessionReason,
+  type PaperclipRunBriefSibling,
+  type PaperclipRunBriefSiblings,
   type PaperclipRunBriefTeam,
 } from "@paperclipai/adapter-utils/wake-run-brief";
 
 export {
   isPaperclipWakeRunBriefEnabled as isRunBriefEnabled,
+  isPaperclipRunBriefSiblingsEnabled as isRunBriefSiblingsEnabled,
 } from "@paperclipai/adapter-utils/wake-run-brief";
 
 export const RUN_BRIEF_PRIOR_RUN_LIMIT = 3;
@@ -344,17 +351,180 @@ export async function loadRunBriefTeam(input: {
   });
 }
 
+export type RunBriefSiblingRow = {
+  id: string;
+  status: string;
+  /** `contextSnapshot.issueId`: null for a run without an issue. */
+  issueId: string | null;
+  /** From the issue row; null when it is missing or in another company. */
+  issueIdentifier: string | null;
+  issueTitle: string | null;
+  createdAt: Date;
+  startedAt: Date | null;
+  lastOutputAt: Date | null;
+  /** The run's retained trust preset (`executionPolicy.trustPreset`). */
+  trustPreset?: string | null;
+};
+
+export const RUN_BRIEF_WITHHELD_SIBLING_TITLE = "[low-trust run; title withheld]";
+
+/**
+ * The woken agent's other live runs for the Run Brief, in the order the
+ * renderer lists them, at most `limit` of them; `total` counts every one.
+ * `rows` must already be limited to the agent's live runs. The current run is
+ * dropped, and so are runs on `excludeIssueId` (the current run's issue): a
+ * follow-up queued on that issue continues this run's own work, and telling
+ * the run to keep off its own issue would contradict its authority line. The
+ * issue title of a low-trust run is withheld, as that run's output is withheld
+ * from higher-trust readers.
+ */
+export function buildRunBriefSiblings(
+  rows: RunBriefSiblingRow[],
+  options: {
+    companyId: string;
+    excludeRunId: string;
+    excludeIssueId?: string | null;
+    now: Date;
+    limit?: number;
+  },
+): PaperclipRunBriefSiblings | null {
+  const iso = (value: Date | null) => value?.toISOString() ?? null;
+  const runs = rows
+    .filter(
+      (row) =>
+        row.id !== options.excludeRunId &&
+        !(options.excludeIssueId && row.issueId === options.excludeIssueId),
+    )
+    .flatMap((row): PaperclipRunBriefSibling[] => {
+      const run = normalizePaperclipRunBriefSibling({
+        id: row.id,
+        status: row.status,
+        issueId: row.issueId,
+        issueIdentifier: row.issueIdentifier,
+        issueTitle:
+          row.trustPreset === LOW_TRUST_REVIEW_PRESET
+            ? RUN_BRIEF_WITHHELD_SIBLING_TITLE
+            : row.issueTitle,
+        queuedAt: iso(row.createdAt),
+        startedAt: iso(row.startedAt),
+        lastOutputAt: iso(row.lastOutputAt),
+      });
+      return run ? [run] : [];
+    })
+    .sort(comparePaperclipRunBriefSiblings);
+  if (runs.length === 0) return null;
+  return {
+    companyId: options.companyId,
+    asOf: options.now.toISOString().replace(/\.\d{3}Z$/, "Z"),
+    total: runs.length,
+    runs: runs.slice(0, options.limit ?? PAPERCLIP_RUN_BRIEF_SIBLINGS_MAX_LINES),
+  };
+}
+
+const uuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Read the woken agent's other live runs (queued, running or waiting on a
+ * scheduled retry), with the same run fields the company live-runs route
+ * serves, plus each run's issue identifier and title. See
+ * `buildRunBriefSiblings`.
+ */
+export async function loadRunBriefSiblings(input: {
+  db: Db;
+  companyId: string;
+  agentId: string;
+  runId: string;
+  excludeIssueId?: string | null;
+  now?: Date;
+}): Promise<PaperclipRunBriefSiblings | null> {
+  const { db, companyId } = input;
+  const now = input.now ?? new Date();
+  const runRows = await db
+    .select({
+      id: heartbeatRuns.id,
+      status: heartbeatRuns.status,
+      issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+      createdAt: heartbeatRuns.createdAt,
+      startedAt: heartbeatRuns.startedAt,
+      lastOutputAt: heartbeatRuns.lastOutputAt,
+      trustPreset: heartbeatRunTrustPresetSql,
+    })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        inArray(heartbeatRuns.status, [...PAPERCLIP_RUN_BRIEF_SIBLING_STATUSES]),
+        ne(heartbeatRuns.id, input.runId),
+      ),
+    )
+    // Oldest first, so a capped read keeps the runs that have been live
+    // longest; the count is then a floor, as for blockers.
+    .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+    .limit(RUN_BRIEF_ROW_LIMIT);
+  if (runRows.length === 0) return null;
+  // A context issue id is plain JSON text; only well-formed ids reach the
+  // uuid column, and only issues of this company are read.
+  const issueIds = [
+    ...new Set(
+      runRows.flatMap((row) =>
+        row.issueId && uuidPattern.test(row.issueId) ? [row.issueId] : [],
+      ),
+    ),
+  ];
+  const issueRows = issueIds.length
+    ? await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          title: issues.title,
+        })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds)))
+    : [];
+  const issueById = new Map(issueRows.map((row) => [row.id, row]));
+  return buildRunBriefSiblings(
+    runRows.map((row) => {
+      const issue = row.issueId ? issueById.get(row.issueId) : undefined;
+      return {
+        ...row,
+        issueIdentifier: issue?.identifier ?? null,
+        issueTitle: issue?.title ?? null,
+      };
+    }),
+    {
+      companyId,
+      excludeRunId: input.runId,
+      excludeIssueId: input.excludeIssueId,
+      now,
+    },
+  );
+}
+
 /**
  * The Run Brief of a run without an issue: only the environment (filled in at
- * dispatch) and the company roster.
+ * dispatch), the agent's other live runs and the company roster.
  */
 export async function loadTeamOnlyRunBrief(input: {
   db: Db;
   companyId: string;
   agentId?: string | null;
+  runId?: string | null;
+  /** Attach the agent's other live runs (see `loadRunBriefSiblings`). */
+  includeSiblings?: boolean;
 }): Promise<PaperclipRunBrief | null> {
   const team = await loadRunBriefTeam(input);
-  if (!team) return null;
+  const siblings =
+    input.includeSiblings && input.agentId && input.runId
+      ? await loadRunBriefSiblings({
+          db: input.db,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          runId: input.runId,
+        })
+      : null;
+  if (!team && !siblings) return null;
   return {
     version: 1,
     issueId: null,
@@ -366,7 +536,8 @@ export async function loadTeamOnlyRunBrief(input: {
     pendingInteractionCount: 0,
     pendingInteractions: [],
     priorRuns: [],
-    team,
+    ...(team ? { team } : {}),
+    ...(siblings ? { siblings } : {}),
   };
 }
 
@@ -388,6 +559,8 @@ export async function loadRunBrief(input: {
   exposeLowTrustRaw?: boolean;
   /** Attach the company roster (see `loadRunBriefTeam`). */
   includeTeam?: boolean;
+  /** Attach the agent's other live runs (see `loadRunBriefSiblings`). */
+  includeSiblings?: boolean;
 }): Promise<PaperclipRunBrief> {
   const { db, companyId } = input;
   const issueId = input.issue.id;
@@ -485,6 +658,17 @@ export async function loadRunBrief(input: {
   const team = input.includeTeam
     ? await loadRunBriefTeam({ db, companyId, agentId: input.agentId })
     : null;
+  // Needs the run id: without it the current run would list itself.
+  const siblings =
+    input.includeSiblings && input.agentId && input.runId
+      ? await loadRunBriefSiblings({
+          db,
+          companyId,
+          agentId: input.agentId,
+          runId: input.runId,
+          excludeIssueId: issueId,
+        })
+      : null;
   return {
     version: 1,
     issueId,
@@ -510,6 +694,7 @@ export async function loadRunBrief(input: {
     priorRuns: priorRuns.slice(0, RUN_BRIEF_PRIOR_RUN_LIMIT),
     // After the issue orientation; absent when not requested or empty.
     ...(team ? { team } : {}),
+    ...(siblings ? { siblings } : {}),
   };
 }
 
