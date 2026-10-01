@@ -133,6 +133,50 @@ fetches with it. Details and caveats:
   [deploy/secrets](../../deploy/secrets.md)) so the token reaches the agent process env. The
   same company secret can back both uses via a binding.
 
+## Git credentials for other hosts
+
+The `git` and `gh` commands an agent runs go through Paperclip's managed GitHub launchers whenever
+the agent has a managed GitHub connection, and in sandbox, plugin, and low-trust executions even
+without one. The launchers ignore the host's global and system Git configuration and clear inherited
+`GIT_CONFIG_*` settings, so GitHub only ever sees the managed credential. To let agents clone,
+fetch, or push over HTTPS to another Git host, such as GitLab, add a credential helper scoped to
+that host with Git's `GIT_CONFIG_*` environment variables on the agent, project, or environment,
+and bind the token from a secret:
+
+| Key | Source | Value |
+|---|---|---|
+| `GITLAB_TOKEN` | Secret | the access token |
+| `GIT_CONFIG_COUNT` | Plain | `2` |
+| `GIT_CONFIG_KEY_0` | Plain | `credential.https://gitlab.com.username` |
+| `GIT_CONFIG_VALUE_0` | Plain | `oauth2` |
+| `GIT_CONFIG_KEY_1` | Plain | `credential.https://gitlab.com.helper` |
+| `GIT_CONFIG_VALUE_1` | Plain | `!f() { test "$1" = get && echo "password=$GITLAB_TOKEN"; }; f` |
+
+The helper value is stored as written. Git runs it through `sh` only when it needs credentials for
+`https://gitlab.com`, and the shell reads the token from the environment at that moment, so the
+token is never part of the Git configuration. Answering only `get` makes `store` and `erase`
+requests no-ops.
+
+The launchers keep an entry only when:
+
+- its key is `credential.<url>.helper`, `credential.<url>.username`, or
+  `credential.<url>.useHttpPath` (in any letter case);
+- `<url>` starts with `https://` or `http://` and names a host other than `github.com` or one of
+  its subdomains, without wildcards (`*`) or percent-encoding;
+- its index is below `GIT_CONFIG_COUNT`, and both `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`
+  are set.
+
+Kept entries are renumbered from zero in the agent's environment and applied after the launchers'
+own settings, so each one affects only requests for its host. Everything else is still removed,
+including an unscoped `credential.helper`, any setting scoped to GitHub, `url.<base>.insteadOf`
+rewrites, and `core.askPass`.
+
+- Executions that use the host's own Git credentials (standard-trust local and SSH runs without a
+  managed GitHub connection) have no launchers and pass these variables to Git unchanged.
+- Native runner (`paperclip_runner`) sessions start commands with a fixed environment that does
+  not include agent, project, or environment variables, so a helper there cannot read its token
+  and this setup does not apply.
+
 ## Cross-run persistence (no-remote-git contract)
 
 Code state moves between runs through the local execution-workspace cwd alone — not through a git remote.
