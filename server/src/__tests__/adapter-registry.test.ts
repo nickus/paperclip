@@ -392,10 +392,20 @@ describe("server adapter registry", () => {
       expect(declared(type, { engine: "acp" }), type).toBe(false);
       expect(declared(type), type).toBe(false);
     }
-    // Codex and the ACP engines skip the instructions when they resume with a
-    // wake delta, and Claude Code replays the system prompt a session started
-    // with, so their sessions restart when instructions or skills change.
-    for (const type of ["claude_local", "codex_local", "paperclip_runner", "pi_local", "grok_local"]) {
+    // claude_local's CLI engine checks the prompt bundle its saved session
+    // recorded and re-renders the system prompt (or starts a new session)
+    // when it changed; its ACP engine (the default) does not, and
+    // resetSessionOnPromptChange asks for a new session on any change.
+    expect(declared("claude_local", { engine: "cli" })).toBe(true);
+    expect(declared("claude_local", { engine: "cli", resetSessionOnPromptChange: false })).toBe(true);
+    expect(declared("claude_local", { engine: "cli", resetSessionOnPromptChange: true })).toBe(false);
+    expect(declared("claude_local", { engine: "acp" })).toBe(false);
+    expect(declared("claude_local", { engine: "auto" })).toBe(false);
+    expect(declared("claude_local")).toBe(false);
+    // Codex and the other ACP engines skip the instructions when they resume
+    // with a wake delta, so their sessions restart when instructions or skills
+    // change.
+    for (const type of ["codex_local", "paperclip_runner", "pi_local", "grok_local"]) {
       expect(declared(type, { engine: "cli" }), type).toBe(false);
     }
   });

@@ -22,6 +22,7 @@ import {
   parseSetupTokenPrompt,
   parseSetupTokenCredential,
   claudeStreamJsonTranslator,
+  resolveClaudeExecutionEngine,
 } from "@paperclipai/adapter-claude-local/server";
 import {
   agentConfigurationDoc as claudeAgentConfigurationDoc,
@@ -271,6 +272,16 @@ const claudeLocalAdapter: ServerAdapterModule = {
   listSkills: listClaudeSkills,
   syncSkills: syncClaudeSkills,
   sessionCodec: claudeSessionCodec,
+  // The CLI engine compares the prompt bundle (instructions file, skills) a
+  // saved session recorded with the current one before it resumes. When they
+  // differ it resumes with the system prompt rendered from the current bundle
+  // (--system-prompt-snapshot off), or starts a new session itself where the
+  // installed CLI cannot do that. The ACP engine sends the instructions only to
+  // a new session, and resetSessionOnPromptChange asks for a new session on
+  // every bundle change, so those keep the server-side reset.
+  resumeRedeliversInstructions: (config) =>
+    resolveClaudeExecutionEngine(config).engine === "cli" &&
+    config.resetSessionOnPromptChange !== true,
   sessionManagement: getAdapterSessionManagement("claude_local") ?? undefined,
   models: claudeModels,
   listModels: listClaudeModels,

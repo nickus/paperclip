@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
+import { getServerAdapter } from "../adapters/index.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
@@ -3245,6 +3246,81 @@ describe("task session continuity across configuration changes", () => {
       reasons: ["effective run configuration changed: instructions"],
       carriedOverCategories: [],
     });
+  });
+
+  it("keeps a claude_local CLI session across instruction and skill edits, and resets the ACP engine's", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-continuity-claude-"));
+    const instructionsPath = path.join(root, "AGENTS.md");
+    const skill = (currentVersionId: string) => [
+      {
+        key: "paperclip",
+        runtimeName: "paperclip",
+        source: "/tmp/paperclip/runtime-skills/paperclip",
+        versionId: null,
+        currentVersionId,
+        sourceStatus: "available" as const,
+        missingDetail: null,
+      },
+    ];
+    // Two runs of a claude_local agent with an instructions edit and a skill
+    // update between them, decided the way the heartbeat decides: with the
+    // registered adapter's declaration for the run's effective config.
+    const decideAfterEdit = async (config: Record<string, unknown>) => {
+      const effectiveAdapterConfig = {
+        command: "claude",
+        model: "claude-sonnet-5",
+        instructionsBundleMode: "managed",
+        instructionsRootPath: root,
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: instructionsPath,
+        ...config,
+      };
+      await fs.writeFile(instructionsPath, "First instructions.\n", "utf8");
+      const base = await buildSessionConfigMetadata({
+        adapterType: "claude_local",
+        effectiveAdapterConfig,
+        runtimeSkills: skill("skill-version-1"),
+      });
+      await fs.writeFile(instructionsPath, "Second instructions.\n", "utf8");
+      const next = await buildSessionConfigMetadata({
+        adapterType: "claude_local",
+        effectiveAdapterConfig,
+        runtimeSkills: skill("skill-version-2"),
+      });
+      return resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "claude-sonnet-5",
+        taskSessionParams: sessionParamsWithConfigMetadata(base, "claude-sonnet-5"),
+        configMetadata: next,
+        resetPolicy: resolveTaskSessionConfigResetPolicy({}),
+        resumeRedeliversInstructions: adapterResumeRedeliversInstructions(
+          getServerAdapter("claude_local"),
+          effectiveAdapterConfig,
+        ),
+      });
+    };
+
+    // The CLI engine decides on its own whether the session it is handed can
+    // run on the current instructions and skills, so the session is kept and
+    // the edits are named to the resumed agent.
+    for (const config of [{ engine: "cli" }, { engine: "cli", resetSessionOnPromptChange: false }]) {
+      expect(await decideAfterEdit(config), JSON.stringify(config)).toMatchObject({
+        reset: false,
+        reasons: [],
+        resetPolicy: "breaking",
+        carriedOverCategories: ["instructions", "runtimeSkills"],
+      });
+    }
+    // The ACP engine (also the default when no engine is set) sends the
+    // instructions only to a new session, and resetSessionOnPromptChange asks
+    // for a new session on every instructions or skills change.
+    for (const config of [{}, { engine: "acp" }, { engine: "cli", resetSessionOnPromptChange: true }]) {
+      expect(await decideAfterEdit(config), JSON.stringify(config)).toMatchObject({
+        reset: true,
+        reasons: ["effective run configuration changed: instructions, runtime skills"],
+        carriedOverCategories: [],
+      });
+    }
   });
 
   it("reads an adapter's instruction re-delivery declaration", () => {

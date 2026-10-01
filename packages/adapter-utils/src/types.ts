@@ -501,7 +501,10 @@ export interface ServerAdapterModule {
    * A resumed turn of a saved session receives the agent's current
    * instructions and skills: the adapter sends the instructions file with
    * every prompt, also when it resumes a session with a wake delta, and
-   * installs the current skills before every run.
+   * installs the current skills before every run. An adapter may also
+   * declare it when it checks, before resuming, whether the session already
+   * runs on the current instructions and skills, and either delivers them to
+   * the resumed turn or starts a new session itself.
    *
    * Paperclip keeps a saved task session across most configuration edits by
    * default. An edit to the instructions or skills still starts a fresh
