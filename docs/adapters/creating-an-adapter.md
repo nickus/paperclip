@@ -207,6 +207,8 @@ export const sessionCodec: AdapterSessionCodec = {
 
 With it, a task whose run was stopped or lost continues as a new conversation turn instead of being held for reconciliation: for example after an agent pause that verified the run's process stopped, once the agent is resumed, or after a graceful server restart. The new turn sees the work the stopped run recorded and decides what remains; nothing the stopped run did is replayed. Leave it unset when a retry would re-run a command or re-send a request (as the `process` and `http` adapters do); such runs keep the reconciliation hold. Built-in conversation adapters keep their behavior when the flag is absent, and `false` opts a type out.
 
+Report the provider process through `ctx.onSpawn` (the `runChildProcess` helper does it for you). When the server loses a run after an unplanned restart, it checks whether that recorded process is still alive before treating the run as lost. A live process keeps the run in place until it exits, so no continuation runs beside it on the same session. The check covers local runs and runs on an SSH host, where the recorded process is the SSH client. A run inside a sandbox, or one that reported no process, is treated as lost as before.
+
 ## Capability Flags
 
 Adapters can declare what "local" capabilities they support by setting optional fields on the `ServerAdapterModule`. The server and UI use these flags to decide which features to enable for agents using the adapter (instructions bundle editor, skills sync, JWT auth, etc.).
