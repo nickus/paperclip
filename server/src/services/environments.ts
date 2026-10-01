@@ -35,6 +35,7 @@ import { logActivity } from "./activity-log.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import {
   PENDING_CLEANUP_INTENT_METADATA_KEY,
+  PENDING_CLEANUP_PARKED_AT_METADATA_KEY,
   PENDING_CLEANUP_RELEASE_RUN_STATUS_METADATA_KEY,
   type PendingCleanupIntent,
 } from "./pending-cleanup-intent.js";
@@ -1656,6 +1657,12 @@ export function environmentService(db: Db) {
         pendingCleanupIntent?: PendingCleanupIntent;
         /** The run status a retried "release" reports to the provider. */
         pendingCleanupReleaseRunStatus?: string;
+        /**
+         * The use time to record instead of now. A late retried release keeps
+         * the time its run ended, so it never ranks above a sandbox the task
+         * used in the meantime (resume candidates are ordered by it).
+         */
+        lastUsedAt?: Date;
       },
     ) => {
       const now = new Date();
@@ -1669,6 +1676,9 @@ export function environmentService(db: Db) {
               ...(options.pendingCleanupIntent === "release" && options.pendingCleanupReleaseRunStatus
                 ? { [PENDING_CLEANUP_RELEASE_RUN_STATUS_METADATA_KEY]: options.pendingCleanupReleaseRunStatus }
                 : {}),
+              ...(options.pendingCleanupIntent === "release"
+                ? { [PENDING_CLEANUP_PARKED_AT_METADATA_KEY]: now.toISOString() }
+                : {}),
             }
           : {}),
       };
@@ -1678,7 +1688,7 @@ export function environmentService(db: Db) {
         ? sql`${environmentLeases.metadata}`
         : sql`(${environmentLeases.metadata} - 'remoteExecutionTermination')`;
       if (options?.pendingCleanupIntent || status !== "pending_cleanup") {
-        metadata = sql`(${metadata} - ${PENDING_CLEANUP_INTENT_METADATA_KEY}::text - ${PENDING_CLEANUP_RELEASE_RUN_STATUS_METADATA_KEY}::text)`;
+        metadata = sql`(${metadata} - ${PENDING_CLEANUP_INTENT_METADATA_KEY}::text - ${PENDING_CLEANUP_RELEASE_RUN_STATUS_METADATA_KEY}::text - ${PENDING_CLEANUP_PARKED_AT_METADATA_KEY}::text)`;
       }
       if (Object.keys(patch).length > 0) {
         metadata = sql`coalesce(${metadata}, '{}'::jsonb) || ${JSON.stringify(patch)}::jsonb`;
@@ -1688,7 +1698,7 @@ export function environmentService(db: Db) {
         .set({
           status,
           releasedAt: status === "retained" ? null : now,
-          lastUsedAt: now,
+          lastUsedAt: options?.lastUsedAt ?? now,
           updatedAt: now,
           ...(options?.failureReason !== undefined ? { failureReason: options.failureReason } : {}),
           ...(options?.cleanupStatus !== undefined ? { cleanupStatus: options.cleanupStatus } : {}),

@@ -2,10 +2,10 @@ import { hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, s
 import { readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { sandboxRunPrivatePaths } from "./sandbox-run-private-paths.js";
-import { readPendingCleanupIntent, readPendingCleanupReleaseRunStatus } from "./pending-cleanup-intent.js";
+import { readPendingCleanupIntent, readPendingCleanupParkedAt, readPendingCleanupReleaseRunStatus } from "./pending-cleanup-intent.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
-import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companySecrets, companySecretVersions, environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import type {
@@ -520,7 +520,7 @@ export type PendingSandboxReleaseResult =
   /** The provider tore the sandbox down instead of keeping it. */
   | { outcome: "destroyed"; lease: EnvironmentLease | null }
   /** The release must not run; tear the sandbox down from the recorded lease data. */
-  | { outcome: "not_releasable"; reason: "provider_changed" | "reuse_disabled" | "release_unsupported" };
+  | { outcome: "not_releasable"; reason: "provider_changed" | "reuse_disabled" | "release_unsupported" | "superseded" };
 
 export interface EnvironmentDriverReleaseInput {
   resourceDisposition?: "stop_and_retain";
@@ -705,9 +705,11 @@ export interface EnvironmentRuntimeDriver {
    * while that attempt still owns the lease, so a late result of an older
    * attempt is ignored. Returns `not_releasable` when the release must not
    * run: the environment no longer points at the lease's provider and plugin,
-   * no longer reuses sandboxes, or the plugin worker cannot release. The
-   * caller then tears the sandbox down from the recorded lease data. Throws
-   * when the release fails or the provider does not confirm the stop.
+   * no longer reuses sandboxes, or the plugin worker cannot release, or a run
+   * of the same task has used another sandbox since the lease was parked
+   * (`superseded`). The caller then tears the sandbox down from the recorded
+   * lease data. Throws when the release fails or the provider does not
+   * confirm the stop.
    */
   retryPendingSandboxRelease?(input: { environment: Environment; lease: EnvironmentLease }): Promise<PendingSandboxReleaseResult>;
   /**
@@ -3606,6 +3608,14 @@ function createSandboxEnvironmentDriver(
     if (!pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentReleaseLease")) {
       return { outcome: "not_releasable", reason: "release_unsupported" };
     }
+    // When the run ended. Leases parked before the stamp existed fall back to
+    // their release time, which a failed retry may have moved later.
+    const parkedAt = readPendingCleanupParkedAt(metadata) ?? input.lease.releasedAt ?? input.lease.acquiredAt;
+    // Checked last, right before the release, to keep the window in which a
+    // new run could still take another sandbox as small as possible.
+    if (await taskUsedAnotherSandboxSince(input.environment.id, input.lease, parkedAt)) {
+      return { outcome: "not_releasable", reason: "superseded" };
+    }
 
     const config = await resolvePluginSandboxRuntimeConfig({
       environment: input.environment,
@@ -3642,8 +3652,52 @@ function createSandboxEnvironmentDriver(
       cleanupStatus: "success",
       failureReason: kept ? "pending_cleanup_release_retry" : "pending_cleanup_retry",
       remoteExecutionTermination: termination,
+      // Rank the kept sandbox by when its run ended, not by when this retry
+      // finished, so it never outranks a sandbox the task used since.
+      lastUsedAt: parkedAt,
     });
     return kept ? { outcome: "released", lease } : { outcome: "destroyed", lease };
+  }
+
+  /**
+   * Whether a run of the same task (same company, environment, workspace or
+   * workspace-less issue, agent and adapter) has used another reusable sandbox
+   * since `since`. A parked lease is no resume candidate, so the task's next
+   * run starts or resumes another sandbox, and the agent session and memory
+   * of that run live there. Keeping the parked sandbox now would put the task
+   * back on the older state: the provider removes the idle sandboxes of the
+   * same task when it keeps one, and the next acquire resumes the most
+   * recently used lease.
+   */
+  async function taskUsedAnotherSandboxSince(
+    environmentId: string,
+    lease: EnvironmentLease,
+    since: Date,
+  ): Promise<boolean> {
+    const agentId = readString(lease.metadata?.agentId);
+    if (!agentId || (!lease.executionWorkspaceId && !lease.issueId)) return false;
+    const scope = lease.metadata?.reusableSandboxLease;
+    const adapterType = isRecord(scope) ? scope.adapterType ?? null : null;
+    const rows = await db
+      .select({ providerLeaseId: environmentLeases.providerLeaseId, metadata: environmentLeases.metadata })
+      .from(environmentLeases)
+      .where(and(
+        ne(environmentLeases.id, lease.id),
+        eq(environmentLeases.companyId, lease.companyId),
+        eq(environmentLeases.environmentId, environmentId),
+        eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+        inArray(environmentLeases.status, ["active", "released", "retained"]),
+        lease.executionWorkspaceId
+          ? eq(environmentLeases.executionWorkspaceId, lease.executionWorkspaceId)
+          : and(isNull(environmentLeases.executionWorkspaceId), eq(environmentLeases.issueId, lease.issueId!)),
+        sql`${environmentLeases.metadata}->>'agentId' = ${agentId}`,
+        or(gt(environmentLeases.acquiredAt, since), gt(environmentLeases.lastUsedAt, since)),
+      ));
+    return rows.some((row) => {
+      if (row.providerLeaseId === lease.providerLeaseId) return false;
+      const otherScope = (row.metadata as Record<string, unknown> | null)?.reusableSandboxLease;
+      return isRecord(otherScope) && (otherScope.adapterType ?? null) === adapterType;
+    });
   }
 
   async function destroyReusableSandboxLease(input: {

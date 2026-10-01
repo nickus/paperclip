@@ -19947,8 +19947,15 @@ export function heartbeatService(
               : { outcome: "not_releasable" as const, reason: "release_unsupported" as const };
             if (result.outcome === "not_releasable") {
               // The environment moved to another provider or plugin, or stopped
-              // reusing sandboxes: no later run can resume this one. Tear it
-              // down from the data recorded on the lease.
+              // reusing sandboxes, or the task has moved on to another sandbox:
+              // no later run should resume this one. Tear it down from the data
+              // recorded on the lease.
+              if (result.reason === "superseded") {
+                logger.info(
+                  { leaseId: row.id, environmentId: row.environmentId },
+                  "a newer sandbox of the same task replaced a parked reusable sandbox; tearing the parked one down",
+                );
+              }
               teardown = "recorded";
             } else {
               settled = true;

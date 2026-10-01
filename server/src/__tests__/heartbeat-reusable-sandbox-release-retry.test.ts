@@ -269,9 +269,9 @@ describeEmbeddedPostgres("reusable sandbox leases parked for a release", () => {
       const parked = await leaseRow(lease.id);
       expect(parked).toMatchObject({
         status: "pending_cleanup",
-        metadata: expect.objectContaining({ pendingCleanupIntent: "release" }),
+        metadata: expect.objectContaining({ pendingCleanupIntent: "release", pendingCleanupParkedAt: expect.any(String) }),
       });
-      return { runId, lease };
+      return { runId, lease, parkedAt: new Date(parked!.metadata!.pendingCleanupParkedAt as string) };
     }
 
     return { companyId, agentId, environmentId, issueId, pluginId, worker, runtime, heartbeat, insertRun, startRun, parkedLease };
@@ -292,7 +292,7 @@ describeEmbeddedPostgres("reusable sandbox leases parked for a release", () => {
   describe("the cleanup sweep", () => {
     it("retries the release and keeps the sandbox for the task's next run", async () => {
       const { worker, heartbeat, startRun, parkedLease } = await seed();
-      const { runId, lease } = await parkedLease();
+      const { runId, lease, parkedAt } = await parkedLease();
 
       await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
 
@@ -313,10 +313,69 @@ describeEmbeddedPostgres("reusable sandbox leases parked for a release", () => {
         }),
       });
       expect(released?.metadata).not.toHaveProperty("pendingCleanupIntent");
+      expect(released?.metadata).not.toHaveProperty("pendingCleanupParkedAt");
+      // Ranked by when its run ended, not by when the retry finished.
+      expect(released?.lastUsedAt.getTime()).toBe(parkedAt.getTime());
 
       const next = await startRun();
       expect(next.lease.providerLeaseId).toBe(lease.providerLeaseId);
       expect(next.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", previousRunId: runId });
+    });
+
+    it("tears the parked sandbox down once a later run of the task has used another sandbox", async () => {
+      const { worker, runtime, heartbeat, startRun, parkedLease } = await seed();
+      const { lease: parked } = await parkedLease();
+      // While the lease is parked it is no resume candidate, so the task's next
+      // run starts in a new sandbox, which then holds the task's session.
+      const next = await startRun();
+      expect(next.lease.providerLeaseId).not.toBe(parked.providerLeaseId);
+      await runtime.releaseRunLeases(next.runId, "released");
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, next.runId));
+      expect(worker.sandboxes.get(next.lease.providerLeaseId!)).toBe("idle");
+      const releasesBefore = worker.calls("environmentReleaseLease").length;
+
+      await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+      // A release would keep the older sandbox and let the provider remove the
+      // newer idle one; the parked sandbox is torn down instead.
+      expect(worker.calls("environmentReleaseLease")).toHaveLength(releasesBefore);
+      expect(worker.calls("environmentDestroyLease")).toEqual([
+        expect.objectContaining({ providerLeaseId: parked.providerLeaseId }),
+      ]);
+      expect(worker.sandboxes.has(parked.providerLeaseId!)).toBe(false);
+      expect(worker.sandboxes.get(next.lease.providerLeaseId!)).toBe("idle");
+      expect(await leaseRow(parked.id)).toMatchObject({ status: "expired", cleanupStatus: "success" });
+
+      const third = await startRun();
+      expect(third.lease.providerLeaseId).toBe(next.lease.providerLeaseId);
+      expect(third.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", previousRunId: next.runId });
+    });
+
+    it("keeps the parked sandbox when the task's other sandbox was last used before the run ended", async () => {
+      const { worker, runtime, heartbeat, startRun } = await seed();
+      // Two runs of the task overlap, so each holds its own sandbox. The
+      // second one ends first; the first one's release is then parked.
+      const first = await startRun();
+      const second = await startRun();
+      expect(second.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
+      await runtime.releaseRunLeases(second.runId, "released");
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, second.runId));
+      worker.state.releases.push("throw");
+      await runtime.releaseRunLeases(first.runId, "expired", undefined, undefined, true);
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, first.runId));
+      expect(await leaseRow(first.lease.id)).toMatchObject({ status: "pending_cleanup" });
+
+      await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+      // The first run ended last, so its sandbox holds the newer session.
+      expect(await leaseRow(first.lease.id)).toMatchObject({ status: "released" });
+      expect(worker.sandboxes.get(first.lease.providerLeaseId!)).toBe("idle");
+      expect(worker.calls("environmentDestroyLease")).toEqual([]);
+      const next = await startRun();
+      expect(next.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
     });
 
     it("defers the release while the plugin worker is down without using up an attempt", async () => {

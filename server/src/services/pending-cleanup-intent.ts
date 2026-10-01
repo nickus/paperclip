@@ -20,6 +20,14 @@ export type PendingCleanupIntent = "release" | "destroy";
 export const PENDING_CLEANUP_INTENT_METADATA_KEY = "pendingCleanupIntent";
 /** The run status a retried release reports to the provider (see releaseRunLease). */
 export const PENDING_CLEANUP_RELEASE_RUN_STATUS_METADATA_KEY = "pendingCleanupReleaseRunStatus";
+/**
+ * When the lease was parked for a release (ISO time). The cleanup sweep's
+ * claims and failed attempts move the lease's own timestamps, so the retry
+ * reads this to tell whether the task used another sandbox since the run
+ * ended, and to rank a kept sandbox by when its run ended, not by when the
+ * retry finished.
+ */
+export const PENDING_CLEANUP_PARKED_AT_METADATA_KEY = "pendingCleanupParkedAt";
 
 export function readPendingCleanupIntent(
   metadata: Record<string, unknown> | null | undefined,
@@ -33,4 +41,13 @@ export function readPendingCleanupReleaseRunStatus(
 ): "released" | "expired" | "failed" | null {
   const value = metadata?.[PENDING_CLEANUP_RELEASE_RUN_STATUS_METADATA_KEY];
   return value === "released" || value === "expired" || value === "failed" ? value : null;
+}
+
+export function readPendingCleanupParkedAt(
+  metadata: Record<string, unknown> | null | undefined,
+): Date | null {
+  const value = metadata?.[PENDING_CLEANUP_PARKED_AT_METADATA_KEY];
+  if (typeof value !== "string") return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
