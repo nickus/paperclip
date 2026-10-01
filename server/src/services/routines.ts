@@ -301,9 +301,48 @@ function isSubHourlyCronExpression(expression: string, timeZone: string, after: 
   return true;
 }
 
+function routineFiringSourceLabel(source: "schedule" | "manual" | "api" | "webhook" | string) {
+  switch (source) {
+    case "schedule":
+      return "scheduled trigger";
+    case "manual":
+      return "manual run";
+    case "webhook":
+      return "webhook trigger";
+    case "api":
+      return "API dispatch";
+    default:
+      return source;
+  }
+}
+
+function formatRoutineFiringVariablesNote(variables: Record<string, unknown> | null | undefined) {
+  const entries = Object.entries(variables ?? {});
+  if (entries.length === 0) return "none";
+  return entries
+    .map(([name, value]) => `${name}=${stringifyRoutineVariableValue(value)}`)
+    .join(", ");
+}
+
+/**
+ * The FYI comment posted on an issue that a new firing coalesced into. Keeps
+ * the assignee from quietly working two parallel copies of the same routine
+ * when a later firing (often with different variables) lands on an issue
+ * that is still open from an earlier one.
+ */
+function buildRoutineRefiredNote(input: {
+  source: "schedule" | "manual" | "api" | "webhook";
+  triggeredAt: Date;
+  variables: Record<string, unknown> | null | undefined;
+}) {
+  const sourceLabel = routineFiringSourceLabel(input.source);
+  const variablesText = formatRoutineFiringVariablesNote(input.variables);
+  return `This routine fired again (${sourceLabel}, ${input.triggeredAt.toISOString()}, variables ${variablesText}) while this issue is still open; continue here instead of starting a parallel review.`;
+}
+
 function nextResultText(status: string, issueId?: string | null) {
   if (status === "issue_created" && issueId) return `Created execution issue ${issueId}`;
-  if (status === "coalesced") return "Coalesced into an existing live execution issue";
+  if (status === "coalesced") return "Coalesced into an existing open execution issue";
   if (status === "skipped_paused") return "Skipped because the project is paused";
   if (status === "skipped") return "Skipped because a live execution issue already exists";
   if (status === "completed") return "Execution issue completed";
@@ -1571,6 +1610,54 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
   }
 
+  /**
+   * Fallback for coalesce_if_active / skip_if_active, tried only once
+   * findLiveExecutionIssue (fingerprint + live-run) finds nothing: any OPEN
+   * issue (not done/cancelled) at this routine's own dedicated origin is
+   * still a coalescing target, regardless of dispatch fingerprint and
+   * regardless of whether a heartbeat run is currently live on it.
+   *
+   * findLiveExecutionIssue requires both a matching fingerprint and a live
+   * execution run, which misses the common case where the issue's run
+   * finished (e.g. moved the issue to in_review or blocked waiting on a
+   * human) but the issue itself is still open: a later firing — often with
+   * different variables, e.g. a manual run followed by the next scheduled
+   * tick — would otherwise open a second, parallel issue the assignee has no
+   * reason to know about. Because this path only runs when the fingerprint
+   * and/or liveness differs from what the routine last dispatched, the
+   * caller treats a match here as worth an FYI note to the assignee, unlike
+   * the silent, already-handled findLiveExecutionIssue match.
+   *
+   * Only called when this routine dispatches to its own origin id (the
+   * default: origin id === routine id). A managed/plugin routine whose issue
+   * template points `originId` at a shared value — e.g. the same plugin
+   * operation bound into more than one project — keeps the old fingerprint +
+   * live-run matching from findLiveExecutionIssue instead (see the dispatch
+   * call sites below): broadening there could coalesce a different project's
+   * firing into this one's issue just because they share that origin id.
+   */
+  async function findCoalescableOpenIssue(
+    routine: typeof routines.$inferSelect,
+    executor: Db = db,
+    origin: { kind: string; id: string },
+  ) {
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, origin.kind),
+          eq(issues.originId, origin.id),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          visibleIssueCondition(),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
     return executor
       .update(routineRuns)
@@ -1786,7 +1873,17 @@ export function routineService(
       description,
     });
     let reusedExistingRun = false;
-    const run = await db.transaction(async (tx) => {
+    type RefireNoteTarget = { id: string; assigneeAgentId: string | null; status: string } | null;
+    // The transaction returns its routine-run row alongside an optional
+    // refire-note target instead of mutating an outer variable from inside
+    // settleOnExistingIssue: see that function's comment for why the note
+    // itself has to wait until after the transaction commits, and keeping
+    // the hand-off as this call's return value (rather than a closed-over
+    // `let`) is also just more obviously correct here.
+    const { run, refireNoteTarget } = await db.transaction(async (tx): Promise<{
+      run: typeof routineRuns.$inferSelect;
+      refireNoteTarget: RefireNoteTarget;
+    }> => {
       const txDb = tx as unknown as Db;
       await tx.execute(
         sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
@@ -1821,7 +1918,7 @@ export function routineService(
             throw conflict("Webhook replay detected");
           }
           reusedExistingRun = true;
-          return existing;
+          return { run: existing, refireNoteTarget: null };
         }
       }
 
@@ -1870,6 +1967,64 @@ export function routineService(
           ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
           : undefined;
 
+      // Settles this run against an already-open issue instead of creating a
+      // new one: finalizes the run as "coalesced" or "skipped" and updates
+      // the routine/trigger bookkeeping. `postRefiredNote` is true only for
+      // a match that the original fingerprint + live-run check
+      // (findLiveExecutionIssue) would have missed — the silent,
+      // already-handled case stays silent.
+      //
+      // The FYI note itself is NOT posted here. This runs inside the dispatch
+      // transaction, which still holds its `for update` lock on the routine
+      // row and, once this function's own update below touches the issue
+      // row, a lock on that too; queueing the assignee wakeup from in here
+      // can make the wakeup's own issue read/write (a separate connection)
+      // wait on this same uncommitted row while this transaction waits on
+      // the wakeup call to return — a self-deadlock. Instead this hands the
+      // target back as part of the return value, and the caller posts the
+      // note once the transaction has committed.
+      const settleOnExistingIssue = async (
+        existingIssue: typeof issues.$inferSelect,
+        options: { postRefiredNote: boolean },
+      ): Promise<{ run: typeof routineRuns.$inferSelect; refireNoteTarget: RefireNoteTarget }> => {
+        const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+        if (manualRunnerUserId) {
+          await touchIssueForUserInbox(txDb, {
+            companyId: input.routine.companyId,
+            issueId: existingIssue.id,
+            userId: manualRunnerUserId,
+            touchedAt: triggeredAt,
+          });
+        }
+        const refireNoteTarget: RefireNoteTarget = status === "coalesced" && options.postRefiredNote
+          ? {
+            id: existingIssue.id,
+            assigneeAgentId: existingIssue.assigneeAgentId,
+            status: existingIssue.status,
+          }
+          : null;
+        const updated = await finalizeRun(createdRun.id, {
+          status,
+          linkedIssueId: existingIssue.id,
+          coalescedIntoRunId: existingIssue.originRunId,
+          completedAt: triggeredAt,
+        }, txDb);
+        await updateRoutineTouchedState({
+          routineId: input.routine.id,
+          triggerId: input.trigger?.id ?? null,
+          triggeredAt,
+          status,
+          issueId: existingIssue.id,
+          nextRunAt,
+        }, txDb);
+        return { run: updated ?? createdRun, refireNoteTarget };
+      };
+
+      // Issues dispatched to a shared/managed origin (issueOriginId overridden
+      // away from the routine's own id — see findCoalescableOpenIssue's
+      // comment) keep the narrower fingerprint + live-run matching below.
+      const dispatchesToOwnOrigin = issueOriginId === input.routine.id;
+
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
@@ -1877,30 +2032,17 @@ export function routineService(
           id: issueOriginId,
         });
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
-          const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          if (manualRunnerUserId) {
-            await touchIssueForUserInbox(txDb, {
-              companyId: input.routine.companyId,
-              issueId: activeIssue.id,
-              userId: manualRunnerUserId,
-              touchedAt: triggeredAt,
-            });
-          }
-          const updated = await finalizeRun(createdRun.id, {
-            status,
-            linkedIssueId: activeIssue.id,
-            coalescedIntoRunId: activeIssue.originRunId,
-            completedAt: triggeredAt,
-          }, txDb);
-          await updateRoutineTouchedState({
-            routineId: input.routine.id,
-            triggerId: input.trigger?.id ?? null,
-            triggeredAt,
-            status,
-            issueId: activeIssue.id,
-            nextRunAt,
-          }, txDb);
-          return updated ?? createdRun;
+          return await settleOnExistingIssue(activeIssue, { postRefiredNote: false });
+        }
+
+        const coalescableIssue = input.routine.concurrencyPolicy === "always_enqueue" || !dispatchesToOwnOrigin
+          ? null
+          : await findCoalescableOpenIssue(input.routine, txDb, {
+            kind: issueOriginKind,
+            id: issueOriginId,
+          });
+        if (coalescableIssue) {
+          return await settleOnExistingIssue(coalescableIssue, { postRefiredNote: true });
         }
 
         try {
@@ -1939,35 +2081,19 @@ export function routineService(
             throw error;
           }
 
+          // This insert only loses the open-execution unique-index race when
+          // the broadened matcher above didn't apply (a shared/managed
+          // origin — see findCoalescableOpenIssue's comment) or another
+          // dispatch won it between our check and this insert. Either way
+          // the index itself is fingerprint-scoped, so the fallback lookup
+          // here stays fingerprint + live-run based to match what it just
+          // collided with.
           const existingIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
             kind: issueOriginKind,
             id: issueOriginId,
           });
           if (!existingIssue) throw error;
-          const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          if (manualRunnerUserId) {
-            await touchIssueForUserInbox(txDb, {
-              companyId: input.routine.companyId,
-              issueId: existingIssue.id,
-              userId: manualRunnerUserId,
-              touchedAt: triggeredAt,
-            });
-          }
-          const updated = await finalizeRun(createdRun.id, {
-            status,
-            linkedIssueId: existingIssue.id,
-            coalescedIntoRunId: existingIssue.originRunId,
-            completedAt: triggeredAt,
-          }, txDb);
-          await updateRoutineTouchedState({
-            routineId: input.routine.id,
-            triggerId: input.trigger?.id ?? null,
-            triggeredAt,
-            status,
-            issueId: existingIssue.id,
-            nextRunAt,
-          }, txDb);
-          return updated ?? createdRun;
+          return await settleOnExistingIssue(existingIssue, { postRefiredNote: false });
         }
 
         // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
@@ -1992,7 +2118,7 @@ export function routineService(
           issueId: createdIssue.id,
           nextRunAt,
         }, txDb);
-        return updated ?? createdRun;
+        return { run: updated ?? createdRun, refireNoteTarget: null };
       } catch (error) {
         if (createdIssue) {
           await txDb.delete(issues).where(eq(issues.id, createdIssue.id));
@@ -2010,9 +2136,38 @@ export function routineService(
           status: "failed",
           nextRunAt,
         }, txDb);
-        return failed ?? createdRun;
+        return { run: failed ?? createdRun, refireNoteTarget: null };
       }
     });
+
+    // Posted after the dispatch transaction committed (see
+    // settleOnExistingIssue's comment) so queueing the assignee wakeup can
+    // freely read/write the issue without waiting on a lock this function
+    // itself still held.
+    if (refireNoteTarget) {
+      try {
+        const note = buildRoutineRefiredNote({
+          source: input.source,
+          triggeredAt: run.triggeredAt,
+          variables: resolvedVariables,
+        });
+        const comment = await issueSvc.addComment(refireNoteTarget.id, note, {}, { authorType: "system" });
+        await queueIssueAssignmentWakeup({
+          heartbeat,
+          issue: refireNoteTarget,
+          reason: "routine_refired_while_open",
+          mutation: "comment",
+          contextSource: "routine.dispatch",
+          wakeCommentId: comment.id,
+          requestedByActorType: input.source === "schedule" ? "system" : undefined,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, routineId: input.routine.id, issueId: refireNoteTarget.id },
+          "failed to post routine re-fire note on coalesced issue",
+        );
+      }
+    }
 
     if (!reusedExistingRun && (input.source === "schedule" || input.source === "webhook")) {
       const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";
