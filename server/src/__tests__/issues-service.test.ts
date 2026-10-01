@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { asc, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
+  agentWakeupRequests,
   companies,
   companyMemberships,
   createDb,
@@ -42,6 +43,7 @@ import {
   ISSUE_LIST_MAX_LIMIT,
   issueService,
 } from "../services/issues.ts";
+import { ISSUE_BLOCKERS_CANCELLED_WAKE_REASON } from "../services/issue-dependency-wakeups.ts";
 import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -3986,6 +3988,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await db.delete(issueRelations);
     await db.delete(issueInboxArchives);
     await db.delete(activityLog);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(workspaceOperations);
     await db.delete(executionWorkspaces);
@@ -4854,10 +4857,182 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
           issueId: blockerId,
           identifier: "PAP-1",
           title: "Blocker",
+          status: "todo",
           reason: "not_done",
         }],
       },
     });
+  });
+
+  async function seedBoardOverrideBlockerScenario(blockerStatus: "cancelled" | "todo") {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const blockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId,
+        identifier: "PAP-900",
+        title: "Blocker",
+        status: blockerStatus,
+        priority: "medium",
+        ...(blockerStatus === "cancelled" ? { cancelledAt: new Date() } : {}),
+      },
+      {
+        id: blockedId,
+        companyId,
+        title: "Board-driven task",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await svc.update(blockedId, { blockedByIssueIds: [blockerId] });
+    return { companyId, assigneeAgentId, blockerId, blockedId };
+  }
+
+  it("lets a board actor proceed past a blocker that was cancelled, detaching it", async () => {
+    const { companyId, assigneeAgentId, blockerId, blockedId } =
+      await seedBoardOverrideBlockerScenario("cancelled");
+
+    const updated = await svc.update(blockedId, {
+      status: "in_progress",
+      actorUserId: "local-board",
+    });
+    expect(updated?.status).toBe("in_progress");
+    expect(updated?.blockedByIssueIds).toEqual([]);
+
+    // The relation is removed; the cancelled blocker issue itself is untouched.
+    await expect(
+      db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, blockedId)),
+    ).resolves.toEqual([]);
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, blockerId)),
+    ).resolves.toEqual([{ status: "cancelled" }]);
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.blockers_detached")));
+    expect(activity).toHaveLength(1);
+    expect(activity[0]?.entityId).toBe(blockedId);
+    expect(activity[0]?.details).toMatchObject({
+      blockerIssueIds: [blockerId],
+      reason: "cancelled_blocker_overridden_by_board",
+    });
+
+    // sanity: assigneeAgentId stayed on the agent that was already assigned.
+    const persisted = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, blockedId));
+    expect(persisted[0]?.assigneeAgentId).toBe(assigneeAgentId);
+  });
+
+  it("resolves a pending cancelled-blocker decision wake once the board detaches the blocker", async () => {
+    const { companyId, assigneeAgentId, blockerId, blockedId } =
+      await seedBoardOverrideBlockerScenario("cancelled");
+    const [wake] = await db
+      .insert(agentWakeupRequests)
+      .values({
+        companyId,
+        agentId: assigneeAgentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: ISSUE_BLOCKERS_CANCELLED_WAKE_REASON,
+        status: "queued",
+        payload: { issueId: blockedId, cancelledBlockerIssueIds: [blockerId] },
+      })
+      .returning();
+
+    await svc.update(blockedId, { status: "in_progress", actorUserId: "local-board" });
+
+    const resolved = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wake!.id))
+      .then((rows) => rows[0]);
+    expect(resolved?.status).toBe("cancelled");
+    expect(resolved?.finishedAt).not.toBeNull();
+  });
+
+  it("still rejects a board actor when a remaining blocker is not cancelled", async () => {
+    const { blockerId, blockedId } = await seedBoardOverrideBlockerScenario("todo");
+
+    await expect(
+      svc.update(blockedId, { status: "in_progress", actorUserId: "local-board" }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        unresolvedBlockerIssueIds: [blockerId],
+        unresolvedBlockers: [{
+          issueId: blockerId,
+          status: "todo",
+          reason: "not_done",
+        }],
+      },
+    });
+
+    // Nothing was detached.
+    await expect(
+      db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, blockedId)),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("keeps the 422 for an agent actor on a cancelled blocker, but explains how to resolve it", async () => {
+    const { assigneeAgentId, blockerId, blockedId } =
+      await seedBoardOverrideBlockerScenario("cancelled");
+
+    await expect(
+      svc.update(blockedId, { status: "in_progress", actorAgentId: assigneeAgentId }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        unresolvedBlockerIssueIds: [blockerId],
+        unresolvedBlockers: [{
+          issueId: blockerId,
+          status: "cancelled",
+          reason: "cancelled",
+          guidance: expect.stringContaining(`PATCH /api/issues/${blockedId}`),
+        }],
+      },
+    });
+    await expect(
+      svc.checkout(blockedId, assigneeAgentId, ["todo", "blocked"], null),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        unresolvedBlockers: [{
+          issueId: blockerId,
+          status: "cancelled",
+          reason: "cancelled",
+        }],
+      },
+    });
+
+    // The agent path never detaches the relation; only a board actor's
+    // explicit status change counts as the decision.
+    await expect(
+      db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, blockedId)),
+    ).resolves.toHaveLength(1);
   });
 
   it("wakes parents only when all direct children are terminal", async () => {
