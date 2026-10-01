@@ -294,6 +294,16 @@ export const WATCHDOG_DEFAULT_MANDATE = [
   "- Keep the work moving. Do not loop on the same unchanged state.",
 ].join("\n");
 
+// The exact request bodies that record an execution-policy review/approval
+// decision. A reviewer/approver wake renders this so the participant never
+// has to guess the shape; see issue-execution-policy.ts's STAGE_DECISION_COMMENT_HINT
+// for the server-side rule this describes.
+export const EXECUTION_REVIEW_DECISION_RECIPE_LINES = [
+  "How to record your review decision (both fields must be in the same PATCH; a comment alone, or a prior comment, records nothing):",
+  '- Approve: PATCH /issues/{issueId} { "status": "done", "comment": "<your verdict>" }',
+  '- Request changes: PATCH /issues/{issueId} { "status": "in_progress", "comment": "<your verdict>" } — any status other than "in_review" hands the issue back to the stored return assignee',
+];
+
 type PaperclipWakeTaskWatchdogLeaf = {
   id: string | null;
   identifier: string | null;
@@ -862,6 +872,11 @@ type PaperclipWakePayload = {
   documentReviewContext: PaperclipWakeDocumentReviewContext | null;
   dispositionRepair: PaperclipWakeLivenessContinuation | null;
   livenessContinuation: PaperclipWakeLivenessContinuation | null;
+  // Set when this wake follows a run that ended (successfully or not) while
+  // the woken agent was still the execution-review stage's current
+  // participant and recorded no decision. `instruction` names the concrete
+  // next step; the prompt renders it in place of the generic reviewer intro.
+  reviewParticipantRecovery: PaperclipWakeLivenessContinuation | null;
   taskWatchdog: PaperclipWakeTaskWatchdogContext | null;
   interactionId: string | null;
   sourceRunId: string | null;
@@ -1830,6 +1845,9 @@ export function normalizePaperclipWakePayload(
   const livenessContinuation = normalizePaperclipWakeLivenessContinuation(
     payload.livenessContinuation,
   );
+  const reviewParticipantRecovery = normalizePaperclipWakeLivenessContinuation(
+    payload.reviewParticipantRecovery,
+  );
   const taskWatchdog = normalizePaperclipWakeTaskWatchdog(payload.taskWatchdog);
   const recovery = normalizePaperclipWakeRecovery(payload.recovery);
   const childIssueSummaries = Array.isArray(payload.childIssueSummaries)
@@ -1911,6 +1929,7 @@ export function normalizePaperclipWakePayload(
     !documentReviewContext &&
     !dispositionRepair &&
     !livenessContinuation &&
+    !reviewParticipantRecovery &&
     !taskWatchdog &&
     !checkboxSelection &&
     !questionResponse &&
@@ -1966,6 +1985,7 @@ export function normalizePaperclipWakePayload(
     annotationDeltas,
     dispositionRepair,
     livenessContinuation,
+    reviewParticipantRecovery,
     taskWatchdog,
     interactionId: asString(payload.interactionId, "").trim() || null,
     sourceRunId: asString(payload.sourceRunId, "").trim() || null,
@@ -2090,6 +2110,7 @@ function hasNormalizedPaperclipExternalChatContext(
     normalized.documentReviewContext ||
     normalized.dispositionRepair ||
     normalized.livenessContinuation ||
+    normalized.reviewParticipantRecovery ||
     normalized.taskWatchdog ||
     normalized.skillTest ||
     normalized.interactionKind ||
@@ -2173,6 +2194,7 @@ function isNormalizedPaperclipExternalChatQuestionResponseTurn(
     normalized.documentReviewContext ||
     normalized.dispositionRepair ||
     normalized.livenessContinuation ||
+    normalized.reviewParticipantRecovery ||
     normalized.taskWatchdog ||
     normalized.skillTest ||
     normalized.checkboxSelection ||
@@ -3125,13 +3147,22 @@ function renderPaperclipWakePromptBody(
       executionStage.wakeRole === "reviewer" ||
       executionStage.wakeRole === "approver"
     ) {
-      lines.push(
-        `You are waking as the active ${executionStage.wakeRole} for this issue.`,
-        "Do not execute the task itself or continue executor work.",
-        "Review the issue and choose one of the allowed actions above.",
-        "If you request changes, the workflow routes back to the stored return assignee.",
-        "",
-      );
+      // The participant-recovery section below already states the explicit
+      // "previous run ended without a decision" framing and the recipe, so a
+      // re-wake that carries both this executionStage (forwarded from the
+      // original wake) and reviewParticipantRecovery skips the generic
+      // first-time intro here rather than repeating the recipe twice.
+      if (!normalized.reviewParticipantRecovery) {
+        lines.push(
+          `You are waking as the active ${executionStage.wakeRole} for this issue.`,
+          "Do not execute the task itself or continue executor work.",
+          "Review the issue and choose one of the allowed actions above.",
+          "If you request changes, the workflow routes back to the stored return assignee.",
+          "",
+          ...EXECUTION_REVIEW_DECISION_RECIPE_LINES,
+          "",
+        );
+      }
     } else if (executionStage.wakeRole === "executor") {
       lines.push(
         "You are waking because changes were requested in the execution workflow.",
@@ -3139,6 +3170,25 @@ function renderPaperclipWakePromptBody(
         "",
       );
     }
+  }
+
+  if (normalized.reviewParticipantRecovery) {
+    // Rendered independently of executionStage: the review-participant
+    // recovery run's own contextSnapshot (queueReviewParticipantRecoveryRun)
+    // carries this instruction without re-sending the stage's wakeRole, so
+    // this section must stand on its own rather than nest inside the
+    // executionStage block above.
+    const recovery = normalized.reviewParticipantRecovery;
+    lines.push(
+      "",
+      `The previous run for this execution-review stage ended without recording a decision` +
+        `${recovery.sourceRunId ? ` (run ${recovery.sourceRunId})` : ""}, while you were still the current participant.`,
+      recovery.instruction ??
+        "Record a decision now using the recipe below, or leave a comment naming who must act if you cannot.",
+      "",
+      ...EXECUTION_REVIEW_DECISION_RECIPE_LINES,
+      "",
+    );
   }
 
   if (normalized.taskWatchdog) {
