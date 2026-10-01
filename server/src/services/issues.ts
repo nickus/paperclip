@@ -248,12 +248,18 @@ const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = [
   "issue.tree_hold_wakeup_deferred",
 ] as const;
 
-export type IssuePostCommitAction = {
-  type: "cancel_native_question_run";
-  runId: string;
-  issueId: string;
-  issueStatus: string;
-};
+export type IssuePostCommitAction =
+  | {
+      type: "cancel_native_question_run";
+      runId: string;
+      issueId: string;
+      issueStatus: string;
+    }
+  | {
+      type: "cancel_cancelled_blocker_wake_run";
+      runId: string;
+      issueId: string;
+    };
 
 /** Execute side effects that must never run before the issue transaction commits. */
 export async function executeIssuePostCommitActions(
@@ -268,23 +274,38 @@ export async function executeIssuePostCommitActions(
     if (cancelledRunIds.has(action.runId)) continue;
     cancelledRunIds.add(action.runId);
     try {
-      await heartbeat.cancelRun(
-        action.runId,
-        "Task closed while waiting for operator input",
-        {
-          resultJson: {
-            cancelledByIssueStatus: action.issueStatus,
-            cancelledIssueId: action.issueId,
+      if (action.type === "cancel_native_question_run") {
+        await heartbeat.cancelRun(
+          action.runId,
+          "Task closed while waiting for operator input",
+          {
+            resultJson: {
+              cancelledByIssueStatus: action.issueStatus,
+              cancelledIssueId: action.issueId,
+            },
           },
-        },
-      );
+        );
+      } else {
+        // Only ever closes a still-`queued` run: a decision wake's run that
+        // got claimed between the issue transaction committing and this
+        // post-commit action running is already an agent acting on it, and
+        // must run to its own conclusion instead of being torn down here.
+        await heartbeat.cancelRun(
+          action.runId,
+          "Cancelled: a board actor's status change already resolved this issue's cancelled blockers",
+          {
+            resultJson: { cancelledIssueId: action.issueId },
+            allowedFromStatuses: ["queued"],
+          },
+        );
+      }
     } catch (err) {
       // The durable marker written by the issue transaction remains available
       // to startup and periodic recovery. Do not report a post-commit failure
       // as though the already-committed issue transition had rolled back.
       logger.warn(
         { err, runId: action.runId, issueId: action.issueId },
-        "native question cancellation deferred to recovery sweep",
+        "issue post-commit run cancellation deferred to recovery sweep",
       );
     }
   }
@@ -10734,6 +10755,15 @@ export function issueService(db: Db) {
         actorRunStopId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
+        // Set only by the PATCH /issues/:id route, and only when the
+        // authenticated caller is a board user (`req.actor.type === "board"`,
+        // surfaced as `actorType: "user"` by `getActorInfo`). This is the
+        // single signal that the status change past all-cancelled blockers
+        // below is the human decision the cancelled-blocker wake exists to
+        // ask for — never derived from `actorUserId`, which a plugin (or any
+        // other non-route caller forwarding a patch) can set to an arbitrary
+        // string with no agent id attached.
+        cancelledBlockerOverride?: boolean;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10781,6 +10811,7 @@ export function issueService(db: Db) {
         actorRunStopId,
         actorUserId,
         companyGuard,
+        cancelledBlockerOverride,
         ...issueData
       } = data;
       // Reassigned below only when a board actor's explicit status change
@@ -10926,11 +10957,19 @@ export function issueService(db: Db) {
           // decision instead of bouncing the same 422 back forever. Any
           // blocker that is still open/in progress/blocked/in review keeps
           // the hard stop for everyone, board included.
-          const isBoardActor = Boolean(actorUserId) && !actorAgentId;
+          //
+          // Gated on the explicit `cancelledBlockerOverride` flag, not on
+          // `actorUserId` being present: `actorUserId` is caller-supplied
+          // (the PATCH route sets it to the authenticated user, but a plugin
+          // relaying its own `patch.actorUserId`, or any other internal
+          // caller forwarding an id it never verified, could set it to
+          // anything with no agent id attached). Only the route sets the
+          // flag, and only when its own authenticated actor is a board user.
+          const boardOverrideRequested = Boolean(cancelledBlockerOverride);
           const allUnresolvedBlockersCancelled = unresolvedBlockers.every(
             (blocker) => blocker.reason === "cancelled",
           );
-          if (!isBoardActor || !allUnresolvedBlockersCancelled) {
+          if (!boardOverrideRequested || !allUnresolvedBlockersCancelled) {
             throw unprocessable("Issue is blocked by unresolved blockers", {
               unresolvedBlockerIssueIds,
               unresolvedBlockers,
@@ -11317,14 +11356,29 @@ export function issueService(db: Db) {
           });
           // The board actor's status change already made the decision the
           // cancelled-blocker wake was asking for; close out any copy of
-          // that wake still waiting to be delivered so it does not later
-          // tell someone to decide on blockers that no longer hold this
-          // issue.
-          await resolveIssueBlockersCancelledWakeupsForIssue(tx, {
-            companyId: updated.companyId,
-            dependentIssueId: updated.id,
-            reason: "cancelled_blocker_overridden_by_board",
-          });
+          // that wake still waiting to be delivered — and the queued run
+          // the normal enqueue path already attached to it — so neither
+          // later tells someone to decide on blockers that no longer hold
+          // this issue.
+          const resolvedCancelledBlockerWakes =
+            await resolveIssueBlockersCancelledWakeupsForIssue(tx, {
+              companyId: updated.companyId,
+              dependentIssueId: updated.id,
+              reason: "cancelled_blocker_overridden_by_board",
+            });
+          for (const wake of resolvedCancelledBlockerWakes) {
+            if (!wake.runId) continue;
+            if (dbOrTx !== db && !postCommitActions) {
+              throw new Error(
+                "Resolving a cancelled-blocker wake's queued run in an external transaction requires a post-commit action queue",
+              );
+            }
+            queuedPostCommitActions.push({
+              type: "cancel_cancelled_blocker_wake_run",
+              runId: wake.runId,
+              issueId: updated.id,
+            });
+          }
         }
         if (
           issueData.executionWorkspaceSettings !== undefined &&

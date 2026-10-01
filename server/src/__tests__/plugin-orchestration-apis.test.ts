@@ -311,6 +311,51 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     ).rejects.toThrow("Plugin may only use originKind values under plugin:paperclip.missions");
   });
 
+  it("does not let a plugin step an issue past a cancelled blocker by forwarding actorUserId", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Blocker",
+      status: "cancelled",
+      priority: "medium",
+      identifier: `${issuePrefix(companyId)}-blocker`,
+      cancelledAt: new Date(),
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const issue = await services.issues.create({
+      companyId,
+      title: "Plugin-owned task",
+      status: "todo",
+      assigneeAgentId: agentId,
+      blockedByIssueIds: [blockerIssueId],
+      actorAgentId: agentId,
+    });
+
+    // A plugin only ever declares the `issues.update` capability — there is
+    // no separate, harder-to-get capability for stepping past all-cancelled
+    // blockers — and host services only validate that `actorUserId` names a
+    // real active human member, never that the plugin's own call is backed
+    // by one. Sending it anyway must not unlock the board-only override.
+    await expect(
+      services.issues.update({
+        issueId: issue.id,
+        companyId,
+        patch: { status: "in_progress", actorUserId: "some-human-user-id" },
+      }),
+    ).rejects.toMatchObject({ status: 422 });
+
+    const [relation] = await db
+      .select()
+      .from(issueRelations)
+      .where(and(eq(issueRelations.issueId, blockerIssueId), eq(issueRelations.relatedIssueId, issue.id)));
+    expect(relation?.type).toBe("blocks");
+    const [stored] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issue.id));
+    expect(stored?.status).toBe("todo");
+  });
+
   it("creates plugin operation issues with the generic operation origin", async () => {
     const { companyId } = await seedCompanyAndAgent();
     const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());

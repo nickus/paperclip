@@ -1959,6 +1959,11 @@ export function buildHostServices(
         delete patch.actorAgentId;
         delete patch.actorUserId;
         delete patch.actorRunId;
+        // Never forwarded, regardless of what the plugin sends: stepping past
+        // all-cancelled blockers is an authenticated board actor's decision,
+        // opted into only by the PATCH /issues/:id route. A plugin has no
+        // route-verified board actor behind it, however it fills actorUserId.
+        delete patch.cancelledBlockerOverride;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }

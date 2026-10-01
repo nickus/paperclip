@@ -14,6 +14,7 @@ import {
   environments,
   executionWorkspaces,
   goals,
+  heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
   issueComments,
@@ -3988,6 +3989,12 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await db.delete(issueRelations);
     await db.delete(issueInboxArchives);
     await db.delete(activityLog);
+    // heartbeat_run_events FKs into heartbeat_runs, which FKs into
+    // agent_wakeup_requests (wakeup_request_id) — delete in that order.
+    // Some tests above seed a wake with a queued run attached and cancel it,
+    // which writes a lifecycle event row for the run.
+    await db.delete(heartbeatRunEvents);
+    await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(workspaceOperations);
@@ -4916,6 +4923,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const updated = await svc.update(blockedId, {
       status: "in_progress",
       actorUserId: "local-board",
+      cancelledBlockerOverride: true,
     });
     expect(updated?.status).toBe("in_progress");
     expect(updated?.blockedByIssueIds).toEqual([]);
@@ -4947,7 +4955,43 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(persisted[0]?.assigneeAgentId).toBe(assigneeAgentId);
   });
 
-  it("resolves a pending cancelled-blocker decision wake once the board detaches the blocker", async () => {
+  it("rejects a plugin-style actor that only supplies actorUserId, without the board override flag", async () => {
+    const { blockerId, blockedId } = await seedBoardOverrideBlockerScenario("cancelled");
+
+    // A plugin with only the `issues.update` capability can set
+    // `patch.actorUserId` to any string with no agent id attached (see
+    // plugin-host-services.ts's `issues.update`), and any other internal
+    // caller that forwards a patch can do the same. Only the PATCH
+    // /issues/:id route sets `cancelledBlockerOverride`, and only for its
+    // own authenticated board actor — so an `actorUserId` with no flag must
+    // still hit the same hard stop an agent actor gets.
+    await expect(
+      svc.update(blockedId, {
+        status: "in_progress",
+        actorUserId: "some-plugin-supplied-user-id",
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        unresolvedBlockerIssueIds: [blockerId],
+        unresolvedBlockers: [{
+          issueId: blockerId,
+          status: "cancelled",
+          reason: "cancelled",
+        }],
+      },
+    });
+
+    // Nothing was detached.
+    await expect(
+      db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, blockedId)),
+    ).resolves.toHaveLength(1);
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, blockedId)),
+    ).resolves.toEqual([{ status: "todo" }]);
+  });
+
+  it("resolves a pending cancelled-blocker decision wake with no run attached (deferred_issue_execution) once the board detaches the blocker", async () => {
     const { companyId, assigneeAgentId, blockerId, blockedId } =
       await seedBoardOverrideBlockerScenario("cancelled");
     const [wake] = await db
@@ -4958,12 +5002,16 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         source: "automation",
         triggerDetail: "system",
         reason: ISSUE_BLOCKERS_CANCELLED_WAKE_REASON,
-        status: "queued",
+        status: "deferred_issue_execution",
         payload: { issueId: blockedId, cancelledBlockerIssueIds: [blockerId] },
       })
       .returning();
 
-    await svc.update(blockedId, { status: "in_progress", actorUserId: "local-board" });
+    await svc.update(blockedId, {
+      status: "in_progress",
+      actorUserId: "local-board",
+      cancelledBlockerOverride: true,
+    });
 
     const resolved = await db
       .select()
@@ -4974,11 +5022,194 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(resolved?.finishedAt).not.toBeNull();
   });
 
+  // The normal enqueue path (heartbeat.ts) pairs every new wake with a
+  // queued heartbeat run in the same transaction, so a decision wake
+  // waiting in the agent's queue has `runId` set from the moment it is
+  // created — the `runId IS NULL` case above is not the common shape.
+  // Seed that real shape directly: insert the wake, then a `queued` run
+  // that references it, then point the wake's `runId` at that run, mirroring
+  // heartbeat.ts's own insert order (the run's `wakeupRequestId` FK requires
+  // the wake to exist first).
+  async function seedQueuedDecisionWakeWithRun(input: {
+    companyId: string;
+    agentId: string;
+    blockedId: string;
+    blockerId: string;
+    reason?: string;
+    runStatus?: "queued" | "claimed" | "running";
+    wakeStatus?: "queued" | "claimed";
+    payloadIssueId?: string;
+  }) {
+    const [wake] = await db
+      .insert(agentWakeupRequests)
+      .values({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: input.reason ?? ISSUE_BLOCKERS_CANCELLED_WAKE_REASON,
+        status: input.wakeStatus ?? "queued",
+        payload: {
+          issueId: input.payloadIssueId ?? input.blockedId,
+          cancelledBlockerIssueIds: [input.blockerId],
+        },
+      })
+      .returning();
+    const [run] = await db
+      .insert(heartbeatRuns)
+      .values({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        status: input.runStatus ?? "queued",
+        wakeupRequestId: wake!.id,
+      })
+      .returning();
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId: run!.id })
+      .where(eq(agentWakeupRequests.id, wake!.id));
+    return { wake: wake!, run: run! };
+  }
+
+  it("closes both the pending decision wake and its still-queued run once the board detaches the blocker", async () => {
+    const { companyId, assigneeAgentId, blockerId, blockedId } =
+      await seedBoardOverrideBlockerScenario("cancelled");
+    const { wake, run } = await seedQueuedDecisionWakeWithRun({
+      companyId,
+      agentId: assigneeAgentId,
+      blockedId,
+      blockerId,
+    });
+
+    await svc.update(blockedId, {
+      status: "in_progress",
+      actorUserId: "local-board",
+      cancelledBlockerOverride: true,
+    });
+
+    const resolvedWake = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wake.id))
+      .then((rows) => rows[0]);
+    expect(resolvedWake?.status).toBe("cancelled");
+    expect(resolvedWake?.finishedAt).not.toBeNull();
+
+    const resolvedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, run.id))
+      .then((rows) => rows[0]);
+    expect(resolvedRun?.status).toBe("cancelled");
+  });
+
+  it("leaves a claimed decision wake and its running run alone", async () => {
+    const { companyId, assigneeAgentId, blockerId, blockedId } =
+      await seedBoardOverrideBlockerScenario("cancelled");
+    const { wake, run } = await seedQueuedDecisionWakeWithRun({
+      companyId,
+      agentId: assigneeAgentId,
+      blockedId,
+      blockerId,
+      runStatus: "running",
+      wakeStatus: "claimed",
+    });
+
+    await svc.update(blockedId, {
+      status: "in_progress",
+      actorUserId: "local-board",
+      cancelledBlockerOverride: true,
+    });
+
+    const persistedWake = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wake.id))
+      .then((rows) => rows[0]);
+    expect(persistedWake?.status).toBe("claimed");
+
+    const persistedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, run.id))
+      .then((rows) => rows[0]);
+    expect(persistedRun?.status).toBe("running");
+  });
+
+  it("leaves a cancelled-blocker decision wake for a different issue alone", async () => {
+    const { companyId, assigneeAgentId, blockerId, blockedId } =
+      await seedBoardOverrideBlockerScenario("cancelled");
+    const otherIssueId = randomUUID();
+    const { wake, run } = await seedQueuedDecisionWakeWithRun({
+      companyId,
+      agentId: assigneeAgentId,
+      blockedId,
+      blockerId,
+      payloadIssueId: otherIssueId,
+    });
+
+    await svc.update(blockedId, {
+      status: "in_progress",
+      actorUserId: "local-board",
+      cancelledBlockerOverride: true,
+    });
+
+    const persistedWake = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wake.id))
+      .then((rows) => rows[0]);
+    expect(persistedWake?.status).toBe("queued");
+
+    const persistedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, run.id))
+      .then((rows) => rows[0]);
+    expect(persistedRun?.status).toBe("queued");
+  });
+
+  it("leaves a wake with a different reason alone", async () => {
+    const { companyId, assigneeAgentId, blockerId, blockedId } =
+      await seedBoardOverrideBlockerScenario("cancelled");
+    const { wake, run } = await seedQueuedDecisionWakeWithRun({
+      companyId,
+      agentId: assigneeAgentId,
+      blockedId,
+      blockerId,
+      reason: "issue_assigned",
+    });
+
+    await svc.update(blockedId, {
+      status: "in_progress",
+      actorUserId: "local-board",
+      cancelledBlockerOverride: true,
+    });
+
+    const persistedWake = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wake.id))
+      .then((rows) => rows[0]);
+    expect(persistedWake?.status).toBe("queued");
+
+    const persistedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, run.id))
+      .then((rows) => rows[0]);
+    expect(persistedRun?.status).toBe("queued");
+  });
+
   it("still rejects a board actor when a remaining blocker is not cancelled", async () => {
     const { blockerId, blockedId } = await seedBoardOverrideBlockerScenario("todo");
 
     await expect(
-      svc.update(blockedId, { status: "in_progress", actorUserId: "local-board" }),
+      svc.update(blockedId, {
+        status: "in_progress",
+        actorUserId: "local-board",
+        cancelledBlockerOverride: true,
+      }),
     ).rejects.toMatchObject({
       status: 422,
       details: {
