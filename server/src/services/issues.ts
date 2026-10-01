@@ -184,7 +184,10 @@ import {
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { dependencyBlockersAwaitDecision } from "./issue-dependency-wakeups.js";
+import {
+  dependencyBlockersAwaitDecision,
+  resolveIssueBlockersCancelledWakeupsForIssue,
+} from "./issue-dependency-wakeups.js";
 import {
   buildIssueChildrenCompletedWakeIdempotencyKey,
   findDeliveredIssueChildrenCompletedWake,
@@ -2742,6 +2745,7 @@ async function listUnresolvedBlockerDetails(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
   unresolvedBlockerIssueIds: string[],
+  dependentIssueId: string,
   pendingFinalizeBlockerIssueIds: string[] = [],
 ) {
   if (unresolvedBlockerIssueIds.length === 0) return [];
@@ -2751,6 +2755,7 @@ async function listUnresolvedBlockerDetails(
       issueId: issues.id,
       identifier: issues.identifier,
       title: issues.title,
+      status: issues.status,
     })
     .from(issues)
     .where(
@@ -2762,13 +2767,26 @@ async function listUnresolvedBlockerDetails(
   const rowsById = new Map(rows.map((row) => [row.issueId, row]));
   return unresolvedBlockerIssueIds.map((issueId) => {
     const row = rowsById.get(issueId);
+    // A cancelled blocker never resolves on its own: the caller cannot just
+    // wait it out like a "not_done" blocker, so it gets its own reason plus
+    // copy-pasteable next steps instead of the generic message.
+    const reason =
+      row?.status === "cancelled"
+        ? ("cancelled" as const)
+        : pendingFinalizeIds.has(issueId)
+          ? ("pending_finalize" as const)
+          : ("not_done" as const);
     return {
       issueId,
       identifier: row?.identifier ?? null,
       title: row?.title ?? null,
-      reason: pendingFinalizeIds.has(issueId)
-        ? ("pending_finalize" as const)
-        : ("not_done" as const),
+      status: row?.status ?? null,
+      reason,
+      ...(reason === "cancelled"
+        ? {
+            guidance: `blocker ${row?.identifier ?? issueId} was cancelled: remove it with PATCH /api/issues/${dependentIssueId} {blockedByIssueIds: [...]} or replace it, then retry`,
+          }
+        : {}),
     };
   });
 }
@@ -10757,7 +10775,7 @@ export function issueService(db: Db) {
 
       const {
         labelIds: nextLabelIds,
-        blockedByIssueIds,
+        blockedByIssueIds: requestedBlockedByIssueIds,
         actorAgentId,
         actorRunId,
         actorRunStopId,
@@ -10765,6 +10783,15 @@ export function issueService(db: Db) {
         companyGuard,
         ...issueData
       } = data;
+      // Reassigned below only when a board actor's explicit status change
+      // past all-cancelled blockers stands in for the decision the
+      // cancelled-blocker wake would otherwise ask a human for: the override
+      // then detaches those blockers by widening this to the retained set.
+      let blockedByIssueIds = requestedBlockedByIssueIds;
+      // Set below to the cancelled blocker ids detached by that override, so
+      // the transaction can log the decision and close out any pending
+      // cancelled-blocker wake for them.
+      let cancelledBlockersOverriddenByBoard: string[] | null = null;
       if (
         issueData.assigneeAgentId !== undefined &&
         issueData.assigneeAgentId !== existing.assigneeAgentId
@@ -10889,12 +10916,37 @@ export function issueService(db: Db) {
             dbOrTx,
             existing.companyId,
             unresolvedBlockerIssueIds,
+            id,
             dependencyReadiness?.pendingFinalizeBlockerIssueIds,
           );
-          throw unprocessable("Issue is blocked by unresolved blockers", {
-            unresolvedBlockerIssueIds,
-            unresolvedBlockers,
-          });
+          // A board actor is a human at the controls, not a waiting agent: an
+          // explicit status change past blockers that are every one of them
+          // cancelled IS the decision the cancelled-blocker wake exists to
+          // ask for (see issue-dependency-wakeups.ts). Treat it as that
+          // decision instead of bouncing the same 422 back forever. Any
+          // blocker that is still open/in progress/blocked/in review keeps
+          // the hard stop for everyone, board included.
+          const isBoardActor = Boolean(actorUserId) && !actorAgentId;
+          const allUnresolvedBlockersCancelled = unresolvedBlockers.every(
+            (blocker) => blocker.reason === "cancelled",
+          );
+          if (!isBoardActor || !allUnresolvedBlockersCancelled) {
+            throw unprocessable("Issue is blocked by unresolved blockers", {
+              unresolvedBlockerIssueIds,
+              unresolvedBlockers,
+            });
+          }
+          cancelledBlockersOverriddenByBoard = unresolvedBlockerIssueIds;
+          // Keep any already-resolved (done) blocker relation intact; only
+          // the cancelled ones that can never resolve on their own are
+          // detached. `blockedByIssueIds` becoming non-undefined here is
+          // what makes the transaction below actually sync the relation.
+          const currentBlockerIssueIds =
+            blockedByIssueIds ?? dependencyReadiness?.blockerIssueIds ?? [];
+          blockedByIssueIds = currentBlockerIssueIds.filter(
+            (blockerIssueId) =>
+              !unresolvedBlockerIssueIds.includes(blockerIssueId),
+          );
         }
       }
       const shouldValidateNextAssignee =
@@ -11247,6 +11299,34 @@ export function issueService(db: Db) {
           );
         }
         if (
+          cancelledBlockersOverriddenByBoard &&
+          cancelledBlockersOverriddenByBoard.length > 0
+        ) {
+          await logActivity(tx as unknown as Db, {
+            companyId: updated.companyId,
+            actorType: "user",
+            actorId: actorUserId ?? "issue_service",
+            action: "issue.blockers_detached",
+            entityType: "issue",
+            entityId: updated.id,
+            details: {
+              identifier: updated.identifier ?? null,
+              blockerIssueIds: cancelledBlockersOverriddenByBoard,
+              reason: "cancelled_blocker_overridden_by_board",
+            },
+          });
+          // The board actor's status change already made the decision the
+          // cancelled-blocker wake was asking for; close out any copy of
+          // that wake still waiting to be delivered so it does not later
+          // tell someone to decide on blockers that no longer hold this
+          // issue.
+          await resolveIssueBlockersCancelledWakeupsForIssue(tx, {
+            companyId: updated.companyId,
+            dependentIssueId: updated.id,
+            reason: "cancelled_blocker_overridden_by_board",
+          });
+        }
+        if (
           issueData.executionWorkspaceSettings !== undefined &&
           nextExecutionWorkspaceId &&
           nextExecutionWorkspacePreference === "reuse_existing"
@@ -11544,6 +11624,7 @@ export function issueService(db: Db) {
           db,
           issueCompany.companyId,
           unresolvedBlockerIssueIds,
+          id,
           readiness?.pendingFinalizeBlockerIssueIds,
         );
         throw unprocessable("Issue is blocked by unresolved blockers", {

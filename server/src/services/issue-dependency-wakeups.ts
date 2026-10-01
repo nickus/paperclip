@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents } from "@paperclipai/db";
@@ -317,6 +317,46 @@ export async function findExistingIssueBlockersCancelledWake(
     )
     .limit(1);
   return row ?? null;
+}
+
+/** Not-yet-delivered statuses a cancelled-blocker wake can still be closed out from. */
+const RESOLVABLE_DEPENDENCY_WAKE_STATUSES = ["queued", "deferred_issue_execution"] as const;
+
+/**
+ * Closes out any cancelled-blocker decision wake still waiting to be
+ * delivered for a dependent issue. Something other than that wake made the
+ * decision instead — most often a board actor's explicit status change past
+ * blockers that are all cancelled (see `issues.ts`'s `update`) — so the wake
+ * must not later ask someone to decide on blockers that no longer hold the
+ * issue.
+ *
+ * Only `queued`/`deferred_issue_execution` wakes with no run attached are
+ * touched. A `claimed` wake already has a run acting on it and must run to
+ * its own conclusion; a `completed` one already did.
+ */
+export async function resolveIssueBlockersCancelledWakeupsForIssue(
+  dbOrTx: Pick<Db, "update">,
+  input: { companyId: string; dependentIssueId: string; reason: string },
+): Promise<Array<{ id: string; agentId: string }>> {
+  const now = new Date();
+  return dbOrTx
+    .update(agentWakeupRequests)
+    .set({
+      status: "cancelled",
+      finishedAt: now,
+      error: input.reason,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.reason, ISSUE_BLOCKERS_CANCELLED_WAKE_REASON),
+        inArray(agentWakeupRequests.status, [...RESOLVABLE_DEPENDENCY_WAKE_STATUSES]),
+        isNull(agentWakeupRequests.runId),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.dependentIssueId}`,
+      ),
+    )
+    .returning({ id: agentWakeupRequests.id, agentId: agentWakeupRequests.agentId });
 }
 
 /**
