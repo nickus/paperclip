@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -32,6 +32,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { issueService } from "../services/issues.ts";
+import {
+  applyIssueExecutionPolicyTransition,
+  normalizeIssueExecutionPolicy,
+} from "../services/issue-execution-policy.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import * as providerRegistry from "../secrets/provider-registry.ts";
 import { routineService } from "../services/routines.ts";
@@ -245,6 +249,81 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       })
       .returning()
       .then((rows) => rows[0]!);
+  }
+
+  // Ends every heartbeat run bound to the issue, so the issue stays open but
+  // nothing is working on it, and applies `patch` (usually a status change).
+  async function makeIssueIdle(issueId: string, patch: Partial<typeof issues.$inferInsert> = {}) {
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`);
+    await db
+      .update(issues)
+      .set({ executionRunId: null, executionLockedAt: null, updatedAt: new Date(), ...patch })
+      .where(eq(issues.id, issueId));
+  }
+
+  async function listIssueComments(issueId: string) {
+    return db
+      .select({ body: issueComments.body, authorType: issueComments.authorType })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+  }
+
+  // Makes the schedule trigger due and runs the real scheduler tick.
+  async function fireScheduleTrigger(
+    svc: ReturnType<typeof routineService>,
+    triggerId: string,
+  ) {
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: new Date(Date.now() - 60_000) })
+      .where(eq(routineTriggers.id, triggerId));
+    return svc.tickScheduledTriggers(new Date());
+  }
+
+  async function listScheduledRuns(routineId: string) {
+    return db
+      .select()
+      .from(routineRuns)
+      .where(sql`${routineRuns.routineId} = ${routineId} and ${routineRuns.source} = 'schedule'`)
+      .orderBy(asc(routineRuns.triggeredAt));
+  }
+
+  function refireWakeups(wakeups: Awaited<ReturnType<typeof seedFixture>>["wakeups"]) {
+    return wakeups.filter((wakeup) => wakeup.opts.reason === "routine_refired_while_open");
+  }
+
+  // A coalesce_if_active routine with a `branch` variable (default "main")
+  // and an hourly schedule. The trigger is created up front because adding
+  // one appends a new routine revision.
+  async function seedBranchRoutine(fixture: Awaited<ReturnType<typeof seedFixture>>) {
+    const routine = await fixture.svc.create(
+      fixture.companyId,
+      {
+        projectId: fixture.projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "pre-pr for {{branch}}",
+        description: "Create a pre-PR from {{branch}}",
+        assigneeAgentId: fixture.agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "coalesce_if_active",
+        catchUpPolicy: "skip_missed",
+        variables: [
+          { name: "branch", label: null, type: "text", defaultValue: "main", required: true, options: [] },
+        ],
+      },
+      {},
+    );
+    const { trigger } = await fixture.svc.createTrigger(
+      routine.id,
+      { kind: "schedule", cronExpression: "0 * * * *", timezone: "UTC" },
+      {},
+    );
+    return { routine, trigger };
   }
 
   it("clears transient routine run failures when execution issues resume", async () => {
@@ -678,14 +757,14 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await expect(svc.evaluateActivityGate(projectRoutine, now)).resolves.toMatchObject({ fire: true });
   });
 
-  it("coalesces into a previous routine issue that is open but idle (no live run) instead of opening a parallel one", async () => {
+  it("creates a fresh execution issue when the open idle issue cannot be traced to a plain firing of the current routine", async () => {
     const { companyId, issueSvc, routine, svc } = await seedFixture();
     const previousRunId = randomUUID();
     const previousIssue = await issueSvc.create(companyId, {
       projectId: routine.projectId,
       title: routine.title,
       description: routine.description,
-      status: "in_review",
+      status: "todo",
       priority: routine.priority,
       assigneeAgentId: routine.assigneeAgentId,
       originKind: "routine_execution",
@@ -705,61 +784,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       completedAt: new Date("2026-03-20T12:00:00.000Z"),
     });
 
-    // No live run is bound to the issue (its executionRunId is null, as it
-    // would be once the run that created it finished), so the routine detail
-    // view still reports no active issue.
     const detailBefore = await svc.getDetail(routine.id);
     expect(detailBefore?.activeIssue).toBeNull();
-
-    const run = await svc.runRoutine(routine.id, { source: "manual" });
-    expect(run.status).toBe("coalesced");
-    expect(run.linkedIssueId).toBe(previousIssue.id);
-    expect(run.coalescedIntoRunId).toBe(previousRunId);
-
-    const routineIssues = await db
-      .select({ id: issues.id })
-      .from(issues)
-      .where(eq(issues.originId, routine.id));
-
-    expect(routineIssues).toHaveLength(1);
-
-    const notes = await db
-      .select({ body: issueComments.body, authorType: issueComments.authorType })
-      .from(issueComments)
-      .where(eq(issueComments.issueId, previousIssue.id));
-    expect(notes).toHaveLength(1);
-    expect(notes[0]?.authorType).toBe("system");
-    expect(notes[0]?.body).toMatch(/fired again/i);
-    expect(notes[0]?.body).toMatch(/still open/i);
-    expect(notes[0]?.body).toMatch(/manual run/i);
-  });
-
-  it("creates a fresh execution issue once the previous routine issue is closed", async () => {
-    const { companyId, issueSvc, routine, svc } = await seedFixture();
-    const previousRunId = randomUUID();
-    const previousIssue = await issueSvc.create(companyId, {
-      projectId: routine.projectId,
-      title: routine.title,
-      description: routine.description,
-      status: "done",
-      priority: routine.priority,
-      assigneeAgentId: routine.assigneeAgentId,
-      originKind: "routine_execution",
-      originId: routine.id,
-      originRunId: previousRunId,
-    });
-
-    await db.insert(routineRuns).values({
-      id: previousRunId,
-      companyId,
-      routineId: routine.id,
-      triggerId: null,
-      source: "manual",
-      status: "issue_created",
-      triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
-      linkedIssueId: previousIssue.id,
-      completedAt: new Date("2026-03-20T12:00:00.000Z"),
-    });
 
     const run = await svc.runRoutine(routine.id, { source: "manual" });
     expect(run.status).toBe("issue_created");
@@ -776,6 +802,23 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(routineIssues).toHaveLength(2);
     expect(routineIssues.map((issue) => issue.id)).toContain(previousIssue.id);
     expect(routineIssues.map((issue) => issue.id)).toContain(run.linkedIssueId);
+  });
+
+  it("creates a fresh execution issue once the previous routine issue is closed", async () => {
+    const { routine, svc } = await seedFixture();
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(first.status).toBe("issue_created");
+    await makeIssueIdle(first.linkedIssueId!, { status: "done" });
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(first.linkedIssueId);
+
+    const routineIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toHaveLength(2);
   });
 
   it("creates draft routines without a project or default assignee", async () => {
@@ -1611,7 +1654,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(inboxIssues.map((issue) => issue.id)).toContain(previousIssue.id);
   });
 
-  it("coalesces a second firing with different resolved variables into the still-open issue (manual run, then the next firing)", async () => {
+  it("does not coalesce live routine runs with different resolved variables", async () => {
     const { companyId, agentId, projectId, svc } = await seedFixture();
     const variableRoutine = await svc.create(
       companyId,
@@ -1633,23 +1676,20 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       {},
     );
 
-    // A manual run fires with one set of variables...
     const first = await svc.runRoutine(variableRoutine.id, {
       source: "manual",
       variables: { branch: "feature/a" },
     });
-    // ...then the next scheduled tick fires with different variables while
-    // the first issue is still open. It must land on the same issue instead
-    // of opening a second one the assignee doesn't know about.
     const second = await svc.runRoutine(variableRoutine.id, {
-      source: "schedule",
+      source: "manual",
       variables: { branch: "feature/b" },
     });
 
     expect(first.status).toBe("issue_created");
-    expect(second.status).toBe("coalesced");
-    expect(second.linkedIssueId).toBe(first.linkedIssueId);
-    expect(second.coalescedIntoRunId).toBe(first.id);
+    expect(second.status).toBe("issue_created");
+    expect(first.linkedIssueId).toBeTruthy();
+    expect(second.linkedIssueId).toBeTruthy();
+    expect(first.linkedIssueId).not.toBe(second.linkedIssueId);
 
     const routineIssues = await db
       .select({
@@ -1660,19 +1700,12 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .from(issues)
       .where(eq(issues.originId, variableRoutine.id));
 
-    expect(routineIssues).toHaveLength(1);
-    // The issue keeps the first firing's title/fingerprint; it is not
-    // rewritten for the later firing's variables.
-    expect(routineIssues[0]?.title).toBe("pre-pr for feature/a");
-
-    const notes = await db
-      .select({ body: issueComments.body })
-      .from(issueComments)
-      .where(eq(issueComments.issueId, first.linkedIssueId!));
-    expect(notes).toHaveLength(1);
-    expect(notes[0]?.body).toMatch(/fired again/i);
-    expect(notes[0]?.body).toMatch(/scheduled trigger/i);
-    expect(notes[0]?.body).toMatch(/feature\/b/);
+    expect(routineIssues).toHaveLength(2);
+    expect(routineIssues.map((issue) => issue.title).sort()).toEqual([
+      "pre-pr for feature/a",
+      "pre-pr for feature/b",
+    ]);
+    expect(new Set(routineIssues.map((issue) => issue.originFingerprint)).size).toBe(2);
   });
 
   it("does not coalesce a run requested for a different project into another project's still-open issue", async () => {
@@ -1738,55 +1771,280 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     );
   });
 
-  it("skips (without a note) into an open but idle routine issue when the policy is skip_if_active", async () => {
-    const { companyId, issueSvc, routine, svc } = await seedFixture();
+  it("merges the next scheduled tick into an idle issue opened by a manual run with other variables, announcing it once", async () => {
+    const fixture = await seedFixture();
+    const { agentId, svc, wakeups } = fixture;
+    const { routine, trigger } = await seedBranchRoutine(fixture);
+
+    const manual = await svc.runRoutine(routine.id, { source: "manual", variables: { branch: "feature/a" } });
+    expect(manual.status).toBe("issue_created");
+    const issueId = manual.linkedIssueId!;
+    // The agent's run finished and the issue now waits for review.
+    await makeIssueIdle(issueId, { status: "in_review" });
+
+    expect(await fireScheduleTrigger(svc, trigger.id)).toEqual({ triggered: 1 });
+    let ticks = await listScheduledRuns(routine.id);
+    expect(ticks).toHaveLength(1);
+    expect(ticks[0]).toMatchObject({ status: "coalesced", linkedIssueId: issueId, coalescedIntoRunId: manual.id });
+
+    const notes = await listIssueComments(issueId);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]?.authorType).toBe("system");
+    expect(notes[0]?.body).toMatch(/fired again/i);
+    expect(notes[0]?.body).toMatch(/scheduled trigger/i);
+    expect(notes[0]?.body).toContain(ticks[0]!.id);
+    expect(notes[0]?.body).toContain("branch=main");
+    expect(refireWakeups(wakeups)).toHaveLength(1);
+    expect(refireWakeups(wakeups)[0]).toMatchObject({
+      agentId,
+      opts: { contextSnapshot: expect.objectContaining({ issueId }) },
+    });
+
+    // The issue keeps waiting and the same tick fires again: it is merged
+    // without another note or wake.
+    await makeIssueIdle(issueId, { status: "in_review" });
+    expect(await fireScheduleTrigger(svc, trigger.id)).toEqual({ triggered: 1 });
+    ticks = await listScheduledRuns(routine.id);
+    expect(ticks).toHaveLength(2);
+    expect(ticks[1]).toMatchObject({ status: "coalesced", linkedIssueId: issueId });
+    expect(await listIssueComments(issueId)).toHaveLength(1);
+    expect(refireWakeups(wakeups)).toHaveLength(1);
+
+    const routineIssues = await db
+      .select({ id: issues.id, title: issues.title })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toEqual([{ id: issueId, title: "pre-pr for feature/a" }]);
+  });
+
+  it("merges an identical firing into its idle open issue without a note or a wake", async () => {
+    const { routine, svc, wakeups } = await seedFixture();
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    await makeIssueIdle(first.linkedIssueId!, { status: "in_review" });
+    const wakeupsBefore = wakeups.length;
+
+    const second = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(second.status).toBe("coalesced");
+    expect(second.linkedIssueId).toBe(first.linkedIssueId);
+    expect(await listIssueComments(first.linkedIssueId!)).toHaveLength(0);
+    expect(wakeups).toHaveLength(wakeupsBefore);
+  });
+
+  it("merges an identical firing of a routine without a project into its idle open issue", async () => {
+    const { agentId, companyId, svc } = await seedFixture();
+    const routine = await svc.create(
+      companyId,
+      {
+        projectId: null,
+        goalId: null,
+        parentIssueId: null,
+        title: "company-wide sweep",
+        description: "Sweep the company",
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "coalesce_if_active",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(first.status).toBe("issue_created");
+    await makeIssueIdle(first.linkedIssueId!, { status: "blocked" });
+
+    const second = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(second.status).toBe("coalesced");
+    expect(second.linkedIssueId).toBe(first.linkedIssueId);
+  });
+
+  it("does not merge a manual run with other explicit variables into an idle open issue", async () => {
+    const fixture = await seedFixture();
+    const { svc } = fixture;
+    const { routine } = await seedBranchRoutine(fixture);
+    const first = await svc.runRoutine(routine.id, { source: "manual", variables: { branch: "feature/a" } });
+    await makeIssueIdle(first.linkedIssueId!, { status: "in_review" });
+
+    const second = await svc.runRoutine(routine.id, { source: "manual", variables: { branch: "feature/b" } });
+    expect(second.status).toBe("issue_created");
+    expect(second.linkedIssueId).not.toBe(first.linkedIssueId);
+    expect(await listIssueComments(first.linkedIssueId!)).toHaveLength(0);
+  });
+
+  it("opens a new issue instead of joining an idle one once the routine definition changed", async () => {
+    const { routine, svc } = await seedFixture();
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    await makeIssueIdle(first.linkedIssueId!, { status: "in_review" });
+
+    await svc.update(routine.id, { description: "Run the frog routine, then report the frog count" }, {});
+    const second = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(second.status).toBe("issue_created");
+    expect(second.linkedIssueId).not.toBe(first.linkedIssueId);
+    expect(await listIssueComments(first.linkedIssueId!)).toHaveLength(0);
+  });
+
+  it("keeps runs that differ in project workspace on separate issues", async () => {
+    const { companyId, projectId, routine, svc } = await seedFixture();
+    const projectWorkspaceId = randomUUID();
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Second repository",
+      isPrimary: false,
+    });
+
+    const plain = await svc.runRoutine(routine.id, { source: "manual" });
+    await makeIssueIdle(plain.linkedIssueId!, { status: "in_review" });
+
+    // A run aimed at another workspace does not join the plain run's issue...
+    const pinned = await svc.runRoutine(routine.id, { source: "manual", projectWorkspaceId });
+    expect(pinned.status).toBe("issue_created");
+    expect(pinned.linkedIssueId).not.toBe(plain.linkedIssueId);
+    await makeIssueIdle(pinned.linkedIssueId!, { status: "in_review" });
+
+    // ...and a later plain run joins the plain issue, not the pinned one,
+    // even though the pinned issue was updated more recently.
+    const again = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(again.status).toBe("coalesced");
+    expect(again.linkedIssueId).toBe(plain.linkedIssueId);
+  });
+
+  it("does not merge a firing into an issue that was moved to backlog", async () => {
+    const { routine, svc } = await seedFixture();
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    await makeIssueIdle(first.linkedIssueId!, { status: "backlog" });
+
+    const second = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(second.status).toBe("issue_created");
+    expect(second.linkedIssueId).not.toBe(first.linkedIssueId);
+  });
+
+  it("does not merge a scheduled tick into an open issue from a webhook delivery", async () => {
+    const { routine, svc } = await seedFixture();
+    const { trigger: webhook } = await svc.createTrigger(routine.id, { kind: "webhook", signingMode: "none" }, {});
+    const { trigger: schedule } = await svc.createTrigger(
+      routine.id,
+      { kind: "schedule", cronExpression: "0 * * * *", timezone: "UTC" },
+      {},
+    );
+
+    const delivery = await svc.firePublicTrigger(webhook.publicId!, { payload: { event: "meeting.one" } });
+    expect(delivery.status).toBe("issue_created");
+    await makeIssueIdle(delivery.linkedIssueId!, { status: "in_review" });
+
+    expect(await fireScheduleTrigger(svc, schedule.id)).toEqual({ triggered: 1 });
+    const [tick] = await listScheduledRuns(routine.id);
+    expect(tick?.status).toBe("issue_created");
+    expect(tick?.linkedIssueId).not.toBe(delivery.linkedIssueId);
+  });
+
+  it.each([
+    { reviewer: "an agent" as const },
+    { reviewer: "a user" as const },
+  ])("merges a firing into an issue whose review stage is pending with $reviewer, without waking anyone", async ({ reviewer }) => {
+    const fixture = await seedFixture();
+    const { agentId, companyId, svc, wakeups } = fixture;
+    const { routine, trigger } = await seedBranchRoutine(fixture);
+    const [reviewerAgent] = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "Reviewer",
+        role: "qa",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      })
+      .returning();
+    const reviewerUserId = "reviewer-user";
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{
+        type: "review",
+        participants: reviewer === "an agent"
+          ? [{ type: "agent", agentId: reviewerAgent!.id }]
+          : [{ type: "user", userId: reviewerUserId }],
+      }],
+    })!;
+
+    const manual = await svc.runRoutine(routine.id, { source: "manual", variables: { branch: "feature/a" } });
+    const issueId = manual.linkedIssueId!;
+    // The executor finishes and the policy hands the issue to the reviewer.
+    const transition = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId },
+      commentBody: "Ready for review",
+    });
+    expect(transition.patch).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: reviewer === "an agent" ? reviewerAgent!.id : null,
+    });
+    await makeIssueIdle(issueId, {
+      ...(transition.patch as Partial<typeof issues.$inferInsert>),
+      executionPolicy: policy as unknown as Record<string, unknown>,
+    });
+    const wakeupsBefore = wakeups.length;
+
+    expect(await fireScheduleTrigger(svc, trigger.id)).toEqual({ triggered: 1 });
+    const [tick] = await listScheduledRuns(routine.id);
+    expect(tick).toMatchObject({ status: "coalesced", linkedIssueId: issueId });
+    expect(await listIssueComments(issueId)).toHaveLength(1);
+    // Neither the reviewer nor the executor is woken while the stage is pending.
+    expect(wakeups).toHaveLength(wakeupsBefore);
+  });
+
+  it("posts the note but does not wake the assignee while the issue has an unresolved blocker", async () => {
+    const fixture = await seedFixture();
+    const { companyId, issueSvc, svc, wakeups } = fixture;
+    const { routine, trigger } = await seedBranchRoutine(fixture);
+    const manual = await svc.runRoutine(routine.id, { source: "manual", variables: { branch: "feature/a" } });
+    const issueId = manual.linkedIssueId!;
+    const blocker = await issueSvc.create(companyId, {
+      title: "Upstream dependency",
+      status: "todo",
+      priority: "medium",
+    });
+    await issueSvc.update(issueId, { blockedByIssueIds: [blocker.id] });
+    await makeIssueIdle(issueId, { status: "blocked" });
+    const wakeupsBefore = wakeups.length;
+
+    expect(await fireScheduleTrigger(svc, trigger.id)).toEqual({ triggered: 1 });
+    const [tick] = await listScheduledRuns(routine.id);
+    expect(tick).toMatchObject({ status: "coalesced", linkedIssueId: issueId });
+    expect(await listIssueComments(issueId)).toHaveLength(1);
+    expect(wakeups).toHaveLength(wakeupsBefore);
+  });
+
+  it("keeps skip_if_active on live runs: an open but idle issue does not swallow later firings", async () => {
+    const { routine, svc } = await seedFixture();
     await db
       .update(routines)
       .set({ concurrencyPolicy: "skip_if_active" })
       .where(eq(routines.id, routine.id));
 
-    const previousRunId = randomUUID();
-    const previousIssue = await issueSvc.create(companyId, {
-      projectId: routine.projectId,
-      title: routine.title,
-      description: routine.description,
-      status: "blocked",
-      priority: routine.priority,
-      assigneeAgentId: routine.assigneeAgentId,
-      originKind: "routine_execution",
-      originId: routine.id,
-      originRunId: previousRunId,
-    });
-    await db.insert(routineRuns).values({
-      id: previousRunId,
-      companyId,
-      routineId: routine.id,
-      triggerId: null,
-      source: "manual",
-      status: "issue_created",
-      triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
-      linkedIssueId: previousIssue.id,
-      completedAt: new Date("2026-03-20T12:00:00.000Z"),
-    });
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(first.status).toBe("issue_created");
+    // While the first issue's run is live, an identical firing is skipped.
+    const whileLive = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(whileLive.status).toBe("skipped");
+    expect(whileLive.linkedIssueId).toBe(first.linkedIssueId);
 
-    const run = await svc.runRoutine(routine.id, { source: "schedule" });
-
-    expect(run.status).toBe("skipped");
-    expect(run.linkedIssueId).toBe(previousIssue.id);
-    expect(run.coalescedIntoRunId).toBe(previousRunId);
-
-    const routineIssues = await db
-      .select({ id: issues.id })
-      .from(issues)
-      .where(eq(issues.originId, routine.id));
-    expect(routineIssues).toHaveLength(1);
-
-    // skip_if_active stays silent: no FYI note, no extra wake.
-    const notes = await db
-      .select({ id: issueComments.id })
-      .from(issueComments)
-      .where(eq(issueComments.issueId, previousIssue.id));
-    expect(notes).toHaveLength(0);
+    // Once the issue only waits (no live run), the next firing gets new work.
+    await makeIssueIdle(first.linkedIssueId!, { status: "blocked" });
+    const next = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(next.status).toBe("issue_created");
+    expect(next.linkedIssueId).not.toBe(first.linkedIssueId);
+    expect(await listIssueComments(first.linkedIssueId!)).toHaveLength(0);
   });
 
   it("interpolates routine variables into the execution issue and stores resolved values", async () => {

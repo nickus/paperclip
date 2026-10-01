@@ -59,7 +59,7 @@ Fields:
 
 | Value | Behaviour |
 |-------|-----------|
-| `coalesce_if_active` (default) | Incoming run is immediately finalised as `coalesced` and linked to the active run — no new issue is created |
+| `coalesce_if_active` (default) | Incoming run is immediately finalised as `coalesced` and linked to the active run — no new issue is created. For an ordinary routine (not a pipeline stage automation or plugin-managed), a scheduled or manual run with no payload or workspace override also joins an open (not backlog) issue that an earlier scheduled or manual run of the same routine revision created, even after that issue's run has finished; if its variables differ, a note is posted on the issue once. A manual run with explicit variables joins only an issue created with the same values |
 | `skip_if_active` | Incoming run is immediately finalised as `skipped` and linked to the active run — no new issue is created |
 | `always_enqueue` | Always create a new run regardless of active runs |
 

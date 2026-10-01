@@ -24,6 +24,7 @@ import {
   projects,
   routineRuns,
   routines,
+  routineTriggers,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -1459,6 +1460,77 @@ describeEmbeddedPostgres("pipelineService", () => {
       .where(eq(issues.id, issueIdB!));
     expect(issueB?.description).toContain("Case B");
     expect(issueB?.description).not.toContain("Case A");
+  });
+
+  it("keeps scheduled and manual firings of a stage automation routine out of an open case's execution issue", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Review on enter");
+    const routineSvc = routineService(db, { heartbeat: noopHeartbeat });
+    // A coalescing routine with a schedule of its own, then adopted as a
+    // stage-entry automation, which keeps its trigger.
+    await db.update(routines).set({ concurrencyPolicy: "coalesce_if_active" }).where(eq(routines.id, routine.id));
+    const { trigger } = await routineSvc.createTrigger(
+      routine.id,
+      { kind: "schedule", cronExpression: "0 * * * *", timezone: "UTC" },
+      {},
+    );
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "adopted-automation",
+      name: "Adopted automation",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "review", name: "Review", kind: "working", config: { onEnter: { type: "run_routine", routineId: routine.id } } },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "adopted-automation",
+      title: "Adopted automation case",
+      actor: userActor,
+    });
+    const moved = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "review",
+      expectedVersion: 1,
+      actor: userActor,
+    });
+    expect(moved.automationExecution.status).toBe("succeeded");
+    const caseIssueId = moved.automationExecution.status === "succeeded"
+      ? moved.automationExecution.execution.executionIssueId
+      : null;
+    expect(caseIssueId).toBeTruthy();
+    const [adopted] = await db.select({ originKind: routines.originKind }).from(routines).where(eq(routines.id, routine.id));
+    expect(adopted?.originKind).toBe("pipeline_automation");
+
+    // The case's issue is still open and idle when the routine's own
+    // schedule ticks and when someone runs it by hand.
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: new Date(Date.now() - 60_000) })
+      .where(eq(routineTriggers.id, trigger.id));
+    expect(await routineSvc.tickScheduledTriggers(new Date())).toEqual({ triggered: 1 });
+    const manual = await routineSvc.runRoutine(routine.id, { source: "manual" });
+
+    const scheduled = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.routineId, routine.id))
+      .then((runs) => runs.find((run) => run.source === "schedule"));
+    expect(scheduled?.status).toBe("issue_created");
+    expect(scheduled?.linkedIssueId).not.toBe(caseIssueId);
+    expect(manual.status).toBe("issue_created");
+    expect(manual.linkedIssueId).not.toBe(caseIssueId);
+    const caseIssueComments = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, caseIssueId!));
+    expect(caseIssueComments).toHaveLength(0);
   });
 
   it("carries saved stage automation workspace context into the execution issue", async () => {
