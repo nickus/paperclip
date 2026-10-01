@@ -111,6 +111,7 @@ function hostLeaseMetadata(metadata: Record<string, unknown> | undefined): Recor
 function resume(
   lease: { providerLeaseId: string | null; metadata?: Record<string, unknown> },
   config: Record<string, unknown> = REUSE_CONFIG,
+  overrides: Record<string, unknown> = {},
 ) {
   return plugin.definition.onEnvironmentResumeLease!({
     driverKey: "kubernetes",
@@ -119,6 +120,7 @@ function resume(
     config,
     providerLeaseId: lease.providerLeaseId!,
     leaseMetadata: hostLeaseMetadata(lease.metadata),
+    ...overrides,
   });
 }
 
@@ -769,6 +771,51 @@ describe("resume with reuseLease", () => {
     // And the cycle repeats: release again, resume again, same sandbox.
     await expect(release(resumed)).resolves.toMatchObject({ state: "stopped" });
     await expect(resume(resumed)).resolves.toMatchObject({ providerLeaseId: name });
+  });
+
+  it("stops what the last run left running when its release never completed", async () => {
+    // The run's host went away before it released the sandbox: still busy.
+    const lease = await acquire();
+    vi.mocked(execInPod).mockClear();
+
+    const resumed = await resume(lease, REUSE_CONFIG, { releasedAt: new Date(Date.now() + 1_000).toISOString() });
+
+    expect(resumed.providerLeaseId).toBe(lease.providerLeaseId);
+    expect(vi.mocked(execInPod).mock.calls.map((call) => call[4])).toEqual([
+      ["/bin/sh", "-c", PROCESS_RESET_SCRIPT, "paperclip-process-reset"],
+    ]);
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations[REUSE_ANNOTATIONS.leaseState]).toBe("busy");
+  });
+
+  it("leaves a sandbox alone that a run marked busy after the release, or that was kept running", async () => {
+    const lease = await acquire();
+    const releasedAt = new Date(Date.now() - 1_000).toISOString();
+    await release(lease);
+    // Another run resumed the sandbox after the release and is using it.
+    await resume(lease);
+    vi.mocked(execInPod).mockClear();
+
+    await expect(resume(lease, REUSE_CONFIG, { releasedAt })).resolves.toMatchObject({
+      providerLeaseId: lease.providerLeaseId,
+    });
+    // A sandbox kept running for a warm runner comes without a release time.
+    await expect(resume(lease)).resolves.toMatchObject({ providerLeaseId: lease.providerLeaseId });
+    expect(execInPod).not.toHaveBeenCalled();
+  });
+
+  it("replaces a sandbox whose leftover work cannot be stopped, and retries an unreachable pod", async () => {
+    const releasedAt = new Date(Date.now() + 1_000).toISOString();
+    const stuck = await acquire();
+    vi.mocked(execInPod).mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "paperclip-process-reset: failed remaining= 9" });
+    await expect(resume(stuck, REUSE_CONFIG, { releasedAt })).resolves.toEqual({
+      providerLeaseId: null,
+      metadata: expect.objectContaining({ expired: false, reason: "leftover_work" }),
+    });
+
+    const unreachable = await acquire();
+    vi.mocked(execInPod).mockRejectedValueOnce(new Error("connection dropped")).mockRejectedValueOnce(new Error("connection dropped"));
+    await expect(resume(unreachable, REUSE_CONFIG, { releasedAt })).rejects.toThrow(/temporary failure/);
+    expect(cluster.sandboxes.get(unreachable.providerLeaseId!)!.metadata.annotations[REUSE_ANNOTATIONS.leaseState]).toBe("busy");
   });
 
   it("reports a deleted sandbox as expired (not found)", async () => {

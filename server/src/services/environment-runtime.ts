@@ -2137,6 +2137,12 @@ function createSandboxEnvironmentDriver(
                     config: workerConfig,
                     providerLeaseId: resumeProviderLeaseId,
                     leaseMetadata: reusableLease.metadata ?? undefined,
+                    // Nothing was kept running in a released sandbox (a warm
+                    // runner's sandbox is retained instead), so the provider
+                    // can stop what a release that never completed left.
+                    ...(reusableLease.status === "released" && reusableLease.releasedAt
+                      ? { releasedAt: new Date(reusableLease.releasedAt).toISOString() }
+                      : {}),
                   },
                   Math.min(
                     configuredResumeTimeoutMs,

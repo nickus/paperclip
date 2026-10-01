@@ -839,6 +839,46 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     );
   });
 
+  it("tells the provider when a sandbox was released, but not for one kept running", async () => {
+    const seeded = await seedReusablePluginSandboxLease();
+    const providerMetadata = { provider: "fake-plugin", image: "fake:test", timeoutMs: 1234, reuseLease: true, remoteCwd: "/workspace" };
+    const call = vi.fn(async (_pluginId: string, method: string, params: Record<string, unknown>) => {
+      if (method === "environmentAcquireLease") return { providerLeaseId: "sandbox-released-at", metadata: providerMetadata };
+      if (method === "environmentResumeLease") return { providerLeaseId: params.providerLeaseId, metadata: providerMetadata };
+      if (method === "environmentReleaseLease") return { providerLeaseId: params.providerLeaseId, state: "stopped" };
+      throw new Error(`Unexpected plugin method: ${method}`);
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager });
+    const nextRun = async () => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: seeded.companyId, agentId: seeded.agentId, status: "running" });
+      const acquired = await runtime.acquireRunLease({
+        companyId: seeded.companyId, environment: seeded.environment, issueId: null, agentId: seeded.agentId,
+        heartbeatRunId: runId, persistedExecutionWorkspace: { id: seeded.executionWorkspaceId, mode: "shared_workspace" },
+      });
+      return { runId, lease: acquired.lease, resume: call.mock.calls.filter(([, method]) => method === "environmentResumeLease").at(-1)?.[2] };
+    };
+
+    await environmentService(db).releaseLease(seeded.reusableLease.id, "expired");
+    const first = await nextRun();
+    expect(first.resume).toBeUndefined();
+    await runtime.releaseRunLeases(first.runId, "released");
+    const released = await environmentService(db).getLeaseById(first.lease.id);
+    expect(released?.status).toBe("released");
+    const second = await nextRun();
+    expect(second.lease.providerLeaseId).toBe("sandbox-released-at");
+    expect(second.resume.releasedAt).toBe(new Date(released!.releasedAt!).toISOString());
+
+    // A sandbox kept running for a warm runner is retained, not released.
+    await runtime.releaseRunLeases(second.runId, "released", undefined, "keep_running");
+    const third = await nextRun();
+    expect(third.lease.providerLeaseId).toBe("sandbox-released-at");
+    expect(third.resume).not.toHaveProperty("releasedAt");
+  });
+
   it.each(["same task", "different task", "different agent", "no task"])(
     "scopes projectless reusable leases to their task and agent: %s", async (scenario) => {
     const seeded = await seedReusablePluginSandboxLease();

@@ -396,7 +396,13 @@ export type ReuseExpiryReason =
   | "pod_not_ready";
 
 export type ReusableResumeCheck =
-  | { resumable: true; podName: string; podUid: string }
+  | {
+      resumable: true;
+      podName: string;
+      podUid: string;
+      /** When the sandbox was last marked busy (ms since epoch), if it is still marked busy; else null. */
+      busySince: number | null;
+    }
   | { resumable: false; reason: ReuseExpiryReason; detail: string };
 
 /** Container waiting reasons that will not fix themselves in a reused pod. */
@@ -519,6 +525,10 @@ export async function checkReusableLeaseResumable(
       detail: "Sandbox was created from a different image or configuration",
     };
   }
+  // A busy mark without a time is as old as it can be.
+  const busySince = annotations[REUSE_ANNOTATIONS.leaseState] === "busy"
+    ? toMillis(annotations[REUSE_ANNOTATIONS.busySince]) ?? 0
+    : null;
   const recordedPodUid =
     typeof annotations[REUSE_ANNOTATIONS.podUid] === "string" && annotations[REUSE_ANNOTATIONS.podUid]
       ? (annotations[REUSE_ANNOTATIONS.podUid] as string)
@@ -564,7 +574,7 @@ export async function checkReusableLeaseResumable(
     }
     const ready = (pod.status?.conditions ?? []).find((c) => c.type === "Ready");
     if (phase === "Running" && ready?.status === "True" && uid) {
-      return { resumable: true, podName, podUid: uid };
+      return { resumable: true, podName, podUid: uid, busySince };
     }
     notReadySince =
       toMillis(ready?.lastTransitionTime) ?? toMillis(pod.metadata?.creationTimestamp) ?? notReadySince;

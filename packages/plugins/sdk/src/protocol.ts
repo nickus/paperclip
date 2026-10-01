@@ -667,6 +667,15 @@ export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDr
 export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDriverBaseParams {
   providerLeaseId: string;
   leaseMetadata?: Record<string, unknown>;
+  /**
+   * When the host released the lease after its last run (ISO 8601). Sent only
+   * for a lease released with nothing left running in it on purpose, never for
+   * a sandbox the host kept running for a warm runner. A provider that keeps
+   * sandboxes between runs and finds this one still marked in use since before
+   * that time (the release never completed, for example because the host went
+   * away) stops whatever the last run left running before the next run starts.
+   */
+  releasedAt?: string;
 }
 
 export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDriverBaseParams {

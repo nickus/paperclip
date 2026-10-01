@@ -449,7 +449,7 @@ async function resumeReusableLease(
     specHash = null;
   }
 
-  const { clients } = getKubeConnection(config);
+  const { kc, clients } = getKubeConnection(config);
   const check = await checkReusableLeaseResumable(clients, {
     namespace,
     name: params.providerLeaseId,
@@ -463,8 +463,35 @@ async function resumeReusableLease(
     return check.reason === "identity_mismatch" ? mismatch(check.detail) : expired(check.reason, check.detail);
   }
 
-  // Mark the sandbox busy last: the checks above are read-only, so a transient
-  // failure there leaves an idle sandbox idle. The patch bumps the CR's
+  // Still marked busy since before the host released the lease: that release
+  // never completed (for example its host went away), so what the last run
+  // started may still be running. Stop it before the next run starts. A busy
+  // mark set after the release belongs to a run that resumed the sandbox in
+  // the meantime, and a sandbox kept running for a warm runner comes without a
+  // release time; neither is touched.
+  const releasedAtMs = typeof params.releasedAt === "string" ? Date.parse(params.releasedAt) : Number.NaN;
+  if (check.busySince !== null && Number.isFinite(releasedAtMs) && check.busySince < releasedAtMs) {
+    const reset = await stopPodProcesses(kc, config, {
+      namespace,
+      podName: check.podName,
+      retryDeadline: Date.now() + REUSE_RELEASE_RETRY_BUDGET_MS,
+    });
+    if (!reset.ok && reset.execFailed) {
+      // The host retries a resume whose error reads as temporary.
+      throw new Error(
+        `Could not reach pod ${check.podName} to stop the work its last run left running (temporary failure; retry): ${reset.detail}`,
+      );
+    }
+    if (!reset.ok) {
+      return expired("leftover_work", `The work the last run left running in pod ${check.podName} could not be stopped`);
+    }
+    console.info(
+      `[plugin-kubernetes] stopped the work the last run left running in sandbox ${namespace}/${params.providerLeaseId} before resuming it`,
+    );
+  }
+
+  // Mark the sandbox busy last: nothing above changes its reuse state, so a
+  // transient failure there leaves an idle sandbox idle. The patch bumps the CR's
   // resourceVersion, which makes a concurrent reaper delete fail its
   // precondition; a delete that won the race shows up here as gone/deleting.
   //
