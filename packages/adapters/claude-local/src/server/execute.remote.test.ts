@@ -438,8 +438,11 @@ describe("claude remote execution", () => {
       onLog: async () => {},
     });
 
-    expect(runChildProcess).toHaveBeenCalledTimes(1);
-    const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
+    // Besides the run itself, only `claude --help` (read to decide whether
+    // the instructions file goes along with the resume) may be spawned.
+    const runs = runChildProcess.mock.calls.filter((entry) => !(entry[2] as string[]).includes("--help"));
+    expect(runs).toHaveLength(1);
+    const call = runs[0] as unknown as [string, string, string[]] | undefined;
     expect(call?.[2]).toContain("--resume");
     expect(call?.[2]).toContain("12345678-1234-4abc-9def-123456789012");
   });
@@ -534,7 +537,9 @@ describe("claude remote execution", () => {
         executionTarget: target("lease-2"),
       });
 
-      const secondRun = runChildProcess.mock.calls.find((entry) => !entry[2].includes("--version")) as unknown as
+      const secondRun = runChildProcess.mock.calls.find(
+        (entry) => !entry[2].includes("--version") && !entry[2].includes("--help"),
+      ) as unknown as
         | [string, string, string[], { remoteExecution?: { remoteCwd: string } | null }]
         | undefined;
       expect(secondRun?.[2]).toContain("--resume");

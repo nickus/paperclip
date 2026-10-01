@@ -238,6 +238,12 @@ afterEach(() => {
 async function writePoisonedMessageIdClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+// Answers --help like the CLI (without --system-prompt-snapshot) and records
+// only real runs.
+if (process.argv.includes("--help")) {
+  process.stdout.write("Usage: claude [options]\\n  --print\\n  --resume <id>\\n");
+  process.exit(0);
+}
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const statePath = process.env.PAPERCLIP_TEST_STATE_PATH;
@@ -274,6 +280,12 @@ console.log(JSON.stringify({ type: "result", session_id: "bbbbbbbb-bbbb-4bbb-8bb
 async function writeAlwaysPoisonedMessageIdClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+// Answers --help like the CLI (without --system-prompt-snapshot) and records
+// only real runs.
+if (process.argv.includes("--help")) {
+  process.stdout.write("Usage: claude [options]\\n  --print\\n  --resume <id>\\n");
+  process.exit(0);
+}
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
@@ -304,6 +316,12 @@ process.exit(1);
 async function writeRetryThenSucceedClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+// Answers --help like the CLI (without --system-prompt-snapshot) and records
+// only real runs.
+if (process.argv.includes("--help")) {
+  process.stdout.write("Usage: claude [options]\\n  --print\\n  --resume <id>\\n");
+  process.exit(0);
+}
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const statePath = process.env.PAPERCLIP_TEST_STATE_PATH;
@@ -492,6 +510,10 @@ describe("claude execute", () => {
    * --append-system-prompt-file should only be passed on fresh sessions.
    * On resumed sessions the instructions are already in the session cache;
    * re-injecting them wastes tokens and may be rejected by the CLI.
+   *
+   * A CLI that advertises --system-prompt-snapshot is the exception: there
+   * every resume passes the file again (see execute.prompt-refresh.test.ts).
+   * The fake CLI here does not advertise it.
    */
   it("passes --append-system-prompt-file on a fresh session when instructionsFile is set", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-fresh-"));
@@ -598,7 +620,7 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
     }
   });
 
-  it("omits --append-system-prompt-file on a resumed session even when instructionsFile is set", async () => {
+  it("omits --append-system-prompt-file on a resumed session without --system-prompt-snapshot support", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-resume-"));
     const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
     const instructionsFile = path.join(root, "instructions.md");
@@ -736,7 +758,7 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
     }
   });
 
-  it("commandNotes is empty on a resumed session even when instructionsFile is set", async () => {
+  it("commandNotes is empty on a resumed session without --system-prompt-snapshot support", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-notes-resume-"));
     const { workspace, commandPath, restore } = await setupExecuteEnv(root);
     const instructionsFile = path.join(root, "instructions.md");

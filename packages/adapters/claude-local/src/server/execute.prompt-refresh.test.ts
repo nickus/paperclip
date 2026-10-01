@@ -171,17 +171,60 @@ describe("claude_local resume after an instructions change", () => {
     };
   }
 
-  it("resumes without the refresh flags while the instructions are unchanged", async () => {
+  it("resumes on the recorded prompt and passes the current instructions again while they are unchanged", async () => {
     const first = await run({ instructions: "Version one.\n", sessionParams: null });
     const second = await run({ instructions: "Version one.\n", sessionParams: first.result.sessionParams ?? null });
 
     expect(argValue(second.args, "--resume")).toBe(first.result.sessionId);
     // A plain resume keeps the recorded system prompt, so the prompt cache holds.
     expect(second.args).not.toContain("--system-prompt-snapshot");
-    expect(second.args).not.toContain("--append-system-prompt-file");
-    expect(cli.helpCalls).toBe(0);
+    // The instructions still go along, for the prompt rendered after the
+    // conversation is compacted, and so does the current skills directory.
+    expect(second.instructionsSent).toContain("Version one.");
+    expect(argValue(second.args, "--add-dir")).toBeTruthy();
+    expect(second.log).not.toContain("without passing the agent instructions again");
+    expect(cli.helpCalls).toBe(1);
     expect(second.result.sessionParams).not.toHaveProperty("promptSnapshotBundleKey");
     expect(second.result.sessionParams?.promptBundleKey).toBe(first.result.sessionParams?.promptBundleKey);
+  });
+
+  it("keeps a plain resume without the instructions file when the CLI does not advertise the snapshot flag", async () => {
+    cli.helpText = HELP_WITHOUT_SNAPSHOT;
+    const first = await run({ instructions: "Version one.\n", sessionParams: null });
+    const second = await run({ instructions: "Version one.\n", sessionParams: first.result.sessionParams ?? null });
+
+    expect(argValue(second.args, "--resume")).toBe(first.result.sessionId);
+    expect(second.args).not.toContain("--system-prompt-snapshot");
+    expect(second.args).not.toContain("--append-system-prompt-file");
+    const notice =
+      `[paperclip] Resuming Claude session "${first.result.sessionId}" without passing the agent instructions again: ` +
+      "the Claude CLI does not advertise --system-prompt-snapshot.";
+    expect(second.log.split(notice)).toHaveLength(2);
+    // A new session does not need the notice.
+    expect(first.log).not.toContain("without passing the agent instructions again");
+  });
+
+  it("keeps a plain resume without the instructions file when the CLI support cannot be confirmed", async () => {
+    const config = { command: "/opt/tools/claude-wrapper" };
+    const first = await run({ instructions: "Version one.\n", sessionParams: null, config });
+    const second = await run({ instructions: "Version one.\n", sessionParams: first.result.sessionParams ?? null, config });
+
+    expect(argValue(second.args, "--resume")).toBe(first.result.sessionId);
+    expect(second.args).not.toContain("--append-system-prompt-file");
+    expect(second.log).toContain(
+      "without passing the agent instructions again: could not confirm that the Claude CLI supports --system-prompt-snapshot.",
+    );
+  });
+
+  it("does not probe the CLI for a plain resume without instructions to pass", async () => {
+    const config = { instructionsFilePath: "", paperclipRuntimeSkills: [] };
+    const first = await run({ instructions: "Version one.\n", sessionParams: null, config });
+    const second = await run({ instructions: "Version one.\n", sessionParams: first.result.sessionParams ?? null, config });
+
+    expect(argValue(second.args, "--resume")).toBe(first.result.sessionId);
+    expect(second.args).not.toContain("--append-system-prompt-file");
+    expect(second.log).not.toContain("without passing the agent instructions again");
+    expect(cli.helpCalls).toBe(0);
   });
 
   it("keeps the session and runs on the new instructions when the CLI supports the snapshot flag", async () => {
@@ -268,7 +311,7 @@ describe("claude_local resume after an instructions change", () => {
     const back = await run({ instructions: "Version one.\n", sessionParams: v3.result.sessionParams ?? null });
     expect(argValue(back.args, "--resume")).toBe(sessionId);
     expect(back.args).not.toContain("--system-prompt-snapshot");
-    expect(back.args).not.toContain("--append-system-prompt-file");
+    expect(back.instructionsSent).toContain("Version one.");
     expect(back.result.sessionParams?.promptBundleKey).toBe(v1Key);
     expect(back.result.sessionParams).not.toHaveProperty("promptSnapshotBundleKey");
     // One --help probe served every run.

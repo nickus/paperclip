@@ -812,9 +812,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Claude Code records the system prompt rendered on a conversation's first
   // request (including --append-system-prompt-file) and replays that record on
   // every later request and resume until the conversation is compacted; text
-  // passed on a later launch is ignored. Only `--system-prompt-snapshot off`
-  // renders the prompt fresh, and it does not update the record: a later
-  // default-mode resume goes back to the first request's prompt.
+  // passed on a later launch is ignored while the record exists. Only
+  // `--system-prompt-snapshot off` renders the prompt fresh, and it does not
+  // update the record: a later default-mode resume goes back to the first
+  // request's prompt.
   //
   // So the bundle that matters for a resume is the one in that record. When it
   // matches the current bundle, a plain resume runs on the current
@@ -826,6 +827,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // a resumed session (seen with the snapshot off) is told the new skill list.
   // A fresh session is the fallback when the CLI lacks the flag, and the
   // behavior when resetSessionOnPromptChange is set.
+  //
+  // Every resume on a CLI with the flag also passes the current instructions
+  // file. A plain resume ignores it while the record exists, at the cost of a
+  // few uncached tokens, but once the conversation has been compacted (or on
+  // a CLI that does not record the prompt) the system prompt is rendered from
+  // this launch and still holds the agent's instructions.
   const hasMatchingPromptBundle =
     runtimePromptSnapshotBundleKey.length === 0 || runtimePromptSnapshotBundleKey === promptBundle.bundleKey;
   const hasMatchingMcpServers =
@@ -843,35 +850,45 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       executionTargetIsRemote,
     }) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
+  const resetsSessionForPromptChange = !hasMatchingPromptBundle && resetSessionOnPromptChange;
+  // Whether the CLI offers --system-prompt-snapshot (true/false, null when
+  // unknown). Read only when a resume depends on it: a changed bundle, or a
+  // plain resume with an instructions file to pass again.
+  const supportsSnapshotFlag =
+    sessionMatchesApartFromPrompt &&
+    !resetsSessionForPromptChange &&
+    (!hasMatchingPromptBundle || Boolean(effectiveInstructionsFilePath))
+      ? await claudeCommandSupportsSystemPromptSnapshotFlag({
+          runId,
+          command,
+          target: runtimeExecutionTarget,
+          cwd,
+          env,
+          timeoutSec,
+          graceSec,
+        })
+      : null;
   // True when the session is resumed on a freshly rendered system prompt.
-  let refreshesPromptOnResume = false;
+  const refreshesPromptOnResume =
+    sessionMatchesApartFromPrompt && !hasMatchingPromptBundle && supportsSnapshotFlag === true;
   // Why a prompt change alone forces a fresh session, for the log line.
-  let promptChangeResetReason: string | null = null;
-  if (sessionMatchesApartFromPrompt && !hasMatchingPromptBundle) {
-    if (resetSessionOnPromptChange) {
-      promptChangeResetReason = "resetSessionOnPromptChange is enabled";
-    } else {
-      const supportsSnapshotFlag = await claudeCommandSupportsSystemPromptSnapshotFlag({
-        runId,
-        command,
-        target: runtimeExecutionTarget,
-        cwd,
-        env,
-        timeoutSec,
-        graceSec,
-      });
-      if (supportsSnapshotFlag === true) {
-        refreshesPromptOnResume = true;
-      } else {
-        promptChangeResetReason = supportsSnapshotFlag === false
-          ? "the Claude CLI does not advertise --system-prompt-snapshot, so a resumed session would keep its recorded instructions. Upgrade Claude Code to keep sessions across instruction changes"
-          : "could not confirm that the Claude CLI supports --system-prompt-snapshot, so a resumed session might keep its recorded instructions";
-      }
-    }
-  }
+  const promptChangeResetReason =
+    !sessionMatchesApartFromPrompt || hasMatchingPromptBundle
+      ? null
+      : resetSessionOnPromptChange
+      ? "resetSessionOnPromptChange is enabled"
+      : supportsSnapshotFlag === true
+      ? null
+      : supportsSnapshotFlag === false
+      ? "the Claude CLI does not advertise --system-prompt-snapshot, so a resumed session would keep its recorded instructions. Upgrade Claude Code to keep sessions across instruction changes"
+      : "could not confirm that the Claude CLI supports --system-prompt-snapshot, so a resumed session might keep its recorded instructions";
   const canResumeSession =
     sessionMatchesApartFromPrompt && (hasMatchingPromptBundle || refreshesPromptOnResume);
   const sessionId = canResumeSession ? runtimeSessionId : null;
+  // Pass the current instructions file with the resume as well (see above).
+  // Without the flag the CLI may not record the prompt, but that is not known,
+  // so the earlier behavior stays: a plain resume passes no instructions file.
+  const resendsInstructionsOnResume = canResumeSession && supportsSnapshotFlag === true;
   if (runtimeSessionId && !isValidUuid) {
     await onLog(
       "stdout",
@@ -922,6 +939,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" was saved with a different runtime MCP server set and will not be resumed.\n`,
+    );
+  }
+  if (canResumeSession && !resendsInstructionsOnResume && effectiveInstructionsFilePath) {
+    await onLog(
+      "stdout",
+      `[paperclip] Resuming Claude session "${runtimeSessionId}" without passing the agent instructions again: ${
+        supportsSnapshotFlag === false
+          ? "the Claude CLI does not advertise --system-prompt-snapshot"
+          : "could not confirm that the Claude CLI supports --system-prompt-snapshot"
+      }. Once the conversation is compacted, the session may run without them. Upgrade Claude Code to have the instructions passed on every resume.\n`,
     );
   }
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
@@ -998,8 +1025,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (effectiveEffort) args.push("--effort", effectiveEffort);
     if (maxTurns > 0) args.push("--max-turns", String(maxTurns));
-    // runAttempt passes the file only for a fresh session or a refreshed
-    // resume; a plain resume replays the instructions the session recorded.
+    // runAttempt decides when to pass the file (see resendsInstructionsOnResume).
     if (attemptInstructionsFilePath) {
       args.push("--append-system-prompt-file", attemptInstructionsFilePath);
     }
@@ -1029,8 +1055,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const runAttempt = async (resumeSessionId: string | null) => {
     const refreshSystemPrompt = Boolean(resumeSessionId) && refreshesPromptOnResume;
+    // A new session records the file; a resume passes it where the CLI
+    // offers the snapshot flag (always so when refreshSystemPrompt is set).
     const attemptInstructionsFilePath =
-      !resumeSessionId || refreshSystemPrompt ? effectiveInstructionsFilePath : undefined;
+      !resumeSessionId || resendsInstructionsOnResume ? effectiveInstructionsFilePath : undefined;
     const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath, refreshSystemPrompt);
     // The bundle the session's recorded system prompt holds after this attempt:
     // a fresh session records the current bundle; a resume keeps its record
@@ -1045,6 +1073,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (refreshSystemPrompt) {
       commandNotes.push(
         `Resuming with --system-prompt-snapshot off so the session runs on prompt bundle ${promptBundle.bundleKey} instead of its recorded bundle ${promptSnapshotBundleKey}.`,
+      );
+    } else if (resumeSessionId && attemptInstructionsFilePath) {
+      commandNotes.push(
+        "Passing the agent instructions with the resume as well: the session's recorded system prompt takes precedence until the conversation is compacted, and the prompt rendered after that includes them.",
       );
     }
     if (dangerouslySkipPermissions && executionTargetIsRemote) {
