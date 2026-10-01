@@ -23,6 +23,22 @@ export function getConfigSchema(): AdapterConfigSchema {
         hint: "Default uses ACP. If ACP is unavailable, the run fails with a setup error. Choose CLI explicitly to use it.",
       },
       {
+        key: "billingType",
+        label: "Cost ledger billing type",
+        type: "select",
+        default: "auto",
+        options: [
+          { value: "auto", label: "Auto-detect (default)" },
+          { value: "api", label: "Metered API usage" },
+          { value: "subscription", label: "Subscription (included)" },
+        ],
+        hint:
+          "Auto-detect guesses from auth (Bedrock, an ANTHROPIC_API_KEY, or otherwise subscription). " +
+          "Override to \"Metered API usage\" when this agent authenticates with a token that is actually " +
+          "billed at API prices (e.g. an OAuth/long-lived token), so its reported cost is not forced to $0. " +
+          "Override to \"Subscription (included)\" to force the opposite.",
+      },
+      {
         key: "agentCommand",
         label: "ACP server command",
         type: "text",

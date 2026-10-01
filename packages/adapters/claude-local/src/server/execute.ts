@@ -96,6 +96,7 @@ import {
 } from "./cli-capabilities.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
+import { parseClaudeBillingTypeOverride, resolveClaudeBillingTypeWithOverride } from "./billing.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs, claudeSandboxPermissionEnv } from "./permissions.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -168,9 +169,22 @@ function isBedrockAuth(env: Record<string, string>): boolean {
   );
 }
 
-function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscription" | "metered_api" {
+function resolveClaudeAutoBillingType(env: Record<string, string>): "api" | "subscription" | "metered_api" {
   if (isBedrockAuth(env)) return "metered_api";
   return hasNonEmptyEnvValue(env, "ANTHROPIC_API_KEY") ? "api" : "subscription";
+}
+
+/**
+ * Resolve the CLI lane's ledger billingType, honoring an explicit
+ * `billingType` config override (see ./billing.js) on top of the
+ * auth-based auto-detection.
+ */
+export function resolveClaudeBillingType(
+  config: Record<string, unknown>,
+  env: Record<string, string>,
+): "api" | "subscription" | "metered_api" {
+  const override = parseClaudeBillingTypeOverride(config.billingType);
+  return resolveClaudeBillingTypeWithOverride(override, resolveClaudeAutoBillingType(env));
 }
 
 async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<ClaudeRuntimeConfig> {
@@ -497,7 +511,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const modelEnv = executionTargetIsRemote ? env : effectiveEnv;
   const model = resolveClaudeModel(config.model, modelEnv);
-  const billingType = resolveClaudeBillingType(effectiveEnv);
+  const billingType = resolveClaudeBillingType(config, effectiveEnv);
   const claudeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = new Set(resolveClaudeDesiredSkillNames(config, claudeSkillEntries));
   // When instructionsFilePath is configured, build a stable content-addressed
