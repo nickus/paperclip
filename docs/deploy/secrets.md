@@ -58,6 +58,10 @@ GitHub repos for repo-only project workspaces and refreshing worktree base
 refs. See
 [Execution workspaces](../guides/board-operator/execution-workspaces-and-runtime-services.md#private-repositories-and-repo-only-project-workspaces).
 
+To give agents HTTPS credentials for a Git host other than GitHub, bind the
+token to a variable and point a host-scoped Git credential helper at it; see
+[Git credentials for other hosts](../guides/board-operator/execution-workspaces-and-runtime-services.md#git-credentials-for-other-hosts).
+
 ## User-Specific Secrets
 
 User-specific secrets let a shared agent or project declare a slot such as

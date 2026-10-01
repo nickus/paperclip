@@ -30,6 +30,19 @@ Server-side Git operations and GitHub gateway calls follow the same selection ru
 
 Managed commands disable ambient Git credential helpers, Git global/system configuration, host GitHub CLI configuration, and host SSH identity access. Per-operation GitHub CLI configuration is isolated in a writable configuration directory beneath the managed launcher directory. Missing credentials clear previous author and token values; no teammate, standing delegation, host token, or company-default user's account is substituted. Anonymous/local operations remain available where supported.
 
+Credential settings for other Git hosts survive that reset. `GIT_CONFIG_KEY_<n>`
+entries of the form `credential.<url>.helper`, `.username`, or `.useHttpPath`,
+where `<url>` is an explicit http(s) URL naming a host other than `github.com`
+or one of its subdomains, are renumbered from zero in the run environment and
+appended by each launcher after its own and any brokered entries. The leading
+`credential.helper` reset still clears unscoped helpers, and GitHub requests
+see only managed credentials. Unscoped helpers, GitHub-scoped or wildcard
+entries, `url.*.insteadOf`, `core.askPass`, and all other inherited Git
+configuration remain cleared. `otherHostGitCredentialConfig` in
+`packages/adapter-utils/src/github-launcher.ts` defines the selection; operator
+setup is described in
+`docs/guides/board-operator/execution-workspaces-and-runtime-services.md`.
+
 Without a managed identity, local commits can use an explicitly configured
 repository identity or `git -c user.name=... -c user.email=...`. The launcher
 leaves author/committer environment variables unset and requires configured
