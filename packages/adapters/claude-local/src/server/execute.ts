@@ -790,6 +790,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
   const runtimePromptBundleKey = asString(runtimeSessionParams.promptBundleKey, "");
   const runtimeMcpServerIdentity = asString(runtimeSessionParams.mcpServerIdentity, "");
+  // Resuming across a changed instructions/skills bundle is intentionally
+  // refused rather than resumed with the new bundle, even though a fresh
+  // bundle key is always recomputed for the current invocation below.
+  // Verified empirically against the installed CLI: a resumed call's system
+  // prompt defaults to "snapshot on", meaning the text rendered on a
+  // conversation's *first* request is recorded once and replayed verbatim on
+  // every later resume, so a new --append-system-prompt/-file passed on the
+  // resumed call is silently ignored until the conversation is compacted
+  // (the CLI does expose an explicit --system-prompt-snapshot off opt-in to
+  // change that, which this adapter does not take). On top of that, this
+  // adapter already skips re-sending the instructions file on resume at all
+  // (see the `!resumeSessionId` guard a bit below) to avoid the wasted
+  // tokens and possible CLI rejection of sending both --resume and
+  // --append-system-prompt-file together. So blocking resume on a bundle
+  // mismatch is what prevents an agent from silently running a stale set of
+  // instructions or skills while Paperclip believes it handed over the
+  // current ones; starting a fresh session is the only way to actually pick
+  // up the change.
   const hasMatchingPromptBundle =
     runtimePromptBundleKey.length === 0 || runtimePromptBundleKey === promptBundle.bundleKey;
   const hasMatchingMcpServers =
