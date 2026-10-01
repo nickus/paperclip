@@ -513,6 +513,11 @@ describe("sandbox callback bridge route policies", () => {
 
     it("keeps refusing routes only the agent policy opens, with the unchanged message", () => {
       for (const request of [...AGENT_ONLY_ALLOWED, ...AGENT_DENIED, ...STEWARD_ONLY_ALLOWED, ...STEWARD_DENIED]) {
+        // `GET /api/issues` is the one common wrong guess in this set: the
+        // restricted list only forwards a single issue, not the bare
+        // listing, so it keeps the unchanged message plus the route hint
+        // (see the "route hints" describe block below).
+        if (request.method === "GET" && request.path === "/api/issues") continue;
         expect(restricted(request)).toBe(`Route not allowed: ${request.method} ${request.path}`);
       }
     });
@@ -524,6 +529,79 @@ describe("sandbox callback bridge route policies", () => {
           "Route not allowed: GET /api/companies/co-1/heartbeat-runs",
         );
       }
+    });
+  });
+
+  describe("route hints for common wrong instance-level guesses", () => {
+    // Each wrong guess and the documented, company-scoped route it should
+    // point at. `GET /api/issues` is left out here: under `agent`/`steward`
+    // it is itself a forwarded route (see the `agent`/`steward` cases
+    // below), so no hint about it ever fires there.
+    const HINTS: { request: RouteCase; suggestion: string }[] = [
+      {
+        request: { method: "GET", path: "/api/agents" },
+        suggestion: "list colleagues with GET /api/companies/{companyId}/agents",
+      },
+      {
+        request: { method: "GET", path: "/api/projects" },
+        suggestion: "list projects with GET /api/companies/{companyId}/projects",
+      },
+      {
+        request: { method: "GET", path: "/api/routines" },
+        suggestion: "list routines with GET /api/companies/{companyId}/routines",
+      },
+    ];
+
+    it("restricted: appends the hint, after the unchanged 'Route not allowed: METHOD PATH' prefix, for agents/projects/routines and for the bare issues listing", () => {
+      for (const { request, suggestion } of [
+        ...HINTS,
+        {
+          request: { method: "GET", path: "/api/issues" },
+          suggestion: "list issues with GET /api/companies/{companyId}/issues",
+        },
+      ]) {
+        const denial = restricted(request);
+        const unchangedPrefix = `Route not allowed: ${request.method} ${request.path}`;
+        expect(denial, `${request.method} ${request.path}`).not.toBeNull();
+        expect(denial!.startsWith(unchangedPrefix), denial!).toBe(true);
+        expect(denial).toBe(`${unchangedPrefix}. Instead, ${suggestion}.`);
+        // The suggested route is one the same (restricted) policy actually
+        // forwards, substituting a concrete company id for the placeholder.
+        const suggestedRoute = suggestion.match(/GET (\/api\/\S+)/)![1]!.replace("{companyId}", COMPANY);
+        expect(restricted({ method: "GET", path: suggestedRoute }), suggestedRoute).toBeNull();
+      }
+    });
+
+    it("agent and steward: append the same hint, after the unchanged policy-named prefix, for agents/projects/routines", () => {
+      for (const authorize of [agent, steward]) {
+        for (const { request, suggestion } of HINTS) {
+          const denial = authorize(request);
+          expect(denial, `${request.method} ${request.path}`).not.toBeNull();
+          expect(denial).toContain(`${request.method} ${request.path}`);
+          expect(denial).toContain("retrying this route will not succeed.");
+          expect(denial).toContain(`Instead, ${suggestion}.`);
+          // The suggested route is one the same policy actually forwards.
+          const suggestedRoute = suggestion.match(/GET (\/api\/\S+)/)![1]!.replace("{companyId}", COMPANY);
+          expect(authorize({ method: "GET", path: suggestedRoute }), suggestedRoute).toBeNull();
+        }
+      }
+    });
+
+    it("agent and steward: never hint at GET /api/issues, because that bare listing is itself already forwarded", () => {
+      for (const authorize of [agent, steward]) {
+        expect(authorize({ method: "GET", path: "/api/issues" })).toBeNull();
+      }
+    });
+
+    it("never hints on a denial for a different method on the same path, or for a deny-listed path", () => {
+      // Wrong method on a hinted path: no matching hint entry.
+      expect(restricted({ method: "POST", path: "/api/agents" })).toBe("Route not allowed: POST /api/agents");
+      const deniedAgentPost = agent({ method: "POST", path: "/api/agents" });
+      expect(deniedAgentPost).not.toContain("Instead,");
+      // A deny-rule match (secrets) never grows a hint even though the path
+      // is close to a hinted family.
+      const secretsDenial = agent({ method: "GET", path: "/api/agents/agent-1/secrets" });
+      expect(secretsDenial).not.toContain("Instead,");
     });
   });
 

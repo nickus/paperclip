@@ -468,14 +468,77 @@ export function createSandboxCallbackBridgeToken(bytes = DEFAULT_BRIDGE_TOKEN_BY
   return randomBytes(bytes).toString("base64url");
 }
 
+interface SandboxCallbackBridgeRouteHintEntry {
+  /** The wrong instance-level guess agents commonly send. */
+  method: string;
+  path: string;
+  /** The documented route to name instead, written with a literal
+   * `{companyId}` placeholder the way the skill docs do. */
+  suggestion: string;
+  /** A concrete method/path used to confirm the suggested route is actually
+   * forwarded by whichever policy is asking, before the hint is shown. */
+  suggestedRouteCheck: { method: string; path: string };
+}
+
+// Common instance-level route guesses that exist only company-scoped. Each
+// hint is confirmed against the asking policy's own allow rules before it is
+// added to a 403 body (see `sandboxCallbackBridgeRouteHint`), so a hint never
+// names a route the same policy would also refuse.
+const SANDBOX_CALLBACK_BRIDGE_ROUTE_HINTS: readonly SandboxCallbackBridgeRouteHintEntry[] = [
+  {
+    method: "GET",
+    path: "/api/agents",
+    suggestion: "list colleagues with GET /api/companies/{companyId}/agents",
+    suggestedRouteCheck: { method: "GET", path: "/api/companies/check-company/agents" },
+  },
+  {
+    method: "GET",
+    path: "/api/issues",
+    suggestion: "list issues with GET /api/companies/{companyId}/issues",
+    suggestedRouteCheck: { method: "GET", path: "/api/companies/check-company/issues" },
+  },
+  {
+    method: "GET",
+    path: "/api/projects",
+    suggestion: "list projects with GET /api/companies/{companyId}/projects",
+    suggestedRouteCheck: { method: "GET", path: "/api/companies/check-company/projects" },
+  },
+  {
+    method: "GET",
+    path: "/api/routines",
+    suggestion: "list routines with GET /api/companies/{companyId}/routines",
+    suggestedRouteCheck: { method: "GET", path: "/api/companies/check-company/routines" },
+  },
+];
+
+/**
+ * Look up the hint for one wrong-guess request, or null when there is none or
+ * the policy asking would refuse the suggested route too (`isSuggestedRouteAllowed`
+ * decides that, bound to the same allow rules the caller just checked `path`
+ * against). Matching is exact on method and path: a hint names one specific
+ * documented alternative, so it only fires for the bare guess it was written
+ * for, not a prefix or a lookalike.
+ */
+function sandboxCallbackBridgeRouteHint(
+  method: string,
+  path: string,
+  isSuggestedRouteAllowed: (candidate: { method: string; path: string }) => boolean,
+): string | null {
+  const entry = SANDBOX_CALLBACK_BRIDGE_ROUTE_HINTS.find((hint) => hint.method === method && hint.path === path);
+  if (!entry || !isSuggestedRouteAllowed(entry.suggestedRouteCheck)) return null;
+  return entry.suggestion;
+}
+
 export function authorizeSandboxCallbackBridgeRequestWithRoutes(
   request: Pick<SandboxCallbackBridgeRequest, "method" | "path">,
   routes: readonly SandboxCallbackBridgeRouteRule[] = DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
 ): string | null {
   const method = normalizeMethod(request.method);
-  return routes.some((route) => route.method === method && route.path.test(request.path))
-    ? null
-    : `Route not allowed: ${method} ${request.path}`;
+  const isAllowed = (candidate: { method: string; path: string }) =>
+    routes.some((route) => route.method === candidate.method && route.path.test(candidate.path));
+  if (isAllowed({ method, path: request.path })) return null;
+  const hint = sandboxCallbackBridgeRouteHint(method, request.path, isAllowed);
+  return `Route not allowed: ${method} ${request.path}${hint ? `. Instead, ${hint}.` : ""}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -738,11 +801,20 @@ function agentPolicyRouteMatches(rules: readonly AgentBridgeRouteRule[], method:
   return rules.some((rule) => rule.methods.includes(method) && rule.path.test(path));
 }
 
-function agentPolicyDenial(policy: WidePolicy, method: string, path: string): string {
+function agentPolicyDenial(
+  policy: WidePolicy,
+  method: string,
+  path: string,
+  isSuggestedRouteAllowed: (candidate: { method: string; path: string }) => boolean,
+  // The canonicalized (lower-cased, trailing-slash-stripped) path to match a
+  // hint against, when it differs from the raw `path` shown in the message.
+  hintLookupPath: string = path,
+): string {
+  const hint = sandboxCallbackBridgeRouteHint(method, hintLookupPath, isSuggestedRouteAllowed);
   return (
     `Route not allowed (bridge policy "${policy}"): ${method} ${path}. ` +
     "Secret values, credentials, environment configuration and administration APIs are not reachable " +
-    "from isolated agent runs; retrying this route will not succeed."
+    `from isolated agent runs; retrying this route will not succeed.${hint ? ` Instead, ${hint}.` : ""}`
   );
 }
 
@@ -787,18 +859,25 @@ export function authorizeSandboxCallbackBridgeRequestForPolicy(
     return authorizeSandboxCallbackBridgeRequestWithRoutes(request, DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST);
   }
 
+  const steward = policy === "steward";
+  // Bound to this policy's own allow rules, so a hint never names a route
+  // the same policy would also refuse. Reused by every `agentPolicyDenial`
+  // call below.
+  const isSuggestedRouteAllowed = (candidate: { method: string; path: string }) =>
+    agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, candidate.method, candidate.path) ||
+    (steward && agentPolicyRouteMatches(STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, candidate.method, candidate.path));
+
   // Percent-encoding could spell a denied segment in a form the rules do not
   // see (the router matches literal routes on the raw path, but decodes
   // parameters), so the wider policy accepts no encoded characters at all.
   if (request.path.includes("%")) {
-    return agentPolicyDenial(policy, method, request.path);
+    return agentPolicyDenial(policy, method, request.path, isSuggestedRouteAllowed);
   }
   const lowered = request.path.toLowerCase();
   const matchPath = lowered.length > 1 && lowered.endsWith("/") ? lowered.slice(0, -1) : lowered;
-  const steward = policy === "steward";
   const denyRules = steward ? STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES : AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES;
   if (agentPolicyRouteMatches(denyRules, method, matchPath)) {
-    return agentPolicyDenial(policy, method, request.path);
+    return agentPolicyDenial(policy, method, request.path, isSuggestedRouteAllowed, matchPath);
   }
   // A run with no bound company reaches no company-scoped path at all, so a
   // target that stamps the policy but not the company fails closed.
@@ -816,7 +895,7 @@ export function authorizeSandboxCallbackBridgeRequestForPolicy(
   if (steward && agentPolicyRouteMatches(STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, method, matchPath)) {
     return null;
   }
-  return agentPolicyDenial(policy, method, request.path);
+  return agentPolicyDenial(policy, method, request.path, isSuggestedRouteAllowed, matchPath);
 }
 
 /** Build a request authorizer bound to one policy and run company. */
