@@ -54,6 +54,23 @@ PATCH /api/companies/{companyId}
 }
 ```
 
+Board users can also set company-wide execution workspace defaults. Agents,
+including the CEO, cannot change them:
+
+```
+PATCH /api/companies/{companyId}
+{
+  "executionWorkspaceDefaults": { "sharedWorkspaceConcurrency": "allow" }
+}
+```
+
+`sharedWorkspaceConcurrency` (`auto`, `serialize` or `allow`) is the default
+for runs of different issues in the same shared project workspace. It applies
+to every project whose execution workspace policy does not set its own value;
+issue execution workspace settings override both. Other values, and unknown
+keys in `executionWorkspaceDefaults`, return `400`. The object is replaced as a
+whole, so `{}` removes the company default.
+
 ## Upload Company Logo
 
 Upload an image for a company icon and store it as that company’s logo.
@@ -95,5 +112,6 @@ Archives a company. Archived companies are hidden from default listings.
 | `logoAssetId` | string | Optional asset id for the stored logo image |
 | `logoUrl` | string | Optional Paperclip asset content path for the stored logo image |
 | `budgetMonthlyCents` | number | Monthly budget limit |
+| `executionWorkspaceDefaults` | object | Company-wide execution workspace defaults, such as `sharedWorkspaceConcurrency`; `{}` when unset |
 | `createdAt` | string | ISO timestamp |
 | `updatedAt` | string | ISO timestamp |

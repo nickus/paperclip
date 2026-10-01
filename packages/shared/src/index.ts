@@ -765,6 +765,7 @@ export {
 
 export type {
   Company,
+  CompanyExecutionWorkspaceDefaults,
   InteractionResolverGovernance,
   InteractionResolverKindGovernance,
   GenerateSummarySlotRequest,
@@ -1831,6 +1832,7 @@ export {
 } from "./validators/index.js";
 
 export {
+  companyExecutionWorkspaceDefaultsSchema,
   createCompanySchema,
   interactionResolverGovernanceSchema,
   updateCompanySchema,

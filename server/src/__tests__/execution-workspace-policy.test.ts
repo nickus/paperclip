@@ -10,6 +10,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   isUnrunnableWorktreeCombo,
   issueExecutionWorkspaceModeForPersistedWorkspace,
+  parseCompanyExecutionWorkspaceDefaults,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   ManagedSandboxUnavailableError,
@@ -68,6 +69,86 @@ describe("execution workspace policy helpers", () => {
       }),
     ).toBe("auto");
     expect(resolveSharedWorkspaceConcurrency({ projectPolicy: null, issueSettings: null })).toBe("auto");
+  });
+
+  describe("company default for shared-workspace concurrency", () => {
+    const companyDefaults = { sharedWorkspaceConcurrency: "allow" } as const;
+
+    it("applies to a project without a policy", () => {
+      expect(
+        resolveSharedWorkspaceConcurrency({ projectPolicy: null, issueSettings: null, companyDefaults }),
+      ).toBe("allow");
+    });
+
+    it("applies to a disabled project policy and to an enabled one that leaves the value unset", () => {
+      expect(
+        resolveSharedWorkspaceConcurrency({
+          projectPolicy: { enabled: false, sharedWorkspaceConcurrency: "serialize" },
+          issueSettings: null,
+          companyDefaults,
+        }),
+      ).toBe("allow");
+      expect(
+        resolveSharedWorkspaceConcurrency({
+          projectPolicy: { enabled: true, defaultMode: "shared_workspace" },
+          issueSettings: { mode: "shared_workspace" },
+          companyDefaults,
+        }),
+      ).toBe("allow");
+    });
+
+    it("is overridden by a project policy value", () => {
+      expect(
+        resolveSharedWorkspaceConcurrency({
+          projectPolicy: { enabled: true, sharedWorkspaceConcurrency: "serialize" },
+          issueSettings: null,
+          companyDefaults,
+        }),
+      ).toBe("serialize");
+      // An explicit project "auto" also wins over the company default.
+      expect(
+        resolveSharedWorkspaceConcurrency({
+          projectPolicy: { enabled: true, sharedWorkspaceConcurrency: "auto" },
+          issueSettings: null,
+          companyDefaults,
+        }),
+      ).toBe("auto");
+    });
+
+    it("is overridden by issue settings, which also beat the project policy", () => {
+      expect(
+        resolveSharedWorkspaceConcurrency({
+          projectPolicy: null,
+          issueSettings: { sharedWorkspaceConcurrency: "serialize" },
+          companyDefaults,
+        }),
+      ).toBe("serialize");
+      expect(
+        resolveSharedWorkspaceConcurrency({
+          projectPolicy: { enabled: true, sharedWorkspaceConcurrency: "allow" },
+          issueSettings: { sharedWorkspaceConcurrency: "serialize" },
+          companyDefaults: { sharedWorkspaceConcurrency: "allow" },
+        }),
+      ).toBe("serialize");
+    });
+
+    it("falls back to auto when the company has no default", () => {
+      for (const defaults of [undefined, null, {}]) {
+        expect(
+          resolveSharedWorkspaceConcurrency({ projectPolicy: null, issueSettings: null, companyDefaults: defaults }),
+        ).toBe("auto");
+      }
+    });
+
+    it("drops unrecognized stored values instead of trusting them", () => {
+      expect(parseCompanyExecutionWorkspaceDefaults({ sharedWorkspaceConcurrency: "serialize" })).toEqual({
+        sharedWorkspaceConcurrency: "serialize",
+      });
+      expect(parseCompanyExecutionWorkspaceDefaults({ sharedWorkspaceConcurrency: "parallel" })).toEqual({});
+      expect(parseCompanyExecutionWorkspaceDefaults({ unrelated: true })).toEqual({});
+      expect(parseCompanyExecutionWorkspaceDefaults(null)).toEqual({});
+      expect(parseCompanyExecutionWorkspaceDefaults("allow")).toEqual({});
+    });
   });
 
   it("validates the shared-workspace concurrency enum on project and issue settings", () => {

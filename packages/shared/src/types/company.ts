@@ -4,6 +4,7 @@ import type {
   IssueThreadInteractionResolverPolicy,
   PauseReason,
 } from "../constants.js";
+import type { SharedWorkspaceConcurrency } from "./workspace-runtime.js";
 
 export interface InteractionResolverKindGovernance {
   defaultPolicy?: IssueThreadInteractionResolverPolicy;
@@ -13,6 +14,15 @@ export interface InteractionResolverKindGovernance {
 export type InteractionResolverGovernance = Partial<
   Record<IssueThreadInteractionKind, InteractionResolverKindGovernance>
 >;
+
+/**
+ * Company-wide defaults for execution workspaces. Each value applies to every
+ * project in the company that does not set its own value in an enabled
+ * execution workspace policy; issue execution workspace settings still win.
+ */
+export interface CompanyExecutionWorkspaceDefaults {
+  sharedWorkspaceConcurrency?: SharedWorkspaceConcurrency;
+}
 
 export interface Company {
   id: string;
@@ -28,6 +38,7 @@ export interface Company {
   defaultResponsibleUserId: string | null;
   requireBoardApprovalForNewAgents: boolean;
   interactionResolverGovernance: InteractionResolverGovernance;
+  executionWorkspaceDefaults: CompanyExecutionWorkspaceDefaults;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;
   feedbackDataSharingConsentByUserId: string | null;

@@ -26,6 +26,7 @@ function makeCompany(overrides: Partial<Company>): Company {
     updatedAt: new Date(),
     ...overrides,
     interactionResolverGovernance: overrides.interactionResolverGovernance ?? {},
+    executionWorkspaceDefaults: overrides.executionWorkspaceDefaults ?? {},
   };
 }
 

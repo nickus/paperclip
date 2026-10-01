@@ -30,13 +30,26 @@ Explicit project policies and issue workspace settings still take precedence. A 
 
 ## Shared workspace concurrency policy
 
-Projects and individual issues can set `sharedWorkspaceConcurrency` in their execution workspace policy/settings:
+Companies, projects and individual issues can set `sharedWorkspaceConcurrency`. A company sets a default for all of its projects in `executionWorkspaceDefaults`; projects and issues set it in their execution workspace policy/settings:
 
-- `auto` (the default when absent): allow concurrent shared-workspace runs on `local` and `ssh` environments, and serialize runs on `sandbox` and `plugin` environments. An instance forced to Kubernetes always serializes in `auto` mode.
+- `auto` (the built-in default when no level sets a value): allow concurrent shared-workspace runs on `local` and `ssh` environments, and serialize runs on `sandbox` and `plugin` environments. An instance forced to Kubernetes always serializes in `auto` mode.
 - `serialize`: on `sandbox` and `plugin` environments, defer a run while another live run holds the same project workspace, using the `workspace_busy` retry path. Local and SSH folders remain concurrent, even when an existing project or issue policy requests serialization.
 - `allow`: dispatch alongside a live holder on every environment.
 
-Issue settings override the project policy, which overrides the default `auto`. The final execution environment determines whether workspace serialization applies; an instance forced to Kubernetes is a sandbox even if the agent normally runs locally. Local and SSH folder runs never wait for exclusive workspace ownership. Task checkout and per-agent concurrency limits still apply. When concurrency is allowed and a live holder exists, Paperclip adds the holder run and issue to the dispatched task context so agents can coordinate concurrent mutations through commits. The setting is optional JSON policy data, so existing databases require no migration.
+Issue settings override the project policy, which overrides the company default, which overrides the built-in default `auto`. A project policy only takes part when it is enabled and sets a value, so a newly created project with no policy follows the company default. The final execution environment determines whether workspace serialization applies; an instance forced to Kubernetes is a sandbox even if the agent normally runs locally. Local and SSH folder runs never wait for exclusive workspace ownership. Task checkout and per-agent concurrency limits still apply. When concurrency is allowed and a live holder exists, Paperclip adds the holder run and issue to the dispatched task context so agents can coordinate concurrent mutations through commits. The project and issue values are optional JSON policy data. The company default is stored in the `companies.execution_workspace_defaults` JSON column, which defaults to `{}` (no company default).
+
+### Company default
+
+A board user sets the company default through the company update API. Agents, including the CEO, cannot change it:
+
+```
+PATCH /api/companies/{companyId}
+{
+  "executionWorkspaceDefaults": { "sharedWorkspaceConcurrency": "allow" }
+}
+```
+
+`sharedWorkspaceConcurrency` accepts `auto`, `serialize` or `allow`; any other value, or an unknown key in `executionWorkspaceDefaults`, returns `400`. The object is replaced as a whole, so `{ "executionWorkspaceDefaults": {} }` removes the company default. Project policies and issue settings are read only while isolated workspaces are enabled for the instance; the company default applies either way.
 
 ## Hidden UI entrypoints
 

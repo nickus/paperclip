@@ -534,6 +534,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
+  parseCompanyExecutionWorkspaceDefaults,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveEffectiveWorkspaceStrategyType,
@@ -11339,6 +11340,19 @@ export function heartbeatService(
       responsibleUserId:
         routineRun?.responsibleUserId ?? routine?.responsibleUserId ?? null,
     };
+  }
+
+  async function getCompanyExecutionWorkspaceDefaults(companyId: string) {
+    const company = await db
+      .select({
+        executionWorkspaceDefaults: companies.executionWorkspaceDefaults,
+      })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0] ?? null);
+    return parseCompanyExecutionWorkspaceDefaults(
+      company?.executionWorkspaceDefaults,
+    );
   }
 
   async function resolveCompanyDefaultResponsibleUserId(companyId: string) {
@@ -22198,10 +22212,6 @@ export function heartbeatService(
           },
         );
       }
-      const sharedWorkspaceConcurrency = resolveSharedWorkspaceConcurrency({
-        projectPolicy: projectExecutionWorkspacePolicy,
-        issueSettings: issueExecutionWorkspaceSettings,
-      });
       // A live holder is always consulted for shared workspaces. Depending on policy and the final
       // execution target it either remains the existing deferral gate or becomes dispatch context.
       // Local/SSH folders never take an exclusive workspace lock, including when older
@@ -22225,6 +22235,15 @@ export function heartbeatService(
           honorIsolatedWorkspaceModes: isolatedWorkspacesEnabled,
         });
         if (workspaceHolder) {
+          // The policy only matters once a live holder exists, so the company
+          // default is read here rather than on every dispatch.
+          const sharedWorkspaceConcurrency = resolveSharedWorkspaceConcurrency({
+            projectPolicy: projectExecutionWorkspacePolicy,
+            issueSettings: issueExecutionWorkspaceSettings,
+            companyDefaults: await getCompanyExecutionWorkspaceDefaults(
+              agent.companyId,
+            ),
+          });
           const environmentDriver =
             selectedEnvironmentForConfig?.driver ?? null;
           const shouldSerialize =

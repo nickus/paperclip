@@ -151,6 +151,7 @@ export function companyService(db: Db) {
     defaultResponsibleUserId: companies.defaultResponsibleUserId,
     requireBoardApprovalForNewAgents: companies.requireBoardApprovalForNewAgents,
     interactionResolverGovernance: companies.interactionResolverGovernance,
+    executionWorkspaceDefaults: companies.executionWorkspaceDefaults,
     feedbackDataSharingEnabled: companies.feedbackDataSharingEnabled,
     feedbackDataSharingConsentAt: companies.feedbackDataSharingConsentAt,
     feedbackDataSharingConsentByUserId: companies.feedbackDataSharingConsentByUserId,

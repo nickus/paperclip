@@ -74,6 +74,7 @@ export {
 } from "./smoke-lab.js";
 
 export {
+  companyExecutionWorkspaceDefaultsSchema,
   createCompanySchema,
   interactionResolverGovernanceSchema,
   updateCompanySchema,

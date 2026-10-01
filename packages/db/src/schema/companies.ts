@@ -1,4 +1,4 @@
-import type { InteractionResolverGovernance } from "@paperclipai/shared";
+import type { CompanyExecutionWorkspaceDefaults, InteractionResolverGovernance } from "@paperclipai/shared";
 import { pgTable, uuid, text, integer, timestamp, boolean, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const companies = pgTable(
@@ -20,6 +20,12 @@ export const companies = pgTable(
       .default(false),
     interactionResolverGovernance: jsonb("interaction_resolver_governance")
       .$type<InteractionResolverGovernance>()
+      .notNull()
+      .default({}),
+    // Company-wide execution workspace defaults; project policies and issue
+    // settings take precedence over these values.
+    executionWorkspaceDefaults: jsonb("execution_workspace_defaults")
+      .$type<CompanyExecutionWorkspaceDefaults>()
       .notNull()
       .default({}),
     feedbackDataSharingEnabled: boolean("feedback_data_sharing_enabled")

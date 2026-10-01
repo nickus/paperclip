@@ -21,6 +21,13 @@ export const interactionResolverGovernanceSchema = z.object({
   request_item_verdicts: interactionResolverKindGovernanceSchema.optional(),
 }).strict().default({});
 
+// Company-wide execution workspace defaults. A PATCH replaces the whole object,
+// so `{}` clears every default. Unknown keys are rejected to catch typos.
+export const companyExecutionWorkspaceDefaultsSchema = z.object({
+  // Same values as the project policy and issue settings field of this name.
+  sharedWorkspaceConcurrency: z.enum(["auto", "serialize", "allow"]).optional(),
+}).strict();
+
 export const createCompanySchema = z.object({
   name: z.string().min(1),
   description: z.string().optional().nullable(),
@@ -38,6 +45,7 @@ export const updateCompanySchema = objectWithoutDefaults(
       spentMonthlyCents: z.number().int().nonnegative().optional(),
       requireBoardApprovalForNewAgents: z.boolean().optional(),
       interactionResolverGovernance: interactionResolverGovernanceSchema.optional(),
+      executionWorkspaceDefaults: companyExecutionWorkspaceDefaultsSchema.optional(),
       feedbackDataSharingEnabled: z.boolean().optional(),
       feedbackDataSharingConsentAt: z.coerce.date().nullable().optional(),
       feedbackDataSharingConsentByUserId: z.string().min(1).nullable().optional(),
