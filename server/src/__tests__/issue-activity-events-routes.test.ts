@@ -183,6 +183,7 @@ function issueUpdateWithReceipt(issue: ReturnType<typeof makeIssue>, patch: Reco
     actorRunStopId: _actorRunStopId,
     actorUserId: _actorUserId,
     blockedByIssueIds: _blockedByIssueIds,
+    cancelledBlockerOverride: _cancelledBlockerOverride,
     ...issuePatch
   } = patch;
   const updated = {
