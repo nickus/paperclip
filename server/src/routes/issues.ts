@@ -62,6 +62,7 @@ import {
 } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
+  editIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
   attachmentArtifactWorkProductMetadataSchema,
   cancelIssueThreadInteractionSchema,
@@ -405,6 +406,18 @@ const rejectUnknownIssueCommentFields = rejectUnknownBodyFields({
       'PATCH /api/issues/{issueId} with {"status":"...","comment":"..."} to change status and comment together',
     assigneeAgentId:
       'PATCH /api/issues/{issueId} with {"assigneeAgentId":"...","comment":"..."} to reassign and comment together',
+  },
+});
+// Same `comment` alias as comment creation above, for the same reason.
+const rejectUnknownIssueCommentEditFields = rejectUnknownBodyFields({
+  payloadName: "issue comment edit",
+  acceptedFields: Object.keys(editIssueCommentSchema.shape),
+  aliases: { comment: "body" },
+  hints: {
+    comment: "body (send the edited comment text once)",
+    text: "body",
+    message: "body",
+    content: "body",
   },
 });
 const queuedCommentMutationTargetSchema = z.object({
@@ -17416,6 +17429,97 @@ export function issueRoutes(
 
     res.json(deleted);
   });
+
+  // Authorization mirrors DELETE /issues/:id/comments/:commentId exactly
+  // (own-comment ownership, board override via assertAgentIssueMutationAllowed):
+  // whoever may delete a comment may edit it instead. This intentionally
+  // skips the queued-comment cancel/legacy-queue branch above, which governs
+  // withdrawing an undelivered comment before it wakes anyone — editing only
+  // ever applies to an already-posted comment.
+  //
+  // An edit never wakes anyone: it does not re-run assignee wakes or
+  // @-mention wakes, even for mentions that are newly added by the edit.
+  // Re-deriving "new" mentions would mean diffing against the pre-edit body
+  // and then replaying the same delegation-routing/addWakeup path the
+  // comment-creation route uses for its mentions — behavior entangled with
+  // run state that does not belong in a plain content fix. An agent that
+  // wants to notify someone of edited content should still post (or leave)
+  // a normal comment/mention.
+  router.patch(
+    "/issues/:id/comments/:commentId",
+    rejectUnknownIssueCommentEditFields,
+    validate(editIssueCommentSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const commentId = req.params.commentId as string;
+      const issue = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(id),
+        "Issue not found",
+      );
+      if (!issue) return;
+      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+
+      const comment = await svc.getComment(commentId);
+      if (!comment || comment.issueId !== id) {
+        res.status(404).json({ error: "Comment not found" });
+        return;
+      }
+
+      const actor = getActorInfo(req);
+      const actorOwnsComment =
+        actor.actorType === "agent"
+          ? comment.authorAgentId === actor.agentId
+          : comment.authorUserId === actor.actorId;
+      if (!actorOwnsComment) {
+        res
+          .status(403)
+          .json({ error: "Only the comment author can edit comments" });
+        return;
+      }
+
+      if (comment.deletedAt) {
+        res.status(404).json({ error: "Comment not found" });
+        return;
+      }
+
+      const edited = await svc.editComment(commentId, req.body.body, {
+        afterEdit: async (editedComment, tx) => {
+          await issueReferencesSvc.syncComment(editedComment.id, tx);
+          await externalObjectsSvc.syncCommentSafely(editedComment.id, tx);
+        },
+      });
+      if (!edited) {
+        res.status(404).json({ error: "Comment not found" });
+        return;
+      }
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.comment_edited",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          commentId: edited.id,
+          identifier: issue.identifier,
+          issueTitle: issue.title,
+          editedByType: actor.actorType,
+          editedByAgentId: actor.actorType === "agent" ? actor.agentId : null,
+          editedByUserId: actor.actorType === "user" ? actor.actorId : null,
+          editedByRunId: actor.runId,
+          editedAt: edited.updatedAt,
+        },
+      });
+
+      res.json(edited);
+    },
+  );
 
   router.get("/issues/:id/feedback-votes", async (req, res) => {
     const id = req.params.id as string;

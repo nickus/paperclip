@@ -12249,6 +12249,58 @@ export function issueService(db: Db) {
       });
     },
 
+    // Replaces a live comment's body in place. There is no dedicated
+    // "edited at" column — `updatedAt` already distinguishes an edited
+    // comment from a freshly-created one (where it equals `createdAt`), so
+    // reusing it keeps this change schema-free. A tombstoned comment cannot
+    // be edited: the where-clause's `isNull(deletedAt)` makes that a no-op
+    // (the caller sees `null` and reports 404), matching how
+    // `tombstoneComment` already guards against double-deletes.
+    editComment: async (
+      commentId: string,
+      body: string,
+      options?: {
+        afterEdit?: (comment: IssueComment, tx: any) => Promise<void>;
+      },
+    ) => {
+      const currentUserRedactionOptions = {
+        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+      };
+      const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
+
+      return db.transaction(async (tx) => {
+        const now = new Date();
+        const [comment] = await tx
+          .update(issueComments)
+          .set({
+            body: redactedBody,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issueComments.id, commentId),
+              isNull(issueComments.deletedAt),
+            ),
+          )
+          .returning();
+
+        if (!comment) return null;
+
+        await tx
+          .update(issues)
+          .set({ updatedAt: now })
+          .where(eq(issues.id, comment.issueId));
+
+        const redacted = redactIssueComment(
+          comment,
+          currentUserRedactionOptions.enabled,
+        );
+        await options?.afterEdit?.(redacted, tx);
+
+        return redacted;
+      });
+    },
+
     addComment: async function addComment(
       issueId: string,
       body: string,
