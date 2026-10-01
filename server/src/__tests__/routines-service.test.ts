@@ -15,6 +15,7 @@ import {
   folders,
   heartbeatRuns,
   instanceSettings,
+  issueComments,
   issueInboxArchives,
   issues,
   projectWorkspaces,
@@ -677,14 +678,14 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await expect(svc.evaluateActivityGate(projectRoutine, now)).resolves.toMatchObject({ fire: true });
   });
 
-  it("creates a fresh execution issue when the previous routine issue is open but idle", async () => {
+  it("coalesces into a previous routine issue that is open but idle (no live run) instead of opening a parallel one", async () => {
     const { companyId, issueSvc, routine, svc } = await seedFixture();
     const previousRunId = randomUUID();
     const previousIssue = await issueSvc.create(companyId, {
       projectId: routine.projectId,
       title: routine.title,
       description: routine.description,
-      status: "todo",
+      status: "in_review",
       priority: routine.priority,
       assigneeAgentId: routine.assigneeAgentId,
       originKind: "routine_execution",
@@ -704,8 +705,61 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       completedAt: new Date("2026-03-20T12:00:00.000Z"),
     });
 
+    // No live run is bound to the issue (its executionRunId is null, as it
+    // would be once the run that created it finished), so the routine detail
+    // view still reports no active issue.
     const detailBefore = await svc.getDetail(routine.id);
     expect(detailBefore?.activeIssue).toBeNull();
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(run.status).toBe("coalesced");
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+    expect(run.coalescedIntoRunId).toBe(previousRunId);
+
+    const routineIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+
+    expect(routineIssues).toHaveLength(1);
+
+    const notes = await db
+      .select({ body: issueComments.body, authorType: issueComments.authorType })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, previousIssue.id));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]?.authorType).toBe("system");
+    expect(notes[0]?.body).toMatch(/fired again/i);
+    expect(notes[0]?.body).toMatch(/still open/i);
+    expect(notes[0]?.body).toMatch(/manual run/i);
+  });
+
+  it("creates a fresh execution issue once the previous routine issue is closed", async () => {
+    const { companyId, issueSvc, routine, svc } = await seedFixture();
+    const previousRunId = randomUUID();
+    const previousIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "done",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: previousRunId,
+    });
+
+    await db.insert(routineRuns).values({
+      id: previousRunId,
+      companyId,
+      routineId: routine.id,
+      triggerId: null,
+      source: "manual",
+      status: "issue_created",
+      triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
+      linkedIssueId: previousIssue.id,
+      completedAt: new Date("2026-03-20T12:00:00.000Z"),
+    });
 
     const run = await svc.runRoutine(routine.id, { source: "manual" });
     expect(run.status).toBe("issue_created");
@@ -1327,7 +1381,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(wakeupResolved).toBe(true);
   });
 
-  it("coalesces only when the existing routine issue has a live execution run", async () => {
+  it("coalesces into an existing routine issue that has a live execution run", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
     const previousRunId = randomUUID();
     const liveHeartbeatRunId = randomUUID();
@@ -1557,7 +1611,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(inboxIssues.map((issue) => issue.id)).toContain(previousIssue.id);
   });
 
-  it("does not coalesce live routine runs with different resolved variables", async () => {
+  it("coalesces a second firing with different resolved variables into the still-open issue (manual run, then the next firing)", async () => {
     const { companyId, agentId, projectId, svc } = await seedFixture();
     const variableRoutine = await svc.create(
       companyId,
@@ -1579,20 +1633,23 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       {},
     );
 
+    // A manual run fires with one set of variables...
     const first = await svc.runRoutine(variableRoutine.id, {
       source: "manual",
       variables: { branch: "feature/a" },
     });
+    // ...then the next scheduled tick fires with different variables while
+    // the first issue is still open. It must land on the same issue instead
+    // of opening a second one the assignee doesn't know about.
     const second = await svc.runRoutine(variableRoutine.id, {
-      source: "manual",
+      source: "schedule",
       variables: { branch: "feature/b" },
     });
 
     expect(first.status).toBe("issue_created");
-    expect(second.status).toBe("issue_created");
-    expect(first.linkedIssueId).toBeTruthy();
-    expect(second.linkedIssueId).toBeTruthy();
-    expect(first.linkedIssueId).not.toBe(second.linkedIssueId);
+    expect(second.status).toBe("coalesced");
+    expect(second.linkedIssueId).toBe(first.linkedIssueId);
+    expect(second.coalescedIntoRunId).toBe(first.id);
 
     const routineIssues = await db
       .select({
@@ -1603,12 +1660,70 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .from(issues)
       .where(eq(issues.originId, variableRoutine.id));
 
-    expect(routineIssues).toHaveLength(2);
-    expect(routineIssues.map((issue) => issue.title).sort()).toEqual([
-      "pre-pr for feature/a",
-      "pre-pr for feature/b",
-    ]);
-    expect(new Set(routineIssues.map((issue) => issue.originFingerprint)).size).toBe(2);
+    expect(routineIssues).toHaveLength(1);
+    // The issue keeps the first firing's title/fingerprint; it is not
+    // rewritten for the later firing's variables.
+    expect(routineIssues[0]?.title).toBe("pre-pr for feature/a");
+
+    const notes = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, first.linkedIssueId!));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]?.body).toMatch(/fired again/i);
+    expect(notes[0]?.body).toMatch(/scheduled trigger/i);
+    expect(notes[0]?.body).toMatch(/feature\/b/);
+  });
+
+  it("skips (without a note) into an open but idle routine issue when the policy is skip_if_active", async () => {
+    const { companyId, issueSvc, routine, svc } = await seedFixture();
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const previousRunId = randomUUID();
+    const previousIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "blocked",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: previousRunId,
+    });
+    await db.insert(routineRuns).values({
+      id: previousRunId,
+      companyId,
+      routineId: routine.id,
+      triggerId: null,
+      source: "manual",
+      status: "issue_created",
+      triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
+      linkedIssueId: previousIssue.id,
+      completedAt: new Date("2026-03-20T12:00:00.000Z"),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+    expect(run.coalescedIntoRunId).toBe(previousRunId);
+
+    const routineIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toHaveLength(1);
+
+    // skip_if_active stays silent: no FYI note, no extra wake.
+    const notes = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, previousIssue.id));
+    expect(notes).toHaveLength(0);
   });
 
   it("interpolates routine variables into the execution issue and stores resolved values", async () => {
