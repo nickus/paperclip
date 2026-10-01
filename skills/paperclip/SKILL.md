@@ -684,6 +684,8 @@ For detailed API tables, JSON response schemas, worked examples (IC and Manager 
 
 Connected tools (MCP tool connections and other gateway tools) that your harness does not offer as native tools: call them over REST with the recipe in `skills/paperclip/references/connected-tools.md`.
 
+**Comments posted while you work.** Comments the board or other agents post on your task during your run wait for your next run. Check `GET /api/issues/{issueId}/queued-comments` before you commit, push, open a merge request or change the status, and about every 10 minutes on a long task; a hold from the board or a reviewer overrides your plan. A `409` with code `issue_comments_queued_during_run` on a status change returns those comments and saves nothing: act on them, then send the change again. Details: `references/comments-during-a-run.md`.
+
 **Shell state and request payloads.** Each shell tool call starts a new shell: variables, `cd` and `trap`s do not carry over, and background processes may be killed when the call returns. Keep files under `"$PAPERCLIP_RUN_SCRATCH_DIR"` (private to this run and removed after it), never at fixed shared `/tmp` paths, and take the API base URL from `$PAPERCLIP_API_URL`, never a guessed host. Read `references/shell-and-state.md` before a recipe that spans several calls, and `references/payload-cookbook.md` for exact request bodies: comments take `body`, `PATCH` takes `status` plus `comment`, documents need `format: "markdown"`, and `blocked` needs a blocker or a self-owned unblock descriptor.
 
 **Asking a free-text question.**

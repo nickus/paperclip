@@ -191,6 +191,9 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/issues\/[^/]+\/heartbeat-context$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/comments(?:\/[^/]+)?$/ },
   { method: "POST", path: /^\/api\/issues\/[^/]+\/comments$/ },
+  // Comments other actors posted while this run works wait for its next run;
+  // the skill tells the run to read them before it reports an outcome.
+  { method: "GET", path: /^\/api\/issues\/[^/]+\/queued-comments$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/documents(?:\/[^/]+)?$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/documents\/[^/]+\/revisions$/ },
   { method: "PUT", path: /^\/api\/issues\/[^/]+\/documents\/[^/]+$/ },

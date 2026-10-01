@@ -147,6 +147,16 @@ while :; do
     exit 0
   fi
 
+  # Comments arrived on the task while this run worked and it has not seen
+  # them. Not a failed write: read them, act on them, then run the same
+  # command again (see references/comments-during-a-run.md).
+  if [[ "$curl_exit" -eq 0 && "$http_code" == "409" ]] &&
+    [[ "$(jq -r '.code // empty' <<<"$body" 2>/dev/null || true)" == "issue_comments_queued_during_run" ]]; then
+    printf 'Issue update NOT saved yet (HTTP 409 issue_comments_queued_during_run): comments arrived while you were working and you have not seen them. Read them below, re-check your work (pause or revert it if they ask you to), then run this command again; the same comments do not stop it a second time.\n' >&2
+    printf '%s\n' "$body" >&2
+    exit 1
+  fi
+
   # 4xx (other than 429) is a definitive rejection; retrying cannot change it.
   if [[ "$curl_exit" -eq 0 && "$http_code" == 4* && "$http_code" != "429" ]]; then
     printf 'Issue update rejected (HTTP %s).\n' "$http_code" >&2
