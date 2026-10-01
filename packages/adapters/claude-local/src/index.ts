@@ -61,6 +61,7 @@ Core fields:
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file injected at runtime
 - model (string, optional): Claude model id. Missing or blank defaults to ${DEFAULT_CLAUDE_LOCAL_MODEL} in both CLI and ACP, including existing agents. Explicit model IDs and ANTHROPIC_MODEL overrides are preserved. Bedrock/Vertex without an explicit model retain their provider default.
 - effort (string, optional): model-specific reasoning effort passed via --effort (low|medium|high; current Opus, Sonnet 5, and Fable models also support xhigh|max)
+- resetSessionOnPromptChange (boolean, optional, default false): CLI engine only. When the agent instructions or enabled skills change, a saved Claude session is normally kept and resumed with --system-prompt-snapshot off plus the current instructions, so the conversation continues under the new versions (a CLI without that flag gets a fresh session instead). Set true to always start a fresh session after such a change.
 - chrome (boolean, optional): pass --chrome when running Claude
 - promptTemplate (string, optional): run prompt template
 - maxTurnsPerRun (number, optional): max turns for one run

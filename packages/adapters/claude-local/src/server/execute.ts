@@ -90,6 +90,7 @@ import {
   claudeCliVersionAtLeast,
   claudeCommandLooksLike,
   claudeCommandSupportsEffortFlag,
+  claudeCommandSupportsSystemPromptSnapshotFlag,
   minimumClaudeCliVersionForModel,
   readClaudeCommandVersion,
 } from "./cli-capabilities.js";
@@ -435,6 +436,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const effort = asString(config.effort, "");
+  const resetSessionOnPromptChange = asBoolean(config.resetSessionOnPromptChange, false);
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
   const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
@@ -789,36 +791,39 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
   const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
   const runtimePromptBundleKey = asString(runtimeSessionParams.promptBundleKey, "");
+  // The bundle whose instructions the session's recorded system prompt holds.
+  // It is stored only while it differs from promptBundleKey (the bundle of the
+  // latest run), so an absent value means the two are the same.
+  const runtimePromptSnapshotBundleKey =
+    asString(runtimeSessionParams.promptSnapshotBundleKey, "") || runtimePromptBundleKey;
   const runtimeMcpServerIdentity = asString(runtimeSessionParams.mcpServerIdentity, "");
-  // Resuming across a changed instructions/skills bundle is intentionally
-  // refused rather than resumed with the new bundle, even though a fresh
-  // bundle key is always recomputed for the current invocation below.
-  // Verified empirically against the installed CLI: a resumed call's system
-  // prompt defaults to "snapshot on", meaning the text rendered on a
-  // conversation's *first* request is recorded once and replayed verbatim on
-  // every later resume, so a new --append-system-prompt/-file passed on the
-  // resumed call is silently ignored until the conversation is compacted
-  // (the CLI does expose an explicit --system-prompt-snapshot off opt-in to
-  // change that, which this adapter does not take). On top of that, this
-  // adapter already skips re-sending the instructions file on resume at all
-  // (see the `!resumeSessionId` guard a bit below) to avoid the wasted
-  // tokens and possible CLI rejection of sending both --resume and
-  // --append-system-prompt-file together. So blocking resume on a bundle
-  // mismatch is what prevents an agent from silently running a stale set of
-  // instructions or skills while Paperclip believes it handed over the
-  // current ones; starting a fresh session is the only way to actually pick
-  // up the change.
+  // Claude Code records the system prompt rendered on a conversation's first
+  // request (including --append-system-prompt-file) and replays that record on
+  // every later request and resume until the conversation is compacted; text
+  // passed on a later launch is ignored. Only `--system-prompt-snapshot off`
+  // renders the prompt fresh, and it does not update the record: a later
+  // default-mode resume goes back to the first request's prompt.
+  //
+  // So the bundle that matters for a resume is the one in that record. When it
+  // matches the current bundle, a plain resume runs on the current
+  // instructions and keeps the prompt cache. When it differs, the session is
+  // resumed with the snapshot off and the current instructions file; the
+  // record keeps its old bundle, so every later resume of the session does the
+  // same until the bundle matches the record again or a fresh session starts.
+  // Skills need nothing more: --add-dir always names the current bundle, and
+  // a resumed session (seen with the snapshot off) is told the new skill list.
+  // A fresh session is the fallback when the CLI lacks the flag, and the
+  // behavior when resetSessionOnPromptChange is set.
   const hasMatchingPromptBundle =
-    runtimePromptBundleKey.length === 0 || runtimePromptBundleKey === promptBundle.bundleKey;
+    runtimePromptSnapshotBundleKey.length === 0 || runtimePromptSnapshotBundleKey === promptBundle.bundleKey;
   const hasMatchingMcpServers =
     runtimeMcpServerIdentity.length === 0
       ? runtimeMcpServers.length === 0
       : runtimeMcpServerIdentity === runtimeMcpIdentity;
   const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
-  const canResumeSession =
+  const sessionMatchesApartFromPrompt =
     runtimeSessionId.length > 0 &&
     isValidUuid &&
-    hasMatchingPromptBundle &&
     hasMatchingMcpServers &&
     claudeSessionCwdMatchesExecutionTarget({
       runtimeSessionCwd,
@@ -826,6 +831,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       executionTargetIsRemote,
     }) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
+  // True when the session is resumed on a freshly rendered system prompt.
+  let refreshesPromptOnResume = false;
+  // Why a prompt change alone forces a fresh session, for the log line.
+  let promptChangeResetReason: string | null = null;
+  if (sessionMatchesApartFromPrompt && !hasMatchingPromptBundle) {
+    if (resetSessionOnPromptChange) {
+      promptChangeResetReason = "resetSessionOnPromptChange is enabled";
+    } else {
+      const supportsSnapshotFlag = await claudeCommandSupportsSystemPromptSnapshotFlag({
+        runId,
+        command,
+        target: runtimeExecutionTarget,
+        cwd,
+        env,
+        timeoutSec,
+        graceSec,
+      });
+      if (supportsSnapshotFlag === true) {
+        refreshesPromptOnResume = true;
+      } else {
+        promptChangeResetReason = supportsSnapshotFlag === false
+          ? "the Claude CLI does not advertise --system-prompt-snapshot, so a resumed session would keep its recorded instructions. Upgrade Claude Code to keep sessions across instruction changes"
+          : "could not confirm that the Claude CLI supports --system-prompt-snapshot, so a resumed session might keep its recorded instructions";
+      }
+    }
+  }
+  const canResumeSession =
+    sessionMatchesApartFromPrompt && (hasMatchingPromptBundle || refreshesPromptOnResume);
   const sessionId = canResumeSession ? runtimeSessionId : null;
   if (runtimeSessionId && !isValidUuid) {
     await onLog(
@@ -862,10 +895,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
     );
   }
-  if (runtimeSessionId && runtimePromptBundleKey.length > 0 && runtimePromptBundleKey !== promptBundle.bundleKey) {
+  if (refreshesPromptOnResume) {
     await onLog(
       "stdout",
-      `[paperclip] Claude session "${runtimeSessionId}" was saved for prompt bundle "${runtimePromptBundleKey}" and will not be resumed with "${promptBundle.bundleKey}".\n`,
+      `[paperclip] Instructions or skills changed since Claude session "${runtimeSessionId}"; resuming it with the current versions.\n`,
+    );
+  } else if (runtimeSessionId && !hasMatchingPromptBundle) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session "${runtimeSessionId}" was saved for prompt bundle "${runtimePromptSnapshotBundleKey}" and will not be resumed with "${promptBundle.bundleKey}"${promptChangeResetReason ? `: ${promptChangeResetReason}` : ""}.\n`,
     );
   }
   if (runtimeSessionId && !hasMatchingMcpServers) {
@@ -926,10 +964,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const buildClaudeArgs = (
     resumeSessionId: string | null,
     attemptInstructionsFilePath: string | undefined,
+    refreshSystemPrompt: boolean,
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
     if (config.managedAiConnection) args.push("--setting-sources", "user");
     if (resumeSessionId) args.push("--resume", resumeSessionId);
+    // Render the system prompt from this launch instead of replaying the one
+    // the session recorded, so the current instructions file takes effect.
+    if (refreshSystemPrompt) args.push("--system-prompt-snapshot", "off");
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
       targetIsRemote: executionTargetIsRemote,
@@ -944,10 +986,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (effectiveEffort) args.push("--effort", effectiveEffort);
     if (maxTurns > 0) args.push("--max-turns", String(maxTurns));
-    // On resumed sessions the instructions are already in the session cache;
-    // re-injecting them via --append-system-prompt-file wastes 5-10K tokens
-    // per heartbeat and the Claude CLI may reject the combination outright.
-    if (attemptInstructionsFilePath && !resumeSessionId) {
+    // runAttempt passes the file only for a fresh session or a refreshed
+    // resume; a plain resume replays the instructions the session recorded.
+    if (attemptInstructionsFilePath) {
       args.push("--append-system-prompt-file", attemptInstructionsFilePath);
     }
     if (runtimeMcpServers.length > 0) {
@@ -975,18 +1016,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   const runAttempt = async (resumeSessionId: string | null) => {
-    const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
-    const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
+    const refreshSystemPrompt = Boolean(resumeSessionId) && refreshesPromptOnResume;
+    const attemptInstructionsFilePath =
+      !resumeSessionId || refreshSystemPrompt ? effectiveInstructionsFilePath : undefined;
+    const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath, refreshSystemPrompt);
+    // The bundle the session's recorded system prompt holds after this attempt:
+    // a fresh session records the current bundle; a resume keeps its record
+    // (legacy sessions without a stored key adopt the current bundle).
+    const promptSnapshotBundleKey = resumeSessionId
+      ? runtimePromptSnapshotBundleKey || promptBundle.bundleKey
+      : promptBundle.bundleKey;
     const commandNotes: string[] = [];
     if (!resumeSessionId) {
       commandNotes.push(`Using stable Claude prompt bundle ${promptBundle.bundleKey}.`);
+    }
+    if (refreshSystemPrompt) {
+      commandNotes.push(
+        `Resuming with --system-prompt-snapshot off so the session runs on prompt bundle ${promptBundle.bundleKey} instead of its recorded bundle ${promptSnapshotBundleKey}.`,
+      );
     }
     if (dangerouslySkipPermissions && executionTargetIsRemote) {
       commandNotes.push(
         "Using full Claude permission bypass for remote execution, including connected tools.",
       );
     }
-    if (attemptInstructionsFilePath && !resumeSessionId) {
+    if (attemptInstructionsFilePath) {
       commandNotes.push(
         `Injected agent instructions via --append-system-prompt-file ${instructionsFilePath} (with path directive appended)`,
       );
@@ -1031,7 +1085,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
-    return { proc, parsedStream, parsed };
+    return { proc, parsedStream, parsed, promptSnapshotBundleKey };
   };
 
   const toAdapterResult = (
@@ -1039,10 +1093,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       proc: RunProcessResult;
       parsedStream: ReturnType<typeof parseClaudeStreamJson>;
       parsed: Record<string, unknown> | null;
+      promptSnapshotBundleKey: string;
     },
     opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
   ): AdapterExecutionResult => {
-    const { proc, parsedStream, parsed } = attempt;
+    const { proc, parsedStream, parsed, promptSnapshotBundleKey } = attempt;
     const loginMeta = detectClaudeLoginRequired({
       parsed,
       stdout: proc.stdout,
@@ -1190,6 +1245,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         sessionId: resolvedSessionId,
         cwd,
         promptBundleKey: promptBundle.bundleKey,
+        // Kept only while the session's recorded prompt is from another bundle.
+        ...(promptSnapshotBundleKey !== promptBundle.bundleKey ? { promptSnapshotBundleKey } : {}),
         mcpServerIdentity: runtimeMcpIdentity,
         ...(executionTargetIsRemote
           ? {

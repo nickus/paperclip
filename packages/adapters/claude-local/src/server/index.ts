@@ -85,6 +85,7 @@ export const sessionCodec: AdapterSessionCodec = {
     const promptBundleKey =
       readNonEmptyString(record.promptBundleKey) ??
       readNonEmptyString(record.prompt_bundle_key);
+    const promptSnapshotBundleKey = readNonEmptyString(record.promptSnapshotBundleKey);
     const mcpServerIdentity = readNonEmptyString(record.mcpServerIdentity);
     const workspaceId = readNonEmptyString(record.workspaceId) ?? readNonEmptyString(record.workspace_id);
     const repoUrl = readNonEmptyString(record.repoUrl) ?? readNonEmptyString(record.repo_url);
@@ -95,6 +96,7 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(cwd ? { cwd } : {}),
       ...(remoteExecution ? { remoteExecution } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
+      ...(promptSnapshotBundleKey ? { promptSnapshotBundleKey } : {}),
       ...(mcpServerIdentity ? { mcpServerIdentity } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
@@ -112,6 +114,7 @@ export const sessionCodec: AdapterSessionCodec = {
     const promptBundleKey =
       readNonEmptyString(params.promptBundleKey) ??
       readNonEmptyString(params.prompt_bundle_key);
+    const promptSnapshotBundleKey = readNonEmptyString(params.promptSnapshotBundleKey);
     const mcpServerIdentity = readNonEmptyString(params.mcpServerIdentity);
     const workspaceId = readNonEmptyString(params.workspaceId) ?? readNonEmptyString(params.workspace_id);
     const repoUrl = readNonEmptyString(params.repoUrl) ?? readNonEmptyString(params.repo_url);
@@ -122,6 +125,7 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(cwd ? { cwd } : {}),
       ...(remoteExecution ? { remoteExecution } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
+      ...(promptSnapshotBundleKey ? { promptSnapshotBundleKey } : {}),
       ...(mcpServerIdentity ? { mcpServerIdentity } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),

@@ -2,7 +2,24 @@ import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/executio
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import path from "node:path";
 
-const effortFlagSupportCache = new Map<string, Promise<boolean | null>>();
+// One `--help` probe per command/target; every flag check reads the same
+// result. Holds null when the probe timed out or could not run.
+const helpProbeCache = new Map<string, Promise<ClaudeHelpProbe | null>>();
+
+interface ClaudeHelpProbe {
+  output: string;
+  exitCode: number | null;
+}
+
+export interface ClaudeCommandProbeInput {
+  runId: string;
+  command: string;
+  target: AdapterExecutionTarget | null | undefined;
+  cwd: string;
+  env: Record<string, string>;
+  timeoutSec: number;
+  graceSec: number;
+}
 
 export const CLAUDE_FABLE_5_1_MIN_CLI_VERSION = "2.1.251";
 
@@ -109,15 +126,7 @@ export async function readClaudeCommandVersion(input: {
   return probeClaudeCommandVersion(input).catch(() => null);
 }
 
-async function probeClaudeCommandSupportsEffortFlag(input: {
-  runId: string;
-  command: string;
-  target: AdapterExecutionTarget | null | undefined;
-  cwd: string;
-  env: Record<string, string>;
-  timeoutSec: number;
-  graceSec: number;
-}): Promise<boolean | null> {
+async function probeClaudeCommandHelp(input: ClaudeCommandProbeInput): Promise<ClaudeHelpProbe | null> {
   const help = await runAdapterExecutionTargetProcess(
     input.runId,
     input.target,
@@ -133,38 +142,55 @@ async function probeClaudeCommandSupportsEffortFlag(input: {
   );
 
   if (help.timedOut) return null;
-  const output = `${help.stdout}\n${help.stderr}`;
-  if (output.includes("--effort")) return true;
+  return { output: `${help.stdout}\n${help.stderr}`, exitCode: help.exitCode };
+}
+
+async function claudeCommandAdvertisesFlag(
+  input: ClaudeCommandProbeInput,
+  flag: string,
+): Promise<boolean | null> {
+  // A wrapper script or other binary may not forward --help, so its output
+  // proves nothing either way.
+  if (!claudeCommandLooksLike(input.command, "claude")) return null;
+
+  const key = cacheKeyForTarget(input.command, input.target);
+  let probe = helpProbeCache.get(key);
+  if (!probe) {
+    // A thrown probe (e.g. sandbox connection error, ENOENT spawning the binary)
+    // must degrade to the conservative fallback rather than killing the run, so we
+    // resolve to null and drop the cache entry to retry on the next lease.
+    probe = probeClaudeCommandHelp(input).catch(() => {
+      helpProbeCache.delete(key);
+      return null;
+    });
+    helpProbeCache.set(key, probe);
+  }
+
+  const help = await probe;
+  if (!help) return null;
+  if (help.output.includes(flag)) return true;
+  // Only a clean exit proves the flag is absent; a failing --help is unknown.
   if ((help.exitCode ?? 0) === 0) return false;
   return null;
 }
 
-export async function claudeCommandSupportsEffortFlag(input: {
-  runId: string;
-  command: string;
-  target: AdapterExecutionTarget | null | undefined;
-  cwd: string;
-  env: Record<string, string>;
-  timeoutSec: number;
-  graceSec: number;
-}): Promise<boolean | null> {
-  if (!claudeCommandLooksLike(input.command, "claude")) return null;
+/** true/false when `--help` settles it; null when it is unknown. */
+export async function claudeCommandSupportsEffortFlag(input: ClaudeCommandProbeInput): Promise<boolean | null> {
+  return claudeCommandAdvertisesFlag(input, "--effort");
+}
 
-  const key = cacheKeyForTarget(input.command, input.target);
-  const cached = effortFlagSupportCache.get(key);
-  if (cached) return cached;
-
-  // A thrown probe (e.g. sandbox connection error, ENOENT spawning the binary)
-  // must degrade to the conservative fallback rather than killing the run, so we
-  // resolve to null and drop the cache entry to retry on the next lease.
-  const probe = probeClaudeCommandSupportsEffortFlag(input).catch(() => {
-    effortFlagSupportCache.delete(key);
-    return null;
-  });
-  effortFlagSupportCache.set(key, probe);
-  return probe;
+/**
+ * Whether the CLI accepts `--system-prompt-snapshot`, which lets a resumed
+ * conversation run on a newly rendered system prompt instead of the one it
+ * recorded on its first request. true/false when `--help` settles it; null
+ * when it is unknown.
+ */
+export async function claudeCommandSupportsSystemPromptSnapshotFlag(
+  input: ClaudeCommandProbeInput,
+): Promise<boolean | null> {
+  return claudeCommandAdvertisesFlag(input, "--system-prompt-snapshot");
 }
 
 export function resetClaudeCliCapabilitiesCacheForTests() {
-  effortFlagSupportCache.clear();
+  helpProbeCache.clear();
 }
