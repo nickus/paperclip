@@ -241,6 +241,20 @@ describe("readRunStreamJsonPage", () => {
     expect(streamJsonItemLines(result.items as StreamJsonItem[]).map((line) => JSON.parse(line).subtype)).toEqual(["init", "paperclip_raw"]);
   });
 
+  it("returns an empty, non-complete page for an active run whose log store has not been created yet", async () => {
+    // Mirrors the raw log API's just-created-run case: the run row exists
+    // but begin() has not run yet, so there is no handle to read from. The
+    // reader already treats a null handle as an immediate EOF, so this page
+    // builds a correct empty page rather than erroring.
+    const result = await page(meta({ status: "queued", logStore: null, logRef: null }), {});
+
+    expect(result.items).toEqual([]);
+    expect(result.complete).toBe(false);
+    expect(result.nextCursor).toBeNull();
+    expect(result.reset).toBe(false);
+    expect(result.runStatus).toBe("queued");
+  });
+
   it("synthesizes the result of a terminal run without a log", async () => {
     const result = await page(
       terminal({ logStore: null, logRef: null, status: "failed", error: "could not start", errorCode: "adapter_failed" }),

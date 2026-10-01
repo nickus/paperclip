@@ -32018,7 +32018,25 @@ export function heartbeatService(
       const runId =
         typeof runOrLookup === "string" ? runOrLookup : runOrLookup.id;
       if (!run) throw notFound("Heartbeat run not found");
-      if (!run.logStore || !run.logRef) throw notFound("Run log not found");
+      if (!run.logStore || !run.logRef) {
+        // The run exists and is readable, but its log store has not been
+        // created yet -- `begin()` runs once the adapter starts streaming
+        // output, which lands slightly after the run row itself. A client
+        // polling a just-created run must see an empty, pageable page here,
+        // not a 404: a mobile client that treats any 4xx as an error would
+        // otherwise show a freshly started run as broken for about a
+        // second. Echo back the requested offset (defaulting to 0) as
+        // `nextOffset` so the caller's normal paging loop keeps polling from
+        // the same place instead of reading an absent `nextOffset` as "caught
+        // up, stop".
+        return {
+          runId,
+          store: run.logStore ?? null,
+          logRef: run.logRef ?? null,
+          content: "",
+          nextOffset: opts?.offset ?? 0,
+        };
+      }
 
       const result = await runLogStore.read(
         {
