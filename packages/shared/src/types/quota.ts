@@ -25,4 +25,29 @@ export interface ProviderQuotaResult {
   /** error message when ok is false */
   error?: string;
   windows: QuotaWindow[];
+  /**
+   * Non-secret display label for the credential this result came from, e.g.
+   * a bound company secret's name, "Claude login", or "Server login". Lets
+   * the UI render one panel per distinct bound token for providers (like
+   * claude_local) that can poll more than one credential for a company.
+   * Omitted for providers that only ever report a single, unlabeled result.
+   */
+  label?: string | null;
+  /** ISO timestamp when this result's data was actually observed. Set when
+   *  `stale` is true, or when the data came from a passively-observed run
+   *  instead of a live poll, so the UI can show "as of <time>". */
+  observedAt?: string | null;
+  /**
+   * True when `windows` reflects a cached or passively-observed snapshot
+   * rather than a fresh live poll (e.g. the live endpoint was rate limited
+   * and the result is serving the last good read, or no live read is
+   * possible and a run's own rate-limit snapshot is shown instead).
+   */
+  stale?: boolean;
+  /**
+   * True when the account is currently drawing on "extra usage" beyond its
+   * subscription window, which Anthropic bills at standard API prices. Set
+   * from a passively observed `rate_limit_event`'s overage fields.
+   */
+  overageInUse?: boolean | null;
 }

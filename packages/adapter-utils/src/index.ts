@@ -35,6 +35,8 @@ export type {
   ServerAdapterModule,
   QuotaWindow,
   ProviderQuotaResult,
+  QuotaWindowsCredential,
+  GetQuotaWindowsContext,
   TranscriptEntry,
   PaperclipQuestion,
   PaperclipQuestionOption,
