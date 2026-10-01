@@ -92,7 +92,7 @@ describe("activity formatting", () => {
     expect(formatIssueActivityAction("issue.queued_comments_delivered")).toBe("was shown comments posted during its run");
     expect(formatActivityVerb("issue.queued_comments_undelivered")).toBe("retired comments its run never saw on");
     expect(formatIssueActivityAction("issue.queued_comments_undelivered"))
-      .toBe("retired comments its run never saw (the task was cancelled)");
+      .toBe("retired comments its run never saw (the task was closed)");
   });
 
   // PAP-16506 P4: agents can now resolve an interaction, including a review of

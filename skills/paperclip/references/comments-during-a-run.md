@@ -54,4 +54,4 @@ When your run sets its own task to `done`, `in_review` or `cancelled` (also with
 
 ## After your run
 
-Comments your run never saw are not lost. They start your next run, and its wake says which of them arrived while your previous run was working ("comments your previous run did not see"). Re-check what that run did, and pause or revert it if they ask for that. If your run completed the task without seeing them, the task is reopened for you.
+Comments your run never saw are not lost. They start your next run, and its wake says which of them arrived while your previous run was working ("comments your previous run did not see"). Re-check what that run did, and pause or revert it if they ask for that. If your run completed the task without seeing them, the task is reopened for you. If someone else closed the task while your run worked (the board, or a reviewer approving it), or it was cancelled, it stays closed: the comments do not start a run, and the task's activity lists them as comments your run never saw.

@@ -1204,14 +1204,17 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
   }, 120_000);
 
   it.each([
-    { caseName: "allows a non-assignee mention on completed work", targetAssignee: false, terminalStatus: "done", explicitResume: false, shownToRun: false },
-    { caseName: "delivers explicit agent feedback after completion", targetAssignee: true, terminalStatus: "done", explicitResume: true, shownToRun: false },
+    { caseName: "allows a non-assignee mention on completed work", targetAssignee: false, terminalStatus: "done", explicitResume: false, shownToRun: false, closedBy: "run" },
+    { caseName: "delivers explicit agent feedback after completion", targetAssignee: true, terminalStatus: "done", explicitResume: true, shownToRun: false, closedBy: "run" },
     // The run completed the task without seeing this comment, so it may have
     // finished work the comment asked it to hold: deliver it like a resume.
-    { caseName: "delivers agent feedback that the completing run never saw", targetAssignee: true, terminalStatus: "done", explicitResume: false, shownToRun: false },
-    { caseName: "cancels an assignee continuation without resume intent that the run saw before completing", targetAssignee: true, terminalStatus: "done", explicitResume: false, shownToRun: true },
-    { caseName: "cancels an assignee continuation on cancelled work", targetAssignee: true, terminalStatus: "cancelled", explicitResume: true, shownToRun: false },
-  ] as const)("$caseName", async ({ targetAssignee, terminalStatus, explicitResume, shownToRun }) => {
+    { caseName: "delivers agent feedback that the completing run never saw", targetAssignee: true, terminalStatus: "done", explicitResume: false, shownToRun: false, closedBy: "run" },
+    // A board user closed the task while the run worked: the run did not
+    // complete it, so the comment cannot reopen it; the activity names it.
+    { caseName: "keeps a task the board closed during the run closed and names the comment the run never saw", targetAssignee: true, terminalStatus: "done", explicitResume: false, shownToRun: false, closedBy: "board" },
+    { caseName: "cancels an assignee continuation without resume intent that the run saw before completing", targetAssignee: true, terminalStatus: "done", explicitResume: false, shownToRun: true, closedBy: "run" },
+    { caseName: "cancels an assignee continuation on cancelled work", targetAssignee: true, terminalStatus: "cancelled", explicitResume: true, shownToRun: false, closedBy: "run" },
+  ] as const)("$caseName", async ({ targetAssignee, terminalStatus, explicitResume, shownToRun, closedBy }) => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -1220,7 +1223,8 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const heartbeat = heartbeatService(db);
     const targetAgentId = targetAssignee ? assigneeAgentId : mentionedAgentId;
-    const shouldReopen = targetAssignee && terminalStatus === "done" && (explicitResume || !shownToRun);
+    const shouldReopen = targetAssignee && terminalStatus === "done" &&
+      (explicitResume || (!shownToRun && closedBy === "run"));
     const commentingAgentId = targetAssignee ? mentionedAgentId : assigneeAgentId;
     const wakeReason = targetAssignee ? "issue_commented" : "issue_comment_mentioned";
 
@@ -1391,6 +1395,28 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           updatedAt: new Date(),
         })
         .where(eq(issues.id, issueId));
+      // The issue update that closed the task, as the issue routes record it.
+      await db.insert(activityLog).values(closedBy === "run"
+        ? {
+          companyId,
+          actorType: "agent",
+          actorId: assigneeAgentId,
+          agentId: assigneeAgentId,
+          runId: firstRun!.id,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: issueId,
+          details: { status: terminalStatus },
+        }
+        : {
+          companyId,
+          actorType: "user",
+          actorId: "responsible-user",
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: issueId,
+          details: { status: terminalStatus },
+        });
 
       gateway.releaseFirstWait();
 

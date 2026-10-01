@@ -432,17 +432,25 @@ async function promoteDeferredWake(
           workingCandidate.deferredContextSeed.resumeIntent === true &&
           workingCandidate.queuedCommentIds.length > 0));
   }
-  // A task completed by a run that never saw comments posted during it (a
-  // hold from a reviewer or another agent, for example) is reopened for its
-  // assignee like an explicit resume: the completion may contradict them, and
-  // only a run that reads them can tell. The comments stay queued, so the
-  // reopened run receives them. Comments the run was shown before it
-  // completed the task do not reopen it.
+  // A task that the finishing run itself completed without seeing comments
+  // posted during it (a hold from a reviewer or another agent, for example)
+  // is reopened for its assignee like an explicit resume: the completion may
+  // contradict them, and only a run that reads them can tell. The comments
+  // stay queued, so the reopened run receives them. Comments the run was
+  // shown before it completed the task do not reopen it, and neither does a
+  // task that someone else closed (a board user, or a reviewer approving it
+  // while the run still worked): an agent comment must not override whoever
+  // closed it.
   if (
     !shouldReopen &&
     currentIssue.status === "done" &&
     workingCandidate.agentId === currentIssue.assigneeAgentId &&
-    unseenByFinishingRun.length > 0
+    unseenByFinishingRun.length > 0 &&
+    await ports.transaction.isIssueCompletedByFinishingRun({
+      companyId: run.companyId,
+      issueId: currentIssue.id,
+      finishingRunId: run.id,
+    })
   ) {
     shouldReopen = true;
   }
@@ -465,18 +473,20 @@ async function promoteDeferredWake(
       now: input.now,
     });
     if (cancelled && unseenByFinishingRun.length > 0) {
-      // Only a cancelled task gets here with such comments (a completed one
-      // is reopened above). It stays cancelled: cancelling already stops the
-      // work the comments could ask to hold, and an agent comment must not
-      // override whoever cancelled it. The comments are not dropped
-      // silently: the issue activity names them for the board.
+      // A cancelled task, or a completed one that someone other than the
+      // finishing run closed (one the run completed is reopened above). It
+      // stays closed: an agent comment must not override whoever closed it.
+      // The comments are not dropped silently: the issue activity names them
+      // for the board.
       await ports.transaction.recordUndeliveredQueuedComments({
         companyId: run.companyId,
         issueId: currentIssue.id,
         wakeId: workingCandidate.id,
         finishingRunId: run.id,
         commentIds: unseenByFinishingRun,
-        reason: "The task was cancelled before its run saw these comments",
+        reason: currentIssue.status === "cancelled"
+          ? "The task was cancelled before its run saw these comments"
+          : "Someone other than its run closed the task before the run saw these comments",
       });
     }
     return null;

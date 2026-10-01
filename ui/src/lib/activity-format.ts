@@ -137,7 +137,7 @@ const ISSUE_ACTIVITY_LABELS: Record<string, string> = {
   "issue.queued_comments_reordered": "reordered queued comments",
   "issue.queued_comment_discarded": "discarded a queued comment",
   "issue.queued_comments_delivered": "was shown comments posted during its run",
-  "issue.queued_comments_undelivered": "retired comments its run never saw (the task was cancelled)",
+  "issue.queued_comments_undelivered": "retired comments its run never saw (the task was closed)",
   "issue.comment_deleted": "deleted a comment",
   "issue.feedback_vote_saved": "saved feedback on an AI output",
   "issue.attachment_added": "added an attachment",

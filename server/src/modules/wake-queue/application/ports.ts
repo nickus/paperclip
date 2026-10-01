@@ -197,6 +197,17 @@ export interface WakeQueueTransaction {
     commentIds: string[];
   }): Promise<string[]>;
   /**
+   * Whether the finishing run itself moved the issue to `done` (its own
+   * status update, approving comment or native status decision). False when
+   * a board user or another agent's run closed the task, or when nothing
+   * records who closed it.
+   */
+  isIssueCompletedByFinishingRun(input: {
+    companyId: string;
+    issueId: string;
+    finishingRunId: string;
+  }): Promise<boolean>;
+  /**
    * Writes an issue activity entry naming queued comments whose wake this
    * drain retires without delivering them, so the board can see them.
    */

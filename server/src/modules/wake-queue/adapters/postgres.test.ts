@@ -947,8 +947,18 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
   // Another agent can ask the assignee to hold while the assignee's run is
   // working. That comment waits for the assignee's next run; if the run
   // completes the task without having seen it, the comment must still reach
-  // the assignee instead of being retired with the task.
-  it.each(["unseen", "shown_by_conflict", "posted_before_run_start", "own_comment", "cancelled_task"])(
+  // the assignee instead of being retired with the task. A task that someone
+  // else closed meanwhile (a board user, or a reviewer approving it) stays
+  // closed, and the issue activity names the comment instead.
+  it.each([
+    "unseen",
+    "shown_by_conflict",
+    "posted_before_run_start",
+    "own_comment",
+    "cancelled_task",
+    "closed_by_board",
+    "approved_by_reviewer",
+  ])(
     "delivers another agent's comment that the run completing the task never saw (%s)",
     async (scenario) => {
       const companyId = await seedCompany();
@@ -963,6 +973,30 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       const startedAt = new Date(Date.now() - 10 * 60_000);
       await db.update(heartbeatRuns).set({ startedAt }).where(eq(heartbeatRuns.id, runId));
       await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+      if (scenario !== "cancelled_task") {
+        // The issue update that closed the task, as the issue routes record it.
+        const reviewerRunId = scenario === "approved_by_reviewer"
+          ? await seedRun({ companyId, agentId: reviewerId, status: "succeeded", contextSnapshot: { issueId } })
+          : null;
+        await db.insert(activityLog).values(
+          scenario === "closed_by_board"
+            ? {
+              companyId, actorType: "user", actorId: "board-user", action: "issue.updated",
+              entityType: "issue", entityId: issueId, details: { status: "done" },
+            }
+            : {
+              companyId,
+              actorType: "agent",
+              actorId: reviewerRunId ? reviewerId : builderId,
+              agentId: reviewerRunId ? reviewerId : builderId,
+              runId: reviewerRunId ?? runId,
+              action: "issue.updated",
+              entityType: "issue",
+              entityId: issueId,
+              details: reviewerRunId ? { status: "done", source: "auto_approval_comment" } : { status: "done" },
+            },
+        );
+      }
       const [comment] = await db.insert(issueComments).values({
         companyId,
         issueId,
@@ -1033,11 +1067,17 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
         expect(result.outcome.kind).toBe("released");
         expect(issue!.status).toBe(scenario === "cancelled_task" ? "cancelled" : "done");
         expect(wake!.status).toBe("cancelled");
-        if (scenario === "cancelled_task") {
+        if (scenario === "cancelled_task" || scenario === "closed_by_board" || scenario === "approved_by_reviewer") {
           expect(undelivered).toEqual([expect.objectContaining({
             entityId: issueId,
             runId,
-            details: expect.objectContaining({ wakeId, commentIds: [comment!.id] }),
+            details: {
+              wakeId,
+              commentIds: [comment!.id],
+              reason: scenario === "cancelled_task"
+                ? "The task was cancelled before its run saw these comments"
+                : "Someone other than its run closed the task before the run saw these comments",
+            },
           })]);
         } else {
           expect(undelivered).toHaveLength(0);

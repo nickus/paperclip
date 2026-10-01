@@ -116,6 +116,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     })),
     getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false })),
     getCommentsUnseenByFinishingRun: vi.fn(async () => []),
+    isIssueCompletedByFinishingRun: vi.fn(async () => true),
     recordUndeliveredQueuedComments: vi.fn(async () => {}),
     isCompletedDelegationMention: vi.fn(async () => false),
     reopenIssue: vi.fn(async () => null),
@@ -772,13 +773,25 @@ describe("releaseIssueExecution", () => {
     }
   });
 
-  it.each(["done_unseen", "done_seen", "cancelled_unseen", "cancelled_seen", "in_progress_unseen", "other_agent"])(
+  it.each([
+    "done_unseen",
+    "done_seen",
+    "closed_by_other_unseen",
+    "cancelled_unseen",
+    "cancelled_seen",
+    "in_progress_unseen",
+    "other_agent",
+  ])(
     "handles comments the finishing run never saw: %s",
     async (scenario) => {
       const commentIds = ["hold-from-reviewer"];
       const [issueStatus, seen] = scenario === "other_agent"
         ? ["done", "unseen"]
-        : [scenario.slice(0, scenario.lastIndexOf("_")), scenario.slice(scenario.lastIndexOf("_") + 1)];
+        : scenario === "closed_by_other_unseen"
+          // A board user or a reviewer's run closed the task while the
+          // finishing run still worked.
+          ? ["done", "unseen"]
+          : [scenario.slice(0, scenario.lastIndexOf("_")), scenario.slice(scenario.lastIndexOf("_") + 1)];
       const queue = [wakeCandidate({
         // The finishing run's own agent, which is also the assignee, unless
         // the wake addresses another agent.
@@ -793,6 +806,7 @@ describe("releaseIssueExecution", () => {
         findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
         getQueuedCommentLiveness: vi.fn(async () => ({ liveNonSelfCommentIds: commentIds, containedSelfAuthoredComment: false })),
         getCommentsUnseenByFinishingRun: vi.fn(async () => (seen === "unseen" ? commentIds : [])),
+        isIssueCompletedByFinishingRun: vi.fn(async () => scenario !== "closed_by_other_unseen"),
         reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
       });
       const issue = scenario === "other_agent"
@@ -822,18 +836,33 @@ describe("releaseIssueExecution", () => {
         expect(result.outcome.kind).toBe("promoted");
         expect(promotedContext).toMatchObject({ queuedDuringPreviousRun: { runId: RUN.id, commentIds } });
       } else {
-        // A completed task whose run saw the comments, and a cancelled task,
-        // stay closed; the wake is retired as before.
+        // A completed task whose run saw the comments, a task someone else
+        // closed, and a cancelled task stay closed; the wake is retired.
         expect(transaction.reopenIssue).not.toHaveBeenCalled();
         expect(transaction.cancelDeferredWake).toHaveBeenCalledWith(expect.objectContaining({
           reason: "Deferred execution wake no longer applies to a terminal task",
         }));
         expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
       }
-      if (scenario === "cancelled_unseen") {
+      if (scenario === "done_unseen" || scenario === "closed_by_other_unseen") {
+        // Who completed the task decides between reopening and retiring.
+        expect(transaction.isIssueCompletedByFinishingRun).toHaveBeenCalledWith({
+          companyId: RUN.companyId, issueId: ISSUE.id, finishingRunId: RUN.id,
+        });
+      } else {
+        expect(transaction.isIssueCompletedByFinishingRun).not.toHaveBeenCalled();
+      }
+      if (scenario === "cancelled_unseen" || scenario === "closed_by_other_unseen") {
         // Not dropped silently: the issue activity names the comments.
         expect(transaction.recordUndeliveredQueuedComments).toHaveBeenCalledWith(expect.objectContaining({
-          companyId: RUN.companyId, issueId: ISSUE.id, wakeId: "wake-1", finishingRunId: RUN.id, commentIds,
+          companyId: RUN.companyId,
+          issueId: ISSUE.id,
+          wakeId: "wake-1",
+          finishingRunId: RUN.id,
+          commentIds,
+          reason: scenario === "cancelled_unseen"
+            ? "The task was cancelled before its run saw these comments"
+            : "Someone other than its run closed the task before the run saw these comments",
         }));
       } else {
         expect(transaction.recordUndeliveredQueuedComments).not.toHaveBeenCalled();

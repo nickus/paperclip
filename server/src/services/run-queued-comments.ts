@@ -1,4 +1,4 @@
-import { and, asc, eq, gte, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
   activityLog,
   agentWakeupRequests,
@@ -45,6 +45,13 @@ export const ISSUE_COMMENTS_QUEUED_DURING_RUN_MESSAGE =
 export const RUN_QUEUED_COMMENTS_DELIVERED_ACTION = "issue.queued_comments_delivered";
 
 export type RunQueuedCommentsDeliveryVia = "status_change_conflict" | "queue_read";
+
+/**
+ * Activity action that names queued comments whose wake was retired without
+ * reaching the agent, because the task was closed before its run saw them.
+ * It keeps them visible to the board on the task.
+ */
+export const RUN_QUEUED_COMMENTS_UNDELIVERED_ACTION = "issue.queued_comments_undelivered";
 
 /** The run a lookup is for. Only the fields the lookup reads. */
 export type QueuedCommentsRunFacts = {
@@ -282,4 +289,66 @@ export async function recordQueuedCommentsDeliveredToRun(
       ...(input.attemptedStatus ? { attemptedStatus: input.attemptedStatus } : {}),
     },
   });
+}
+
+/**
+ * Writes the issue activity entry that names queued comments a closed task's
+ * run never saw, whose wake is retired without delivering them.
+ */
+export async function recordUndeliveredQueuedComments(
+  executor: Executor,
+  input: {
+    companyId: string;
+    issueId: string;
+    wakeId: string;
+    runId: string;
+    commentIds: string[];
+    reason: string;
+  },
+) {
+  const commentIds = uniqueStrings(input.commentIds);
+  if (commentIds.length === 0) return;
+  await executor.insert(activityLog).values({
+    companyId: input.companyId,
+    actorType: "system",
+    actorId: "heartbeat",
+    action: RUN_QUEUED_COMMENTS_UNDELIVERED_ACTION,
+    entityType: "issue",
+    entityId: input.issueId,
+    runId: input.runId,
+    details: { wakeId: input.wakeId, commentIds, reason: input.reason },
+  });
+}
+
+/**
+ * Whether `runId` itself moved the issue to `done`: the newest issue update
+ * that records the issue becoming done names that run. That covers a run's
+ * own status update or approving comment and a native run's status decision.
+ * A task that a board user closed, or that a reviewer's run approved, names
+ * another actor (or no run), and so does a task closed without any record.
+ */
+export async function wasIssueCompletedByRun(
+  executor: Executor,
+  input: { companyId: string; issueId: string; runId: string },
+): Promise<boolean> {
+  const [latest] = await executor
+    .select({ runId: activityLog.runId })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        eq(activityLog.action, "issue.updated"),
+        // Route updates record the new status as `status`; native status
+        // decisions record it as `toStatus`.
+        or(
+          sql`${activityLog.details} ->> 'status' = 'done'`,
+          sql`${activityLog.details} ->> 'toStatus' = 'done'`,
+        ),
+      ),
+    )
+    .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+    .limit(1);
+  return latest?.runId === input.runId;
 }
