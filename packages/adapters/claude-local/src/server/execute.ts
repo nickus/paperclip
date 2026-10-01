@@ -797,6 +797,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimePromptSnapshotBundleKey =
     asString(runtimeSessionParams.promptSnapshotBundleKey, "") || runtimePromptBundleKey;
   const runtimeMcpServerIdentity = asString(runtimeSessionParams.mcpServerIdentity, "");
+  // This block only runs at all when the server has already decided to try
+  // resuming runtimeSessionParams. Paperclip's own fingerprint of this
+  // agent's managed instructions file and enabled skill versions is checked
+  // earlier and separately, and still starts a fresh session (no
+  // runtimeSessionParams reach this adapter) whenever either one changes —
+  // the common case an operator would call "instructions or skills changed".
+  // What follows instead picks up a narrower set of prompt-bundle drifts
+  // that fingerprint does not cover: a legacy instructionsFilePath with no
+  // absolute instructionsRootPath, adapter-generated prompt text (the path
+  // directive, the skill-library manifest format) changing after an
+  // upgrade, or a skill's files edited on disk without a new version id.
+  //
   // Claude Code records the system prompt rendered on a conversation's first
   // request (including --append-system-prompt-file) and replays that record on
   // every later request and resume until the conversation is compacted; text
