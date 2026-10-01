@@ -820,7 +820,11 @@ function interactionTerminalError(row: { status: string; result?: unknown }) {
 // withdrawal would contradict, so those keep conflicting with 409. Every
 // other terminal status (`expired`, `cancelled` — covering already withdrawn,
 // superseded, stale-target, issue-closed, skipped, and addressee-deleted) is
-// not a decision, so re-withdrawing it is idempotent.
+// not a decision, so re-withdrawing it is idempotent, whether or not the
+// issue itself has since been closed (withdrawInteraction checks this status
+// before the issue-open guard for exactly that reason). A card that is still
+// `pending` on a closed issue is the one case this does not cover; that
+// legacy state still 409s via assertIssueOpenForInteractionResolution.
 function isDecidedInteractionStatus(status: string) {
   return status === "answered" || status === "accepted" || status === "rejected";
 }
@@ -4671,13 +4675,12 @@ export function issueThreadInteractionService(
     },
 
     withdrawInteraction: async (
-      issue: { id: string; companyId: string },
+      issue: { id: string; companyId: string; status?: string },
       interactionId: string,
       input: WithdrawIssueThreadInteraction,
       actor: InteractionActor,
       mutationOptions: InteractionResolutionMutationOptions = {},
     ) => {
-      assertIssueOpenForInteractionResolution(issue);
       const data = withdrawIssueThreadInteractionSchema.parse(input);
       const current = await db
         .select()
@@ -4699,8 +4702,17 @@ export function issueThreadInteractionService(
         // already satisfied. Report that instead of a surprise 409, and skip
         // straight back out without touching the row, any linked tool
         // action/secret proposal, or activity — there is nothing left to do.
+        // This also covers the most common case of all: closing an issue
+        // sweeps every pending card to exactly this status (expired,
+        // outcome issue_closed) via expirePendingInteractionsForTerminalIssue,
+        // so a closed issue must not stop this no-op from reporting success.
         return { ...hydrateInteraction(current), alreadyClosed: true as const };
       }
+      // The row is still pending, so a closed issue blocks withdrawal same
+      // as any other resolution. In the normal flow this is unreachable —
+      // closing an issue expires every pending card first — but a legacy
+      // row created before that sweep existed can still land here.
+      assertIssueOpenForInteractionResolution(issue);
 
       const reason = data.reason?.trim() || null;
       const now = new Date();

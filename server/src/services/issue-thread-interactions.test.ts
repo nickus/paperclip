@@ -379,6 +379,39 @@ describe("issueThreadInteractionService", () => {
     },
   );
 
+  it("idempotently reports an already-expired/issue_closed interaction even though the issue is closed", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+    // This is the common case in practice: closing an issue sweeps every
+    // pending card on it to status "expired"/outcome "issue_closed"
+    // (expirePendingInteractionsForTerminalIssue), so a retried withdraw
+    // against that now-closed issue must still report the no-op success
+    // instead of the issue-closed 409 meant for interactions still pending.
+    const interactionRow = {
+      id: "interaction-withdraw-issue-closed", companyId: "company-1", issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "request_confirmation", status: "expired", continuationPolicy: "wake_assignee",
+      sourceCommentId: null, sourceRunId: null, title: null, summary: null,
+      createdByAgentId: "agent-1", createdByUserId: null, resolvedByAgentId: "agent-1", resolvedByUserId: null,
+      payload: { version: 1, prompt: "Proceed?" },
+      result: { version: 1, outcome: "issue_closed" },
+      resolvedAt: new Date("2026-07-25T11:00:00.000Z"),
+      createdAt: new Date("2026-07-25T10:00:00.000Z"), updatedAt: new Date("2026-07-25T11:00:00.000Z"),
+    };
+    const state = createFakeDb({ interactionRow });
+    const svc = issueThreadInteractionService(state.db as never);
+    const response = await svc.withdrawInteraction(
+      { id: interactionRow.issueId, companyId: "company-1", status: "done" },
+      interactionRow.id,
+      { reason: "Trying again" },
+      { agentId: "agent-2" },
+    );
+    expect(response.alreadyClosed).toBe(true);
+    expect(response.status).toBe("expired");
+    expect(response.result).toEqual({ version: 1, outcome: "issue_closed" });
+    expect(state.interactionUpdates).toHaveLength(0);
+    expect(state.toolActionRequestUpdates).toHaveLength(0);
+    expect(state.issueTouches).toHaveLength(0);
+  });
+
   it("refuses withdrawal when the linked tool action is already executing", async () => {
     const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
     const interactionRow = {
