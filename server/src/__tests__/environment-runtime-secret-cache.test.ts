@@ -14,13 +14,17 @@ import {
   plugins,
   secretAccessEvents,
 } from "@paperclipai/db";
-import { JsonRpcCallError } from "@paperclipai/plugin-sdk";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { resolveEnvironmentDriverConfigForRuntime } from "../services/environment-config.ts";
-import { environmentRuntimeService } from "../services/environment-runtime.ts";
+import {
+  environmentRuntimeService,
+  isTransientEnvironmentSyncInTimeoutError,
+  TRANSIENT_ENVIRONMENT_SYNC_IN_TIMEOUT_ERROR_CODE,
+} from "../services/environment-runtime.ts";
 import { secretService } from "../services/secrets.ts";
 import {
   createRuntimeSecretValueCache,
@@ -566,6 +570,87 @@ describeEmbeddedPostgres("runtime secret resolution for plugin sandbox leases", 
       expect(failing.method).toBeNull();
       await exec();
       expect(await countAccessEvents(seeded.secretId)).toBe(1);
+    });
+  });
+
+  // Right after a provider host/pod restart, environmentSyncIn can transiently
+  // time out before answering normally a moment later. A retried sync
+  // reproduces the same source->target mapping, so this is safe to retry once
+  // with a longer budget rather than failing the run outright.
+  describe("environmentSyncIn transient timeout retry", () => {
+    function syncInput(seeded: Awaited<ReturnType<typeof seed>>) {
+      return {
+        environment: seeded.environment as any,
+        lease: makeLease(seeded),
+        operations: [{ operationId: "op-1", files: [] }],
+      };
+    }
+
+    it("retries once with a longer budget and returns the result that then succeeds", async () => {
+      const seeded = await seed();
+      const seenTimeouts: Array<number | undefined> = [];
+      let calls = 0;
+      const workerManager = {
+        isRunning: vi.fn(() => true),
+        getWorker: vi.fn(() => ({ supportedMethods: ["environmentSyncIn", "environmentSyncOut"] })),
+        call: vi.fn(async (_pluginId: string, method: string, _params: unknown, timeoutMs?: number) => {
+          if (method !== "environmentSyncIn") throw new Error(`Unexpected plugin method: ${method}`);
+          calls += 1;
+          seenTimeouts.push(timeoutMs);
+          if (calls === 1) {
+            throw new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.TIMEOUT, message: "environmentSyncIn timed out" });
+          }
+          return { filesTransferred: 1, bytesTransferred: 10 };
+        }),
+      } as unknown as PluginWorkerManager;
+      const runtime = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+      const result = await runtime.syncIn(syncInput(seeded));
+
+      expect(result).toEqual({ filesTransferred: 1, bytesTransferred: 10 });
+      expect(calls).toBe(2);
+      // The retry gets strictly more room than the first attempt.
+      expect(seenTimeouts[1]).toBeGreaterThan(seenTimeouts[0] ?? 0);
+    });
+
+    it("classifies the timeout as transient once the retry also times out", async () => {
+      const seeded = await seed();
+      let calls = 0;
+      const workerManager = {
+        isRunning: vi.fn(() => true),
+        getWorker: vi.fn(() => ({ supportedMethods: ["environmentSyncIn", "environmentSyncOut"] })),
+        call: vi.fn(async (_pluginId: string, method: string) => {
+          if (method !== "environmentSyncIn") throw new Error(`Unexpected plugin method: ${method}`);
+          calls += 1;
+          throw new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.TIMEOUT, message: "environmentSyncIn timed out" });
+        }),
+      } as unknown as PluginWorkerManager;
+      const runtime = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+      const error = await runtime.syncIn(syncInput(seeded)).catch((e: unknown) => e);
+
+      expect(isTransientEnvironmentSyncInTimeoutError(error)).toBe(true);
+      expect((error as { code: string }).code).toBe(TRANSIENT_ENVIRONMENT_SYNC_IN_TIMEOUT_ERROR_CODE);
+      // One retry only: the base attempt plus exactly one extra try.
+      expect(calls).toBe(2);
+    });
+
+    it("does not retry a non-timeout environmentSyncIn failure", async () => {
+      const seeded = await seed();
+      let calls = 0;
+      const workerManager = {
+        isRunning: vi.fn(() => true),
+        getWorker: vi.fn(() => ({ supportedMethods: ["environmentSyncIn", "environmentSyncOut"] })),
+        call: vi.fn(async (_pluginId: string, method: string) => {
+          if (method !== "environmentSyncIn") throw new Error(`Unexpected plugin method: ${method}`);
+          calls += 1;
+          throw new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR, message: "sync hook rejected" });
+        }),
+      } as unknown as PluginWorkerManager;
+      const runtime = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+      await expect(runtime.syncIn(syncInput(seeded))).rejects.toThrow(/sync hook rejected/);
+      expect(calls).toBe(1);
     });
   });
 });

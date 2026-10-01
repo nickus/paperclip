@@ -1,5 +1,5 @@
 import { hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
-import { readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { sandboxRunPrivatePaths } from "./sandbox-run-private-paths.js";
 import { readPendingCleanupIntent, readPendingCleanupParkedAt, readPendingCleanupReleaseRunStatus } from "./pending-cleanup-intent.js";
@@ -533,6 +533,32 @@ export interface EnvironmentDriverReleaseInput {
   environment: Environment;
   lease: EnvironmentLease;
   status: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed">;
+}
+
+/**
+ * Thrown by `callPluginEnvironmentSync` when an `environmentSyncIn` RPC call
+ * still times out after the one retry with a longer budget. Carries a stable
+ * `code` the heartbeat setup-failure path (heartbeat.ts) recognizes to retry
+ * the run through its bounded transient-failure budget instead of opening a
+ * stranded-issue hold.
+ */
+export const TRANSIENT_ENVIRONMENT_SYNC_IN_TIMEOUT_ERROR_CODE = "transient_environment_sync_in_timeout";
+
+export class TransientEnvironmentSyncInTimeoutError extends Error {
+  readonly code = TRANSIENT_ENVIRONMENT_SYNC_IN_TIMEOUT_ERROR_CODE;
+  constructor(cause: unknown) {
+    super(
+      `environmentSyncIn timed out on retry with a longer budget${cause instanceof Error ? `: ${cause.message}` : ""}`,
+    );
+    this.name = "TransientEnvironmentSyncInTimeoutError";
+    this.cause = cause;
+  }
+}
+
+export function isTransientEnvironmentSyncInTimeoutError(
+  error: unknown,
+): error is TransientEnvironmentSyncInTimeoutError {
+  return error instanceof TransientEnvironmentSyncInTimeoutError;
 }
 
 function resolvePluginSandboxRpcTimeoutMs(
@@ -1932,19 +1958,52 @@ function createSandboxEnvironmentDriver(
       provider: providerKey,
     });
     const sanitizedConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
-    return await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(pluginId, method, {
-      driverKey: providerKey,
-      companyId: input.lease.companyId,
-      environmentId: input.environment.id,
-      issueId: input.lease.issueId,
-      config: sanitizedConfig,
-      lease: {
-        providerLeaseId: input.lease.providerLeaseId,
-        metadata: input.lease.metadata ?? undefined,
-        expiresAt: input.lease.expiresAt?.toISOString() ?? null,
-      },
-      operations: input.operations,
-    }, resolvePluginSandboxRpcTimeoutMs(sanitizedConfig)));
+    const baseTimeoutMs = resolvePluginSandboxRpcTimeoutMs(sanitizedConfig);
+    const callSyncRpc = (timeoutMs: number | undefined) =>
+      evictRuntimeSecretsOnCredentialRejection(input.environment.id, () => pluginWorkerManager.call(pluginId, method, {
+        driverKey: providerKey,
+        companyId: input.lease.companyId,
+        environmentId: input.environment.id,
+        issueId: input.lease.issueId,
+        config: sanitizedConfig,
+        lease: {
+          providerLeaseId: input.lease.providerLeaseId,
+          metadata: input.lease.metadata ?? undefined,
+          expiresAt: input.lease.expiresAt?.toISOString() ?? null,
+        },
+        operations: input.operations,
+      }, timeoutMs));
+    try {
+      return await callSyncRpc(baseTimeoutMs);
+    } catch (error) {
+      // A plugin provider re-produces the same source->target mapping on a
+      // retried environmentSyncIn (the sync contract is only the observable
+      // result, see PluginSyncFileMapping in protocol.ts), so a bare RPC
+      // timeout right after a host/pod restart — never a worker error
+      // response — is worth one retry with a longer budget before this setup
+      // stage fails the run. environmentSyncOut is left alone: its target is
+      // the controller's own filesystem, outside this review's scope.
+      if (
+        method !== "environmentSyncIn" ||
+        !(error instanceof JsonRpcCallError) ||
+        error.code !== PLUGIN_RPC_ERROR_CODES.TIMEOUT
+      ) {
+        throw error;
+      }
+      const retryTimeoutMs = Math.max((baseTimeoutMs ?? 30_000) * 2, 60_000);
+      try {
+        return await callSyncRpc(retryTimeoutMs);
+      } catch (retryError) {
+        // Still timing out with more room is a transient infra condition, not
+        // a sync configuration problem: classify it so the heartbeat
+        // setup-failure path (heartbeat.ts) retries the run through its
+        // bounded transient-failure budget instead of stranding the issue.
+        if (retryError instanceof JsonRpcCallError && retryError.code === PLUGIN_RPC_ERROR_CODES.TIMEOUT) {
+          throw new TransientEnvironmentSyncInTimeoutError(retryError);
+        }
+        throw retryError;
+      }
+    }
   }
 
   return {
