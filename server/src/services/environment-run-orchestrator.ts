@@ -618,7 +618,11 @@ export function environmentRunOrchestrator(
     agentId: string;
     status?: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed">;
     failureReason?: string;
-    /** Explicit Stop during adapter startup; never used for ordinary cleanup. */
+    /**
+     * Stop the work still running on the lease before the release: an explicit
+     * Stop, or the release of a cancelled run. Never used for a run that ended
+     * on its own.
+     */
     cancelActiveWork?: boolean;
     /** Explicit paperclip_runner resource lifecycle. Omitted for legacy adapters. */
     providerResourceDisposition?: ProviderResourceDisposition;

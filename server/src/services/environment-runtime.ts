@@ -513,7 +513,11 @@ export interface EnvironmentDriverAcquireInput {
 
 export interface EnvironmentDriverReleaseInput {
   resourceDisposition?: "stop_and_retain";
-  /** Explicit Stop may terminate in-flight setup rather than drain it. */
+  /**
+   * Stop the lease's in-flight work rather than drain it: an explicit Stop, or
+   * the release of a cancelled run. The release then counts only with a
+   * provider receipt that confirms the stop.
+   */
   cancelActiveWork?: boolean;
   environment: Environment;
   lease: EnvironmentLease;
@@ -2624,6 +2628,15 @@ function createSandboxEnvironmentDriver(
 
     async releaseRunLease(input) {
       if (input.status === "expired" && input.lease.leasePolicy === "reuse_by_environment") {
+        if (isPluginBackedReusableSandboxLease(input.lease)) {
+          // A cancelled run (Stop, a comment interrupt, a pause, a
+          // reassignment) ends a turn, not the task. The agent's session store
+          // and memory live in the sandbox, so stop the run's work and keep the
+          // sandbox for the next run, like any other release. A `stopped`
+          // receipt keeps the lease resumable; a release the provider could
+          // not confirm is parked for the cleanup sweep to retry.
+          return await releasePluginBackedSandboxLease({ ...input, cancelActiveWork: true });
+        }
         return await destroyReusableSandboxLease({
           environment: input.environment,
           lease: input.lease,
@@ -3393,12 +3406,12 @@ function createSandboxEnvironmentDriver(
       input.lease.leasePolicy === "retain_on_failure" && input.status === "failed";
     // A reusable provider resource that the provider confirmed stopped (not
     // destroyed) stays eligible for resume whatever the run's outcome, so a
-    // follow-up run after a failed or timed-out run continues in the same
-    // sandbox. Only `released`/`retained` leases are resume candidates; the
-    // failure reason is still recorded below.
+    // follow-up run after a failed, timed-out or cancelled run continues in the
+    // same sandbox. Only `released`/`retained` leases are resume candidates;
+    // the failure reason is still recorded below.
     const stoppedReusable =
       input.lease.leasePolicy === "reuse_by_environment" &&
-      input.status === "failed" &&
+      (input.status === "failed" || input.status === "expired") &&
       cleanupStatus === "success" &&
       termination?.state === "stopped";
     const releaseStatus = retained
@@ -3547,6 +3560,21 @@ function pluginDriverProviderKey(config: PluginEnvironmentConfig): string {
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * A reusable sandbox lease acquired through a sandbox provider plugin, with the
+ * plugin and provider it was acquired from recorded on the lease. Only such a
+ * lease can be released back to the same plugin and resumed later.
+ */
+function isPluginBackedReusableSandboxLease(
+  lease: Pick<EnvironmentLease, "leasePolicy" | "metadata">,
+): boolean {
+  const metadata = lease.metadata ?? {};
+  return lease.leasePolicy === "reuse_by_environment" &&
+    Boolean(metadata.sandboxProviderPlugin) &&
+    readString(metadata.pluginId) !== null &&
+    readString(metadata.provider) !== null;
 }
 
 // Keys the runtime stores in the lease metadata that are not part of the

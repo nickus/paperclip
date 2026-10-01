@@ -10969,6 +10969,10 @@ export function heartbeatService(
         agentId: input.agentId,
         status: leaseReleaseStatusForRunStatus(input.status),
         failureReason: input.failureReason ?? undefined,
+        // A cancelled run's work may still be running in its sandbox. The
+        // provider stops it before keeping the sandbox, and only a confirmed
+        // stop counts as a release.
+        ...(input.status === "cancelled" ? { cancelActiveWork: true } : {}),
         providerResourceDisposition: input.providerResourceDisposition,
         nativeLifecycleTelemetry: input.nativeLifecycleTelemetry,
       })
