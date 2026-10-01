@@ -322,6 +322,88 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     });
   }
 
+  it("queues a review-participant recovery run when a successful reviewer run leaves the stage undecided, and its wake prompt says so explicitly", async () => {
+    const companyId = await seedCompany();
+    const reviewerId = await seedAgent({ companyId, name: "Reviewer" });
+    const coderId = await seedAgent({ companyId, name: "Coder" });
+    const stageId = randomUUID();
+    const issueId = await seedIssue({ companyId, status: "in_review", assigneeAgentId: reviewerId });
+    const runId = await seedRun({
+      companyId,
+      agentId: reviewerId,
+      status: "succeeded",
+      contextSnapshot: { issueId, wakeReason: "execution_review_requested" },
+    });
+    await db.update(issues).set({
+      executionRunId: runId,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerId, userId: null },
+        returnAssignee: { type: "agent", agentId: coderId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: { escalateStrandedAssignedIssue: async () => { throw new Error("unexpected escalation"); },
+        escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected escalation"); } },
+    });
+    const result = await release({ companyId, runId, now: new Date() });
+    expect(result.outcome.kind).toBe("queued_review_participant_recovery");
+
+    const recoveryRun = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerId))
+      .then((rows) => rows.find((row) => row.id !== runId));
+    expect(recoveryRun).toMatchObject({
+      status: "queued",
+      retryOfRunId: runId,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "execution_review_participant_recovery",
+        retryReason: "execution_review_participant_recovery",
+        source: "issue.execution_review_recovery",
+        currentStageId: stageId,
+        currentStageType: "review",
+        reviewRecoveryInstruction: expect.stringContaining(
+          "ended while this execution-review stage was still pending",
+        ),
+      },
+    });
+
+    // The previously dead contextSnapshot field now reaches the agent: the
+    // retried reviewer's prompt states explicitly that its previous run
+    // recorded no decision, and repeats the exact PATCH recipe, instead of
+    // reading like a first-time review wake.
+    const payload = await buildPaperclipWakePayload({
+      db,
+      companyId,
+      agentId: reviewerId,
+      runId: recoveryRun!.id,
+      contextSnapshot: recoveryRun!.contextSnapshot as Record<string, unknown>,
+    });
+    expect(payload).toMatchObject({
+      reviewParticipantRecovery: {
+        sourceRunId: runId,
+        instruction: expect.stringContaining(
+          "ended while this execution-review stage was still pending",
+        ),
+      },
+    });
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain(
+      `The previous run for this execution-review stage ended without recording a decision (run ${runId}), while you were still the current participant.`,
+    );
+    expect(prompt).toContain("How to record your review decision");
+    expect(prompt).toContain('{ "status": "done", "comment": "<your verdict>" }');
+  });
+
   it("releases an acknowledged native handoff without blocking or restarting the old owner", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent({ companyId });

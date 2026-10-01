@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import {
+  applyIssueExecutionPolicyTransition,
+  EXECUTION_REVIEW_DECISION_MISSING_COMMENT_CODE,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
 const coderAgentId = "11111111-1111-4111-8111-111111111111";
@@ -835,6 +840,80 @@ describe("issue execution policy transitions", () => {
           commentBody: null,
         }),
       ).toThrow(/Requesting changes requires a comment.*same PATCH request.*prior comments are not considered/);
+    });
+
+    it("names the missing comment field and a worked approve body on the 422 details", () => {
+      let caught: unknown;
+      try {
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "",
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect((caught as { details?: unknown }).details).toEqual({
+        code: EXECUTION_REVIEW_DECISION_MISSING_COMMENT_CODE,
+        missing: "comment",
+        expectedBody: { status: "done", comment: "<your verdict>" },
+      });
+    });
+
+    it("names the missing comment field and a worked hand-back body on the 422 details", () => {
+      let caught: unknown;
+      try {
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy,
+          requestedStatus: "in_progress",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: null,
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect((caught as { details?: unknown }).details).toEqual({
+        code: EXECUTION_REVIEW_DECISION_MISSING_COMMENT_CODE,
+        missing: "comment",
+        expectedBody: { status: "in_progress", comment: "<your verdict>" },
+      });
     });
 
     it("whitespace-only comment is treated as empty", () => {

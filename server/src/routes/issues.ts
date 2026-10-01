@@ -4945,6 +4945,28 @@ export function issueRoutes(
         "typed_execution_state_current_participant",
         "scheduled_issue_monitor",
       ],
+      // One worked body for the review path agents reach for most often on an
+      // execution-policy stage, so this error does not just name the path and
+      // leave the exact shape to be guessed. The other four paths are plain
+      // fields (assigneeUserId) or already documented elsewhere (interactions,
+      // approvals, the monitor fields on executionPolicy).
+      example: {
+        reviewPath: "typed_execution_state_current_participant",
+        body: {
+          status: "in_review",
+          executionState: {
+            status: "pending",
+            currentStageId: "<a stage id from this issue's executionPolicy>",
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "user", userId: "<the reviewer's user id>" },
+            returnAssignee: { type: "agent", agentId: "<your agent id>" },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+      },
     });
   }
 

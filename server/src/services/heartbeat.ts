@@ -1019,6 +1019,16 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON =
   "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE =
   "execution_review_participant_recovery";
+// The generic bounded retry (scheduleBoundedRetryForRun) carries the source
+// run's whole contextSnapshot forward, including its executionStage, so the
+// retried run still wakes the same reviewer/approver role. Without this
+// instruction that retry looked identical to a first-time review wake, and
+// the participant had no signal that its previous run already ended without
+// recording a decision (#review-decision-recipe).
+const EXECUTION_REVIEW_PARTICIPANT_NO_DECISION_RETRY_INSTRUCTION =
+  "The previous run for this execution-review stage ended without recording a decision while you were still the " +
+  "current participant. Record a decision now using the recipe below, or leave a comment naming who must act if " +
+  "you cannot.";
 const GITHUB_PR_WORKFLOW_SKILL_KEY =
   "paperclipai/bundled/software-development/github-pr-workflow";
 const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
@@ -8974,6 +8984,23 @@ export async function buildPaperclipWakePayload(input: {
       sourceRunId: input.contextSnapshot.retryOfRunId,
       instruction: input.contextSnapshot.dispositionRepairInstruction,
     } : null,
+    // Set by every execution-review participant retry/recovery path
+    // (scheduleBoundedRetryForRun's review-participant continuationContext,
+    // the wake-queue module's queueReviewParticipantRecoveryRun, and the
+    // stranded-issue recovery sweep) once the current participant's previous
+    // run ended with no recorded decision. Previously this context key was
+    // written to the run row but never read back into the wake payload, so
+    // the retry rendered as a generic wake with no explanation.
+    reviewParticipantRecovery: readNonEmptyString(
+      input.contextSnapshot.reviewRecoveryInstruction,
+    )
+      ? {
+          instruction: readNonEmptyString(
+            input.contextSnapshot.reviewRecoveryInstruction,
+          ),
+          sourceRunId: readNonEmptyString(input.contextSnapshot.retryOfRunId),
+        }
+      : null,
     livenessContinuation:
       readNonEmptyString(input.contextSnapshot.livenessContinuationState) ||
       readNonEmptyString(
@@ -10668,6 +10695,14 @@ export function heartbeatService(
           await scheduleBoundedRetryForRun(source, agent, effect.reviewParticipant ? {
             retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
             wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
+            // Without this the retry's contextSnapshot carries forward only
+            // the source run's original executionStage, and the participant
+            // sees what looks like a first-time review wake with no sign
+            // that its previous run already ended undecided.
+            continuationContext: {
+              reviewRecoveryInstruction:
+                EXECUTION_REVIEW_PARTICIPANT_NO_DECISION_RETRY_INSTRUCTION,
+            },
           } : undefined);
         }
       } else if (effect.kind === "run_queued") {

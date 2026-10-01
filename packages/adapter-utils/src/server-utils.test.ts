@@ -3076,6 +3076,125 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt).toContain(
       "You are waking as the active reviewer for this issue.",
     );
+    // The exact PATCH recipe, so the participant never has to guess the
+    // two request bodies that record a decision.
+    expect(prompt).toContain("How to record your review decision");
+    expect(prompt).toContain(
+      '{ "status": "done", "comment": "<your verdict>" }',
+    );
+    expect(prompt).toContain(
+      '{ "status": "in_progress", "comment": "<your verdict>" }',
+    );
+  });
+
+  it.each(["reviewer", "approver"] as const)(
+    "includes the decision recipe for a %s execution wake",
+    (wakeRole) => {
+      const prompt = renderPaperclipWakePrompt({
+        reason: "execution_review_requested",
+        issue: { id: "issue-1", status: "in_review" },
+        executionStage: {
+          wakeRole,
+          stageId: "stage-1",
+          stageType: wakeRole === "approver" ? "approval" : "review",
+          currentParticipant: { type: "agent", agentId: "agent-1" },
+          returnAssignee: { type: "agent", agentId: "agent-2" },
+          allowedActions: ["approve", "request_changes"],
+        },
+        fallbackFetchNeeded: false,
+      });
+      expect(prompt).toContain("How to record your review decision");
+      expect(prompt).toContain("Approve: PATCH /issues/{issueId}");
+      expect(prompt).toContain("Request changes: PATCH /issues/{issueId}");
+    },
+  );
+
+  it("does not add the decision recipe to an executor's changes-requested wake", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "execution_changes_requested",
+      issue: { id: "issue-1", status: "in_progress" },
+      executionStage: {
+        wakeRole: "executor",
+        stageId: "stage-1",
+        stageType: "review",
+        currentParticipant: { type: "agent", agentId: "agent-1" },
+        returnAssignee: { type: "agent", agentId: "agent-2" },
+        lastDecisionOutcome: "changes_requested",
+        allowedActions: ["address_changes", "resubmit"],
+      },
+      fallbackFetchNeeded: false,
+    });
+    expect(prompt).toContain(
+      "You are waking because changes were requested in the execution workflow.",
+    );
+    expect(prompt).not.toContain("How to record your review decision");
+  });
+
+  it("tells a retried review participant its previous run recorded no decision, instead of a generic review wake", () => {
+    const payload = {
+      reason: "execution_review_participant_recovery",
+      issue: { id: "issue-1", identifier: "PAP-2011", status: "in_review" },
+      executionStage: {
+        wakeRole: "reviewer" as const,
+        stageId: "stage-1",
+        stageType: "review" as const,
+        currentParticipant: { type: "agent" as const, agentId: "agent-1" },
+        returnAssignee: { type: "agent" as const, agentId: "agent-2" },
+        allowedActions: ["approve", "request_changes"],
+      },
+      reviewParticipantRecovery: {
+        sourceRunId: "run-1",
+        instruction:
+          "The previous run for this execution-review stage ended without recording a decision while you were still the current participant. Record a decision now using the recipe below, or leave a comment naming who must act if you cannot.",
+      },
+      fallbackFetchNeeded: false,
+    };
+    const prompt = renderPaperclipWakePrompt(payload);
+
+    expect(prompt).toContain(
+      "The previous run for this execution-review stage ended without recording a decision (run run-1), while you were still the current participant.",
+    );
+    expect(prompt).toContain(payload.reviewParticipantRecovery.instruction);
+    expect(prompt).toContain("How to record your review decision");
+    // The explicit recovery framing replaces the generic first-time wake text.
+    expect(prompt).not.toContain(
+      "You are waking as the active reviewer for this issue.",
+    );
+    expect(JSON.parse(stringifyPaperclipWakePayload(payload)!)).toMatchObject({
+      reviewParticipantRecovery: payload.reviewParticipantRecovery,
+    });
+    // Printed once: the executionStage block defers to the standalone
+    // recovery section instead of repeating the recipe.
+    expect(
+      prompt.split("How to record your review decision").length - 1,
+    ).toBe(1);
+  });
+
+  it("renders the no-decision recovery notice on its own, without a forwarded executionStage", () => {
+    // queueReviewParticipantRecoveryRun (the wake-queue module) builds a
+    // fresh contextSnapshot for this retry with no executionStage at all —
+    // only issueId/taskId/wakeReason/retryReason/reviewRecoveryInstruction —
+    // unlike a re-wake that forwards the original wake's full contextSnapshot.
+    const payload = {
+      reason: "execution_review_participant_recovery",
+      issue: { id: "issue-1", identifier: "PAP-2011", status: "in_review" },
+      reviewParticipantRecovery: {
+        sourceRunId: "run-1",
+        instruction:
+          "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
+      },
+      fallbackFetchNeeded: false,
+    };
+    const prompt = renderPaperclipWakePrompt(payload);
+
+    expect(prompt).toContain(
+      "The previous run for this execution-review stage ended without recording a decision (run run-1), while you were still the current participant.",
+    );
+    expect(prompt).toContain(payload.reviewParticipantRecovery.instruction);
+    expect(prompt).toContain("How to record your review decision");
+    expect(prompt).toContain(
+      '{ "status": "done", "comment": "<your verdict>" }',
+    );
   });
 
   it("delivers typed disposition repair instructions without liveness classification", () => {
