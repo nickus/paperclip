@@ -11,6 +11,8 @@ const { cli, runAdapterExecutionTargetProcess } = vi.hoisted(() => {
     helpText: "",
     helpCalls: 0,
     runs: [] as string[][],
+    // The prompt (stdin) of each run, in the same order.
+    prompts: [] as string[],
     freshSessions: 0,
     // When set, a --resume fails as if the CLI had lost the session.
     loseResumedSession: false,
@@ -25,13 +27,20 @@ const { cli, runAdapterExecutionTargetProcess } = vi.hoisted(() => {
     startedAt: new Date().toISOString(),
   });
   const runAdapterExecutionTargetProcess = vi.fn(
-    async (_runId: string, _target: unknown, _command: string, args: string[]): Promise<RunProcessResult> => {
+    async (
+      _runId: string,
+      _target: unknown,
+      _command: string,
+      args: string[],
+      options?: { stdin?: string },
+    ): Promise<RunProcessResult> => {
       if (args.includes("--help")) {
         cli.helpCalls += 1;
         return ok(cli.helpText);
       }
       if (args.includes("--version")) return ok("2.1.283 (Claude Code)\n");
       cli.runs.push(args);
+      cli.prompts.push(options?.stdin ?? "");
       const resumeIndex = args.indexOf("--resume");
       const resumed = resumeIndex >= 0 ? args[resumeIndex + 1] : null;
       if (resumed && cli.loseResumedSession) {
@@ -76,6 +85,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
+import { withPaperclipWakeSessionConfigChanges } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "./execute.js";
 import { sessionCodec } from "./index.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
@@ -111,6 +121,7 @@ describe("claude_local resume after an instructions change", () => {
     cli.helpText = HELP_WITH_SNAPSHOT;
     cli.helpCalls = 0;
     cli.runs = [];
+    cli.prompts = [];
     cli.freshSessions = 0;
     cli.loseResumedSession = false;
   });
@@ -128,6 +139,7 @@ describe("claude_local resume after an instructions change", () => {
     instructions: string;
     sessionParams: Record<string, unknown> | null;
     config?: Record<string, unknown>;
+    context?: Record<string, unknown>;
   }) {
     await writeFile(instructionsPath, input.instructions, "utf8");
     const logs: string[] = [];
@@ -155,7 +167,7 @@ describe("claude_local resume after an instructions change", () => {
         promptTemplate: "Continue your work.",
         ...input.config,
       },
-      context: {},
+      context: input.context ?? {},
       onLog: async (_stream, chunk) => {
         logs.push(chunk);
       },
@@ -166,6 +178,7 @@ describe("claude_local resume after an instructions change", () => {
       result,
       args,
       attempts: cli.runs.length - runsBefore,
+      prompt: cli.prompts[cli.prompts.length - 1] ?? "",
       log: logs.join(""),
       instructionsSent: instructionsFile ? await readFile(instructionsFile, "utf8") : null,
     };
@@ -331,6 +344,70 @@ describe("claude_local resume after an instructions change", () => {
     expect(second.result.sessionId).not.toBe(first.result.sessionId);
     expect(second.result.sessionParams?.promptBundleKey).not.toBe(first.result.sessionParams?.promptBundleKey);
     expect(second.result.sessionParams).not.toHaveProperty("promptSnapshotBundleKey");
+  });
+
+  describe("wake prompt", () => {
+    const CHANGE_NOTE = "Changed since your previous turn on this task: your instructions.";
+    // An issue wake on a session the server kept across an instructions edit.
+    const context = {
+      issueId: "issue-1",
+      paperclipWake: withPaperclipWakeSessionConfigChanges(
+        {
+          reason: "issue_commented",
+          issue: { id: "issue-1", identifier: "T-1", title: "Task", status: "in_progress", priority: "medium" },
+          comments: [{ id: "comment-1", body: "Please continue.", authorType: "user" }],
+          commentIds: ["comment-1"],
+        },
+        ["your instructions"],
+      ),
+    };
+
+    it("names the configuration changes to a resumed session only", async () => {
+      const fresh = await run({ instructions: "Version one.\n", sessionParams: null, context });
+      expect(fresh.prompt).toContain("Please continue.");
+      expect(fresh.prompt).not.toContain(CHANGE_NOTE);
+      expect(fresh.prompt).toContain("Continue your work.");
+
+      const plain = await run({ instructions: "Version one.\n", sessionParams: fresh.result.sessionParams ?? null, context });
+      expect(argValue(plain.args, "--resume")).toBe(fresh.result.sessionId);
+      expect(plain.prompt).toContain(CHANGE_NOTE);
+      expect(plain.prompt).toContain("## Paperclip Resume Delta");
+
+      const refreshed = await run({ instructions: "Version two.\n", sessionParams: plain.result.sessionParams ?? null, context });
+      expect(argValue(refreshed.args, "--system-prompt-snapshot")).toBe("off");
+      expect(refreshed.prompt).toContain(CHANGE_NOTE);
+    });
+
+    it("leaves the note out when the adapter starts a new session instead", async () => {
+      cli.helpText = HELP_WITHOUT_SNAPSHOT;
+      const first = await run({ instructions: "Version one.\n", sessionParams: null, context });
+      const second = await run({ instructions: "Version two.\n", sessionParams: first.result.sessionParams ?? null, context });
+
+      expect(second.args).not.toContain("--resume");
+      expect(second.prompt).not.toContain(CHANGE_NOTE);
+      expect(second.prompt).not.toContain("## Paperclip Resume Delta");
+      expect(second.prompt).toContain("Continue your work.");
+    });
+
+    it("gives the retry after a lost session the prompt of a new session", async () => {
+      const config = { bootstrapPromptTemplate: "Read the repository first." };
+      const first = await run({ instructions: "Version one.\n", sessionParams: null, config, context });
+      cli.loseResumedSession = true;
+      const second = await run({ instructions: "Version one.\n", sessionParams: first.result.sessionParams ?? null, config, context });
+
+      expect(second.attempts).toBe(2);
+      const resumedPrompt = cli.prompts[cli.prompts.length - 2] ?? "";
+      expect(resumedPrompt).toContain(CHANGE_NOTE);
+      expect(resumedPrompt).toContain("## Paperclip Resume Delta");
+      expect(resumedPrompt).not.toContain("Read the repository first.");
+
+      expect(second.args).not.toContain("--resume");
+      expect(second.prompt).not.toContain(CHANGE_NOTE);
+      expect(second.prompt).not.toContain("## Paperclip Resume Delta");
+      expect(second.prompt).toContain("## Paperclip Wake Payload");
+      expect(second.prompt).toContain("Read the repository first.");
+      expect(second.prompt).toContain("Continue your work.");
+    });
   });
 
   it("does not probe or resume when the session is from another working directory", async () => {

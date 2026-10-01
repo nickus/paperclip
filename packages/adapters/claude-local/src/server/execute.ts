@@ -961,40 +961,48 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     run: { id: runId, source: "on_demand" },
     context,
   };
-  const renderedBootstrapPrompt =
-    !sessionId && bootstrapPromptTemplate.trim().length > 0
-      ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
-      : "";
-  const taskContextNote = selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId) });
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
-    resumedSession: Boolean(sessionId),
-    conversationMode: context.conversationMode === true,
-    // The task-context markdown is the authoritative brief on this lane; keep
-    // the wake prompt's description copy out so the prompt carries it once.
-    suppressIssueDescription: taskContextNote.length > 0,
-  });
-  const shouldUseResumeDeltaPrompt =
-    Boolean(sessionId) && wakePrompt.length > 0 &&
-    // A brief-only wake (no issue) orients but keeps the heartbeat prompt.
-    !isPaperclipRunBriefOnlyWake(context.paperclipWake);
-  const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
-    ? ""
-    : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-  const prompt = joinPromptSections([
-    renderedBootstrapPrompt,
-    wakePrompt,
-    sessionHandoffNote,
-    taskContextNote,
-    renderedPrompt,
-  ]);
-  const promptMetrics = {
-    promptChars: prompt.length,
-    bootstrapPromptChars: renderedBootstrapPrompt.length,
-    wakePromptChars: wakePrompt.length,
-    sessionHandoffChars: sessionHandoffNote.length,
-    taskContextChars: taskContextNote.length,
-    heartbeatPromptChars: renderedPrompt.length,
+  // The prompt of one attempt, for a resumed or a new session. A resumed
+  // session gets the wake delta and, from the wake payload, the note on what
+  // changed since its previous turn. A new session gets the full prompt of a
+  // first turn and no such note; that includes the retry with a new session
+  // after the resumed one turned out to be unusable.
+  const buildPrompt = (resumedSession: boolean) => {
+    const renderedBootstrapPrompt =
+      !resumedSession && bootstrapPromptTemplate.trim().length > 0
+        ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+        : "";
+    const taskContextNote = selectPaperclipTaskMarkdown(context, { resumedSession });
+    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+      resumedSession,
+      conversationMode: context.conversationMode === true,
+      // The task-context markdown is the authoritative brief on this lane; keep
+      // the wake prompt's description copy out so the prompt carries it once.
+      suppressIssueDescription: taskContextNote.length > 0,
+    });
+    const shouldUseResumeDeltaPrompt =
+      resumedSession && wakePrompt.length > 0 &&
+      // A brief-only wake (no issue) orients but keeps the heartbeat prompt.
+      !isPaperclipRunBriefOnlyWake(context.paperclipWake);
+    const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
+      ? ""
+      : renderTemplate(promptTemplate, templateData);
+    const prompt = joinPromptSections([
+      renderedBootstrapPrompt,
+      wakePrompt,
+      sessionHandoffNote,
+      taskContextNote,
+      renderedPrompt,
+    ]);
+    const promptMetrics = {
+      promptChars: prompt.length,
+      bootstrapPromptChars: renderedBootstrapPrompt.length,
+      wakePromptChars: wakePrompt.length,
+      sessionHandoffChars: sessionHandoffNote.length,
+      taskContextChars: taskContextNote.length,
+      heartbeatPromptChars: renderedPrompt.length,
+    };
+    return { prompt, promptMetrics };
   };
   const passesConfiguredModel = Boolean(
     model && (!isBedrockAuth(modelEnv) || isBedrockModelId(model)),
@@ -1060,6 +1068,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const attemptInstructionsFilePath =
       !resumeSessionId || resendsInstructionsOnResume ? effectiveInstructionsFilePath : undefined;
     const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath, refreshSystemPrompt);
+    const { prompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
     // The bundle the session's recorded system prompt holds after this attempt:
     // a fresh session records the current bundle; a resume keeps its record
     // (legacy sessions without a stored key adopt the current bundle).
