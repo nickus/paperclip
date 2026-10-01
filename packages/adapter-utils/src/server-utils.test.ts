@@ -1531,6 +1531,15 @@ describe("renderPaperclipWakePrompt", () => {
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
       "adapter/runtime status channel as the sanctioned fallback",
     );
+    // A second (or later) issue_comments_queued_during_run 409 is an expected
+    // delivery when more than 20 comments are queued, not a failure: it must
+    // never be confused with the 2-consecutive-failure retry limit above.
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
+      "issue_comments_queued_during_run",
+    );
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
+      "never counts toward this 2-failure limit",
+    );
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
       "Use child issues",
     );
@@ -1641,6 +1650,10 @@ describe("renderPaperclipWakePrompt", () => {
       expect(prompt).toContain(
         "adapter/runtime status channel as the sanctioned fallback",
       );
+      expect(prompt).toContain(
+        "A 409 issue_comments_queued_during_run on a status change or an approving comment is a delivery of comments to read, not a failure",
+      );
+      expect(prompt).toContain("never counts toward this 2-failure limit");
       expect(prompt).toContain(
         "evidence, not valid liveness paths by themselves",
       );

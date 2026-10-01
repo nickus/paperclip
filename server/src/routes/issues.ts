@@ -361,7 +361,10 @@ import {
 import {
   findQueuedCommentsUnseenByRun,
   ISSUE_COMMENTS_QUEUED_DURING_RUN_CODE,
+  ISSUE_COMMENTS_QUEUED_DURING_RUN_COMMENT_MESSAGE,
+  ISSUE_COMMENTS_QUEUED_DURING_RUN_COMMENT_NEXT_STEP,
   ISSUE_COMMENTS_QUEUED_DURING_RUN_MESSAGE,
+  ISSUE_COMMENTS_QUEUED_DURING_RUN_NEXT_STEP,
   recordQueuedCommentsDeliveredToRun,
   resolveQueuedCommentAuthorNames,
   RUN_COMPLETION_STATUSES,
@@ -7289,7 +7292,6 @@ export function issueRoutes(
     const names = await resolveQueuedCommentAuthorNames(db, { companyId: issue.companyId, comments });
     const entries = comments.map((comment) => {
       const safe = redactLowTrust ? sanitizeQuarantinedCommentForHigherTrust(comment) : comment;
-      const bodyTruncated = safe.body.length > MAX_QUEUED_COMMENT_BODY_CHARS_PER_CONFLICT;
       return {
         id: comment.id,
         authorType: comment.authorType,
@@ -7300,11 +7302,22 @@ export function issueRoutes(
           (comment.authorUserId ? names.users.get(comment.authorUserId) : null) ??
           null,
         createdAt: comment.createdAt.toISOString(),
-        body: bodyTruncated ? safe.body.slice(0, MAX_QUEUED_COMMENT_BODY_CHARS_PER_CONFLICT) : safe.body,
+        body: safe.body,
+      };
+    });
+    // Redact secrets before truncating each body to the per-conflict cap: a
+    // secret whose offset straddles the cut would otherwise survive the
+    // truncation half-intact, because the truncated text no longer matches
+    // the registered value in full.
+    const redacted = await runRedactions.redactForIssue(issue.companyId, issue.id, entries);
+    return redacted.map((entry) => {
+      const bodyTruncated = entry.body.length > MAX_QUEUED_COMMENT_BODY_CHARS_PER_CONFLICT;
+      return {
+        ...entry,
+        body: bodyTruncated ? entry.body.slice(0, MAX_QUEUED_COMMENT_BODY_CHARS_PER_CONFLICT) : entry.body,
         ...(bodyTruncated ? { bodyTruncated: true } : {}),
       };
     });
-    return runRedactions.redactForIssue(issue.companyId, issue.id, entries);
   }
 
   /**
@@ -7321,6 +7334,11 @@ export function issueRoutes(
     req: Request,
     issue: RunQueuedCommentsIssue,
     nextStatus: unknown,
+    // "approving_comment": the write the agent is about to repeat is the
+    // POST'd review comment that auto-approves the task, not a bare status
+    // field, so the message and nextStep below talk about resending the
+    // comment instead of resending a status change.
+    reportedVia: "status_change" | "approving_comment" = "status_change",
   ) {
     if (
       typeof nextStatus !== "string" ||
@@ -7348,16 +7366,27 @@ export function issueRoutes(
       via: "status_change_conflict",
       attemptedStatus: nextStatus,
     });
-    throw conflict(ISSUE_COMMENTS_QUEUED_DURING_RUN_MESSAGE, {
-      code: ISSUE_COMMENTS_QUEUED_DURING_RUN_CODE,
-      issueId: issue.id,
-      runId: run.id,
-      attemptedStatus: nextStatus,
-      comments,
-      remainingCount: unseen.length - shown.length,
-      nextStep:
-        "Act on these comments first. If they ask you to hold, pause or revert, do that (use `blocked` with a blocker or a self-owned unblock descriptor if you must wait). Then send the status change again: these comments do not block it a second time.",
-    });
+    const isApprovingComment = reportedVia === "approving_comment";
+    throw conflict(
+      isApprovingComment
+        ? ISSUE_COMMENTS_QUEUED_DURING_RUN_COMMENT_MESSAGE
+        : ISSUE_COMMENTS_QUEUED_DURING_RUN_MESSAGE,
+      {
+        code: ISSUE_COMMENTS_QUEUED_DURING_RUN_CODE,
+        issueId: issue.id,
+        runId: run.id,
+        attemptedStatus: nextStatus,
+        comments,
+        remainingCount: unseen.length - shown.length,
+        // This 409 is a delivery of the comments, not a failed write: it
+        // never counts toward the "stop after 2 consecutive failures" rule,
+        // and the same request is expected to be repeated once the agent has
+        // read and acted on what it returns.
+        nextStep: isApprovingComment
+          ? ISSUE_COMMENTS_QUEUED_DURING_RUN_COMMENT_NEXT_STEP
+          : ISSUE_COMMENTS_QUEUED_DURING_RUN_NEXT_STEP,
+      },
+    );
   }
 
   /**
@@ -18255,7 +18284,9 @@ export function issueRoutes(
         };
         // An approving comment completes the task like a status update does,
         // so the same unseen-comment check applies before anything is written.
-        await assertRunSawCommentsQueuedDuringRun(req, currentIssue, updatePatch.status);
+        // The write this agent repeats is the comment it just sent, so the
+        // 409 describes resending the comment rather than a status change.
+        await assertRunSawCommentsQueuedDuringRun(req, currentIssue, updatePatch.status, "approving_comment");
 
         const sourceTrust = await sourceTrustForActorWrite(currentIssue, actor);
         const commentOptions = {

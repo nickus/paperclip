@@ -264,6 +264,12 @@ describeEmbeddedPostgres("run completion with comments queued during the run", (
         remainingCount: 0,
       },
     });
+    // This 409 is a delivery of comments, not a failed write: it must not be
+    // confused with the "stop after 2 consecutive failures" control-plane
+    // write rule, and the agent is told to resend the same status change.
+    expect(blocked.body.details.nextStep).toContain("not a failed write");
+    expect(blocked.body.details.nextStep).toContain("does not count toward");
+    expect(blocked.body.details.nextStep).toContain("send the status change again");
     expect(blocked.body.details.comments).toEqual([
       expect.objectContaining({
         id: hold.id,
@@ -420,6 +426,30 @@ describeEmbeddedPostgres("run completion with comments queued during the run", (
     expect((byId.get(quarantined.id) as { body: string }).body).toBe(LOW_TRUST_QUARANTINED_BODY);
   });
 
+  it("redacts a secret before truncating the body, even when the secret straddles the truncation cut", async () => {
+    const seeded = await seed();
+    const secret = "sk-run-secret-1234567890";
+    await createRunSecretRedactionRegistry(db).register(seeded.companyId, seeded.runId, secret);
+    // The per-comment body cap is 8,000 chars. Put the secret's start just
+    // before that cut, so a truncate-then-redact bug would slice it in half
+    // (keeping the first 10 chars unmasked) instead of masking it whole.
+    const body = "x".repeat(7_990) + secret + "y".repeat(500);
+    const queued = await queueComment(seeded, { author: "board", body });
+    const res = await request(createApp(agentActor(seeded.companyId, seeded.builderId, seeded.runId)))
+      .patch(`/api/issues/${seeded.issueId}`)
+      .send({ status: "done" });
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    const shown = res.body.details.comments.find((comment: { id: string }) => comment.id === queued.id) as {
+      body: string;
+      bodyTruncated?: boolean;
+    };
+    expect(shown.bodyTruncated).toBe(true);
+    expect(shown.body).not.toContain(secret);
+    // Not even the part of the secret that would have survived a truncate-
+    // before-redact cut at char 8,000.
+    expect(shown.body).not.toContain(secret.slice(0, 10));
+  });
+
   it("counts comments the run read from its queue as seen", async () => {
     const seeded = await seed();
     const hold = await queueComment(seeded, { author: "board", body: "Please also update the changelog." });
@@ -469,6 +499,12 @@ describeEmbeddedPostgres("run completion with comments queued during the run", (
     const blocked = await request(app).post(`/api/issues/${seeded.issueId}/comments`).send({ body: approval });
     expect(blocked.status, JSON.stringify(blocked.body)).toBe(409);
     expect(blocked.body.code).toBe(ISSUE_COMMENTS_QUEUED_DURING_RUN_CODE);
+    // This path repeats a comment, not a bare status change, so the message
+    // and nextStep describe resending the comment rather than "the status".
+    expect(blocked.body.error).not.toContain("changing the status");
+    expect(blocked.body.error).toContain("sending that comment");
+    expect(blocked.body.details.nextStep).not.toContain("status change");
+    expect(blocked.body.details.nextStep).toContain("send that comment again");
     expect((await issueRow(seeded.issueId)).status).toBe("in_review");
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, seeded.issueId));
     expect(comments.map((comment) => comment.body)).not.toContain(approval);

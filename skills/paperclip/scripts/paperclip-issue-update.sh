@@ -149,10 +149,12 @@ while :; do
 
   # Comments arrived on the task while this run worked and it has not seen
   # them. Not a failed write: read them, act on them, then run the same
-  # command again (see references/comments-during-a-run.md).
+  # command again (see references/comments-during-a-run.md). This exit does
+  # not count toward the two-consecutive-failure retry limit below — it is a
+  # delivery of comments to read, not evidence that the write itself failed.
   if [[ "$curl_exit" -eq 0 && "$http_code" == "409" ]] &&
     [[ "$(jq -r '.code // empty' <<<"$body" 2>/dev/null || true)" == "issue_comments_queued_during_run" ]]; then
-    printf 'Issue update NOT saved yet (HTTP 409 issue_comments_queued_during_run): comments arrived while you were working and you have not seen them. Read them below, re-check your work (pause or revert it if they ask you to), then run this command again; the same comments do not stop it a second time.\n' >&2
+    printf 'Issue update NOT saved yet (HTTP 409 issue_comments_queued_during_run): comments arrived while you were working and you have not seen them. Read them below, re-check your work (pause or revert it if they ask you to), then run this command again; the same comments do not stop it a second time. This is a delivery, not a failed write, so it does not count toward your two-attempt limit: keep repeating until it succeeds or the comments change your plan.\n' >&2
     printf '%s\n' "$body" >&2
     exit 1
   fi

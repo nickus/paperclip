@@ -37,6 +37,28 @@ export const ISSUE_COMMENTS_QUEUED_DURING_RUN_MESSAGE =
   "Re-check your conclusion (and pause or revert work if they ask you to) before changing the status.";
 
 /**
+ * Same conflict, worded for the one call site that reaches it from an
+ * approving review comment rather than a direct status change: the write
+ * the agent is about to repeat is the comment, not a bare status field.
+ */
+export const ISSUE_COMMENTS_QUEUED_DURING_RUN_COMMENT_MESSAGE =
+  "These comments arrived while you were working and you have not seen them. " +
+  "Re-check your conclusion (and pause or revert work if they ask you to) before sending that comment.";
+
+/**
+ * This 409 reports a delivery (the comments the agent must read), not a
+ * failed write: it never counts toward the "stop retrying after 2
+ * consecutive failures" rule, and the agent is expected to repeat the same
+ * request once it has read and acted on what it returns.
+ */
+export const ISSUE_COMMENTS_QUEUED_DURING_RUN_NEXT_STEP =
+  "This is a delivery, not a failed write: it does not count toward the rule that stops you retrying a control-plane write after 2 consecutive failures. Act on these comments first. If they ask you to hold, pause or revert, do that (use `blocked` with a blocker or a self-owned unblock descriptor if you must wait). Then send the status change again, and repeat until it succeeds or the comments change your plan; if `remainingCount` is above 0, the next attempt shows the rest.";
+
+/** Same as {@link ISSUE_COMMENTS_QUEUED_DURING_RUN_NEXT_STEP}, worded for resending the comment instead of a status change. */
+export const ISSUE_COMMENTS_QUEUED_DURING_RUN_COMMENT_NEXT_STEP =
+  "This is a delivery, not a failed write: it does not count toward the rule that stops you retrying a control-plane write after 2 consecutive failures. Act on these comments first. If they ask you to hold, pause or revert, do that (use `blocked` with a blocker or a self-owned unblock descriptor if you must wait). Then send that comment again, and repeat until it succeeds or the comments change your plan; if `remainingCount` is above 0, the next attempt shows the rest.";
+
+/**
  * Activity action that records which queued comments a run has been shown
  * (in a status-change conflict or by reading its queue). Activity rows
  * outlive the run, unlike the run's own result JSON, which the run's final

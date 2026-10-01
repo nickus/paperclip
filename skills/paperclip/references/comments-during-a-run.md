@@ -47,11 +47,16 @@ When your run sets its own task to `done`, `in_review` or `cancelled` (also with
 }
 ```
 
-- This is not a failed write and not a permission error. Read every comment in `details.comments` (a `bodyTruncated: true` entry carries only the start of the text; fetch `GET /api/issues/{issueId}/comments/{commentId}` for the rest).
+(On the one call site that reaches this from an approving review comment — a comment that moves `in_review` to `done` — `error` and `details.nextStep` talk about resending that comment instead of a bare status change; everything else below is the same.)
+
+- This is a delivery, not a failed write and not a permission error: it never counts toward the "stop retrying a control-plane write after 2 consecutive failures" rule above. Read every comment in `details.comments` (a `bodyTruncated: true` entry carries only the start of the text; fetch `GET /api/issues/{issueId}/comments/{commentId}` for the rest).
 - Re-check your conclusion. If a comment asks you to hold, pause, or revert, do that first; your status may need to be `blocked` instead.
-- Then send the status change again. Retrying after re-checking is expected: the same comments do not stop it a second time. If `remainingCount` is above 0, the next attempt shows the rest.
-- `scripts/paperclip-issue-update.sh` prints these comments and exits 1 with a message that says so.
+- Then send the same request again (the status change, or the approving comment). Retrying after re-checking is expected: the same comments do not stop it a second time. More than 20 comments can be queued at once, so a second (or later) `409` for the rest is also expected, not a failure — `remainingCount` above 0 says the next attempt shows the rest. Keep repeating until the request succeeds or the comments change your plan.
+- `scripts/paperclip-issue-update.sh` prints these comments and exits 1 with a message that says so; that exit is this same delivery, not one of your two allowed write failures.
 
 ## After your run
 
-Comments your run never saw are not lost. They start your next run, and its wake says which of them arrived while your previous run was working ("comments your previous run did not see"). Re-check what that run did, and pause or revert it if they ask for that. If your run completed the task without seeing them, the task is reopened for you. If someone else closed the task while your run worked (the board, or a reviewer approving it), or it was cancelled, it stays closed: the comments do not start a run, and the task's activity lists them as comments your run never saw.
+Comments your run never saw are not lost unless the task ends up closed. They start your next run, and its wake says which of them arrived while your previous run was working ("comments your previous run did not see"). Re-check what that run did, and pause or revert it if they ask for that.
+
+- If your run itself moved the task to `done` without seeing them, the task is reopened for you: the comments stay queued, and your new run's wake names them.
+- If the task is `cancelled`, or someone else (the board, or a reviewer approving it) closed it to `done` while your run was still working, it stays closed either way: the comments do not start a run. The task's activity gets an `issue.queued_comments_undelivered` entry naming them, so the board can still see what your run never saw.
