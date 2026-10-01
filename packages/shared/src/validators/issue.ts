@@ -1183,6 +1183,17 @@ export const issueDocumentKeySchema = z
     "Document key must be lowercase letters, numbers, _ or -",
   );
 
+// Accepts either a single string or a list, so a suggestion with one
+// criterion does not force the caller to wrap it in an array; empty items are
+// rejected rather than silently dropped.
+const suggestedTaskAcceptanceCriteriaSchema = z.preprocess(
+  (value) => {
+    if (value == null) return [];
+    return typeof value === "string" ? [value] : value;
+  },
+  z.array(z.string().trim().min(1).max(500)).max(20),
+);
+
 export const suggestedTaskDraftSchema = z
   .object({
     clientKey: z.string().trim().min(1).max(120),
@@ -1197,12 +1208,24 @@ export const suggestedTaskDraftSchema = z
     workMode: z.enum(ISSUE_WORK_MODES).nullable().optional(),
     assigneeAgentId: z.string().guid().nullable().optional(),
     assigneeUserId: z.string().trim().min(1).nullable().optional(),
+    // A free-text hint ("agent id", agent name key, or user id) proposing who
+    // should own the created task. Unlike assigneeAgentId/assigneeUserId it is
+    // not required to resolve to anything: the accept path tries to match it
+    // to an assignable agent or user in the company and otherwise leaves the
+    // task unassigned with a note, so a guess that does not pan out never
+    // blocks task creation.
+    proposedOwner: z.string().trim().min(1).max(200).nullable().optional(),
+    acceptanceCriteria: suggestedTaskAcceptanceCriteriaSchema.optional(),
     projectId: z.string().guid().nullable().optional(),
     goalId: z.string().guid().nullable().optional(),
     billingCode: z.string().trim().max(120).nullable().optional(),
     labels: z.array(z.string().trim().min(1).max(48)).max(20).optional(),
     hiddenInPreview: z.boolean().optional(),
   })
+  // Reject unknown fields instead of silently dropping them: an agent that
+  // sends a field the server does not understand gets a 400 naming it, not a
+  // card that quietly stored less than it was asked to.
+  .strict()
   .superRefine((value, ctx) => {
     if (value.assigneeAgentId && value.assigneeUserId) {
       ctx.addIssue({

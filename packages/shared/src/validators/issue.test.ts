@@ -9,6 +9,7 @@ import {
   respondIssueThreadInteractionSchema,
   stalledReviewDecisionSchema,
   suggestedTaskDraftSchema,
+  suggestTasksPayloadSchema,
   updateIssueSchema,
   upsertIssueDocumentSchema,
 } from "./issue.js";
@@ -631,6 +632,100 @@ describe("issue validators", () => {
         workMode: "analysis",
       }).success,
     ).toBe(false);
+  });
+
+  it("persists acceptanceCriteria and proposedOwner on a suggested task draft", () => {
+    const withArray = suggestedTaskDraftSchema.parse({
+      clientKey: "criteria-child",
+      title: "Ship the fix",
+      acceptanceCriteria: ["Covers the regression", "Docs updated"],
+      proposedOwner: "automation-owner",
+    });
+    expect(withArray.acceptanceCriteria).toEqual([
+      "Covers the regression",
+      "Docs updated",
+    ]);
+    expect(withArray.proposedOwner).toBe("automation-owner");
+
+    // A single string is accepted as shorthand for a one-item list.
+    const withString = suggestedTaskDraftSchema.parse({
+      clientKey: "criteria-child-2",
+      title: "Ship the fix",
+      acceptanceCriteria: "Covers the regression",
+    });
+    expect(withString.acceptanceCriteria).toEqual(["Covers the regression"]);
+
+    // Omitting it entirely still works and leaves the field unset.
+    const omitted = suggestedTaskDraftSchema.parse({
+      clientKey: "criteria-child-3",
+      title: "Ship the fix",
+    });
+    expect(omitted.acceptanceCriteria).toBeUndefined();
+    expect(omitted.proposedOwner).toBeUndefined();
+  });
+
+  it("rejects unknown fields on a suggested task item instead of silently dropping them", () => {
+    const direct = suggestedTaskDraftSchema.safeParse({
+      clientKey: "unknown-field-child",
+      title: "Ship the fix",
+      madeUpField: "should not vanish quietly",
+    });
+    expect(direct.success).toBe(false);
+    if (!direct.success) {
+      const unrecognized = direct.error.issues.find(
+        (issue) => issue.code === "unrecognized_keys",
+      );
+      expect(unrecognized).toBeDefined();
+      expect((unrecognized as { keys: string[] }).keys).toContain(
+        "madeUpField",
+      );
+    }
+
+    // Surfaced the same way through the full suggest_tasks payload, with the
+    // offending task's index on the issue path.
+    const viaPayload = suggestTasksPayloadSchema.safeParse({
+      version: 1,
+      tasks: [
+        {
+          clientKey: "unknown-field-child",
+          title: "Ship the fix",
+          madeUpField: "should not vanish quietly",
+        },
+      ],
+    });
+    expect(viaPayload.success).toBe(false);
+    if (!viaPayload.success) {
+      const unrecognized = viaPayload.error.issues.find(
+        (issue) => issue.code === "unrecognized_keys",
+      );
+      expect(unrecognized).toBeDefined();
+      expect(unrecognized?.path).toEqual(["tasks", 0]);
+      expect((unrecognized as { keys: string[] }).keys).toContain(
+        "madeUpField",
+      );
+    }
+
+    // Existing, fully-specified payloads keep working.
+    expect(
+      suggestTasksPayloadSchema.safeParse({
+        version: 1,
+        tasks: [
+          {
+            clientKey: "ok-child",
+            title: "Ship the fix",
+            description: "Details",
+            priority: "medium",
+            workMode: "standard",
+            assigneeAgentId: "22222222-2222-4222-8222-222222222222",
+            projectId: "33333333-3333-4333-8333-333333333333",
+            billingCode: "BILL-1",
+            labels: ["backend"],
+            acceptanceCriteria: ["Covers the regression"],
+            proposedOwner: "automation-owner",
+          },
+        ],
+      }).success,
+    ).toBe(true);
   });
 
   it("clamps oversized requestDepth values on update", () => {
