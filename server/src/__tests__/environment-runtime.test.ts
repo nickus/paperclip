@@ -633,6 +633,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     ["failed", null, "failed", "failed"],
     ["timed_out", null, "failed", "failed"],
     ["failed", "process_lost", "failed", "interrupted"],
+    ["failed", "model_endpoint_unreachable", "failed", "interrupted"],
     ["interrupted", "server_shutdown_interrupted", "released", "interrupted"],
     ["succeeded", null, "released", "released"],
     ["cancelled", null, "expired", "expired"],
@@ -654,6 +655,44 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       providerLeaseId: seeded.reusableLease.providerLeaseId, runStatus: reported,
     })]);
   });
+
+  it.each([
+    ["model_endpoint_unreachable", "interrupted"],
+    [null, "failed"],
+  ] as const)(
+    "reports every one of three runs in a row that failed with %s as %s, never letting an outage look like three ordinary failures",
+    async (errorCode, reported) => {
+      const seeded = await seedReusablePluginSandboxLease();
+      const call = vi.fn(async (_id: string, _method: string, params: Record<string, unknown>) => ({
+        providerLeaseId: params.providerLeaseId, state: "stopped",
+      }));
+      const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+        isRunning: () => true, call,
+        getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+      } as unknown as PluginWorkerManager });
+
+      let runId = seeded.runId;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+          // Simulate the sandbox being resumed for the next attempt: the same
+          // reusable lease row, rebound to a fresh run.
+          runId = randomUUID();
+          await db.insert(heartbeatRuns).values({ id: runId, companyId: seeded.companyId, agentId: seeded.agentId, status: "running" });
+          await db.update(environmentLeases).set({ status: "active", heartbeatRunId: runId, releasedAt: null })
+            .where(eq(environmentLeases.id, seeded.reusableLease.id));
+        }
+        await db.update(heartbeatRuns).set({ status: "failed", errorCode }).where(eq(heartbeatRuns.id, runId));
+        await runtime.releaseRunLeases(runId, "failed");
+      }
+
+      expect(call).toHaveBeenCalledTimes(3);
+      for (const entry of call.mock.calls) {
+        expect(entry.slice(1, 3)).toEqual(["environmentReleaseLease", expect.objectContaining({
+          providerLeaseId: seeded.reusableLease.providerLeaseId, runStatus: reported,
+        })]);
+      }
+    },
+  );
 
   it.each(["stopped", "destroyed"] as const)(
     "stops a reusable sandbox through the release of a provider without a stop method (%s receipt)", async (state) => {
