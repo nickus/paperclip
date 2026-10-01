@@ -20,6 +20,28 @@ it.each(["workspace_git_scan_timeout", "workspace_git_scan_saturated"])("does no
   expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "setup_failed" })).toBe(true);
 });
 
+it("exempts a model-endpoint outage from reconciliation on the error code alone, for any adapter", () => {
+  // Deliberately no executionRecovery evidence here: a third-party adapter
+  // plugin that reports this error code should not need to know about the
+  // bootstrap-evidence shape to get the deferred-backoff retry below instead
+  // of a stranded-issue hold.
+  const run = {
+    runtimeMode: "legacy", status: "failed", errorCode: "model_endpoint_unreachable",
+    scheduledRetryAttempt: 12, resultJson: {},
+  };
+  expect(legacyExecutionNeedsReconciliation(run)).toBe(false);
+  // Holds even after many outage retries, unlike the generic
+  // executionFailureRetryCount >= 2 budget other error codes fall back to.
+  expect(legacyExecutionNeedsReconciliation({ ...run, scheduledRetryAttempt: 50 })).toBe(false);
+  // Also exempt when an adapter does supply the bootstrap evidence.
+  expect(legacyExecutionNeedsReconciliation({
+    ...run,
+    resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+  })).toBe(false);
+  // A different error code gets no special treatment from this exemption.
+  expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "adapter_failed" })).toBe(true);
+});
+
 it("permits subscription waits only with explicit evidence that provider work never started", () => {
   const waiting = {
     runtimeMode: "legacy", status: "cancelled", errorCode: "ai_connection_busy", scheduledRetryAttempt: 12,

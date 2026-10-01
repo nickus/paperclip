@@ -98,6 +98,14 @@ export function legacyExecutionNeedsReconciliation(
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
   if ((run.errorCode === "workspace_git_scan_timeout" || run.errorCode === "workspace_git_scan_saturated") &&
       evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
+  // A down model endpoint (connection refused / no route to host / timeout
+  // reaching the configured model server) is an infrastructure outage, not an
+  // ambiguous or failed provider turn — regardless of which adapter reported
+  // it. Deliberately keyed on the error code alone, with no evidence-shape
+  // requirement, so a third-party adapter plugin that has never heard of
+  // `executionRecovery` still gets the deferred-backoff retry below instead
+  // of stranding the issue for a human to reconcile.
+  if (run.errorCode === "model_endpoint_unreachable") return false;
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false
