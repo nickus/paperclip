@@ -567,7 +567,7 @@ npx paperclipai agent instructions-file:put <agent-id> --path AGENTS.md --conten
 npx paperclipai agent instructions-file:delete <agent-id> --path AGENTS.md
 ```
 
-Agent config, instructions, skills, project env, environment, secret, and workspace edits affect the next run. Active runs finish with the config they started with. A saved task session is kept across such edits unless the adapter type or the selected environment changed (set `PAPERCLIP_SESSION_CONFIG_RESET=any` to start fresh on any change); the resumed agent is told what changed. When a reused workspace or sandbox lease no longer matches the effective next-run config, Paperclip may start fresh execution and records non-sensitive freshness categories in run result JSON and workspace operation logs.
+Agent config, instructions, skills, project env, environment, secret, and workspace edits affect the next run. Active runs finish with the config they started with. A saved task session is kept across edits that a resumed turn picks up (secrets, env vars, most adapter, runtime and workspace settings); a changed adapter type, selected environment or prompt template, and on most adapters changed instructions or skills, start a fresh session (set `PAPERCLIP_SESSION_CONFIG_RESET=any` to start fresh on any change). A resumed agent is told what changed. When a reused workspace or sandbox lease no longer matches the effective next-run config, Paperclip may start fresh execution and records non-sensitive freshness categories in run result JSON and workspace operation logs.
 
 `agent local-cli` is the quickest way to run local Claude/Codex manually as a Paperclip agent:
 

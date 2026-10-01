@@ -928,12 +928,21 @@ describe("renderPaperclipWakePrompt", () => {
       "environment settings",
     ]);
     const note =
-      "Changed since your previous turn on this task: your instructions, environment settings. The current versions are in effect.";
+      "Changed since your previous turn on this task: your instructions, environment settings. This turn runs with the updated versions; where they differ from earlier in this conversation, follow the updated ones.";
 
     expect(renderPaperclipWakeSessionConfigChanges(withChanges)).toBe(note);
     const prompt = renderPaperclipWakePrompt(withChanges, { resumedSession: true });
     expect(prompt).toContain(note);
     expect(prompt.indexOf(note)).toBeGreaterThan(prompt.indexOf("## Paperclip"));
+
+    // The server sets the note before the adapter decides whether it can
+    // resume the session. A new session (the adapter declined the saved one)
+    // or a caller that does not report its decision gets no note.
+    for (const options of [{ resumedSession: false }, {}]) {
+      const freshPrompt = renderPaperclipWakePrompt(withChanges, options);
+      expect(freshPrompt).not.toContain("Changed since your previous turn");
+      expect(freshPrompt).toBe(renderPaperclipWakePrompt(payload, options));
+    }
     // The note is runtime-only: it never enters the serialized wake payload.
     expect(stringifyPaperclipWakePayload(withChanges)).not.toContain("sessionConfigChanges");
 
@@ -953,7 +962,9 @@ describe("renderPaperclipWakePrompt", () => {
       renderPaperclipWakeSessionConfigChanges({
         sessionConfigChanges: ["your\ninstructions", "", 42, "x".repeat(200)],
       }),
-    ).toMatch(/^Changed since your previous turn on this task: your instructions, x+…\. The current versions are in effect\.$/);
+    ).toMatch(
+      /^Changed since your previous turn on this task: your instructions, x+…\. This turn runs with the updated versions; where they differ from earlier in this conversation, follow the updated ones\.$/,
+    );
     expect(renderPaperclipWakeSessionConfigChanges({ sessionConfigChanges: [] })).toBe("");
     expect(renderPaperclipWakeSessionConfigChanges({ sessionConfigChanges: "secrets" })).toBe("");
     expect(renderPaperclipWakeSessionConfigChanges(null)).toBe("");

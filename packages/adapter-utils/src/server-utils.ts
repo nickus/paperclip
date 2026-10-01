@@ -2308,9 +2308,11 @@ const PAPERCLIP_WAKE_SESSION_CONFIG_CHANGE_MAX_CHARS = 60;
 
 /**
  * Return a copy of the wake payload that names what changed in the agent's
- * configuration since its previous turn on the task session being resumed
- * (for example "your instructions"), or without that field when nothing did.
- * The server sets it after the resume decision; it is runtime-only.
+ * configuration since its previous turn on the saved task session (for
+ * example "your instructions"), or without that field when nothing did. The
+ * server sets it when it keeps the session; it is runtime-only. Only parts
+ * the run applies again are listed: the server starts a fresh session when a
+ * change would not reach a resumed turn.
  */
 export function withPaperclipWakeSessionConfigChanges(
   wakePayload: unknown,
@@ -2325,7 +2327,11 @@ export function withPaperclipWakeSessionConfigChanges(
     : payload;
 }
 
-/** The one-line note for a resumed session whose configuration changed. */
+/**
+ * The one-line note for a resumed session whose configuration changed. Wake
+ * prompts include it only when the adapter reports that it resumed the
+ * session (see renderPaperclipWakePrompt).
+ */
 export function renderPaperclipWakeSessionConfigChanges(value: unknown): string {
   const raw = parseObject(value)[PAPERCLIP_WAKE_SESSION_CONFIG_CHANGES_KEY];
   if (!Array.isArray(raw)) return "";
@@ -2339,13 +2345,16 @@ export function renderPaperclipWakeSessionConfigChanges(value: unknown): string 
     })
     .slice(0, PAPERCLIP_WAKE_SESSION_CONFIG_CHANGES_MAX_ITEMS);
   if (changes.length === 0) return "";
-  return `Changed since your previous turn on this task: ${changes.join(", ")}. The current versions are in effect.`;
+  return `Changed since your previous turn on this task: ${changes.join(", ")}. This turn runs with the updated versions; where they differ from earlier in this conversation, follow the updated ones.`;
 }
 
 // Runtime-only connector skills are supplied by the server after assignment resolution.
 // Shared-home adapters consume them here on fresh and resumed runs without installing
 // files into a user-wide skills directory. They are not part of serialized wake data.
-// The session configuration note is runtime-only in the same way.
+// The session configuration note is runtime-only in the same way. The server
+// sets it before the adapter decides whether it can resume the saved session,
+// so it is rendered only when the adapter passes resumedSession: true; a new
+// session has no previous turn to compare with.
 export function renderPaperclipWakePrompt(
   value: unknown,
   options: Parameters<typeof renderPaperclipWakePromptBody>[1] = {},
@@ -2353,7 +2362,7 @@ export function renderPaperclipWakePrompt(
   const instructions = asString(parseObject(value).connectorSkillInstructions, "").trim();
   return joinPromptSections([
     renderPaperclipWakePromptBody(value, options),
-    renderPaperclipWakeSessionConfigChanges(value),
+    options.resumedSession === true ? renderPaperclipWakeSessionConfigChanges(value) : "",
     instructions ? `## Assigned connector skills\n\n${instructions}` : "",
   ]);
 }

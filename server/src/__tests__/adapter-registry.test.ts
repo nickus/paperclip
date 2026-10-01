@@ -376,6 +376,30 @@ describe("server adapter registry", () => {
     });
   });
 
+  it("declares instruction re-delivery on resumed turns only for adapters that resend them", () => {
+    const declared = (type: string, config: Record<string, unknown> = {}) => {
+      const value = findActiveServerAdapter(type)?.resumeRedeliversInstructions;
+      return typeof value === "function" ? value(config) : value === true;
+    };
+    // These prepend the instructions file to every prompt, also on resume.
+    for (const type of ["cursor", "opencode_local", "hermes_local"]) {
+      expect(declared(type), type).toBe(true);
+    }
+    // gemini and kimi do so only with the CLI engine; the default ACP engine
+    // sends the instructions to a new session only.
+    for (const type of ["gemini_local", "kimi_local"]) {
+      expect(declared(type, { engine: "cli" }), type).toBe(true);
+      expect(declared(type, { engine: "acp" }), type).toBe(false);
+      expect(declared(type), type).toBe(false);
+    }
+    // Codex and the ACP engines skip the instructions when they resume with a
+    // wake delta, and Claude Code replays the system prompt a session started
+    // with, so their sessions restart when instructions or skills change.
+    for (const type of ["claude_local", "codex_local", "paperclip_runner", "pi_local", "grok_local"]) {
+      expect(declared(type, { engine: "cli" }), type).toBe(false);
+    }
+  });
+
   it("switches active adapter behavior back to the builtin when an override is paused", async () => {
     const builtIn = findServerAdapter("claude_local");
     expect(builtIn).not.toBeNull();

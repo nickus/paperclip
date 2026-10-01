@@ -67,6 +67,7 @@ import {
   testEnvironment as geminiTestEnvironment,
   sessionCodec as geminiSessionCodec,
   getConfigSchema as getGeminiConfigSchema,
+  resolveGeminiExecutionEngine,
 } from "@paperclipai/adapter-gemini-local/server";
 import {
   agentConfigurationDoc as geminiAgentConfigurationDoc,
@@ -91,6 +92,7 @@ import {
   syncKimiSkills,
   testEnvironment as kimiTestEnvironment,
   sessionCodec as kimiSessionCodec,
+  resolveKimiExecutionEngine,
 } from "@paperclipai/adapter-kimi-local/server";
 import {
   agentConfigurationDoc as kimiAgentConfigurationDoc,
@@ -676,6 +678,9 @@ const cursorLocalAdapter: ServerAdapterModule = {
   listSkills: listCursorSkills,
   syncSkills: syncCursorSkills,
   sessionCodec: cursorSessionCodec,
+  // Prepends the instructions file to every prompt and installs the skills
+  // before every run, also when it resumes a session.
+  resumeRedeliversInstructions: true,
   sessionManagement: getAdapterSessionManagement("cursor") ?? undefined,
   models: cursorModels,
   listModels: listCursorModels,
@@ -719,6 +724,11 @@ const geminiLocalAdapter: ServerAdapterModule = {
   listSkills: listGeminiSkills,
   syncSkills: syncGeminiSkills,
   sessionCodec: geminiSessionCodec,
+  // The CLI engine prepends the instructions file to every prompt and
+  // installs the skills before every run. The ACP engine sends the
+  // instructions only to a new session.
+  resumeRedeliversInstructions: (config) =>
+    resolveGeminiExecutionEngine(config).engine === "cli",
   sessionManagement: getAdapterSessionManagement("gemini_local") ?? undefined,
   models: geminiModels,
   supportsLocalAgentJwt: true,
@@ -770,6 +780,10 @@ const kimiLocalAdapter: ServerAdapterModule = {
   listSkills: listKimiSkills,
   syncSkills: syncKimiSkills,
   sessionCodec: kimiSessionCodec,
+  // Same split as gemini_local: only the CLI engine resends the instructions
+  // to a resumed session.
+  resumeRedeliversInstructions: (config) =>
+    resolveKimiExecutionEngine(config).engine === "cli",
   sessionManagement: getAdapterSessionManagement("kimi_local") ?? undefined,
   models: kimiModels,
   supportsLocalAgentJwt: true,
@@ -789,6 +803,9 @@ const hermesGatewayAdapter: ServerAdapterModule = {
 const hermesLocalAdapter: ServerAdapterModule = {
   ...createHermesLocalServerAdapter(),
   runtimeToolDelivery: "environment",
+  // Prepends the instructions file to every prompt and reconciles the skills
+  // before every run, also when it resumes a session.
+  resumeRedeliversInstructions: true,
 };
 
 const openclawGatewayAdapter: ServerAdapterModule = {
@@ -811,6 +828,9 @@ const openCodeLocalAdapter: ServerAdapterModule = {
   listSkills: listOpenCodeSkills,
   syncSkills: syncOpenCodeSkills,
   sessionCodec: openCodeSessionCodec,
+  // Prepends the instructions file to every prompt and installs the skills
+  // before every run, also when it resumes a session.
+  resumeRedeliversInstructions: true,
   models: openCodeModels,
   sessionManagement: getAdapterSessionManagement("opencode_local") ?? undefined,
   listModels: listOpenCodeModels,

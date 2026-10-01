@@ -497,6 +497,20 @@ export interface ServerAdapterModule {
    * type out.
    */
   supportsConversationContinuation?: boolean;
+  /**
+   * A resumed turn of a saved session receives the agent's current
+   * instructions and skills: the adapter sends the instructions file with
+   * every prompt, also when it resumes a session with a wake delta, and
+   * installs the current skills before every run.
+   *
+   * Paperclip keeps a saved task session across most configuration edits by
+   * default. An edit to the instructions or skills still starts a fresh
+   * session for an adapter that does not declare this, because its resumed
+   * turn would keep following the versions already in the conversation.
+   * A function receives the run's effective adapter config, for adapters
+   * whose engine decides it. Undefined means false.
+   */
+  resumeRedeliversInstructions?: boolean | ((adapterConfig: Record<string, unknown>) => boolean);
   sessionManagement?: import("./session-compaction.js").AdapterSessionManagement;
   supportsLocalAgentJwt?: boolean;
   /** How this adapter receives Paperclip's run-scoped control tools. */

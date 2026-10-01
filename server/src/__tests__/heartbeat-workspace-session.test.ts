@@ -34,6 +34,7 @@ import {
   resolveNextSessionState,
   resolveTaskSessionConfigFreshness,
   resolveTaskSessionConfigResetPolicy,
+  adapterResumeRedeliversInstructions,
   describeSessionConfigChangesForAgent,
   formatResumedSessionConfigChangesNotice,
   isWorkspaceSyncConflictFailure,
@@ -2765,6 +2766,25 @@ describe("effective run session config freshness", () => {
         taskSessionParams: sessionParamsWithConfigMetadata(base),
         configMetadata: testCase.metadata,
       });
+      if (testCase.category === "runtimeSkills") {
+        // Skills reach a resumed turn only on adapters that declare it.
+        expect(kept, testCase.name).toMatchObject({
+          reset: true,
+          reasons: ["effective run configuration changed: runtime skills"],
+          carriedOverCategories: [],
+        });
+        expect(
+          resolveTaskSessionConfigFreshness({
+            hasTaskSession: true,
+            configuredModel: "gpt-5.4-mini",
+            taskSessionParams: sessionParamsWithConfigMetadata(base),
+            configMetadata: testCase.metadata,
+            resumeRedeliversInstructions: true,
+          }),
+          testCase.name,
+        ).toMatchObject({ reset: false, carriedOverCategories: ["runtimeSkills"] });
+        continue;
+      }
       expect(kept.reset, testCase.name).toBe(false);
       expect(kept.carriedOverCategories, testCase.name).toContain(testCase.category);
     }
@@ -2808,14 +2828,29 @@ describe("effective run session config freshness", () => {
     expect(decision.changedCategories).toContain("instructions");
     expect(next.fingerprints.sessionFingerprint.canonicalJson).not.toContain("Version two instructions");
 
-    // An instructions edit keeps the saved conversation by default; the new
-    // instructions are supplied on the next turn.
+    // By default an instructions edit starts a fresh session: most adapters
+    // send the instructions only to a new session, so a resumed turn would
+    // keep following the old text.
     expect(
       resolveTaskSessionConfigFreshness({
         hasTaskSession: true,
         configuredModel: "gpt-5.4-mini",
         taskSessionParams: sessionParamsWithConfigMetadata(base),
         configMetadata: next,
+      }),
+    ).toMatchObject({
+      reset: true,
+      reasons: ["effective run configuration changed: instructions"],
+      carriedOverCategories: [],
+    });
+    // An adapter that resends the instructions on every turn keeps it.
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: next,
+        resumeRedeliversInstructions: true,
       }),
     ).toMatchObject({ reset: false, reasons: [], carriedOverCategories: ["instructions"] });
   });
@@ -2969,7 +3004,8 @@ describe("task session continuity across configuration changes", () => {
       },
     });
 
-    const decision = decide(base, next);
+    // This adapter resends the instructions and skills on every turn.
+    const decision = decide(base, next, { resumeRedeliversInstructions: true });
 
     expect(decision.reset).toBe(false);
     expect(decision.reasons).toEqual([]);
@@ -2992,15 +3028,82 @@ describe("task session continuity across configuration changes", () => {
         taskKey: "issue-1",
         carriedOverCategories: ["instructions", "secrets"],
       }),
-    ).toBe('Resuming saved session for task "issue-1"; changed since its last turn: instructions, secrets.');
+    ).toBe(
+      'Saved session for task "issue-1" kept across changes since its last turn (instructions, secrets); the adapter decides whether it can resume it.',
+    );
+    expect(
+      formatResumedSessionConfigChangesNotice({ taskKey: null, carriedOverCategories: ["secrets"] }),
+    ).toBe("Saved session kept across changes since its last turn (secrets); the adapter decides whether it can resume it.");
+    expect(formatResumedSessionConfigChangesNotice({ taskKey: "issue-1", carriedOverCategories: [] })).toBeNull();
     expect(
       describeSessionConfigChangesForAgent(["adapter", "adapterConfig", "instructions", "environment"]),
     ).toEqual(["your agent configuration", "your instructions", "environment settings"]);
 
     // The strict policy resets on the same changes.
-    expect(decide(base, next, { resetPolicy: "any" })).toMatchObject({
+    expect(decide(base, next, { resetPolicy: "any", resumeRedeliversInstructions: true })).toMatchObject({
       reset: true,
       carriedOverCategories: [],
+    });
+    // So does the default policy on an adapter that sends the instructions
+    // and skills only to a new session.
+    expect(decide(base, next)).toMatchObject({
+      reset: true,
+      reasons: ["effective run configuration changed: instructions, runtime skills"],
+      carriedOverCategories: [],
+    });
+  });
+
+  it("starts a fresh session when a prompt template changes, on every adapter", async () => {
+    const adapterConfig = { command: "codex", model: "gpt-5.4-mini", reasoningEffort: "medium" };
+    const base = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: { ...adapterConfig, promptTemplate: "Work on {{context.issueId}}." },
+    });
+    for (const effectiveAdapterConfig of [
+      { ...adapterConfig, promptTemplate: "Work carefully on {{context.issueId}}." },
+      { ...adapterConfig, promptTemplate: "Work on {{context.issueId}}.", bootstrapPromptTemplate: "Read the repo first." },
+      adapterConfig,
+    ]) {
+      const next = await buildSessionConfigMetadata({ effectiveAdapterConfig });
+      expect(next.identityFingerprints.promptTemplates).not.toBe(base.identityFingerprints.promptTemplates);
+      expect(decide(base, next, { resumeRedeliversInstructions: true })).toMatchObject({
+        reset: true,
+        reasons: ["effective run configuration changed: prompt templates"],
+        changedCategories: ["adapterConfig"],
+        carriedOverCategories: [],
+      });
+    }
+
+    // Other adapter settings keep the session.
+    const effortChanged = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: {
+        ...adapterConfig,
+        reasoningEffort: "high",
+        promptTemplate: "Work on {{context.issueId}}.",
+      },
+    });
+    expect(effortChanged.identityFingerprints.promptTemplates).toBe(base.identityFingerprints.promptTemplates);
+    expect(decide(base, effortChanged)).toMatchObject({
+      reset: false,
+      carriedOverCategories: ["adapterConfig"],
+    });
+  });
+
+  it("checks a session saved without a prompt template fingerprint against any adapter config change", async () => {
+    const base = await buildSessionConfigMetadata();
+    const next = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: { command: "codex", model: "gpt-5.4-mini", reasoningEffort: "high" },
+    });
+    const params = sessionParamsWithConfigMetadata(base);
+    const { promptTemplates: _promptTemplates, ...earlierIdentities } = base.identityFingerprints;
+    const decision = resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      configuredModel: "gpt-5.4-mini",
+      taskSessionParams: { ...params, __paperclipConfigIdentityFingerprints: earlierIdentities },
+      configMetadata: next,
+    });
+    expect(decision).toMatchObject({
+      reset: true,
+      reasons: ["effective run configuration changed: adapter config"],
     });
   });
 
@@ -3041,7 +3144,7 @@ describe("task session continuity across configuration changes", () => {
 
   it("keeps the existing reset checks for model changes and fresh-session wakes", async () => {
     const base = await buildSessionConfigMetadata();
-    const next = await buildSessionConfigMetadata({ runtimeSkills: [] });
+    const next = await buildSessionConfigMetadata({ agentRuntimeConfig: { heartbeat: { maxConcurrentRuns: 3 } } });
 
     const modelChanged = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
@@ -3091,6 +3194,80 @@ describe("task session continuity across configuration changes", () => {
         resetPolicy: "any",
       }).reset,
     ).toBe(true);
+  });
+
+  it("checks sessions saved before identity fingerprints for edits whose fingerprint form did not change", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-continuity-"));
+    const instructionsPath = path.join(root, "AGENTS.md");
+    await fs.writeFile(instructionsPath, "First instructions.\n", "utf8");
+    const adapterConfig = {
+      command: "codex",
+      model: "gpt-5.4-mini",
+      instructionsBundleMode: "managed",
+      instructionsRootPath: root,
+      instructionsEntryFile: "AGENTS.md",
+      instructionsFilePath: instructionsPath,
+    };
+    const base = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: adapterConfig,
+      environment: environmentValue(),
+    });
+    const { __paperclipConfigIdentityFingerprints: _identity, ...legacyParams } =
+      sessionParamsWithConfigMetadata(base);
+    const decideLegacy = (next: SessionConfigMetadata) =>
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: legacyParams,
+        configMetadata: next,
+      });
+
+    // A real runtime settings edit is kept and named; the environment
+    // difference (which may be only the fingerprint form) is not named.
+    const runtimeChanged = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: adapterConfig,
+      environment: environmentValue({ configRevisionAt: "2026-06-03T00:00:00.000Z" }),
+      agentRuntimeConfig: { heartbeat: { maxConcurrentRuns: 2 } },
+    });
+    expect(decideLegacy(runtimeChanged)).toMatchObject({
+      reset: false,
+      changedCategories: ["agentRuntimeConfig", "environment"],
+      carriedOverCategories: ["agentRuntimeConfig"],
+    });
+
+    await fs.writeFile(instructionsPath, "Second instructions.\n", "utf8");
+    const instructionsChanged = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: adapterConfig,
+      environment: environmentValue(),
+    });
+    expect(decideLegacy(instructionsChanged)).toMatchObject({
+      reset: true,
+      reasons: ["effective run configuration changed: instructions"],
+      carriedOverCategories: [],
+    });
+  });
+
+  it("reads an adapter's instruction re-delivery declaration", () => {
+    expect(adapterResumeRedeliversInstructions(null, {})).toBe(false);
+    expect(adapterResumeRedeliversInstructions({}, {})).toBe(false);
+    expect(adapterResumeRedeliversInstructions({ resumeRedeliversInstructions: true }, {})).toBe(true);
+    expect(adapterResumeRedeliversInstructions({ resumeRedeliversInstructions: false }, {})).toBe(false);
+    const byEngine = {
+      resumeRedeliversInstructions: (config: Record<string, unknown>) => config.engine === "cli",
+    };
+    expect(adapterResumeRedeliversInstructions(byEngine, { engine: "cli" })).toBe(true);
+    expect(adapterResumeRedeliversInstructions(byEngine, { engine: "acp" })).toBe(false);
+    // A declaration that throws counts as not re-delivering.
+    expect(
+      adapterResumeRedeliversInstructions(
+        {
+          resumeRedeliversInstructions: () => {
+            throw new Error("bad config");
+          },
+        },
+        {},
+      ),
+    ).toBe(false);
   });
 
   it("reads the reset policy from the instance environment", () => {

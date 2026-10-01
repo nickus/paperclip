@@ -656,6 +656,7 @@ import {
   resolvePaperclipRunnerIdleTimeoutMs,
   resolveSessionCompactionPolicy,
   type RuntimeStatusUpdate,
+  type ServerAdapterModule,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import {
@@ -5998,20 +5999,38 @@ const PAPERCLIP_SESSION_METADATA_KEYS = new Set([
 ]);
 /**
  * Instance switch for when a configuration change starts a new task session.
- * "breaking" (the default) keeps the saved session unless the adapter type or
- * the selected environment changed; "any" restores the strict behaviour where
+ * "breaking" (the default) keeps the saved session unless a change would not
+ * reach a resumed turn (see EFFECTIVE_RUN_SESSION_IDENTITIES and
+ * breakingSessionConfigChanges); "any" restores the strict behaviour where
  * any change to the effective run configuration starts a fresh session.
  */
 export const SESSION_CONFIG_RESET_ENV = "PAPERCLIP_SESSION_CONFIG_RESET";
 export type TaskSessionConfigResetPolicy = "breaking" | "any";
 /**
- * The parts of a run's configuration that make a saved task session unusable
- * when they change. Everything else (instructions, skills, secrets, env,
- * adapter knobs, workspace and environment settings) is supplied again on
- * every turn, and adapters check technical resumability (cwd, remote target,
- * model, session files) themselves.
+ * Parts of a run's configuration that always start a fresh task session when
+ * they change, fingerprinted on their own so a change is not lost among the
+ * other fields of its category:
+ * - adapterType and environment (which environment, which driver): the saved
+ *   conversation belongs to another runtime;
+ * - promptTemplates (adapterConfig.promptTemplate and bootstrapPromptTemplate):
+ *   adapters render the heartbeat template only on turns without a wake delta
+ *   and the bootstrap template only for a new session, so a resumed turn
+ *   would never see the edit.
+ * Instructions and runtime skills start a fresh session too, unless the
+ * adapter declares that a resumed turn receives them again
+ * (`resumeRedeliversInstructions`); most adapters send the instructions only
+ * to a new session, and some resume a session with the system prompt it
+ * started with. The remaining categories (secrets, env vars, other adapter
+ * settings, runtime settings, issue overrides, workspace settings and an
+ * environment's own settings) are applied when each run starts, so a resumed
+ * turn runs with them. Adapters still check technical resumability (cwd,
+ * remote target, model, their own session fingerprints) themselves.
  */
-const EFFECTIVE_RUN_SESSION_IDENTITIES = ["adapterType", "environment"] as const;
+const EFFECTIVE_RUN_SESSION_IDENTITIES = [
+  "adapterType",
+  "environment",
+  "promptTemplates",
+] as const;
 const WORKSPACE_CONFIG_FINGERPRINT_METADATA_KEY = "configFingerprint";
 const EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES = [
   "adapter",
@@ -6315,6 +6334,7 @@ const EFFECTIVE_RUN_SESSION_IDENTITY_LABELS: Record<
 > = {
   adapterType: "adapter type",
   environment: "selected environment",
+  promptTemplates: "prompt templates",
 };
 // Wording for the agent itself, used in the note on a resumed session. Several
 // categories describe the same thing from the agent's point of view.
@@ -6435,20 +6455,75 @@ export function resolveTaskSessionConfigResetPolicy(
 }
 
 /**
- * Which session identities changed since the saved session's last turn.
- * Sessions saved before identity fingerprints were recorded carry none; for
- * those an identity counts as unchanged. Task sessions are stored per adapter
- * type, so a saved session never comes from another adapter type, and the
- * adapters' own resume checks (cwd, remote target, session files) still apply.
+ * Session categories whose fingerprint form changed when binding row ids and
+ * environment update times were left out of fingerprints. A session saved
+ * before that (it carries no identity fingerprints) may differ in them only
+ * because of the form change, so such a difference is neither reported to the
+ * agent nor treated as an edit.
  */
-function changedEffectiveRunSessionIdentities(input: {
-  previous: Partial<Record<EffectiveRunSessionIdentity, string>>;
-  next: Record<EffectiveRunSessionIdentity, string>;
+const LEGACY_FORM_CHANGED_SESSION_CONFIG_CATEGORIES =
+  new Set<EffectiveRunSessionConfigCategory>(["environment", "secrets"]);
+
+/**
+ * The changes since the saved session's last turn that a resumed turn would
+ * not pick up, as labels for the reset reason. Empty when the session can be
+ * kept. See EFFECTIVE_RUN_SESSION_IDENTITIES.
+ */
+function breakingSessionConfigChanges(input: {
+  previousIdentities: Partial<Record<EffectiveRunSessionIdentity, string>>;
+  nextIdentities: Record<EffectiveRunSessionIdentity, string>;
+  changedCategories: readonly EffectiveRunSessionConfigCategory[];
+  resumeRedeliversInstructions: boolean;
 }) {
-  return EFFECTIVE_RUN_SESSION_IDENTITIES.filter((identity) => {
-    const previous = input.previous[identity];
-    return previous !== undefined && previous !== input.next[identity];
-  });
+  const labels: string[] = [];
+  // A session saved before identity fingerprints were recorded carries none.
+  // Task sessions are stored per adapter type, so its adapter type is the
+  // current one; a move to another environment is left to the adapters'
+  // remote-target checks, because the environment category of such a session
+  // changed form.
+  for (const identity of ["adapterType", "environment"] as const) {
+    const previous = input.previousIdentities[identity];
+    if (previous !== undefined && previous !== input.nextIdentities[identity]) {
+      labels.push(EFFECTIVE_RUN_SESSION_IDENTITY_LABELS[identity]);
+    }
+  }
+  const previousPromptTemplates = input.previousIdentities.promptTemplates;
+  if (previousPromptTemplates !== undefined) {
+    if (previousPromptTemplates !== input.nextIdentities.promptTemplates) {
+      labels.push(EFFECTIVE_RUN_SESSION_IDENTITY_LABELS.promptTemplates);
+    }
+  } else if (input.changedCategories.includes("adapterConfig")) {
+    // Saved before prompt templates had their own fingerprint: nothing shows
+    // that the adapter config change left them alone.
+    labels.push(EFFECTIVE_RUN_SESSION_CONFIG_CATEGORY_LABELS.adapterConfig);
+  }
+  if (!input.resumeRedeliversInstructions) {
+    for (const category of ["instructions", "runtimeSkills"] as const) {
+      if (input.changedCategories.includes(category)) {
+        labels.push(EFFECTIVE_RUN_SESSION_CONFIG_CATEGORY_LABELS[category]);
+      }
+    }
+  }
+  return labels;
+}
+
+/**
+ * Whether the adapter gives a resumed turn the agent's current instructions
+ * and skills (`ServerAdapterModule.resumeRedeliversInstructions`).
+ */
+export function adapterResumeRedeliversInstructions(
+  adapter: Pick<ServerAdapterModule, "resumeRedeliversInstructions"> | null | undefined,
+  adapterConfig: Record<string, unknown>,
+) {
+  const declared = adapter?.resumeRedeliversInstructions;
+  if (typeof declared === "function") {
+    try {
+      return declared(adapterConfig) === true;
+    } catch {
+      return false;
+    }
+  }
+  return declared === true;
 }
 
 /** Agent-facing names for changed categories, without duplicates. */
@@ -6467,8 +6542,10 @@ export function describeSessionConfigChangesForAgent(
 }
 
 /**
- * The run-log line for a saved session that is resumed although parts of its
- * configuration changed since its last turn.
+ * The run-log line for a saved session that is kept although parts of its
+ * configuration changed since its last turn. It is written before the adapter
+ * runs, and the adapter can still decline the session (for example after a
+ * working-directory change), so it does not claim a resume.
  */
 export function formatResumedSessionConfigChangesNotice(input: {
   taskKey: string | null | undefined;
@@ -6478,9 +6555,10 @@ export function formatResumedSessionConfigChangesNotice(input: {
   const changes = describeEffectiveRunConfigCategories(
     input.carriedOverCategories,
   );
-  return input.taskKey
-    ? `Resuming saved session for task "${input.taskKey}"; changed since its last turn: ${changes}.`
-    : `Resuming saved session; changed since its last turn: ${changes}.`;
+  const session = input.taskKey
+    ? `Saved session for task "${input.taskKey}"`
+    : "Saved session";
+  return `${session} kept across changes since its last turn (${changes}); the adapter decides whether it can resume it.`;
 }
 
 function describeEffectiveRunConfigCategories(
@@ -6953,6 +7031,11 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     value: {
       adapterType: input.adapterType,
       environment: readSessionEnvironmentIdentity(input.environment),
+      promptTemplates: {
+        promptTemplate: input.effectiveAdapterConfig.promptTemplate ?? null,
+        bootstrapPromptTemplate:
+          input.effectiveAdapterConfig.bootstrapPromptTemplate ?? null,
+      },
     } satisfies Record<EffectiveRunSessionIdentity, unknown>,
     subcategories: EFFECTIVE_RUN_SESSION_IDENTITIES,
   });
@@ -7295,6 +7378,11 @@ export function resolveTaskSessionConfigFreshness(input: {
   preserveLegacySessionWithoutConfigMetadata?: boolean;
   /** Defaults to "breaking"; see SESSION_CONFIG_RESET_ENV. */
   resetPolicy?: TaskSessionConfigResetPolicy;
+  /**
+   * The adapter gives a resumed turn the current instructions and skills
+   * (see adapterResumeRedeliversInstructions). Defaults to false.
+   */
+  resumeRedeliversInstructions?: boolean;
 }): TaskSessionConfigFreshnessDecision {
   const resetPolicy = input.resetPolicy ?? "breaking";
   if (!input.hasTaskSession) {
@@ -7355,28 +7443,30 @@ export function resolveTaskSessionConfigFreshness(input: {
           `effective run configuration changed: ${describeEffectiveRunConfigCategories(changedCategories)}`,
         );
       } else {
-        // Only a change that makes the saved conversation unusable starts a
-        // new one. The current instructions, skills, env and settings are
-        // supplied on the next turn either way.
-        const changedIdentities = changedEffectiveRunSessionIdentities({
-          previous: storedConfig.identityFingerprints,
-          next: input.configMetadata.identityFingerprints,
+        // Keep the saved conversation unless a change would not reach a
+        // resumed turn; correctness of the next run's config still takes
+        // priority over continuity.
+        const breakingChanges = breakingSessionConfigChanges({
+          previousIdentities: storedConfig.identityFingerprints,
+          nextIdentities: input.configMetadata.identityFingerprints,
+          changedCategories,
+          resumeRedeliversInstructions:
+            input.resumeRedeliversInstructions === true,
         });
-        if (changedIdentities.length > 0) {
+        if (breakingChanges.length > 0) {
           reasons.push(
-            `effective run configuration changed: ${changedIdentities
-              .map((identity) => EFFECTIVE_RUN_SESSION_IDENTITY_LABELS[identity])
-              .join(", ")}`,
+            `effective run configuration changed: ${breakingChanges.join(", ")}`,
           );
-        } else if (
-          Object.keys(storedConfig.identityFingerprints).length > 0
-        ) {
-          carriedOverCategories = changedCategories;
+        } else {
+          const savedWithIdentities =
+            Object.keys(storedConfig.identityFingerprints).length > 0;
+          carriedOverCategories = savedWithIdentities
+            ? changedCategories
+            : changedCategories.filter(
+                (category) =>
+                  !LEGACY_FORM_CHANGED_SESSION_CONFIG_CATEGORIES.has(category),
+              );
         }
-        // A session recorded without identity fingerprints was saved before
-        // fingerprints stopped covering binding row ids and environment update
-        // times, so its category differences may be only that. It is kept, but
-        // the changes are not reported to the agent as real edits.
       }
     }
   }
@@ -22848,6 +22938,10 @@ export function heartbeatService(
         preserveLegacySessionWithoutConfigMetadata:
           acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
         resetPolicy: resolveTaskSessionConfigResetPolicy(),
+        resumeRedeliversInstructions: adapterResumeRedeliversInstructions(
+          getServerAdapter(agent.adapterType),
+          runtimeConfig,
+        ),
       });
       const resetTaskSession =
         shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
@@ -24146,9 +24240,11 @@ export function heartbeatService(
       ) {
         delete executionContinuation.resumeDelta;
       }
-      // A saved task session resumed across configuration changes: say so in
-      // the run log, and tell the agent which parts changed so a new
-      // instruction or setting never comes as a surprise mid-conversation.
+      // A saved task session kept across configuration changes: say so in the
+      // run log, and hand the changed parts to the adapter. The adapter makes
+      // the final resume decision, so the wake prompt names them to the agent
+      // only when it does resume the session (renderPaperclipWakePrompt with
+      // resumedSession: true); a run that starts a new session gets no note.
       const resumedTaskSessionConfigChanges =
         runtimeForAdapter.sessionId &&
         taskSessionForRun &&
