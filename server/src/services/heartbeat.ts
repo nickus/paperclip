@@ -1439,11 +1439,9 @@ const PLATFORM_ENVIRONMENT_RUN_ERROR_CODES = new Set<EnvironmentErrorCode>([
   "probe_failed",
 ]);
 
-// Forward-compatible errorCode an adapter or environment driver may report
-// for a reachability failure against the model endpoint itself (DNS/connect/
-// TLS failure to the configured host), as opposed to anything about the
-// agent's own adapter configuration.
-const MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE = "model_endpoint_unreachable";
+// MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE (declared above with the outage retry
+// backoff) is also how an adapter reports a model-endpoint reachability failure,
+// which is never about the agent's own adapter configuration.
 
 /**
  * True when `error` is a platform- or infrastructure-caused setup failure:
