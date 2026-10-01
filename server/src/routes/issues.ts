@@ -341,8 +341,10 @@ import {
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
 import {
+  createCompanyAgentCandidatesCache,
   resolveProposedOwnerAssignee,
   resolveSelectedSuggestedTasks,
+  type ResolvedProposedOwnerAssignee,
 } from "../services/issue-thread-interactions.js";
 import {
   crossIssueInfluenceLimitError,
@@ -5927,6 +5929,23 @@ export function issueRoutes(
     return { interactionSvc, current, resolutionAuthorization } as const;
   }
 
+  type SuggestedTaskEffectsAuthorization =
+    | {
+        authorized: true;
+        /**
+         * proposedOwner hints this check already resolved (and
+         * permission-checked) by clientKey, for acceptSuggestedTasks to reuse
+         * instead of resolving the same hint again against a later snapshot.
+         * Undefined when this check did not resolve any hints itself (a
+         * non-agent actor, which this function never gates).
+         */
+        resolvedProposedOwnersByClientKey?: ReadonlyMap<
+          string,
+          ResolvedProposedOwnerAssignee | null
+        >;
+      }
+    | false;
+
   async function assertSuggestedTaskEffectsAllowed(
     req: Request,
     res: Response,
@@ -5935,12 +5954,20 @@ export function issueRoutes(
     },
     interaction: SuggestTasksInteraction,
     selectedClientKeys: string[] | undefined,
-  ) {
-    if (req.actor.type !== "agent") return true;
+  ): Promise<SuggestedTaskEffectsAuthorization> {
+    if (req.actor.type !== "agent") return { authorized: true };
     const { selectedTasks } = resolveSelectedSuggestedTasks({
       interaction,
       selectedClientKeys,
     });
+    const companyAgentCandidatesCache = createCompanyAgentCandidatesCache(
+      db,
+      issue.companyId,
+    );
+    const resolvedProposedOwnersByClientKey = new Map<
+      string,
+      ResolvedProposedOwnerAssignee | null
+    >();
     for (const task of selectedTasks) {
       const explicitParentIssueId =
         task.parentId ?? interaction.payload.defaultParentId ?? issue.id;
@@ -5999,17 +6026,35 @@ export function issueRoutes(
         // time needs the same authorization as an explicit assignee: an
         // agent accepting its own suggestion must not be able to route work
         // around tasks:assign just by writing a name instead of an id.
-        const resolvedAssignee =
-          task.assigneeAgentId || task.assigneeUserId
-            ? {
-                assigneeAgentId: task.assigneeAgentId ?? null,
-                assigneeUserId: task.assigneeUserId ?? null,
-              }
-            : await resolveProposedOwnerAssignee(
-                db,
-                issue.companyId,
-                task.proposedOwner,
-              );
+        const hasExplicitAssignee = Boolean(
+          task.assigneeAgentId || task.assigneeUserId,
+        );
+        let resolvedAssignee: {
+          assigneeAgentId: string | null;
+          assigneeUserId: string | null;
+        } | null;
+        if (hasExplicitAssignee) {
+          resolvedAssignee = {
+            assigneeAgentId: task.assigneeAgentId ?? null,
+            assigneeUserId: task.assigneeUserId ?? null,
+          };
+        } else {
+          const resolvedProposedOwner = await resolveProposedOwnerAssignee(
+            db,
+            issue.companyId,
+            task.proposedOwner,
+            { companyAgents: companyAgentCandidatesCache },
+          );
+          // Record exactly the hint resolutions acceptSuggestedTasks will
+          // later look for (keyed by clientKey, only for the proposedOwner
+          // branch) so it can reuse this permission-checked result instead
+          // of resolving the same hint again inside the accept transaction.
+          resolvedProposedOwnersByClientKey.set(
+            task.clientKey,
+            resolvedProposedOwner,
+          );
+          resolvedAssignee = resolvedProposedOwner;
+        }
         await assertTaskBridgeCreateAllowed(req, issue.companyId, {
           projectId: task.projectId ?? issue.projectId,
           parentIssueId: parent.id,
@@ -6034,7 +6079,7 @@ export function issueRoutes(
         });
       }
     }
-    return true;
+    return { authorized: true, resolvedProposedOwnersByClientKey };
   }
 
   async function resolvePendingReviewInteractionRestriction(
@@ -16556,7 +16601,7 @@ export function issueRoutes(
           "Connection intents must be resolved through the connection intent endpoints",
         );
       }
-      const suggestedTaskEffectsAuthorized =
+      const suggestedTaskEffectsAuthorization =
         current.kind === "suggest_tasks"
           ? await assertSuggestedTaskEffectsAllowed(
               req,
@@ -16565,8 +16610,11 @@ export function issueRoutes(
               current,
               req.body.selectedClientKeys,
             )
-          : true;
-      if (!suggestedTaskEffectsAuthorized) return;
+          : ({
+              authorized: true,
+              resolvedProposedOwnersByClientKey: undefined,
+            } as const);
+      if (!suggestedTaskEffectsAuthorization) return;
 
       const actor = getActorInfo(req);
       if (
@@ -16600,7 +16648,10 @@ export function issueRoutes(
           userId: actor.actorType === "user" ? actor.actorId : null,
           resolverPolicyRestriction:
             resolutionAuthorization.resolverPolicyRestriction,
-          suggestedTaskEffectsAuthorized,
+          suggestedTaskEffectsAuthorized:
+            suggestedTaskEffectsAuthorization.authorized,
+          resolvedProposedOwnersByClientKey:
+            suggestedTaskEffectsAuthorization.resolvedProposedOwnersByClientKey,
         });
       const toolAction =
         interaction.payload && typeof interaction.payload === "object"

@@ -72,6 +72,7 @@ import {
   connectionIntentPayloadSchema,
   connectionIntentResultSchema,
   createIssueThreadInteractionSchema,
+  isAgentStatusAssignableToWork,
   isUuidLike,
   legacyIssueThreadInteractionResolverPolicyAlias,
   normalizeAgentUrlKey,
@@ -90,7 +91,7 @@ import {
   withdrawIssueThreadInteractionSchema,
 } from "@paperclipai/shared";
 import { z } from "zod";
-import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { HttpError, conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import {
   logActivity,
@@ -143,6 +144,21 @@ type InteractionActor = {
     | IssueThreadInteractionResolverRestriction
     | null;
   suggestedTaskEffectsAuthorized?: boolean;
+  /**
+   * Suggested-task `proposedOwner` hints already resolved (and, for an agent
+   * actor, permission-checked) once by the caller, keyed by the task's
+   * `clientKey`. When a key is present -- even with a `null` value, meaning
+   * the hint did not resolve to anyone -- acceptSuggestedTasks reuses it
+   * instead of resolving the hint again inside the accept transaction, so
+   * the assignee that was authorized is the exact assignee that gets
+   * assigned. Absent for callers (e.g. a non-agent actor, or a test calling
+   * the service directly) that never ran that check; acceptSuggestedTasks
+   * falls back to resolving in-transaction for those.
+   */
+  resolvedProposedOwnersByClientKey?: ReadonlyMap<
+    string,
+    ResolvedProposedOwnerAssignee | null
+  >;
   resolutionDetails?: Record<string, unknown>;
 };
 
@@ -1533,21 +1549,72 @@ export type ResolvedProposedOwnerAssignee =
   | { assigneeAgentId: string; assigneeUserId: null }
   | { assigneeAgentId: null; assigneeUserId: string };
 
+type ProposedOwnerAgentCandidate = {
+  id: string;
+  name: string;
+  status: string;
+};
+
+/**
+ * Builds a lazily-populated, per-call cache of a company's agents for
+ * {@link resolveProposedOwnerAssignee}. Resolving several suggested tasks'
+ * `proposedOwner` name hints in the same accept (the route's authorization
+ * loop, and separately the accept transaction) would otherwise re-read the
+ * full company agent list once per task.
+ */
+export function createCompanyAgentCandidatesCache(
+  dbOrTx: Db,
+  companyId: string,
+): () => Promise<ProposedOwnerAgentCandidate[]> {
+  let pending: Promise<ProposedOwnerAgentCandidate[]> | null = null;
+  return () => {
+    if (!pending) {
+      pending = dbOrTx
+        .select({ id: agents.id, name: agents.name, status: agents.status })
+        .from(agents)
+        .where(eq(agents.companyId, companyId));
+    }
+    return pending;
+  };
+}
+
+// The only failures assertAssignableAgent raises for a candidate that is
+// simply not assignable (wrong company, terminated, pending approval,
+// invalid org chain, ...): notFound (404), conflict (409), unprocessable
+// (422). Anything else -- a DB or infrastructure failure -- is not one of
+// those expected outcomes and must propagate instead of being swallowed as
+// "no such agent".
+const ASSERT_ASSIGNABLE_AGENT_ERROR_STATUSES = new Set([404, 409, 422]);
+
+export type ResolveProposedOwnerAssigneeOptions = {
+  /** Reuse a single company-agents read across several hints in one accept call. */
+  companyAgents?: () => Promise<ProposedOwnerAgentCandidate[]>;
+};
+
 /**
  * Resolves a suggested task's free-text `proposedOwner` hint ("agent id",
  * agent name key, or user id) to an assignable agent or active company user.
  * Unlike the explicit `assigneeAgentId`/`assigneeUserId` fields this never
- * throws: a hint that does not resolve to anything assignable returns null so
- * the caller can leave the task unassigned with a note instead of failing
- * the whole accept over a guess that did not pan out.
+ * throws for a hint that simply does not resolve: it returns null so the
+ * caller can leave the task unassigned with a note instead of failing
+ * the whole accept over a guess that did not pan out. It still propagates
+ * unexpected (non-"not assignable") errors -- see
+ * `ASSERT_ASSIGNABLE_AGENT_ERROR_STATUSES` above.
  */
 export async function resolveProposedOwnerAssignee(
   dbOrTx: Db,
   companyId: string,
   proposedOwner: string | null | undefined,
+  options?: ResolveProposedOwnerAssigneeOptions,
 ): Promise<ResolvedProposedOwnerAssignee | null> {
-  const raw = proposedOwner?.trim();
-  if (!raw) return null;
+  const trimmed = proposedOwner?.trim();
+  if (!trimmed) return null;
+  // isUuidLike accepts mixed-case UUIDs, but the membership lookup below
+  // compares principalId as plain text, and a resolved agent id is
+  // persisted verbatim onto the created task. Normalize once, up front, to
+  // the canonical lower-case form so both lookups -- and the stored
+  // assignee -- agree with the rest of the system.
+  const raw = isUuidLike(trimmed) ? trimmed.toLowerCase() : trimmed;
 
   let agentCandidateId: string | null = null;
   if (isUuidLike(raw)) {
@@ -1555,12 +1622,22 @@ export async function resolveProposedOwnerAssignee(
   } else {
     const urlKey = normalizeAgentUrlKey(raw);
     if (urlKey) {
-      const companyAgents = await dbOrTx
-        .select({ id: agents.id, name: agents.name })
-        .from(agents)
-        .where(eq(agents.companyId, companyId));
+      const companyAgents = options?.companyAgents
+        ? await options.companyAgents()
+        : await dbOrTx
+            .select({ id: agents.id, name: agents.name, status: agents.status })
+            .from(agents)
+            .where(eq(agents.companyId, companyId));
+      // A terminated agent can keep sharing a shortname with the active
+      // agent that replaced it: hasAgentShortnameCollision only guards a
+      // new name against *other* non-terminated agents, so a terminated row
+      // with the same shortname survives indefinitely. Without this filter
+      // that makes an otherwise unambiguous hint match two rows and resolve
+      // to nothing instead of the one agent that can actually take it.
       const matches = companyAgents.filter(
-        (agent) => normalizeAgentUrlKey(agent.name) === urlKey,
+        (agent) =>
+          isAgentStatusAssignableToWork(agent.status) &&
+          normalizeAgentUrlKey(agent.name) === urlKey,
       );
       if (matches.length === 1) agentCandidateId = matches[0].id;
     }
@@ -1569,7 +1646,13 @@ export async function resolveProposedOwnerAssignee(
     try {
       await assertAssignableAgent(dbOrTx, companyId, agentCandidateId);
       return { assigneeAgentId: agentCandidateId, assigneeUserId: null };
-    } catch {
+    } catch (error) {
+      if (
+        !(error instanceof HttpError) ||
+        !ASSERT_ASSIGNABLE_AGENT_ERROR_STATUSES.has(error.status)
+      ) {
+        throw error;
+      }
       // Not an assignable agent after all (wrong company, terminated, bad
       // org chain, ...) -- fall through and try it as a user id instead.
     }
@@ -3923,6 +4006,10 @@ export function issueThreadInteractionService(
 
       await db.transaction(async (tx) => {
         await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
+        const companyAgentCandidatesCache = createCompanyAgentCandidatesCache(
+          tx as unknown as Db,
+          issue.companyId,
+        );
         const resolvedAt = new Date();
         const [claimed] = await tx
           .update(issueThreadInteractions)
@@ -3966,11 +4053,24 @@ export function issueThreadInteractionService(
             !effectiveAssigneeUserId &&
             task.proposedOwner
           ) {
-            const resolvedOwner = await resolveProposedOwnerAssignee(
-              tx as unknown as Db,
-              issue.companyId,
-              task.proposedOwner,
-            );
+            // Prefer whatever the caller already resolved (and, for an agent
+            // actor, permission-checked via tasks:assign) for this exact
+            // clientKey over resolving the hint again here. Resolving twice
+            // -- once in the route's authorization check against `db`, once
+            // here against `tx` -- gives a concurrent agent rename/create
+            // between the two reads a window to hand out an assignee that
+            // was never checked.
+            const resolvedOwner = actor.resolvedProposedOwnersByClientKey?.has(
+              task.clientKey,
+            )
+              ? (actor.resolvedProposedOwnersByClientKey.get(task.clientKey) ??
+                null)
+              : await resolveProposedOwnerAssignee(
+                  tx as unknown as Db,
+                  issue.companyId,
+                  task.proposedOwner,
+                  { companyAgents: companyAgentCandidatesCache },
+                );
             if (resolvedOwner) {
               effectiveAssigneeAgentId = resolvedOwner.assigneeAgentId;
               effectiveAssigneeUserId = resolvedOwner.assigneeUserId;

@@ -49,6 +49,21 @@ const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
   cancelRun: vi.fn(async () => null),
 }));
+// The route's suggested-task authorization check resolves a proposedOwner
+// hint itself (so it can permission-check the exact assignee before
+// accepting). Only that one function is mocked here -- resolveSelectedSuggestedTasks
+// and createCompanyAgentCandidatesCache stay real -- so a test can control what
+// the hint resolves to without standing up a real company/agents fixture.
+const mockResolveProposedOwnerAssignee = vi.hoisted(() => vi.fn());
+vi.mock("../services/issue-thread-interactions.js", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("../services/issue-thread-interactions.js")
+  >();
+  return {
+    ...actual,
+    resolveProposedOwnerAssignee: mockResolveProposedOwnerAssignee,
+  };
+});
 const mockRequestNativeQuestionRunCancellation = vi.hoisted(() =>
   vi.fn(async () => null as string | null)
 );
@@ -3233,6 +3248,80 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("resolves a proposedOwner hint once during authorization and hands that exact result to accept", async () => {
+    mockInteractionService.getForIssue.mockResolvedValueOnce({
+      id: "interaction-suggest-proposed-owner",
+      kind: "suggest_tasks",
+      status: "pending",
+      createdByAgentId: CREATED_AGENT_ID,
+      sourceRunId: RUN_1,
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "anyone",
+      payload: {
+        version: 1,
+        tasks: [{
+          clientKey: "named",
+          title: "Named owner child",
+          proposedOwner: "automation-owner",
+        }],
+      },
+    });
+    mockResolveProposedOwnerAssignee.mockResolvedValueOnce({
+      assigneeAgentId: UNRELATED_AGENT_ID,
+      assigneeUserId: null,
+    });
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-suggest-proposed-owner",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "suggest_tasks",
+        status: "accepted",
+        continuationPolicy: "wake_assignee",
+        requestedResolverPolicy: "anyone",
+        effectiveResolverPolicy: "anyone",
+        payload: {
+          version: 1,
+          tasks: [{
+            clientKey: "named",
+            title: "Named owner child",
+            proposedOwner: "automation-owner",
+          }],
+        },
+        result: { version: 1, createdTasks: [] },
+      },
+      createdIssues: [],
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: RUN_2,
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-suggest-proposed-owner/accept")
+      .send({ selectedClientKeys: ["named"] });
+
+    expect(res.status).toBe(200);
+    // Resolved exactly once -- not again inside the accept step -- so a
+    // concurrent agent rename/create between the two has no window to hand
+    // out an assignee that was never permission-checked.
+    expect(mockResolveProposedOwnerAssignee).toHaveBeenCalledTimes(1);
+    expect(mockInteractionService.acceptInteraction).toHaveBeenCalledWith(
+      expect.anything(),
+      "interaction-suggest-proposed-owner",
+      expect.anything(),
+      expect.objectContaining({
+        agentId: ASSIGNEE_AGENT_ID,
+        runId: RUN_2,
+        resolvedProposedOwnersByClientKey: new Map([
+          ["named", { assigneeAgentId: UNRELATED_AGENT_ID, assigneeUserId: null }],
+        ]),
+      }),
+    );
   });
 
   it("blocks human-only and tool-action interactions for agents", async () => {
