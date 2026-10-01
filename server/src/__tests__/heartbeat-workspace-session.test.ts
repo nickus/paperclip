@@ -15,6 +15,7 @@ import {
   buildExplicitResumeSessionOverride,
   buildEffectiveRunSessionConfigMetadata,
   buildEffectiveRunWorkspaceConfigMetadata,
+  buildRunEnvironmentFingerprintValues,
   buildWorkspaceConfigFreshnessOperation,
   deriveTaskKeyWithHeartbeatFallback,
   formatRuntimeWorkspaceWarningLog,
@@ -1589,21 +1590,6 @@ describe("effective run execution workspace config freshness", () => {
         },
       }),
     },
-    {
-      name: "environment realization",
-      category: "environment",
-      next: buildWorkspaceConfigMetadata({
-        environment: {
-          selectedEnvironmentId: "environment-2",
-          driver: "sandbox",
-          config: { provider: "daytona" },
-        },
-        realization: {
-          environmentDriver: "sandbox",
-          environmentProvider: "daytona",
-        },
-      }),
-    },
   ] as const)("replaces the workspace when $name changes", ({ category, next }) => {
     const base = buildWorkspaceConfigMetadata();
 
@@ -1616,6 +1602,127 @@ describe("effective run execution workspace config freshness", () => {
     expect(decision.action).toBe("replace");
     expect(decision.shouldReuseExisting).toBe(false);
     expect(decision.changedCategories).toContain(category);
+  });
+
+  it("refreshes instead of replacing when only the run's environment or realization changes", () => {
+    const base = buildWorkspaceConfigMetadata();
+    const next = buildWorkspaceConfigMetadata({
+      environment: {
+        selectedEnvironmentId: "environment-2",
+        driver: "sandbox",
+        config: { provider: "kubernetes", reuseLease: true },
+      },
+      realization: {
+        environmentDriver: "sandbox",
+        environmentProvider: "kubernetes",
+      },
+      evaluatedAt: "2026-06-27T00:00:00.000Z",
+    });
+
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(base),
+      nextMetadata: next,
+    });
+    expect(decision).toMatchObject({
+      action: "refresh",
+      shouldReuseExisting: true,
+      shouldRefreshConfigSnapshot: true,
+      changedCategories: ["environment", "realization"],
+    });
+
+    // Explicit reuse restores the same workspace and records the new baseline,
+    // so the drift is reported once rather than on every later run.
+    const policy = resolveExecutionWorkspaceReuseProvisioningPolicy({
+      requestedShouldReuseExisting: true,
+      workspaceConfigFreshness: decision,
+    });
+    expect(policy).toEqual({
+      shouldRestoreExistingWorkspace: true,
+      shouldRefreshWorkspaceConfigSnapshot: true,
+      shouldPersistLatestWorkspaceConfigMetadata: true,
+    });
+    const persisted = mergeExecutionWorkspaceMetadataForPersistence({
+      existingMetadata: persistedWorkspaceConfigFingerprint(base),
+      source: "task_session",
+      createdByRuntime: false,
+      strategyType: "git_worktree",
+      configSnapshot: null,
+      shouldReuseExisting: policy.shouldRestoreExistingWorkspace,
+      shouldRefreshConfigSnapshot: policy.shouldRefreshWorkspaceConfigSnapshot,
+      workspaceConfigMetadata: policy.shouldPersistLatestWorkspaceConfigMetadata ? next : null,
+      baseRef: "origin/main",
+      baseRefSha: "main-sha",
+    });
+    const followUp = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persisted,
+      nextMetadata: buildWorkspaceConfigMetadata({
+        environment: {
+          selectedEnvironmentId: "environment-2",
+          driver: "sandbox",
+          config: { provider: "kubernetes", reuseLease: true },
+        },
+        realization: { environmentDriver: "sandbox", environmentProvider: "kubernetes" },
+        evaluatedAt: "2026-06-28T00:00:00.000Z",
+      }),
+    });
+    expect(followUp).toMatchObject({ action: "reuse", reasons: [], changedCategories: [] });
+  });
+
+  it("does not let environment update times or secret binding ids move the workspace fingerprint", () => {
+    const environmentRow = (updatedAt: Date, config: Record<string, unknown> = { provider: "kubernetes", reuseLease: true }) => ({
+      id: "environment-1",
+      driver: "sandbox",
+      config,
+      updatedAt,
+    });
+    const values = (row: ReturnType<typeof environmentRow>) =>
+      buildRunEnvironmentFingerprintValues({
+        selectionSource: "agent",
+        selectedEnvironmentId: row.id,
+        environment: row,
+        executionPolicy: { executionMode: "kubernetes", managedSandboxOnly: false },
+      });
+    const first = values(environmentRow(new Date("2026-06-01T00:00:00.000Z")));
+    const touched = values(environmentRow(new Date("2026-06-05T00:00:00.000Z")));
+    expect(touched).toEqual(first);
+    expect(JSON.stringify(first)).not.toContain("2026-06");
+    expect(values(environmentRow(new Date(), { provider: "kubernetes", reuseLease: false }))).not.toEqual(first);
+    expect(
+      buildRunEnvironmentFingerprintValues({
+        selectionSource: "default",
+        selectedEnvironmentId: null,
+        environment: null,
+        executionPolicy: null,
+      }).workspace,
+    ).toBeNull();
+
+    const manifest = (bindingId: string) => [
+      {
+        configPath: "env.API_TOKEN",
+        envKey: "API_TOKEN",
+        secretId: "secret-1",
+        bindingId,
+        secretKey: "api-token",
+        version: 3,
+        provider: "local_encrypted" as const,
+        outcome: "success" as const,
+      },
+    ];
+    const workspace = (bindingId: string, environment: unknown) =>
+      buildWorkspaceConfigMetadata({
+        configSnapshot: {
+          workspaceRuntime: {
+            services: [{ name: "web", command: "pnpm dev", env: { API_TOKEN: "resolved" } }],
+          },
+        },
+        environment,
+        secretManifest: manifest(bindingId),
+      });
+    expect(workspace("binding-2", touched.workspace).fingerprint).toBe(
+      workspace("binding-1", first.workspace).fingerprint,
+    );
   });
 
   it("keeps replacement-class drift visible when explicit reuse restores the old workspace", () => {

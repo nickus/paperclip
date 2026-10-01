@@ -6346,14 +6346,22 @@ const EFFECTIVE_RUN_WORKSPACE_CONFIG_CATEGORY_LABELS: Record<
   environment: "environment",
   realization: "workspace realization",
 };
+// Drift in these categories means the persisted workspace (its checkout, branch
+// or layout) no longer matches what this run requests. Environment and
+// realization drift are not in this set: they describe where a run executes,
+// not the persisted workspace, which every environment uses as the source of
+// the tree it runs on (a sandbox gets it synced in; whether a kept sandbox can
+// be reused is decided by its own lease fingerprint). That drift refreshes the
+// workspace's recorded configuration instead. Replacement-class drift on a
+// workspace restored by explicit reuse is never recorded as the new baseline,
+// so classifying placement changes as replacement-class reported them again on
+// every later run.
 const WORKSPACE_REPLACEMENT_CONFIG_CATEGORIES =
   new Set<EffectiveRunWorkspaceConfigCategory>([
     "mode",
     "projectWorkspace",
     "strategy",
     "repo",
-    "environment",
-    "realization",
   ]);
 
 function parseStoredConfigCategoryFingerprints(value: unknown) {
@@ -6782,6 +6790,48 @@ async function resolveInstructionsConfigFingerprintMetadata(
     }
   }
   return metadata;
+}
+
+/**
+ * The selected environment as the session and workspace fingerprints see it:
+ * which environment, its driver/provider and its requested settings, plus the
+ * instance execution policy. The environment row's update time is left out.
+ * It also moves for changes that are not run configuration (a rename, an
+ * archive and reactivation, metadata adoption), and the settings it would
+ * stand for are hashed directly. Environment env vars have their own
+ * session category.
+ */
+export function buildRunEnvironmentFingerprintValues(input: {
+  selectionSource: string | null;
+  selectedEnvironmentId: string | null;
+  environment: { id: string; driver: string; config: unknown } | null;
+  executionPolicy: unknown;
+}) {
+  const environment = input.environment;
+  return {
+    session: {
+      selectionSource: input.selectionSource,
+      selectedEnvironmentId: input.selectedEnvironmentId,
+      selectedEnvironment: environment
+        ? {
+            id: environment.id,
+            driver: environment.driver,
+            config: environment.config,
+          }
+        : null,
+      executionPolicy: input.executionPolicy,
+    },
+    workspace: environment
+      ? {
+          selectionSource: input.selectionSource,
+          selectedEnvironmentId: input.selectedEnvironmentId,
+          driver: environment.driver,
+          provider: readNonEmptyString(parseObject(environment.config).provider),
+          config: environment.config,
+          executionPolicy: input.executionPolicy,
+        }
+      : null,
+  };
 }
 
 function buildSessionConfigCategoryValues(input: {
@@ -22721,6 +22771,13 @@ export function heartbeatService(
         agent.companyId,
         agent.id,
       );
+      const runEnvironmentFingerprintValues =
+        buildRunEnvironmentFingerprintValues({
+          selectionSource: environmentResolution.source,
+          selectedEnvironmentId,
+          environment: selectedEnvironmentForConfig,
+          executionPolicy,
+        });
       const sessionConfigMetadata =
         await buildEffectiveRunSessionConfigMetadata({
           adapterType: agent.adapterType,
@@ -22757,22 +22814,7 @@ export function heartbeatService(
                 }
               : null,
           },
-          environment: {
-            selectionSource: environmentResolution.source,
-            selectedEnvironmentId,
-            selectedEnvironment: selectedEnvironmentForConfig
-              ? {
-                  id: selectedEnvironmentForConfig.id,
-                  driver: selectedEnvironmentForConfig.driver,
-                  config: selectedEnvironmentForConfig.config,
-                  configRevisionAt:
-                    selectedEnvironmentForConfig.updatedAt instanceof Date
-                      ? selectedEnvironmentForConfig.updatedAt.toISOString()
-                      : (selectedEnvironmentForConfig.updatedAt ?? null),
-                }
-              : null,
-            executionPolicy,
-          },
+          environment: runEnvironmentFingerprintValues.session,
           environmentEnv: selectedEnvironmentForConfig?.envVars ?? null,
           projectEnv: projectContext?.env ?? null,
           routineEnv: routineEnvContext.env,
@@ -22932,22 +22974,8 @@ export function heartbeatService(
       const selectedEnvironmentConfigForFingerprint = parseObject(
         selectedEnvironmentForConfig?.config,
       );
-      const workspaceEnvironmentFingerprint = selectedEnvironmentForConfig
-        ? {
-            selectionSource: environmentResolution.source,
-            selectedEnvironmentId,
-            driver: selectedEnvironmentForConfig.driver,
-            provider: readNonEmptyString(
-              selectedEnvironmentConfigForFingerprint.provider,
-            ),
-            config: selectedEnvironmentForConfig.config,
-            configRevisionAt:
-              selectedEnvironmentForConfig.updatedAt instanceof Date
-                ? selectedEnvironmentForConfig.updatedAt.toISOString()
-                : (selectedEnvironmentForConfig.updatedAt ?? null),
-            executionPolicy,
-          }
-        : null;
+      const workspaceEnvironmentFingerprint =
+        runEnvironmentFingerprintValues.workspace;
       const workspaceRealizationFingerprint = {
         environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
         environmentProvider: readNonEmptyString(
