@@ -3482,6 +3482,12 @@ function createSandboxEnvironmentDriver(
    * interrupted (a server shutdown, a lost process) is reported `interrupted`
    * whatever its status, so a provider that stops keeping a sandbox in which
    * run after run fails does not count it: it says nothing about the sandbox.
+   * The same applies to a run that only failed because the model endpoint it
+   * depends on was unreachable (`model_endpoint_unreachable`, see
+   * heartbeat.ts): the sandbox itself was never at fault, and a deferred
+   * retry of the same outage reproduces this errorCode on every attempt
+   * until the endpoint comes back, so without this exemption a single
+   * outage can recycle every kept sandbox it touches three failures in.
    */
   async function providerReleaseRunStatus<S extends "released" | "expired" | "failed" | null>(
     lease: Pick<EnvironmentLease, "companyId" | "heartbeatRunId">,
@@ -3493,7 +3499,9 @@ function createSandboxEnvironmentDriver(
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, lease.companyId)))
       .limit(1);
-    return run?.status === "interrupted" || (run?.status === "failed" && run.errorCode === "process_lost")
+    return run?.status === "interrupted" ||
+      (run?.status === "failed" &&
+        (run.errorCode === "process_lost" || run.errorCode === "model_endpoint_unreachable"))
       ? "interrupted"
       : status;
   }
