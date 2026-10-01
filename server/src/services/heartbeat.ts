@@ -7368,9 +7368,15 @@ export function resolveTaskSessionConfigFreshness(input: {
               .map((identity) => EFFECTIVE_RUN_SESSION_IDENTITY_LABELS[identity])
               .join(", ")}`,
           );
-        } else {
+        } else if (
+          Object.keys(storedConfig.identityFingerprints).length > 0
+        ) {
           carriedOverCategories = changedCategories;
         }
+        // A session recorded without identity fingerprints was saved before
+        // fingerprints stopped covering binding row ids and environment update
+        // times, so its category differences may be only that. It is kept, but
+        // the changes are not reported to the agent as real edits.
       }
     }
   }

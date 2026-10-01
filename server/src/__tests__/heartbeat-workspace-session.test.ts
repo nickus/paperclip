@@ -3061,7 +3061,7 @@ describe("task session continuity across configuration changes", () => {
     });
   });
 
-  it("keeps sessions saved before identity fingerprints were recorded", async () => {
+  it("keeps sessions saved before identity fingerprints were recorded without naming changes", async () => {
     const base = await buildSessionConfigMetadata({ environment: environmentValue() });
     const next = await buildSessionConfigMetadata({ environment: environmentValue({ id: "environment-2" }) });
     const { __paperclipConfigIdentityFingerprints: _identity, ...legacyParams } =
@@ -3073,7 +3073,24 @@ describe("task session continuity across configuration changes", () => {
       taskSessionParams: legacyParams,
       configMetadata: next,
     });
-    expect(decision).toMatchObject({ reset: false, carriedOverCategories: ["environment"] });
+    // Such a session predates the current fingerprint form, so a category
+    // difference may be only that: keep it, report the categories in the
+    // decision, but do not tell the agent they changed.
+    expect(decision).toMatchObject({
+      reset: false,
+      reasons: [],
+      changedCategories: ["environment"],
+      carriedOverCategories: [],
+    });
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: legacyParams,
+        configMetadata: next,
+        resetPolicy: "any",
+      }).reset,
+    ).toBe(true);
   });
 
   it("reads the reset policy from the instance environment", () => {
