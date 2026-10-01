@@ -4843,6 +4843,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
     await heartbeat.resumeQueuedRuns();
     await waitForRunToSettle(heartbeat, runId, 5_000);
+    await heartbeat.waitForRunExecutionDrain(runId);
 
     // The lease never succeeded, so the adapter was never dispatched.
     expect(mockAdapterExecute).not.toHaveBeenCalled();
@@ -4867,6 +4868,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           "sandbox_provider_plugin:paperclip.kubernetes-sandbox-provider:error",
       },
     });
+
+    // The plugin being stuck in `error` is a platform failure, not evidence
+    // this agent's own configuration is broken: it must stay idle (not flip
+    // to `error`) so an automatic wake dispatches cleanly again as soon as
+    // an operator re-enables the plugin, with no manual clear-error needed.
+    const settledAgent = await db
+      .select({ status: agents.status, errorReason: agents.errorReason })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(settledAgent).toMatchObject({ status: "idle", errorReason: null });
 
     const issue = await waitForValue(async () =>
       db
@@ -5121,6 +5133,148 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       cancelPluginActivationRetry(pluginId);
       await fs.rm(packageRoot, { recursive: true, force: true });
     }
+  });
+
+  it("keeps the agent idle (not error) when lease acquisition fails for a reason unrelated to agent config", async () => {
+    // A lease-acquisition failure whose message does not match the
+    // sandbox-provider-plugin-not-ready pattern above: the plugin itself is
+    // `ready`, but no plugin worker manager is wired into this server
+    // process, so `environmentRuntime.acquireRunLease` fails before any
+    // adapter dispatch. `environmentRunOrchestrator` wraps this as an
+    // `EnvironmentRunError` with code `lease_acquire_failed`. Unlike the
+    // `sandbox_provider_plugin_not_ready` case, this message never gets a
+    // `configuration_incomplete` errorCode, so this test pins the broader,
+    // message-independent classification: any `lease_acquire_failed`
+    // (acquiring the host-side sandbox lease) is a platform failure, so the
+    // agent must stay idle, not the agent's own fault.
+    const { companyId, agentId, runId } = await seedQueuedIssueRunFixture();
+    const pluginId = randomUUID();
+    const environmentId = randomUUID();
+
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.test-sandbox-provider",
+      packageName: "@acme/test-sandbox-provider",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.test-sandbox-provider",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Acme Test Sandbox Provider",
+        description: "Test sandbox provider with no worker manager wired up",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [
+          {
+            driverKey: "acme-sandbox",
+            kind: "sandbox_provider",
+            displayName: "Acme Sandbox",
+            configSchema: { type: "object" },
+          },
+        ],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+    await db.insert(environments).values({
+      id: environmentId,
+      companyId,
+      name: "Acme Sandbox",
+      driver: "sandbox",
+      status: "active",
+      config: {
+        provider: "acme-sandbox",
+        image: "fake:test",
+        timeoutMs: 1234,
+        reuseLease: false,
+      },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db
+      .update(agents)
+      .set({ defaultEnvironmentId: environmentId })
+      .where(eq(agents.id, agentId));
+
+    // No `pluginWorkerManager` option: this server process has none wired up.
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const failedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.error).toContain(
+      "sandbox plugin workers are unavailable in this server process",
+    );
+    // Confirms this message does not match the plugin-not-ready pattern, so
+    // this is genuinely a different code path than the test above.
+    expect(
+      parseSandboxProviderPluginNotReadyFailureMessage(failedRun?.error),
+    ).toBeNull();
+
+    const settledAgent = await db
+      .select({ status: agents.status, errorReason: agents.errorReason })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(settledAgent).toMatchObject({ status: "idle", errorReason: null });
+  });
+
+  it("returns an agent from error to idle automatically once its next run succeeds", async () => {
+    // Safety net for the agent-status fix above: whatever put the agent into
+    // `error` (here, a stale platform failure an operator never explicitly
+    // cleared), a run that goes on to succeed is conclusive evidence the
+    // agent itself is fine again, so the agent must not stay stuck needing a
+    // manual POST /agents/:id/clear-error.
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(agents)
+      .set({
+        status: "error",
+        errorReason: 'Failed to acquire lease for environment "Stale Env": platform outage',
+      })
+      .where(eq(agents.id, agentId));
+    // Mark the issue done from the run itself so the success leaves no
+    // further continuation/handoff wake behind: this test's only interest
+    // is the agent-status transition, not the post-success wake machinery.
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Done.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("succeeded");
+
+    const settledAgent = await db
+      .select({ status: agents.status, errorReason: agents.errorReason })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(settledAgent).toMatchObject({ status: "idle", errorReason: null });
   });
 
   it("escalates (does not retry) an accepted-interaction-continuation setup failure whose message matches neither retryable pattern", async () => {
