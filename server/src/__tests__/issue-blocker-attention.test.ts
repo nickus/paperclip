@@ -384,6 +384,69 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it("covers a blocker whose run is still queued behind a concurrency slot", async () => {
+    const { companyId, agentId } = await createCompany("PBQ");
+    const parentId = await insertIssue({ companyId, identifier: "PBQ-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PBQ-2",
+      title: "Queued blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+    // A queued run doesn't stamp executionRunId until it's checked out
+    // (claimQueuedRun), so `current: false` here is the realistic shape of a
+    // run still waiting on a concurrency slot or a drain, not a stale one.
+    await activeRun({ companyId, agentId, issueId: blockerId, status: "queued", current: false });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+    });
+  });
+
+  it("covers a blocker whose queued run was promoted from a past-due scheduled retry", async () => {
+    // promoteDueRetryInTx flips status from "scheduled_retry" to "queued"
+    // without clearing scheduledRetryAt, so a genuinely queued run can carry
+    // a scheduledRetryAt that is now in the past. That must not be confused
+    // with a "scheduled_retry" row whose due time has passed without being
+    // promoted (the case the next test covers).
+    const { companyId, agentId } = await createCompany("PBJ");
+    const parentId = await insertIssue({ companyId, identifier: "PBJ-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PBJ-2",
+      title: "Promoted retry blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+    await activeRun({
+      companyId,
+      agentId,
+      issueId: blockerId,
+      status: "queued",
+      scheduledRetryAt: new Date(Date.now() - 60 * 1000),
+      current: false,
+    });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+    });
+  });
+
   it("flags a chain whose leaf is in_review without an action path as stalled", async () => {
     const { companyId, agentId } = await createCompany("PBV");
     const parentId = await insertIssue({ companyId, identifier: "PBV-1", title: "Parent", status: "blocked" });
@@ -607,6 +670,41 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "needs_attention",
       reason: "blocked_by_cancelled_issue",
       leafIssue: { id: cancelledLeafId, identifier: "PBLX-2" },
+    });
+  });
+
+  it("covers a blocker whose run is sitting out a scheduled retry that isn't due yet", async () => {
+    // listIssueBlockerAttentionMap compares scheduledRetryAt against the real
+    // wall clock (no injected "now"), so this has to be a genuinely future
+    // timestamp rather than a fixed date in the test's usual fictional range.
+    const futureRetryAt = new Date(Date.now() + 60 * 60 * 1000);
+    const { companyId, agentId } = await createCompany("PBZ");
+    const parentId = await insertIssue({ companyId, identifier: "PBZ-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PBZ-2",
+      title: "Retrying blocker",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+    await activeRun({
+      companyId,
+      agentId,
+      issueId: blockerId,
+      status: "scheduled_retry",
+      scheduledRetryAt: futureRetryAt,
+      current: false,
+    });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
     });
   });
 

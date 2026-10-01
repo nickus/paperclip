@@ -3403,6 +3403,14 @@ async function watchdogMapForIssues(
 
 const ACTIVE_RUN_STATUSES = ["queued", "running"];
 const BLOCKER_ATTENTION_ACTIVE_RUN_STATUSES = ["queued", "running"];
+// A run that hasn't been checked out yet (still queued behind a concurrency
+// slot or a drain, or waiting out a scheduled retry backoff) never stamps the
+// issue's `executionRunId` column — that happens lazily in claimQueuedRun()
+// once the run actually starts. So these statuses can't be found through
+// `issueIdByExecutionRunId` below like a running run can; they're looked up
+// by the run's own `contextSnapshot.issueId` instead. They are still a live
+// execution path and must count as such.
+const BLOCKER_ATTENTION_ACTIVE_UNSTARTED_RUN_STATUSES = ["queued", "scheduled_retry"];
 const BLOCKER_ATTENTION_ACTIVE_WAKE_STATUSES = [
   "queued",
   "deferred_issue_execution",
@@ -4005,6 +4013,53 @@ async function listIssueBlockerAttentionMap(
         );
     const wakeRows = await wakeRowsPromise;
     for (const row of wakeRows) {
+      if (row.issueId) activeIssueIds.add(row.issueId);
+    }
+
+    // Queued and scheduled-retry runs haven't been checked out yet (see the
+    // comment on BLOCKER_ATTENTION_ACTIVE_UNSTARTED_RUN_STATUSES above), so
+    // they're matched by the run's own contextSnapshot.issueId rather than
+    // the executionRunId join above. They are a live execution path all the
+    // same: a run waiting on a concurrency slot or a drain, or sitting out a
+    // retry backoff, is not a stalled blocker. A scheduled retry whose due
+    // time has already passed is the exception — the promotion to "queued"
+    // that was supposed to happen at that time didn't, so it reads as stuck
+    // rather than live (see "does not treat an expired scheduled retry as
+    // actively covered work").
+    //
+    // The scheduledRetryAt guard only applies while the run is still
+    // "scheduled_retry": once promoteDueRetryInTx flips it to "queued" it
+    // leaves the old (now-past) scheduledRetryAt value in place rather than
+    // clearing it, so applying this guard to "queued" rows too would wrongly
+    // exclude a run that has already been promoted and is genuinely queued.
+    const unstartedRunRowsPromise: Promise<IssueBlockerAttentionActivePathRow[]> =
+      dbOrTx
+        .select({
+          issueId: sql<
+            string | null
+          >`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            inArray(
+              heartbeatRuns.status,
+              BLOCKER_ATTENTION_ACTIVE_UNSTARTED_RUN_STATUSES,
+            ),
+            or(
+              eq(heartbeatRuns.status, "queued"),
+              isNull(heartbeatRuns.scheduledRetryAt),
+              gt(heartbeatRuns.scheduledRetryAt, new Date()),
+            ),
+            inArray(
+              sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+              chunk,
+            ),
+          ),
+        );
+    const unstartedRunRows = await unstartedRunRowsPromise;
+    for (const row of unstartedRunRows) {
       if (row.issueId) activeIssueIds.add(row.issueId);
     }
   }
