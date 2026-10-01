@@ -141,9 +141,18 @@ export const heartbeatsApi = {
   log: (runId: string, offset = 0, limitBytes = 256000, options?: RequestOptions) =>
     api.get<{
       runId: string;
+      // Always non-null strings, including the empty page a client sees
+      // when it polls a run before the adapter has written its first log
+      // chunk, or a run that finished without ever starting one -- never
+      // null. A strictly typed decoder (e.g. a mobile client's non-optional
+      // String fields) would fail on null here.
       store: string;
       logRef: string;
       content: string;
+      // Absent/undefined means "caught up, stop polling from here": either
+      // a normal end-of-log read, or a run that is already terminal and
+      // will never produce a log. Only present while there may be more to
+      // read later (the run is still queued/running).
       nextOffset?: number;
     }>(
       `/heartbeat-runs/${runId}/log?offset=${encodeURIComponent(String(offset))}&limitBytes=${encodeURIComponent(String(limitBytes))}`,

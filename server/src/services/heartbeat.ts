@@ -3649,6 +3649,10 @@ const heartbeatRunLogAccessColumns = {
   companyId: heartbeatRuns.companyId,
   logStore: heartbeatRuns.logStore,
   logRef: heartbeatRuns.logRef,
+  // Needed by readLog() to tell a run that will never get a log (cancelled
+  // while queued, failed before the adapter started streaming output) apart
+  // from one that simply hasn't started streaming yet.
+  status: heartbeatRuns.status,
 } as const;
 
 const heartbeatRunIssueSummaryColumns = {
@@ -32008,6 +32012,7 @@ export function heartbeatService(
             companyId: string;
             logStore: string | null;
             logRef: string | null;
+            status: string | null;
           },
       opts?: { offset?: number; limitBytes?: number },
     ) => {
@@ -32025,16 +32030,27 @@ export function heartbeatService(
         // polling a just-created run must see an empty, pageable page here,
         // not a 404: a mobile client that treats any 4xx as an error would
         // otherwise show a freshly started run as broken for about a
-        // second. Echo back the requested offset (defaulting to 0) as
-        // `nextOffset` so the caller's normal paging loop keeps polling from
-        // the same place instead of reading an absent `nextOffset` as "caught
-        // up, stop".
+        // second. `store`/`logRef` come back as empty strings rather than
+        // null -- every other page of this endpoint has always returned
+        // non-null strings there, and a strictly typed client decoding a
+        // non-optional String field would fail on null.
+        //
+        // A run that is already terminal (cancelled while queued, failed
+        // before the adapter ever started streaming) will never get a log
+        // store, so echoing the offset back as `nextOffset` here would have
+        // a client poll it forever. Only echo the offset while the run is
+        // still queued/running; for a terminal run, omit `nextOffset`
+        // entirely -- the same "caught up, stop" shape the normal
+        // (log-store-backed) path below already uses once it reaches the
+        // end of the file.
         return {
           runId,
-          store: run.logStore ?? null,
-          logRef: run.logRef ?? null,
+          store: "",
+          logRef: "",
           content: "",
-          nextOffset: opts?.offset ?? 0,
+          ...(isHeartbeatRunTerminalStatus(run.status)
+            ? {}
+            : { nextOffset: opts?.offset ?? 0 }),
         };
       }
 

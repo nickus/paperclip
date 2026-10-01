@@ -99,10 +99,14 @@ suite("heartbeat run log before the first chunk is written", () => {
 
     const result = await heartbeat.readLog(runId, {});
 
+    // store/logRef come back as "" rather than null: every other page of
+    // this endpoint returns non-null strings there, and the UI client's
+    // (and any strictly typed mobile client's) non-optional String fields
+    // would fail decoding null.
     expect(result).toEqual({
       runId,
-      store: null,
-      logRef: null,
+      store: "",
+      logRef: "",
       content: "",
       nextOffset: 0,
     });
@@ -116,6 +120,29 @@ suite("heartbeat run log before the first chunk is written", () => {
     expect(result.content).toBe("");
     expect(result.nextOffset).toBe(42);
   });
+
+  it.each(["cancelled", "failed", "timed_out", "interrupted"] as const)(
+    "omits nextOffset for a %s run that never got a log, instead of echoing the offset forever",
+    async (status) => {
+      // A run cancelled while queued, or that failed before the adapter
+      // started streaming output, never gets a log store -- it will stay in
+      // the "no log yet" branch above forever. Echoing `nextOffset` back for
+      // a run like this would have a client poll it in an infinite loop.
+      // Mirror the normal (log-store-backed) path's own "caught up" shape
+      // instead: omit `nextOffset` entirely.
+      const { runId } = await seedRun({ status });
+
+      const result = await heartbeat.readLog(runId, { offset: 10 });
+
+      expect(result).toEqual({
+        runId,
+        store: "",
+        logRef: "",
+        content: "",
+      });
+      expect(result).not.toHaveProperty("nextOffset");
+    },
+  );
 
   it("still throws 404 for a run id that does not exist", async () => {
     await expect(heartbeat.readLog(randomUUID(), {})).rejects.toMatchObject({
