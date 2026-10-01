@@ -630,6 +630,75 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
     }
   });
 
+  it("keeps the heartbeat prompt on a resumed session whose wake carries only the team brief", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-team-brief-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
+    const teamOnlyWake = {
+      reason: "heartbeat_timer",
+      runBrief: {
+        version: 1,
+        issueId: null,
+        issueIdentifier: null,
+        authority: "execute",
+        environment: null,
+        blockerCount: 0,
+        blockers: [],
+        pendingInteractionCount: 0,
+        pendingInteractions: [],
+        priorRuns: [],
+        team: {
+          companyId: "co-1",
+          total: 2,
+          members: [
+            { id: "agent-0", name: "Lead", role: "cto", title: null, status: "idle", reportsTo: null, you: false },
+            { id: "agent-1", name: "Test", role: "engineer", title: null, status: "running", reportsTo: "Lead", you: true },
+          ],
+        },
+      },
+    };
+    const run = async (runId: string, paperclipWake: unknown) => {
+      await execute({
+        runId,
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          promptTemplate: "Check your inbox and continue your work.",
+        },
+        context: { paperclipWake },
+        authToken: "tok",
+        onLog: async () => {},
+        onMeta: async () => {},
+      });
+      return JSON.parse(await fs.readFile(capturePath, "utf-8")).prompt as string;
+    };
+    try {
+      const prompt = await run("run-team-brief", teamOnlyWake);
+      expect(prompt.startsWith("## Run Brief\n")).toBe(true);
+      expect(prompt).toContain('agent id=agent-1 name="Test" role=engineer status=running reports_to="Lead" [you]');
+      // No wake delta: the heartbeat prompt still follows the brief.
+      expect(prompt).toContain("Check your inbox and continue your work.");
+      expect(prompt).not.toContain("## Paperclip Resume Delta");
+      // An issue wake on a resumed session still replaces the heartbeat prompt.
+      const issueWake = {
+        ...teamOnlyWake,
+        reason: "issue_commented",
+        issue: { id: "issue-1", identifier: "PAP-1", title: "Roster", status: "in_progress", priority: "medium", workMode: "standard" },
+        runBrief: { ...teamOnlyWake.runBrief, issueId: "issue-1", issueIdentifier: "PAP-1" },
+      };
+      const issuePrompt = await run("run-issue-brief", issueWake);
+      expect(issuePrompt).toContain("### Team");
+      expect(issuePrompt).toContain("## Paperclip Resume Delta");
+      expect(issuePrompt).not.toContain("Check your inbox and continue your work.");
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   /**
    * Regression tests for commandNotes accuracy (Greptile P2).
    *

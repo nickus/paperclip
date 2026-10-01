@@ -5,7 +5,10 @@ import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, issues } from "@paperclipai/db";
-import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import {
+  isPaperclipRunBriefOnlyWake,
+  renderPaperclipWakePrompt,
+} from "@paperclipai/adapter-utils/server-utils";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -51,7 +54,9 @@ suite("run brief on a heartbeat run", () => {
     heartbeat = heartbeatService(db);
     execute.mockImplementation(async (input) => {
       // Finish the task so no liveness follow-up run is queued.
-      await db.update(issues).set({ status: "done" }).where(eq(issues.id, input.context.issueId));
+      if (input.context.issueId) {
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, input.context.issueId));
+      }
       return {
         exitCode: 0,
         signal: null,
@@ -107,11 +112,11 @@ suite("run brief on a heartbeat run", () => {
     return { companyId, agentId, issueId };
   }
 
-  async function runWake(agentId: string, issueId: string) {
+  async function runWake(agentId: string, issueId: string | null) {
     const run = await heartbeat.wakeup(agentId, {
       source: "on_demand",
       triggerDetail: "manual",
-      contextSnapshot: { issueId },
+      contextSnapshot: issueId ? { issueId } : {},
     });
     expect(run).not.toBeNull();
     await vi.waitFor(
@@ -187,5 +192,47 @@ suite("run brief on a heartbeat run", () => {
     const prompt = renderPaperclipWakePrompt(wake);
     expect(prompt).not.toContain("## Run Brief");
     expect(prompt.startsWith("## Paperclip Wake Payload")).toBe(true);
+  }, 40_000);
+
+  it("orients a run without an issue on the team, with the environment filled in", async () => {
+    const { companyId, agentId } = await seed();
+    const leadId = randomUUID();
+    await db.insert(agents).values({
+      id: leadId,
+      companyId,
+      name: "Lead",
+      role: "cto",
+      title: "Engineering Lead",
+      status: "paused",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(agents).set({ reportsTo: leadId }).where(eq(agents.id, agentId));
+
+    const wake = await runWake(agentId, null);
+    expect(wake.runBrief).toMatchObject({
+      version: 1,
+      issueId: null,
+      environment: { session: "fresh", timeoutSec: 900 },
+      team: {
+        companyId,
+        total: 2,
+        members: [
+          { id: leadId, name: "Lead", status: "paused", reportsTo: null, you: false },
+          { id: agentId, name: "Builder", reportsTo: "Lead", you: true },
+        ],
+      },
+    });
+    expect(isPaperclipRunBriefOnlyWake(wake)).toBe(true);
+    const prompt = renderPaperclipWakePrompt(wake);
+    expect(prompt.startsWith("## Run Brief\n")).toBe(true);
+    expect(prompt).toContain("- environment: session fresh");
+    expect(prompt).toContain(`agent id=${leadId} name="Lead" role=cto title="Engineering Lead" status=paused`);
+    expect(prompt).toMatch(
+      new RegExp(`\\nagent id=${agentId} name="Builder" role=engineer status=[a-z_]+ reports_to="Lead" \\[you\\]\\n`),
+    );
+    expect(prompt).not.toContain("## Paperclip Wake Payload");
   }, 40_000);
 });
