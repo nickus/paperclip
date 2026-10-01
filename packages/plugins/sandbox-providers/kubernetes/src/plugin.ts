@@ -427,16 +427,26 @@ async function resumeReusableLease(
   }
 
   // The host matched this lease by its reuse scope; the key stamped at acquire
-  // must describe the same scope.
+  // must describe the same scope. A projectless issue's scope carries a null
+  // `executionWorkspaceId` plus a `projectlessIssueId` (see
+  // `buildReusableSandboxLeaseScope` in the server's environment-runtime),
+  // the same fallback `onEnvironmentAcquireLease` above uses.
   const scope = params.leaseMetadata?.reusableSandboxLease;
+  const scopeExecutionWorkspaceId =
+    isPlainRecord(scope) && typeof scope.executionWorkspaceId === "string" ? scope.executionWorkspaceId : null;
+  const scopeProjectlessIssueId =
+    isPlainRecord(scope) && scopeExecutionWorkspaceId === null && typeof scope.projectlessIssueId === "string"
+      ? scope.projectlessIssueId
+      : null;
   if (
     isPlainRecord(scope) &&
-    typeof scope.executionWorkspaceId === "string" &&
+    (scopeExecutionWorkspaceId !== null || scopeProjectlessIssueId !== null) &&
     typeof scope.agentId === "string" &&
     computeReuseKey({
       companyId: params.companyId,
       environmentId: params.environmentId,
-      executionWorkspaceId: scope.executionWorkspaceId,
+      executionWorkspaceId: scopeExecutionWorkspaceId,
+      projectlessIssueId: scopeProjectlessIssueId,
       agentId: scope.agentId,
       runAdapterType: stamp.runAdapterType,
     }) !== stamp.key
@@ -1362,24 +1372,36 @@ const plugin = definePlugin(withAuthEviction({
     const jobName = `pc-${newRunUlidDns()}`;
     const secretName = `${jobName}-env`;
 
-    // Reuse applies only to a heartbeat-style run with a reuse scope (execution
-    // workspace + agent) and no caller deadline: a lease that must end by a
-    // fixed time is never kept for later runs. A host that states the lease
-    // policy it will record decides: a lease it records as ephemeral is never
-    // resumed, so its sandbox must not be kept. Without a stated policy (an
-    // older host) the plugin decides from the fields above alone.
+    // Reuse applies only to a heartbeat-style run with a reuse scope and no
+    // caller deadline: a lease that must end by a fixed time is never kept
+    // for later runs. The scope is the execution workspace + agent for a
+    // project issue, or (an issue with no project, e.g. a chat task) the
+    // issue + agent instead — the same fallback the host uses to decide
+    // reuse (see `buildReusableSandboxLeaseScope` in environment-runtime),
+    // so a projectless conversation keeps its sandbox between runs exactly
+    // like a project issue does. A host that states the lease policy it will
+    // record decides: a lease it records as ephemeral is never resumed, so
+    // its sandbox must not be kept. Without a stated policy (an older host)
+    // the plugin decides from the fields above alone.
     const reuseSettings = resolveReuseSettings(config);
     const hostAllowsReuse =
       typeof params.leasePolicy !== "string" || params.leasePolicy === "reuse_by_environment";
+    const executionWorkspaceId =
+      typeof params.executionWorkspaceId === "string" && params.executionWorkspaceId.length > 0
+        ? params.executionWorkspaceId
+        : null;
+    const projectlessIssueId =
+      executionWorkspaceId === null && typeof params.issueId === "string" && params.issueId.length > 0
+        ? params.issueId
+        : null;
     const reuseScope =
       reuseSettings.enabled &&
       hostAllowsReuse &&
-      typeof params.executionWorkspaceId === "string" &&
-      params.executionWorkspaceId.length > 0 &&
+      (executionWorkspaceId !== null || projectlessIssueId !== null) &&
       typeof params.agentId === "string" &&
       params.agentId.length > 0 &&
       !params.requestedExpiresAt
-        ? { executionWorkspaceId: params.executionWorkspaceId, agentId: params.agentId }
+        ? { executionWorkspaceId, projectlessIssueId, agentId: params.agentId }
         : null;
     let reuseStamp: KubernetesReuseLeaseStamp | null = null;
     let reuseAnnotations: Record<string, string> | undefined;
@@ -1389,6 +1411,7 @@ const plugin = definePlugin(withAuthEviction({
         companyId: params.companyId,
         environmentId: params.environmentId,
         executionWorkspaceId: reuseScope.executionWorkspaceId,
+        projectlessIssueId: reuseScope.projectlessIssueId,
         agentId: reuseScope.agentId,
         runAdapterType: effectiveAdapterType,
       });

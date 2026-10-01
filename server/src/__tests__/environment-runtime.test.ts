@@ -879,6 +879,41 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(third.resume).not.toHaveProperty("releasedAt");
   });
 
+  it("records a reusable lease as non-resumable when the provider destroys the sandbox despite a successful run", async () => {
+    const seeded = await seedReusablePluginSandboxLease();
+    await environmentService(db).releaseLease(seeded.reusableLease.id, "expired");
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: seeded.companyId, agentId: seeded.agentId, status: "running" });
+    const call = vi.fn(async (_pluginId: string, method: string, params: Record<string, unknown>) => {
+      if (method === "environmentAcquireLease") return { providerLeaseId: "sandbox-destroyed-at-release", metadata: { remoteCwd: "/workspace" } };
+      // The provider's own scope gate disagreed with the host's (or any other
+      // reason it could not keep the resource) and tore the sandbox down
+      // anyway, even though the run itself succeeded.
+      if (method === "environmentReleaseLease") return { providerLeaseId: params.providerLeaseId, state: "destroyed" };
+      throw new Error(`Unexpected plugin method: ${method}`);
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager });
+    const acquired = await runtime.acquireRunLease({
+      companyId: seeded.companyId, environment: seeded.environment, issueId: null, agentId: seeded.agentId,
+      heartbeatRunId: runId, persistedExecutionWorkspace: { id: seeded.executionWorkspaceId, mode: "shared_workspace" },
+    });
+
+    await runtime.releaseRunLeases(runId, "released");
+
+    const released = await environmentService(db).getLeaseById(acquired.lease.id);
+    // Never left looking reusable: no stale window where a destroyed sandbox
+    // is still recorded as "released" until a later resume discovers it gone.
+    expect(released).toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+      failureReason: "sandbox_not_kept",
+      metadata: { remoteExecutionTermination: { state: "destroyed" } },
+    });
+  });
+
   it.each(["same task", "different task", "different agent", "no task"])(
     "scopes projectless reusable leases to their task and agent: %s", async (scenario) => {
     const seeded = await seedReusablePluginSandboxLease();

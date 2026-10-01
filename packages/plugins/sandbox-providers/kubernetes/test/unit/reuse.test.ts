@@ -103,6 +103,25 @@ describe("reuse key and labels", () => {
     }
   });
 
+  it("falls back to the issue id when there is no execution workspace, same as the host's scope", () => {
+    const projectKey = computeReuseKey(KEY_INPUT);
+    // Adding a projectlessIssueId alongside a real executionWorkspaceId changes
+    // nothing: an existing project-workspace sandbox's key must not shift
+    // under it on upgrade.
+    expect(computeReuseKey({ ...KEY_INPUT, projectlessIssueId: "issue-1" })).toBe(projectKey);
+
+    const projectless = computeReuseKey({ ...KEY_INPUT, executionWorkspaceId: null, projectlessIssueId: "issue-1" });
+    expect(projectless).not.toBe(projectKey);
+    // Stable for the same issue, and distinct per issue (two chat tasks for
+    // the same agent never share a sandbox).
+    expect(computeReuseKey({ ...KEY_INPUT, executionWorkspaceId: null, projectlessIssueId: "issue-1" })).toBe(
+      projectless,
+    );
+    expect(
+      computeReuseKey({ ...KEY_INPUT, executionWorkspaceId: null, projectlessIssueId: "issue-2" }),
+    ).not.toBe(projectless);
+  });
+
   it("labels the sandbox with a 40-character key prefix and omits invalid label values", () => {
     const key = computeReuseKey(KEY_INPUT);
     expect(buildReuseLabels({ reuseKey: key, executionWorkspaceId: "workspace-1", issueId: "issue-1" })).toEqual({
