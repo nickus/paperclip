@@ -1650,6 +1650,12 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
   it("returns null instead of throwing for malformed non-uuid issue refs", async () => {
     await expect(svc.getById("not-a-uuid")).resolves.toBeNull();
   });
+  it("returns null instead of reaching the database for a truncated UUID", async () => {
+    // Neither isUuidLike nor the identifier pattern matches, so this never
+    // reaches a `where(eq(issues.id, ...))` query that Postgres would
+    // otherwise reject with a 22P02 invalid-uuid error.
+    await expect(svc.getById("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaa")).resolves.toBeNull();
+  });
   it("filters issues by execution workspace id", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

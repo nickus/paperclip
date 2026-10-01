@@ -255,6 +255,41 @@ describe("errorHandler", () => {
     });
   });
 
+  it("maps a Postgres invalid-uuid error to 400 instead of 500", () => {
+    // A malformed id in a path parameter (e.g. a truncated UUID) that a
+    // route forwarded straight into a query without validating first.
+    // Drizzle wraps the driver failure, so the code/message live on `cause`.
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+    const err = Object.assign(new Error('Failed query: select * from "issue_comments" where "id" = $1'), {
+      cause: { code: "22P02", message: 'invalid input syntax for type uuid: "trunc-1234"' },
+    });
+
+    errorHandler(err, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({ error: "Invalid id: expected a UUID" });
+    expect(res.err).toBeUndefined();
+    expect(res.__errorContext).toBeUndefined();
+    expect(captureExceptionMock).not.toHaveBeenCalled();
+    expect(telemetryMocks.trackErrorHandlerCrash).not.toHaveBeenCalled();
+  });
+
+  it("keeps a Postgres invalid-input error for a non-uuid cast as a 500", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+    const err = Object.assign(new Error('Failed query: select * from "issues" where "position" = $1'), {
+      cause: { code: "22P02", message: 'invalid input syntax for type integer: "x"' },
+    });
+
+    errorHandler(err, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ error: "Internal server error" });
+  });
+
   it("records responsible-user denial codes on the active agent run", () => {
     const db = { marker: "db" };
     const req = {

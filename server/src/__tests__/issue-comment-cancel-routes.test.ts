@@ -322,6 +322,26 @@ describe.sequential("issue comment cancel routes", () => {
     );
   });
 
+  it("returns 400 instead of 500 when the comment id is a malformed UUID", async () => {
+    // Postgres rejects a malformed (e.g. truncated) UUID path parameter
+    // against the `issue_comments.id` uuid column with SQLSTATE 22P02;
+    // Drizzle wraps the driver failure, so the code/message live on `cause`.
+    // This exercises the real (unmocked) error handler mapping it to 400.
+    mockIssueService.getComment.mockRejectedValue(
+      Object.assign(new Error('Failed query: select * from "issue_comments" where "id" = $1'), {
+        cause: { code: "22P02", message: 'invalid input syntax for type uuid: "trunc-1234"' },
+      }),
+    );
+
+    const res = await request(await installActor(createApp()))
+      .delete("/api/issues/11111111-1111-4111-8111-111111111111/comments/trunc-1234");
+
+    expect(res.status, describeResponse(res)).toBe(400);
+    expect(res.body.error).toBe("Invalid id: expected a UUID");
+    expect(mockIssueService.removeComment).not.toHaveBeenCalled();
+    expect(mockIssueService.tombstoneComment).not.toHaveBeenCalled();
+  });
+
   it("rejects stale queued cancellation after the active run is gone", async () => {
     mockHeartbeatService.getRun.mockResolvedValue(null);
 

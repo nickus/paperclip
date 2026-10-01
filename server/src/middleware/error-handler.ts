@@ -2,6 +2,7 @@ import type { Request, Response, NextFunction } from "express";
 import type { Db } from "@paperclipai/db";
 import { ZodError } from "zod";
 import { HttpError } from "../errors.js";
+import { isInvalidUuidInput } from "../db-errors.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { captureException } from "../sentry.js";
@@ -245,6 +246,17 @@ export function errorHandler(
     "type" in err && err.type === "entity.parse.failed"
   ) {
     res.status(400).json({ error: "Invalid JSON body" });
+    return;
+  }
+
+  // A route forwarded a malformed id (e.g. a truncated UUID in a path
+  // parameter) straight into a query without validating it first, and
+  // Postgres rejected the cast. This is client input, not a server fault:
+  // respond 400 with a clear message instead of letting it fall through to
+  // the generic 500 below, and keep it out of crash reporting the same way
+  // the Zod/JSON-parse client-error branches above do.
+  if (isInvalidUuidInput(err)) {
+    res.status(400).json({ error: "Invalid id: expected a UUID" });
     return;
   }
 
