@@ -1116,6 +1116,8 @@ export interface SuggestedTaskDraft {
   workMode?: IssueWorkMode | null;
   assigneeAgentId?: string | null;
   assigneeUserId?: string | null;
+  proposedOwner?: string | null;
+  acceptanceCriteria?: string[];
   projectId?: string | null;
   goalId?: string | null;
   billingCode?: string | null;

@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
   companies,
+  companyMemberships,
   createDb,
   documentRevisions,
   documents,
@@ -28,8 +29,13 @@ import {
 import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
-import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import {
+  createCompanyAgentCandidatesCache,
+  issueThreadInteractionService,
+  type ResolvedProposedOwnerAssignee,
+} from "../services/issue-thread-interactions.js";
 import { agentService } from "../services/agents.js";
+import * as agentAssignabilityModule from "../services/agent-assignability.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -63,6 +69,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     await db.delete(projects);
     await db.delete(goals);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(instanceSettings);
     await db.delete(companies);
   });
@@ -100,6 +107,22 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
 
     return { companyId, goalId, issueId };
+  }
+
+  async function seedAgent(
+    companyId: string,
+    overrides: Partial<typeof agents.$inferInsert> & { id: string; name: string },
+  ) {
+    await db.insert(agents).values({
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      companyId,
+      ...overrides,
+    });
   }
 
   async function attachPlanDocument(companyId: string, issueId: string) {
@@ -706,6 +729,572 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     const childrenAfterDuplicateAccept = await issuesSvc.list(companyId, { parentId: issueId });
     expect(childrenAfterDuplicateAccept).toHaveLength(1);
+  });
+
+  it("carries acceptanceCriteria into the created issue's description and resolves proposedOwner to an assignable agent", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const ownerAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Richer suggested tasks",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "Automation Owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+      requestDepth: 2,
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [
+          {
+            clientKey: "with-criteria",
+            title: "Ship the fix",
+            description: "Base description",
+            acceptanceCriteria: ["Covers the regression", "Docs updated"],
+            // Matches the agent above by its normalized name key rather
+            // than its id.
+            proposedOwner: "automation-owner",
+          },
+          {
+            clientKey: "unresolved-owner",
+            title: "Follow-up with a bad owner guess",
+            proposedOwner: "nobody-with-this-name",
+          },
+        ],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const accepted = await interactionsSvc.acceptSuggestedTasks({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.createdIssues).toEqual([
+      expect.objectContaining({ assigneeAgentId: ownerAgentId }),
+      expect.objectContaining({ assigneeAgentId: null }),
+    ]);
+
+    const createdIssueRows = await db
+      .select({
+        title: issues.title,
+        description: issues.description,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+      })
+      .from(issues)
+      .where(eq(issues.companyId, companyId));
+
+    const withCriteria = createdIssueRows.find((row) => row.title === "Ship the fix");
+    expect(withCriteria?.assigneeAgentId).toBe(ownerAgentId);
+    expect(withCriteria?.description).toContain("Base description");
+    expect(withCriteria?.description).toContain("## Acceptance Criteria");
+    expect(withCriteria?.description).toContain("- Covers the regression");
+    expect(withCriteria?.description).toContain("- Docs updated");
+
+    const withUnresolvedOwner = createdIssueRows.find(
+      (row) => row.title === "Follow-up with a bad owner guess",
+    );
+    expect(withUnresolvedOwner?.assigneeAgentId).toBeNull();
+    expect(withUnresolvedOwner?.assigneeUserId).toBeNull();
+    expect(withUnresolvedOwner?.description).toContain(
+      "nobody-with-this-name",
+    );
+    expect(withUnresolvedOwner?.description).toContain(
+      "did not resolve to an assignable",
+    );
+  });
+
+  it("prefers an explicit assigneeAgentId over proposedOwner and never consults proposedOwner in that case", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const explicitAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Explicit assignee wins",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: explicitAgentId,
+      companyId,
+      name: "Explicit Assignee",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+      requestDepth: 2,
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [
+          {
+            clientKey: "explicit-wins",
+            title: "Explicit assignee task",
+            assigneeAgentId: explicitAgentId,
+            // Nonsense that would never resolve; must be ignored because an
+            // explicit assignee was already given.
+            proposedOwner: "does-not-matter-here",
+          },
+        ],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const accepted = await interactionsSvc.acceptSuggestedTasks({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.createdIssues).toEqual([
+      expect.objectContaining({ assigneeAgentId: explicitAgentId }),
+    ]);
+    const [createdIssue] = await db
+      .select({ description: issues.description })
+      .from(issues)
+      .where(eq(issues.companyId, companyId));
+    expect(createdIssue?.description ?? "").not.toContain(
+      "does-not-matter-here",
+    );
+  });
+
+  it("resolves a proposedOwner name hint to the one assignable agent even when a terminated agent shares its name", async () => {
+    const { companyId, goalId, issueId } = await seedConfirmationIssue(
+      "Terminated namesake",
+    );
+    const terminatedAgentId = randomUUID();
+    const activeAgentId = randomUUID();
+
+    // A terminated agent can keep the shortname of the active agent that
+    // replaced it: hasAgentShortnameCollision only guards a *new* name
+    // against other non-terminated agents, so a terminated row with a
+    // matching name survives indefinitely.
+    await seedAgent(companyId, {
+      id: terminatedAgentId,
+      name: "Automation Owner",
+      status: "terminated",
+    });
+    await seedAgent(companyId, {
+      id: activeAgentId,
+      name: "Automation Owner",
+      status: "active",
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [{
+          clientKey: "task-1",
+          title: "Ship the fix",
+          proposedOwner: "automation-owner",
+        }],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const accepted = await interactionsSvc.acceptSuggestedTasks({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.createdIssues).toEqual([
+      expect.objectContaining({ assigneeAgentId: activeAgentId }),
+    ]);
+  });
+
+  it("still leaves a task unassigned when a proposedOwner name hint is genuinely ambiguous between two assignable agents", async () => {
+    const { companyId, goalId, issueId } = await seedConfirmationIssue(
+      "Genuinely ambiguous namesake",
+    );
+    const firstAgentId = randomUUID();
+    const secondAgentId = randomUUID();
+
+    await seedAgent(companyId, { id: firstAgentId, name: "Automation Owner" });
+    await seedAgent(companyId, { id: secondAgentId, name: "Automation Owner" });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [{
+          clientKey: "task-1",
+          title: "Ship the fix",
+          proposedOwner: "automation-owner",
+        }],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const accepted = await interactionsSvc.acceptSuggestedTasks({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.createdIssues).toEqual([
+      expect.objectContaining({ assigneeAgentId: null }),
+    ]);
+  });
+
+  it("normalizes an upper-case UUID proposedOwner hint before matching an agent id", async () => {
+    const { companyId, goalId, issueId } = await seedConfirmationIssue(
+      "Upper-case agent id hint",
+    );
+    const ownerAgentId = randomUUID();
+    await seedAgent(companyId, { id: ownerAgentId, name: "Case Sensitive Owner" });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [{
+          clientKey: "task-1",
+          title: "Ship the fix",
+          proposedOwner: ownerAgentId.toUpperCase(),
+        }],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const accepted = await interactionsSvc.acceptSuggestedTasks({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.createdIssues).toEqual([
+      expect.objectContaining({ assigneeAgentId: ownerAgentId }),
+    ]);
+  });
+
+  it("normalizes an upper-case UUID proposedOwner hint before matching a company membership's user id", async () => {
+    const { companyId, goalId, issueId } = await seedConfirmationIssue(
+      "Upper-case user id hint",
+    );
+    const ownerUserId = randomUUID();
+    await db.insert(companyMemberships).values({
+      id: randomUUID(),
+      companyId,
+      principalType: "user",
+      principalId: ownerUserId,
+      status: "active",
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [{
+          clientKey: "task-1",
+          title: "Ship the fix",
+          proposedOwner: ownerUserId.toUpperCase(),
+        }],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    await interactionsSvc.acceptSuggestedTasks({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    const [createdIssue] = await db
+      .select({
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+      })
+      .from(issues)
+      .where(eq(issues.companyId, companyId));
+    expect(createdIssue?.assigneeAgentId).toBeNull();
+    expect(createdIssue?.assigneeUserId).toBe(ownerUserId);
+  });
+
+  it("still swallows assertAssignableAgent's own not-assignable error (expected 409) and leaves the task unassigned", async () => {
+    const { companyId, goalId, issueId } = await seedConfirmationIssue(
+      "Terminated agent id hint",
+    );
+    const terminatedAgentId = randomUUID();
+    await seedAgent(companyId, {
+      id: terminatedAgentId,
+      name: "Retired Agent",
+      status: "terminated",
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [{
+          clientKey: "task-1",
+          title: "Ship the fix",
+          // A direct id hint skips name matching entirely, so this exercises
+          // assertAssignableAgent's own conflict (terminated) rather than the
+          // name-collision filter above.
+          proposedOwner: terminatedAgentId,
+        }],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const accepted = await interactionsSvc.acceptSuggestedTasks({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.createdIssues).toEqual([
+      expect.objectContaining({ assigneeAgentId: null }),
+    ]);
+    const [createdIssue] = await db
+      .select({ description: issues.description })
+      .from(issues)
+      .where(eq(issues.companyId, companyId));
+    expect(createdIssue?.description ?? "").toContain(
+      "did not resolve to an assignable",
+    );
+  });
+
+  it("propagates an unexpected (non-HttpError) assignability failure instead of leaving the task silently unassigned", async () => {
+    const { companyId, goalId, issueId } = await seedConfirmationIssue(
+      "Unexpected assignability failure",
+    );
+    const candidateAgentId = randomUUID();
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [{
+          clientKey: "task-1",
+          title: "Ship the fix",
+          proposedOwner: candidateAgentId,
+        }],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const assignabilitySpy = vi
+      .spyOn(agentAssignabilityModule, "assertAssignableAgent")
+      .mockRejectedValueOnce(new Error("simulated infrastructure failure"));
+
+    try {
+      await expect(
+        interactionsSvc.acceptSuggestedTasks({
+          id: issueId,
+          companyId,
+          goalId,
+          projectId: null,
+        }, created.id, {}, {
+          userId: "local-board",
+        }),
+      ).rejects.toThrow("simulated infrastructure failure");
+    } finally {
+      assignabilitySpy.mockRestore();
+    }
+
+    // The accept transaction must have rolled back instead of quietly
+    // creating an unassigned task: the interaction is still pending.
+    const listed = await interactionsSvc.listForIssue(issueId);
+    expect(listed[0]?.status).toBe("pending");
+  });
+
+  it("uses the actor's pre-resolved proposedOwner instead of re-resolving the hint against a later rename", async () => {
+    const { companyId, goalId, issueId } = await seedConfirmationIssue(
+      "Pre-resolved owner race",
+    );
+    const originalAgentId = randomUUID();
+    const replacementAgentId = randomUUID();
+
+    await seedAgent(companyId, { id: originalAgentId, name: "Rotating Owner" });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [{
+          clientKey: "task-1",
+          title: "Ship the fix",
+          proposedOwner: "rotating-owner",
+        }],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    // Simulate a concurrent rename/replace that happens between the route's
+    // authorization check (which resolved "rotating-owner" to
+    // originalAgentId and permission-checked exactly that agent) and the
+    // accept transaction: the name is now held by a brand new agent.
+    await db
+      .update(agents)
+      .set({ name: "Rotating Owner (retired)" })
+      .where(eq(agents.id, originalAgentId));
+    await seedAgent(companyId, { id: replacementAgentId, name: "Rotating Owner" });
+
+    const resolvedProposedOwnersByClientKey = new Map<
+      string,
+      ResolvedProposedOwnerAssignee | null
+    >([["task-1", { assigneeAgentId: originalAgentId, assigneeUserId: null }]]);
+
+    const accepted = await interactionsSvc.acceptSuggestedTasks({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+      resolvedProposedOwnersByClientKey,
+    });
+
+    // Assigned to the agent that was actually authorized, not to whichever
+    // agent happens to hold the name by the time the transaction runs.
+    expect(accepted.createdIssues).toEqual([
+      expect.objectContaining({ assigneeAgentId: originalAgentId }),
+    ]);
+  });
+
+  it("createCompanyAgentCandidatesCache reads the company's agents only once across repeated calls", async () => {
+    const { companyId } = await seedConfirmationIssue("Cache reuse");
+    const agentId = randomUUID();
+    await seedAgent(companyId, { id: agentId, name: "Cached Agent" });
+
+    const cache = createCompanyAgentCandidatesCache(db, companyId);
+    const selectSpy = vi.spyOn(db, "select");
+    try {
+      const [first, second, third] = await Promise.all([cache(), cache(), cache()]);
+      expect(selectSpy).toHaveBeenCalledTimes(1);
+      expect(first).toEqual(second);
+      expect(second).toEqual(third);
+      expect(first).toEqual([
+        expect.objectContaining({ id: agentId, name: "Cached Agent", status: "active" }),
+      ]);
+    } finally {
+      selectSpy.mockRestore();
+    }
   });
 
   it("accepts a selected subset of suggested tasks and records the skipped drafts", async () => {
