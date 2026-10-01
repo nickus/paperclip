@@ -1,6 +1,7 @@
 import { hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { sandboxRunPrivatePaths } from "./sandbox-run-private-paths.js";
 import { readPendingCleanupIntent, readPendingCleanupReleaseRunStatus } from "./pending-cleanup-intent.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -2809,6 +2810,9 @@ function createSandboxEnvironmentDriver(
             // A provider without a stop method keeps a reusable sandbox on a
             // verified release; the stop ends the run's work like a cancel.
             ...(viaRelease ? { runStatus: "expired" as const } : { resourceDisposition: "stop_and_retain" as const }),
+            // The stopped run cannot remove its private files any more: the
+            // sandbox refuses commands once it is stopped.
+            ...runPrivatePathsParam(hasNativeWorkspaceExportResume(input.lease) ? [] : sandboxRunPrivatePaths(input.lease)),
           }, Math.min(resolvePluginSandboxRpcTimeoutMs(workerConfig) ?? 60_000, 60_000)));
           const state = remoteTerminationReceipt(input.lease, receipt)?.state;
           // A stop may find the sandbox already gone, which ends the lease. A
@@ -3486,6 +3490,9 @@ function createSandboxEnvironmentDriver(
             // How the run ended, so a provider that keeps sandboxes between
             // runs can stop keeping one in which run after run fails.
             runStatus,
+            // A kept sandbox must not carry the run's private files into the
+            // next run, also when the run could not remove them itself.
+            ...runPrivatePathsParam(input.lease.leasePolicy === "reuse_by_environment" ? sandboxRunPrivatePaths(input.lease) : []),
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)))),
         );
         termination = remoteTerminationReceipt(input.lease, receipt);
@@ -3619,6 +3626,8 @@ function createSandboxEnvironmentDriver(
         // release must stop it before the sandbox is kept.
         cancelActiveWork: true,
         ...(runStatus ? { runStatus } : {}),
+        // The run whose release is retried could not remove its private files.
+        ...runPrivatePathsParam(sandboxRunPrivatePaths(input.lease)),
       }, resolvePluginSandboxRpcTimeoutMs(workerConfig)),
     );
     const termination = remoteTerminationReceipt(input.lease, receipt);
@@ -3764,6 +3773,11 @@ function pluginDriverProviderKey(config: PluginEnvironmentConfig): string {
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/** The `runPrivatePaths` release parameter, left out when there is nothing to remove. */
+function runPrivatePathsParam(paths: string[]): { runPrivatePaths?: string[] } {
+  return paths.length > 0 ? { runPrivatePaths: paths } : {};
 }
 
 /**

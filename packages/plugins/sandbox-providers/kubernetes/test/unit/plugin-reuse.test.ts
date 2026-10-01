@@ -465,6 +465,50 @@ describe("release with reuseLease", () => {
     expect(cluster.sandboxes.size).toBe(0);
   });
 
+  it("removes the run's private files from the kept sandbox after its processes stopped", async () => {
+    const lease = await acquire();
+    const runFiles = ["/workspace/.paperclip-runtime/runs/run-1", "/workspace/.paperclip-runtime/github/run-1"];
+
+    await expect(
+      release(lease, REUSE_CONFIG, {
+        cancelActiveWork: true,
+        runPrivatePaths: [
+          ...runFiles,
+          "/workspace/src",
+          "/workspace/.paperclip-runtime/",
+          "/workspace/.paperclip-runtime/runs/../../src",
+          "relative/path",
+        ],
+      }),
+    ).resolves.toMatchObject({ state: "stopped" });
+
+    expect(vi.mocked(execInPod).mock.calls.map((call) => call[4])).toEqual([
+      ["/bin/sh", "-c", PROCESS_RESET_SCRIPT, "paperclip-process-reset"],
+      ["/bin/sh", "-c", expect.stringContaining('rm -rf -- "$p"'), "paperclip-run-files", ...runFiles],
+    ]);
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations[REUSE_ANNOTATIONS.leaseState]).toBe("idle");
+  });
+
+  it("keeps the sandbox when the run's files cannot be removed", async () => {
+    const lease = await acquire();
+    vi.mocked(execInPod)
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "paperclip-process-reset: ok stopped=0\n", stderr: "" })
+      .mockRejectedValueOnce(new Error("connection dropped"));
+    await expect(
+      release(lease, REUSE_CONFIG, { runPrivatePaths: ["/workspace/.paperclip-runtime/runs/run-1"] }),
+    ).resolves.toMatchObject({ state: "stopped" });
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations[REUSE_ANNOTATIONS.leaseState]).toBe("idle");
+  });
+
+  it("does not touch the run's files of a sandbox it removes", async () => {
+    const lease = await acquire();
+    vi.mocked(execInPod).mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "paperclip-process-reset: failed remaining= 3" });
+    await expect(
+      release(lease, REUSE_CONFIG, { runPrivatePaths: ["/workspace/.paperclip-runtime/runs/run-1"] }),
+    ).resolves.toMatchObject({ state: "destroyed" });
+    expect(execInPod).toHaveBeenCalledTimes(1);
+  });
+
   it("leaves the failure count alone for a cancelled or interrupted run", async () => {
     const lease = await acquire();
     const annotations = () => cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations;
@@ -595,6 +639,28 @@ describe("stop and keep", () => {
     expect(cluster.clients.custom.deleteNamespacedCustomObject).not.toHaveBeenCalled();
     // The next run of the task resumes the kept sandbox.
     await expect(resume(resumed)).resolves.toMatchObject({ providerLeaseId: lease.providerLeaseId });
+  });
+
+  it("removes the stopped run's private files", async () => {
+    const lease = await acquire();
+    const runFiles = ["/workspace/.paperclip-runtime/runs/run-1", "/workspace/.paperclip-runtime/github/run-1"];
+    await expect(
+      plugin.definition.onEnvironmentStopLease!({
+        driverKey: "kubernetes",
+        companyId: SCOPE.companyId,
+        environmentId: SCOPE.environmentId,
+        config: REUSE_CONFIG,
+        providerLeaseId: lease.providerLeaseId,
+        leaseMetadata: lease.metadata,
+        cancelActiveWork: true,
+        resourceDisposition: "stop_and_retain",
+        runPrivatePaths: runFiles,
+      }),
+    ).resolves.toMatchObject({ state: "stopped" });
+    expect(vi.mocked(execInPod).mock.calls.map((call) => call[4])).toEqual([
+      ["/bin/sh", "-c", PROCESS_RESET_SCRIPT, "paperclip-process-reset"],
+      ["/bin/sh", "-c", expect.stringContaining('rm -rf -- "$p"'), "paperclip-run-files", ...runFiles],
+    ]);
   });
 
   it("keeps the sandbox when reuse was turned off, for the idle reaper to remove", async () => {

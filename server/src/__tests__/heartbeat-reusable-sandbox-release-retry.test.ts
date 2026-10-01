@@ -528,7 +528,15 @@ describeEmbeddedPostgres("reusable sandbox leases parked for a release", () => {
       // A lost process is not a failure of the sandbox: the provider does not
       // count it toward giving the sandbox up.
       expect(worker.calls("environmentReleaseLease")).toEqual([
-        expect.objectContaining({ providerLeaseId: lease.providerLeaseId, runStatus: "interrupted" }),
+        expect.objectContaining({
+          providerLeaseId: lease.providerLeaseId,
+          runStatus: "interrupted",
+          // The lost run never removed its scratch directory and launchers.
+          runPrivatePaths: [
+            `/workspace/.paperclip-runtime/runs/${runId}`,
+            `/workspace/.paperclip-runtime/github/${runId}`,
+          ],
+        }),
       ]);
     });
 

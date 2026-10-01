@@ -7,6 +7,7 @@ import {
   buildSshReusableWorkspaceStageScript,
   isSshRunIdPathSegment,
   isSshWorkspaceReuseKey,
+  remoteRunGitHubLauncherDir,
   sshReusableWorkspaceDir,
   sshReusableWorkspaceSlotDir,
   sshRunDir,
@@ -80,7 +81,11 @@ describe("ssh workspace layout", () => {
     expect(sshReusableWorkspaceDir("/home/agent/work", KEY)).toBe(
       `/home/agent/work/.paperclip-runtime/workspaces/${KEY}/workspace`,
     );
+    expect(remoteRunGitHubLauncherDir("/home/agent/work", "run-1")).toBe(
+      "/home/agent/work/.paperclip-runtime/github/run-1",
+    );
     expect(() => sshRunScratchDir("/w", "../x")).toThrow();
+    expect(() => remoteRunGitHubLauncherDir("/w", "../x")).toThrow();
     expect(() => sshReusableWorkspaceDir("/w", "../x")).toThrow();
   });
 

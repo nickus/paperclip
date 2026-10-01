@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import path from "node:path";
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
@@ -712,6 +713,12 @@ async function releaseReusableLease(
   if (consecutiveFailures >= REUSE_MAX_CONSECUTIVE_FAILURES) {
     return await destroy(`the last ${consecutiveFailures} runs in it failed; the next run starts in a fresh sandbox`);
   }
+  await removeRunPrivatePaths(kc, config, {
+    namespace,
+    podName: state.podName,
+    label: `reusable sandbox ${namespace}/${leaseId}`,
+    params,
+  });
 
   let marked;
   try {
@@ -773,6 +780,66 @@ async function stopPodProcesses(
     reset = await execReset();
   }
   return reset;
+}
+
+/** Budget for removing a finished run's private files from its kept sandbox. */
+const RUN_PRIVATE_PATHS_TIMEOUT_MS = 15_000;
+
+/**
+ * Remove the files private to the run that held the lease (the host's
+ * `runPrivatePaths`: its scratch directory and generated launchers) from a
+ * sandbox kept for later runs, once the run's processes are stopped. Only
+ * paths strictly inside the lease's `<remoteCwd>/.paperclip-runtime/` are
+ * removed; anything else is skipped. Best effort: the files belong to a run
+ * that has ended, and a failure leaves the sandbox as usable as before.
+ */
+async function removeRunPrivatePaths(
+  kc: ReturnType<typeof getKubeConnection>["kc"],
+  config: KubernetesProviderConfig,
+  input: { namespace: string; podName: string; label: string; params: PluginEnvironmentReleaseLeaseParams },
+): Promise<void> {
+  const requested = Array.isArray(input.params.runPrivatePaths) ? input.params.runPrivatePaths : [];
+  if (requested.length === 0) return;
+  const remoteCwd = input.params.leaseMetadata?.remoteCwd;
+  const root =
+    typeof remoteCwd === "string" && remoteCwd.trim().startsWith("/")
+      ? `${path.posix.join(remoteCwd.trim(), ".paperclip-runtime")}/`
+      : null;
+  const paths = requested.filter(
+    (candidate): candidate is string =>
+      root !== null &&
+      typeof candidate === "string" &&
+      candidate.length > root.length &&
+      candidate.startsWith(root) &&
+      path.posix.normalize(candidate) === candidate &&
+      !candidate.split("/").includes(".."),
+  );
+  if (paths.length < requested.length) {
+    console.warn(
+      `[plugin-kubernetes] skipped ${requested.length - paths.length} run file path(s) outside the runtime directory of ${input.label}`,
+    );
+  }
+  if (paths.length === 0) return;
+  try {
+    // The paths go in as arguments, never into the script text.
+    const result = await execInPod(
+      kc,
+      input.namespace,
+      input.podName,
+      "agent",
+      ["/bin/sh", "-c", 'for p in "$@"; do rm -rf -- "$p" || exit 1; done', "paperclip-run-files", ...paths],
+      undefined,
+      RUN_PRIVATE_PATHS_TIMEOUT_MS,
+      undefined,
+      undefined,
+      execLivenessFromConfig(config),
+    );
+    if (result.exitCode !== 0) throw new Error(`exit code ${result.exitCode}: ${result.stderr.trim().slice(0, 200)}`);
+  } catch (err) {
+    console.warn(
+      `[plugin-kubernetes] could not remove the last run's files from ${input.label}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 /**
@@ -872,6 +939,7 @@ async function stopLeaseKeepingSandbox(
       `Could not verify that the processes in the ${label} stopped (${reset.detail || "no output"}); the sandbox was kept.`,
     );
   }
+  await removeRunPrivatePaths(kc, config, { namespace, podName: state.podName, label, params });
   if (!stamp) return { providerLeaseId: leaseId, state: "stopped" };
 
   const settings = resolveReuseSettings(config);

@@ -99,7 +99,7 @@ import {
   omitOversizedEnvPayloads,
   type EnvPayloadShellExec,
 } from "./env-payload.js";
-import { isSshWorkspaceReuseKey } from "./ssh-workspace-layout.js";
+import { isSshWorkspaceReuseKey, remoteRunGitHubLauncherDir } from "./ssh-workspace-layout.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import {
   runWithRuntimeParent,
@@ -1811,7 +1811,7 @@ function githubOperationLauncherDirectory(input: GitHubLauncherLocation): string
   // Only controller-generated run IDs may name a removable directory.
   if (!/^[a-zA-Z0-9_-]+$/.test(input.runId)) throw new Error("Invalid GitHub launcher run ID");
   return input.target?.kind === "remote"
-    ? path.posix.join(input.target.remoteCwd, ".paperclip-runtime", "github", input.runId)
+    ? remoteRunGitHubLauncherDir(input.target.remoteCwd, input.runId)
     : path.join(os.tmpdir(), "paperclip-github-runtime", input.runId);
 }
 

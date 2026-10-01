@@ -701,6 +701,15 @@ export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDr
    * predate this field.
    */
   runStatus?: "released" | "failed" | "expired" | "interrupted";
+  /**
+   * Absolute paths inside the sandbox that hold only files private to the run
+   * that held the lease (its scratch directory and generated tool launchers),
+   * all below the lease's `remoteCwd`. A run removes them itself when it ends,
+   * but one that was interrupted or stopped may not have. A provider that
+   * keeps the sandbox for later runs removes them once it has stopped the
+   * run's processes; a provider that removes the sandbox can ignore them.
+   */
+  runPrivatePaths?: string[];
 }
 
 /** Returned only after the provider confirms that execution has ended. A queued

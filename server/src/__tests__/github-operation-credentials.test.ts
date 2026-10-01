@@ -834,6 +834,39 @@ const support = await getEmbeddedPostgresTestSupport();
       } finally { await broker.stop(); }
     });
 
+    // A sandbox kept for the task's next run can still hold an ended run's
+    // launchers and environment; its capability must not work any more.
+    it.each(["succeeded", "failed", "timed_out", "cancelled", "interrupted"])(
+      "rejects the run capability once the run has ended (%s)",
+      async (status) => {
+        const input = await seed();
+        await grant(input, "A");
+        const app = express();
+        app.use(express.json());
+        app.use(runtimeConnectionIntentRoutes(db));
+        app.use(errorHandler);
+        const token = createRuntimeToolsToken({
+          ...input,
+          responsibleUserId: "A",
+          scope: "github_credentials",
+        })!.token;
+        const post = () =>
+          request(app)
+            .post("/runtime-tools/github/credentials")
+            .set("Authorization", `Bearer ${token}`);
+        expect((await post()).status).toBe(200);
+
+        await db
+          .update(heartbeatRuns)
+          .set({ status, finishedAt: new Date() })
+          .where(eq(heartbeatRuns.id, input.runId));
+
+        const rejected = await post();
+        expect(rejected.status).toBe(403);
+        expect(rejected.body).not.toHaveProperty("env");
+      },
+    );
+
     it("requires a run-scoped runtime capability and never accepts browser authentication or supplied identities", async () => {
       const input = await seed();
       await grant(input, "A");
