@@ -238,11 +238,66 @@ describe("acquire with reuseLease", () => {
     expect((lease.metadata?.kubernetesReuse as { idleTtlSec: number }).idleTtlSec).toBe(7200);
   });
 
-  it("stays ephemeral without an execution workspace or with a caller deadline", async () => {
-    const noWorkspace = await acquire(REUSE_CONFIG, { executionWorkspaceId: null });
-    expect(noWorkspace.metadata).not.toHaveProperty("kubernetesReuse");
+  it("stays ephemeral with no execution workspace and no issue, or with a caller deadline", async () => {
+    const noScope = await acquire(REUSE_CONFIG, { executionWorkspaceId: null, issueId: null });
+    expect(noScope.metadata).not.toHaveProperty("kubernetesReuse");
     const bounded = await acquire(REUSE_CONFIG, { requestedExpiresAt: new Date(Date.now() + 60_000).toISOString() });
     expect(bounded.metadata).not.toHaveProperty("kubernetesReuse");
+  });
+
+  it("keeps a sandbox for a projectless issue (a chat task) the same way as a project issue", async () => {
+    // No project workspace, only the conversation's issue: the task + agent
+    // identity is still a stable reuse scope (see onEnvironmentAcquireLease's
+    // fallback to the issue, mirroring the host's reusable-lease scope).
+    const lease = await acquire(REUSE_CONFIG, { executionWorkspaceId: null, issueId: "issue-1" });
+    const cr = createdSandbox();
+    const key = computeReuseKey({
+      companyId: SCOPE.companyId,
+      environmentId: SCOPE.environmentId,
+      executionWorkspaceId: null,
+      projectlessIssueId: "issue-1",
+      agentId: SCOPE.agentId,
+      runAdapterType: "opencode_local",
+    });
+
+    expect(cr.metadata.labels).toMatchObject({
+      "paperclip.io/reuse": "true",
+      "paperclip.io/reuse-key": key.slice(0, 40),
+      "paperclip.io/issue-id": "issue-1",
+    });
+    expect(cr.metadata.labels).not.toHaveProperty("paperclip.io/execution-workspace-id");
+    expect(lease.metadata).toMatchObject({
+      remoteCwd: "/workspace",
+      kubernetesReuse: { key },
+    });
+
+    // Release keeps the sandbox idle instead of tearing it down.
+    expect(await release(lease)).toEqual({ providerLeaseId: lease.providerLeaseId, state: "stopped" });
+    expect(cluster.sandboxes.has(lease.providerLeaseId!)).toBe(true);
+
+    // The next message in the same conversation resumes the same sandbox.
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({
+      driverKey: "kubernetes",
+      companyId: SCOPE.companyId,
+      environmentId: SCOPE.environmentId,
+      config: REUSE_CONFIG,
+      providerLeaseId: lease.providerLeaseId!,
+      leaseMetadata: {
+        ...lease.metadata,
+        reusableSandboxLease: {
+          version: 1,
+          companyId: SCOPE.companyId,
+          environmentId: SCOPE.environmentId,
+          executionWorkspaceId: null,
+          projectlessIssueId: "issue-1",
+          agentId: SCOPE.agentId,
+          adapterType: "opencode_local",
+          provider: "kubernetes",
+        },
+      },
+    });
+    expect(resumed.providerLeaseId).toBe(lease.providerLeaseId);
+    expect(resumed.metadata).toMatchObject({ remoteCwd: "/workspace", resumedLease: true });
   });
 
   it("keeps no sandbox for a lease the host records as ephemeral", async () => {

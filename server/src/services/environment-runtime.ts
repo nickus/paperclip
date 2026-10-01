@@ -3584,19 +3584,38 @@ function createSandboxEnvironmentDriver(
       (input.status === "failed" || input.status === "expired") &&
       cleanupStatus === "success" &&
       termination?.state === "stopped";
+    // A successful run still releases a reusable lease as "released"
+    // (resumable) below whatever the provider's own termination receipt says.
+    // When the provider actually tore the sandbox down anyway (its own reuse
+    // scope disagreed with the host's, or any other reason it could not keep
+    // the resource), that left this row claiming a destroyed sandbox was
+    // reusable until the *next* run's resume call found it gone and corrected
+    // the row — a stale window in which the host would hand the lease to a
+    // resume attempt doomed to fail, silently losing the session in between.
+    // Catch it here instead: a reusable lease the provider confirms destroyed
+    // is never resumable, even though the run itself succeeded.
+    const destroyedReusable =
+      input.lease.leasePolicy === "reuse_by_environment" &&
+      input.status === "released" &&
+      cleanupStatus === "success" &&
+      termination?.state === "destroyed";
     const releaseStatus = retained
       ? ("retained" as const)
       : cleanupStatus === "failed"
         ? ("pending_cleanup" as const)
         : stoppedReusable
           ? ("released" as const)
-          : input.status;
+          : destroyedReusable
+            ? ("expired" as const)
+            : input.status;
     const failureReason =
-      input.status === "failed"
-        ? "adapter_or_run_failure"
-        : cleanupStatus === "failed"
-          ? "release_cleanup_failed"
-          : undefined;
+      destroyedReusable
+        ? "sandbox_not_kept"
+        : input.status === "failed"
+          ? "adapter_or_run_failure"
+          : cleanupStatus === "failed"
+            ? "release_cleanup_failed"
+            : undefined;
     return await environmentsSvc.releaseLease(input.lease.id, releaseStatus, {
       failureReason,
       cleanupStatus,

@@ -158,23 +158,32 @@ export function resolveReuseSettings(config: KubernetesProviderConfig): ReuseSet
 export interface ReuseKeyInput {
   companyId: string;
   environmentId: string;
-  executionWorkspaceId: string;
+  /**
+   * The scope key is the execution workspace when the issue has a project, or
+   * (when it has none, e.g. a chat task) the issue itself: the host falls
+   * back to the issue the same way (see `buildReusableSandboxLeaseScope` in
+   * the server's environment-runtime). Exactly one of the two is used; when
+   * `executionWorkspaceId` is set, `projectlessIssueId` is ignored, matching
+   * the host's own precedence.
+   */
+  executionWorkspaceId: string | null;
+  projectlessIssueId?: string | null;
   agentId: string;
   runAdapterType: string;
 }
 
-/** SHA-256 over the reuse scope; the host decides reuse with the same scope. */
+/**
+ * SHA-256 over the reuse scope; the host decides reuse with the same scope.
+ * The scope key stays exactly the bare execution-workspace id when there is
+ * one, so this keeps hashing an existing project-workspace sandbox's key the
+ * same way it always has (no spurious rebuild on upgrade); a projectless
+ * scope hashes a tagged issue id instead, which cannot collide with a real
+ * execution-workspace id.
+ */
 export function computeReuseKey(input: ReuseKeyInput): string {
+  const scopeKey = input.executionWorkspaceId ?? `issue:${input.projectlessIssueId ?? ""}`;
   return createHash("sha256")
-    .update(
-      [
-        input.companyId,
-        input.environmentId,
-        input.executionWorkspaceId,
-        input.agentId,
-        input.runAdapterType,
-      ].join("|"),
-    )
+    .update([input.companyId, input.environmentId, scopeKey, input.agentId, input.runAdapterType].join("|"))
     .digest("hex");
 }
 
@@ -251,7 +260,7 @@ export function computeReuseSpecHash(input: ReuseSpecHashInput): string {
 
 export function buildReuseLabels(input: {
   reuseKey: string;
-  executionWorkspaceId: string;
+  executionWorkspaceId: string | null;
   issueId?: string | null;
 }): Record<string, string> {
   const labels: Record<string, string> = {
