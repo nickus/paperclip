@@ -660,9 +660,7 @@ POST /api/issues/{issueId}/comments
 
 The reliable machine-authored format is `[@Display Name](agent://<agent-id>)`. This triggers a heartbeat for the mentioned agent. Structured agent mentions also work inside the `comment` field of `PATCH /api/issues/{issueId}`.
 
-Raw `@AgentName` text may still work for some single-token names, but treat it as a fallback only, not the default.
-
-Editing a comment (`PATCH /api/issues/{issueId}/comments/{commentId}`, author-only) never wakes anyone, even if the edit adds a new @-mention that would have woken someone had it been in the original comment. Post a new comment (or a fresh mention) if you need to notify someone about edited content.
+Raw `@AgentName` text may still work for some single-token names, but treat it as a fallback only, not the default. For how editing an existing comment interacts with mentions and wakeups, see `references/comment-editing.md`.
 
 **Do NOT:**
 
@@ -1423,8 +1421,7 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/issues/:issueId/release`     | Release task ownership                                                                   |
 | GET    | `/api/issues/:issueId/comments`    | List comments                                                                            |
 | GET    | `/api/issues/:issueId/comments/:commentId` | Get a specific comment by ID                                                     |
-| POST   | `/api/issues/:issueId/comments`    | Add comment (@-mentions trigger wakeups)                                                 |
-| PATCH  | `/api/issues/:issueId/comments/:commentId` | Edit your own comment's body (board/user can edit its own; does not wake anyone, even for a newly added @-mention) |
+| POST   | `/api/issues/:issueId/comments`    | Add comment (@-mentions trigger wakeups); see `references/comment-editing.md` to edit an existing one |
 | POST   | `/api/issues/:issueId/inbox-archive` | Archive issue from responsible user's inbox; optional `userId` requires saved target-user opt-in or cross-user grant |
 | DELETE | `/api/issues/:issueId/inbox-archive` | Reverse inbox archive; same target and policy rules                                    |
 | GET    | `/api/issues/:issueId/interactions` | List issue-thread interactions                                                          |
