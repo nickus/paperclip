@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   canonicalizeEffectiveRunConfigCategory,
   createEffectiveRunConfigFingerprints,
+  createEffectiveRunConfigSubcategoryFingerprints,
   diffEffectiveRunConfigFingerprints,
 } from "../services/effective-run-config-fingerprints.ts";
 
@@ -143,7 +144,7 @@ describe("effective run config fingerprints", () => {
     const canonical = v7.sessionFingerprint.canonicalJson;
 
     expect(canonical).toContain("secret-1");
-    expect(canonical).toContain("binding-1");
+    expect(canonical).not.toContain("binding-1");
     expect(canonical).toContain("provider-version-7");
     expect(canonical).toContain("\"version\":7");
     expect(canonical).not.toContain("resolved-secret-value");
@@ -197,6 +198,63 @@ describe("effective run config fingerprints", () => {
       ],
     });
     expect(versionChanged.sessionFingerprint.fingerprint).not.toBe(v7.sessionFingerprint.fingerprint);
+  });
+
+  it("ignores secret binding row ids so re-saving unchanged bindings keeps every fingerprint", () => {
+    const manifestWithBinding = (bindingId: string, version = 7) => [
+      {
+        configPath: "env.OPENAI_API_KEY",
+        envKey: "OPENAI_API_KEY",
+        secretId: "secret-1",
+        bindingId,
+        version,
+        provider: "local_encrypted",
+        providerVersionRef: `provider-version-${version}`,
+        outcome: "success" as const,
+      },
+    ];
+    // The same env record appears in every category, so each one embeds the
+    // resolved secret metadata.
+    const value = {
+      adapterConfig: { env: { OPENAI_API_KEY: "resolved-secret-value" } },
+      workspaceRuntime: { env: { OPENAI_API_KEY: "resolved-secret-value" } },
+      provider: { env: { OPENAI_API_KEY: "resolved-secret-value" } },
+    };
+    const build = (bindingId: string, version = 7) =>
+      createEffectiveRunConfigFingerprints({
+        session: value,
+        workspace: value,
+        lease: value,
+        secretManifest: manifestWithBinding(bindingId, version),
+      });
+
+    const original = build("binding-before-save");
+    const resaved = build("binding-after-save");
+    expect(resaved.sessionFingerprint).toEqual(original.sessionFingerprint);
+    expect(resaved.workspaceFingerprint).toEqual(original.workspaceFingerprint);
+    expect(resaved.leaseFingerprint).toEqual(original.leaseFingerprint);
+    expect(diffEffectiveRunConfigFingerprints(original, resaved).hasChanges).toBe(false);
+    expect(original.sessionFingerprint.canonicalJson).not.toContain("binding-before-save");
+
+    const subcategories = (bindingId: string) =>
+      createEffectiveRunConfigSubcategoryFingerprints({
+        category: "session",
+        value: {
+          adapterConfig: value.adapterConfig,
+          envBindings: { project: { env: value.adapterConfig.env } },
+        },
+        subcategories: ["adapterConfig", "envBindings"] as const,
+        secretManifest: manifestWithBinding(bindingId),
+      });
+    expect(subcategories("binding-after-save")).toEqual(subcategories("binding-before-save"));
+
+    // A real secret change (a new version) still changes every category.
+    const rotated = build("binding-after-save", 8);
+    expect(diffEffectiveRunConfigFingerprints(original, rotated).changedCategories).toEqual([
+      "session",
+      "workspace",
+      "lease",
+    ]);
   });
 
   it("detects plain env value drift without storing raw values", () => {

@@ -6517,16 +6517,35 @@ async function recordWorkspaceConfigFreshnessOperation(
   }
 }
 
+function compareFingerprintStrings(left: string, right: string) {
+  // Code-unit order, independent of the host locale.
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareSecretManifestFingerprintEntries(
+  left: { configPath: string; envKey: string | null; secretId: string },
+  right: { configPath: string; envKey: string | null; secretId: string },
+) {
+  return (
+    compareFingerprintStrings(left.configPath, right.configPath) ||
+    compareFingerprintStrings(left.envKey ?? "", right.envKey ?? "") ||
+    compareFingerprintStrings(left.secretId, right.secretId)
+  );
+}
+
 function sanitizeSecretManifestForConfigFingerprint(
   manifest: readonly EffectiveRunConfigSecretManifestEntry[],
 ) {
+  // Only the requested secret configuration counts: which secret and version
+  // each config path resolved to. The binding row id is deliberately left out
+  // (it is storage identity and may change when unchanged bindings are saved
+  // again), and entries are sorted so resolution order cannot move the hash.
   return manifest.map((entry) => {
     const record = entry as Record<string, unknown>;
     return {
       configPath: readNonEmptyString(record.configPath) ?? "",
       envKey: readNonEmptyString(record.envKey),
       secretId: readNonEmptyString(record.secretId) ?? "",
-      bindingId: readNonEmptyString(record.bindingId),
       version:
         typeof record.version === "number" && Number.isFinite(record.version)
           ? record.version
@@ -6538,7 +6557,7 @@ function sanitizeSecretManifestForConfigFingerprint(
           ? record.outcome
           : null,
     };
-  });
+  }).sort(compareSecretManifestFingerprintEntries);
 }
 
 async function hashFileContentsForConfigFingerprint(filePath: string) {

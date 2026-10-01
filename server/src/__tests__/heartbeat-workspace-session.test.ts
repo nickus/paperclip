@@ -2675,6 +2675,50 @@ describe("effective run session config freshness", () => {
     expect(canonical).not.toContain("contentHash");
   });
 
+  it("keeps every session fingerprint when bindings are re-saved with new row ids or resolve in another order", async () => {
+    const manifestEntry = (configPath: string, secretId: string, bindingId: string) => ({
+      configPath,
+      envKey: configPath.replace(/^env\./, ""),
+      secretId,
+      bindingId,
+      secretKey: secretId,
+      version: 7,
+      provider: "local_encrypted" as const,
+      outcome: "success" as const,
+    });
+    const effectiveAdapterConfig = {
+      command: "codex",
+      model: "gpt-5.4-mini",
+      env: { OPENAI_API_KEY: "resolved-one", GITHUB_TOKEN: "resolved-two" },
+    };
+    const base = await buildSessionConfigMetadata({
+      effectiveAdapterConfig,
+      secretManifest: [
+        manifestEntry("env.OPENAI_API_KEY", "secret-1", "binding-1"),
+        manifestEntry("env.GITHUB_TOKEN", "secret-2", "binding-2"),
+      ],
+    });
+    const resaved = await buildSessionConfigMetadata({
+      effectiveAdapterConfig,
+      secretManifest: [
+        manifestEntry("env.GITHUB_TOKEN", "secret-2", "binding-4"),
+        manifestEntry("env.OPENAI_API_KEY", "secret-1", "binding-3"),
+      ],
+    });
+
+    expect(resaved.fingerprint).toBe(base.fingerprint);
+    expect(resaved.categoryFingerprints).toEqual(base.categoryFingerprints);
+    expect(base.fingerprints.sessionFingerprint.canonicalJson).not.toContain("binding-1");
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: resaved,
+      }),
+    ).toMatchObject({ reset: false, changedCategories: [], reasons: [] });
+  });
+
   it("does not include raw secret or plain env values in canonical session metadata", async () => {
     const metadata = await buildSessionConfigMetadata();
     const canonical = metadata.fingerprints.sessionFingerprint.canonicalJson;

@@ -22,6 +22,10 @@ export interface EffectiveRunConfigSecretVersionMetadata {
   configPath: string;
   envKey: string | null;
   secretId: string;
+  // Accepted for input compatibility with run secret manifests, but never part
+  // of a fingerprint: a binding row id is storage identity, not configuration.
+  // Re-saving an unchanged binding may give it a new id, and that must not
+  // look like a configuration change.
   bindingId?: string | null;
   version: number | string;
   provider?: string | null;
@@ -138,13 +142,11 @@ function normalizeSecretManifestEntry(
     secretId,
     version,
   };
-  const bindingId = readString(record.bindingId);
   const provider = readString(record.provider);
   const providerVersionRef = readString(record.providerVersionRef);
   const outcome = record.outcome === "success" || record.outcome === "failure"
     ? record.outcome
     : null;
-  if (bindingId !== null) normalized.bindingId = bindingId;
   if (provider !== null) normalized.provider = provider;
   if (providerVersionRef !== null) normalized.providerVersionRef = providerVersionRef;
   if (outcome !== null) normalized.outcome = outcome;
@@ -173,7 +175,6 @@ function canonicalSecretMetadata(
     configPath: metadata.configPath || undefined,
     envKey: metadata.envKey ?? undefined,
     secretId: metadata.secretId,
-    bindingId: metadata.bindingId ?? undefined,
     version: metadata.version,
     provider: metadata.provider ?? undefined,
     providerVersionRef: metadata.providerVersionRef ?? undefined,
