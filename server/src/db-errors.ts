@@ -1,5 +1,6 @@
 const UNIQUE_VIOLATION = "23505";
 const FOREIGN_KEY_VIOLATION = "23503";
+const INVALID_TEXT_REPRESENTATION = "22P02";
 const MAX_CAUSE_DEPTH = 4;
 
 /**
@@ -46,6 +47,36 @@ export function isForeignKeyViolation(error: unknown): boolean {
   for (let depth = 0; depth < MAX_CAUSE_DEPTH && current && typeof current === "object"; depth += 1) {
     const candidate = current as { code?: unknown; cause?: unknown };
     if (candidate.code === FOREIGN_KEY_VIOLATION) return true;
+    current = candidate.cause;
+  }
+  return false;
+}
+
+/**
+ * Recognizes a Postgres invalid-input-syntax error for the `uuid` type
+ * (SQLSTATE 22P02), which Postgres raises when a value that reaches a `uuid`
+ * column or cast is not a well-formed UUID — most often a path or query
+ * parameter (a truncated or otherwise malformed id) that a route forwarded
+ * straight into a query instead of validating first. Drizzle wraps the
+ * driver failure the same way a unique-constraint violation is wrapped, so
+ * this walks `cause` the same way `isUniqueViolation` does.
+ *
+ * Scoped to the `uuid` type specifically via the driver message: `22P02` is
+ * the generic "invalid text representation" code and also covers malformed
+ * input for other cast types (e.g. integers, dates), which should still
+ * surface as a 500 rather than being mistaken for this one known-safe shape.
+ */
+export function isInvalidUuidInput(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current && typeof current === "object"; depth += 1) {
+    const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
+    if (
+      candidate.code === INVALID_TEXT_REPRESENTATION &&
+      typeof candidate.message === "string" &&
+      /\btype uuid\b/i.test(candidate.message)
+    ) {
+      return true;
+    }
     current = candidate.cause;
   }
   return false;

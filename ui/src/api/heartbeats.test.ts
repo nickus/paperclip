@@ -57,6 +57,48 @@ describe("heartbeatsApi.liveRunsForCompany", () => {
   });
 });
 
+describe("heartbeatsApi.log", () => {
+  beforeEach(() => {
+    mockApi.get.mockReset();
+  });
+
+  it("requests the run log with the given offset and limitBytes", async () => {
+    mockApi.get.mockResolvedValue({
+      runId: "run-1",
+      store: "local_file",
+      logRef: "logs/run-1.ndjson",
+      content: "hello\n",
+      nextOffset: 6,
+    });
+
+    await heartbeatsApi.log("run-1", 0, 1000);
+
+    expect(mockApi.get).toHaveBeenCalledWith(
+      "/heartbeat-runs/run-1/log?offset=0&limitBytes=1000",
+      undefined,
+    );
+  });
+
+  it("decodes the before-first-chunk and caught-up-terminal pages as non-null strings with no nextOffset", async () => {
+    // Mirrors what the server now sends for a run that has no log yet: a
+    // just-created run still echoes `nextOffset`, a terminal run (cancelled
+    // while queued, failed before streaming started) omits it so a caller
+    // paging on its presence stops instead of polling forever.
+    mockApi.get.mockResolvedValue({
+      runId: "run-2",
+      store: "",
+      logRef: "",
+      content: "",
+    });
+
+    const result = await heartbeatsApi.log("run-2");
+
+    expect(result.store).toBe("");
+    expect(result.logRef).toBe("");
+    expect(result.nextOffset).toBeUndefined();
+  });
+});
+
 describe("heartbeatsApi.downloadProviderTrace", () => {
   it("initiates tenant-session recovery for a direct trace download", async () => {
     const reload = vi.fn();
