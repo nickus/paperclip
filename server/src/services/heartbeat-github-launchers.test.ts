@@ -75,6 +75,24 @@ describe("heartbeat GitHub launcher lifetime", () => {
     expect(result.cleanupLocation).toEqual({ runId: "run-one", target: mode.target });
     expect(result.env.PAPERCLIP_GITHUB_BROKER_TOKEN).toBe("current-run-secret");
   });
+
+  it.each([false, true])("keeps credential settings for other Git hosts in the run environment (native: %s)", async (native) => {
+    const prepareLaunchers = vi.fn(async (input) => input.env);
+    const result = await prepareHeartbeatGitHubLaunchers({
+      native, githubConfigured: true, agentId: "agent-a", runId: "run-one", target, cwd: "/workspace",
+      brokerUrl: "https://paperclip.test", createBrokerToken: () => "current-run-secret",
+      env: {
+        GIT_CONFIG_COUNT: "2",
+        GIT_CONFIG_KEY_0: "credential.https://github.com.helper", GIT_CONFIG_VALUE_0: "store",
+        GIT_CONFIG_KEY_1: "credential.https://gitlab.com.helper", GIT_CONFIG_VALUE_1: "!gitlab-token-helper",
+      },
+    }, prepareLaunchers);
+    expect(result.env).toMatchObject({
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "credential.https://gitlab.com.helper", GIT_CONFIG_VALUE_0: "!gitlab-token-helper",
+      GIT_CONFIG_KEY_1: "", GIT_CONFIG_VALUE_1: "",
+    });
+  });
 });
 
 
