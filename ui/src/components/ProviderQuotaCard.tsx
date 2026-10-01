@@ -126,8 +126,17 @@ export function ProviderQuotaCard({
   );
   const isClaudeQuotaPanel = provider === "anthropic";
   const supportsSubscriptionQuota = provider === "anthropic" || provider === "openai";
+  // A result with no windows and no error (e.g. claude_local's host-login
+  // probe under Bedrock auth, which is ok:true with an empty windows array)
+  // has nothing to show — rendering it would be a visible but empty panel.
+  // Keep only results that carry data or an error, same as before this card
+  // took a list instead of a single result per provider.
+  const visibleQuotaResults = useMemo(
+    () => quotaResults.filter((result) => (result.ok && result.windows.length > 0) || (!result.ok && !!result.error)),
+    [quotaResults],
+  );
   const showSubscriptionQuotaSection =
-    supportsSubscriptionQuota && (quotaLoading || quotaResults.length > 0);
+    supportsSubscriptionQuota && (quotaLoading || visibleQuotaResults.length > 0);
 
   return (
     <Card>
@@ -318,7 +327,7 @@ export function ProviderQuotaCard({
                 <QuotaPanelSkeleton />
               ) : (
                 <div className="space-y-3">
-                  {quotaResults.map((result, index) => (
+                  {visibleQuotaResults.map((result, index) => (
                     <QuotaResultPanel
                       key={result.label ?? `${provider}-${index}`}
                       provider={provider}
