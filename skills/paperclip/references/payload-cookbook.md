@@ -172,6 +172,51 @@ What the errors mean:
 | `422` `Only the active reviewer or approver can advance the current execution stage` | the actor is not the `executionState.currentParticipant` named on the issue | `GET /api/issues/{issueId}` to see who is, and have them decide |
 | `403` `review_policy_denied` | the issue's `reviewPolicy` restricts who may submit the verdict: `human_only` allows only an authenticated user; `not_creator` disallows the same actor who moved the issue into `in_review` | have a different writer (or a human, for `human_only`) submit the verdict |
 
+## Issue monitor
+
+Scheduling a real monitor (see `SKILL.md`'s "Monitors and Watchers") is one `PATCH` on the issue itself — there is no separate monitor route, and no top-level `monitor` or `monitorNextCheckAt` body field either; a request with either one at the top level is rejected outright (`400` `unknown_fields`, with a `details.suggestions` entry naming the nested path below) rather than silently ignored:
+
+```bash
+jq -n --arg nextCheckAt "2026-04-11T18:00:00.000Z" \
+  '{
+    executionPolicy: {
+      monitor: {
+        nextCheckAt: $nextCheckAt,
+        kind: "external_service",
+        notes: "Waiting on the CI run to finish."
+      }
+    }
+  }' > "$PAPERCLIP_RUN_SCRATCH_DIR/payload.json"
+```
+
+`monitor` fields (from the server's zod schema — `issueExecutionMonitorPolicySchema`):
+
+| Field | Required | Value |
+| --- | --- | --- |
+| `nextCheckAt` | yes | ISO 8601 UTC datetime string ending in a literal `Z`, like the example above (`z.string().datetime()` with default options, no `offset: true` — a numeric offset like `"...+00:00"`, and a space-separated `"2026-04-11 18:00:00"`, both fail) |
+| `notes` | no | string, ≤500 chars; default `null` |
+| `scheduledBy` | no | `"assignee"` or `"board"`; default `"assignee"` |
+| `kind` | no | `"external_service"` is the only accepted value today; default `null` |
+| `serviceName` | no | string, 1–120 chars |
+| `externalRef` | no | string, 1–500 chars — stored redacted; every read of this issue back (including the response to this same `PATCH`) echoes it as `"[redacted]"`, never the value you sent |
+| `timeoutAt` | no | same ISO 8601 `Z` datetime string as `nextCheckAt` |
+| `maxAttempts` | no | positive integer, ≤100 |
+| `recoveryPolicy` | no | `"wake_owner"`, `"create_recovery_issue"`, or `"escalate_to_board"` |
+
+`executionPolicy` is a full replace, not a merge: this `PATCH`'s `executionPolicy` object becomes the issue's entire execution policy, so any `stages` (reviewers/approvers, see "Review transitions" above) or `reviewPreset`/`authorizationPolicy`/`maxReviewRounds` already on the issue are dropped unless this same request repeats them alongside `monitor`. Re-`GET` the issue first if you are not sure what is already set, and send the whole `executionPolicy` back with `monitor` added or changed — not `monitor` alone.
+
+Eligibility is enforced on top of the schema, and it errors only when this exact request is the one setting or changing `executionPolicy.monitor` — see the note below the table for what happens when a monitor already on the issue becomes ineligible through some other field instead:
+
+| Response | Cause | Fix |
+| --- | --- | --- |
+| `400` `unknown_fields` | sent `{"monitor": {...}}` at the top level of the `PATCH` body instead of nested under `executionPolicy` — `details.suggestions.monitor` names the nested path | move it to `{"executionPolicy": {"monitor": {...}}}` |
+| `400` `unknown_fields` | sent `{"monitorNextCheckAt": "..."}` at the top level — it is a read-only column on the issue, never a request field; `details.suggestions.monitorNextCheckAt` names the nested path | move it to `{"executionPolicy": {"monitor": {"nextCheckAt": "..."}}}` |
+| `422` `Invalid execution policy` | a `monitor` field failed the schema: `nextCheckAt`/`timeoutAt` not a valid ISO 8601 datetime (`details.fieldErrors.monitor` is `["Invalid ISO datetime"]`), or `kind` set to anything other than `"external_service"` — `details.fieldErrors.monitor` names it either way | fix the field the message names and resend |
+| `422` `Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review` | the issue has no `assigneeAgentId`, also has a human `assigneeUserId`, or its `status` is not `in_progress`/`in_review` | fix the assignment/status first, then schedule the monitor |
+| `422` `Monitor bounds are already exhausted` | `timeoutAt` has already passed, or the issue's stored attempt count has reached `maxAttempts` — `details.clearReason` is `"timeout_exceeded"` or `"max_attempts_exhausted"` | this monitor is done; do not re-arm it with the same bounds — change `timeoutAt`/`maxAttempts`, or handle the issue another way |
+
+Confirm a monitor actually landed from this same response's `monitorNextCheckAt` (non-null) — do not issue a confirming `GET`. The two failure modes are not symmetric: explicitly sending `executionPolicy.monitor` on an issue that is not eligible gets the `422` above, every time. But a *later*, separate `PATCH` that changes `status` or `assigneeAgentId`/`assigneeUserId` without mentioning `executionPolicy` at all silently clears an already-scheduled monitor instead of erroring, once the new status/assignee makes it ineligible — so re-check `monitorNextCheckAt` after any status or assignee change on an issue you expect to still be monitored, even one that never touched `executionPolicy`.
+
 ## Document
 
 `PUT /api/issues/{issueId}/documents/{key}`; the key uses lowercase letters, digits, `_` and `-`. `format` is required and `"markdown"` is its only value:

@@ -695,6 +695,52 @@ describe("paperclip skill utils", () => {
     ).toBe(false);
   });
 
+  it("documents the exact issue monitor request", async () => {
+    const cookbook = await fs.readFile(path.resolve("skills/paperclip/references/payload-cookbook.md"), "utf8");
+
+    expect(cookbook).toContain("## Issue monitor");
+    // The exact worked body, byte for byte.
+    expect(cookbook).toContain(
+      'executionPolicy: {\n      monitor: {\n        nextCheckAt: $nextCheckAt,\n        kind: "external_service",\n        notes: "Waiting on the CI run to finish."\n      }\n    }',
+    );
+    // No top-level `monitor`/`monitorNextCheckAt`, and why.
+    expect(cookbook).toContain("no top-level `monitor` or `monitorNextCheckAt` body field");
+    expect(cookbook).toContain("`executionPolicy` is a full replace, not a merge");
+
+    // The documented body parses, with the defaults the cookbook's field
+    // table states.
+    const nextCheckAt = "2026-04-11T18:00:00.000Z";
+    const parsed = updateIssueSchema.parse({
+      executionPolicy: { monitor: { nextCheckAt, kind: "external_service", notes: "Waiting on the CI run to finish." } },
+    });
+    expect(parsed.executionPolicy?.monitor).toMatchObject({
+      nextCheckAt,
+      kind: "external_service",
+      notes: "Waiting on the CI run to finish.",
+      scheduledBy: "assignee",
+      serviceName: null,
+      externalRef: null,
+      timeoutAt: null,
+      maxAttempts: null,
+      recoveryPolicy: null,
+    });
+    // executionPolicy is a full replace: a monitor-only PATCH normalizes to
+    // no stages, exactly as the cookbook warns.
+    expect(parsed.executionPolicy?.stages).toEqual([]);
+
+    // `nextCheckAt` is the only required monitor field.
+    expect(updateIssueSchema.safeParse({ executionPolicy: { monitor: {} } }).success).toBe(false);
+    expect(updateIssueSchema.safeParse({ executionPolicy: { monitor: { nextCheckAt } } }).success).toBe(true);
+
+    // The documented datetime format: a literal `Z` is required; a numeric
+    // offset or a space-separated timestamp both fail, as the field table says.
+    expect(updateIssueSchema.safeParse({ executionPolicy: { monitor: { nextCheckAt: "2026-04-11T18:00:00+00:00" } } }).success).toBe(false);
+    expect(updateIssueSchema.safeParse({ executionPolicy: { monitor: { nextCheckAt: "2026-04-11 18:00:00" } } }).success).toBe(false);
+
+    // `kind` accepts only "external_service", as the field table says.
+    expect(updateIssueSchema.safeParse({ executionPolicy: { monitor: { nextCheckAt, kind: "webhook" } } }).success).toBe(false);
+  });
+
   it("quotes status-transition errors exactly as the server sends them", async () => {
     const cookbook = await fs.readFile(path.resolve("skills/paperclip/references/payload-cookbook.md"), "utf8");
     const serverSource = [
