@@ -463,6 +463,26 @@ describe("release with reuseLease", () => {
     expect(cluster.sandboxes.size).toBe(0);
   });
 
+  it("leaves the failure count alone for a cancelled or interrupted run", async () => {
+    const lease = await acquire();
+    const annotations = () => cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations;
+    await release(lease, REUSE_CONFIG, { runStatus: "failed" });
+    let current = await resume(lease);
+    await release(current, REUSE_CONFIG, { runStatus: "failed" });
+    expect(annotations()[REUSE_ANNOTATIONS.consecutiveFailures]).toBe("2");
+
+    // Neither says anything about the sandbox: no third failure, no reset.
+    for (const runStatus of ["interrupted", "expired", "interrupted"]) {
+      current = await resume(current);
+      await expect(release(current, REUSE_CONFIG, { runStatus, cancelActiveWork: true })).resolves.toMatchObject({
+        state: "stopped",
+      });
+      expect(annotations()[REUSE_ANNOTATIONS.consecutiveFailures]).toBe("2");
+    }
+    current = await resume(current);
+    await expect(release(current, REUSE_CONFIG, { runStatus: "failed" })).resolves.toMatchObject({ state: "destroyed" });
+  });
+
   it("tears the sandbox down when its pod was replaced during the run that created it", async () => {
     const lease = await acquire();
     // The run's first command records the pod it started on.

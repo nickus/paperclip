@@ -671,9 +671,17 @@ async function releaseReusableLease(
     return await destroy(`could not verify that the run's processes stopped (${reset.detail || "no output"})`);
   }
 
-  // Only the host knows how the run ended; older hosts do not say, and then
-  // nothing is counted.
-  const consecutiveFailures = params.runStatus === "failed" ? state.consecutiveFailures + 1 : 0;
+  // Only the host knows how the run ended. A failed run adds to the count and
+  // a completed one resets it. A cancelled run or one the host interrupted
+  // (for example because the host went away) says nothing about the sandbox
+  // and leaves the count as it is. Older hosts do not say, and then nothing is
+  // counted.
+  const consecutiveFailures =
+    params.runStatus === "failed"
+      ? state.consecutiveFailures + 1
+      : params.runStatus === "expired" || params.runStatus === "interrupted"
+        ? state.consecutiveFailures
+        : 0;
   if (consecutiveFailures >= REUSE_MAX_CONSECUTIVE_FAILURES) {
     return await destroy(`the last ${consecutiveFailures} runs in it failed; the next run starts in a fresh sandbox`);
   }

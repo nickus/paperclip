@@ -3404,6 +3404,28 @@ function createSandboxEnvironmentDriver(
   }
 
   /**
+   * How the run that held `lease` ended, as a provider release reports it
+   * (`runStatus`). `status` is the lease's release status. A run the host
+   * interrupted (a server shutdown, a lost process) is reported `interrupted`
+   * whatever its status, so a provider that stops keeping a sandbox in which
+   * run after run fails does not count it: it says nothing about the sandbox.
+   */
+  async function providerReleaseRunStatus<S extends "released" | "expired" | "failed" | null>(
+    lease: Pick<EnvironmentLease, "companyId" | "heartbeatRunId">,
+    status: S,
+  ): Promise<S | "interrupted"> {
+    if (!lease.heartbeatRunId || status === "expired") return status;
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, lease.companyId)))
+      .limit(1);
+    return run?.status === "interrupted" || (run?.status === "failed" && run.errorCode === "process_lost")
+      ? "interrupted"
+      : status;
+  }
+
+  /**
    * Whether a stop-and-retain of `lease` goes through the provider's release
    * because its worker has no stop method. Only for a sandbox kept between
    * runs: its release stops the run's work and keeps the sandbox for the next
@@ -3442,6 +3464,7 @@ function createSandboxEnvironmentDriver(
           lease: input.lease,
           provider: providerKey,
         });
+        const runStatus = await providerReleaseRunStatus(input.lease, input.status);
         // The release error is swallowed into cleanupStatus below, so evict the
         // cached secret here: the reaper's retry then re-resolves it in full.
         const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () =>
@@ -3456,7 +3479,7 @@ function createSandboxEnvironmentDriver(
             ...(input.cancelActiveWork ? { cancelActiveWork: true } : {}),
             // How the run ended, so a provider that keeps sandboxes between
             // runs can stop keeping one in which run after run fails.
-            runStatus: input.status,
+            runStatus,
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)))),
         );
         termination = remoteTerminationReceipt(input.lease, receipt);
@@ -3575,7 +3598,7 @@ function createSandboxEnvironmentDriver(
       provider: providerKey,
     });
     const workerConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
-    const runStatus = readPendingCleanupReleaseRunStatus(metadata);
+    const runStatus = await providerReleaseRunStatus(input.lease, readPendingCleanupReleaseRunStatus(metadata));
     const receipt = await evictRuntimeSecretsOnCredentialRejection(input.environment.id, () =>
       pluginWorkerManager.call(pluginId, "environmentReleaseLease", {
         driverKey: providerKey,

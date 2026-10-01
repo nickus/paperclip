@@ -525,6 +525,11 @@ describeEmbeddedPostgres("reusable sandbox leases parked for a release", () => {
       expect(await leaseRow(lease.id)).toMatchObject({ status: "released" });
       expect(worker.calls("environmentDestroyLease")).toEqual([]);
       expect(worker.sandboxes.get(lease.providerLeaseId!)).toBe("idle");
+      // A lost process is not a failure of the sandbox: the provider does not
+      // count it toward giving the sandbox up.
+      expect(worker.calls("environmentReleaseLease")).toEqual([
+        expect.objectContaining({ providerLeaseId: lease.providerLeaseId, runStatus: "interrupted" }),
+      ]);
     });
 
     it("retries a lost run's parked release before it queues the run's retry", async () => {
@@ -551,6 +556,10 @@ describeEmbeddedPostgres("reusable sandbox leases parked for a release", () => {
       expect(retry).toBeDefined();
       // Both releases ran while the lost run was the agent's only run.
       expect(runsAtEachRelease).toEqual([1, 1]);
+      expect(worker.calls("environmentReleaseLease").map((params) => params.runStatus)).toEqual([
+        "interrupted",
+        "interrupted",
+      ]);
     });
   });
 

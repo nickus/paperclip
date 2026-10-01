@@ -683,13 +683,15 @@ export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDr
   leaseMetadata?: Record<string, unknown>;
   /**
    * How the run that held the lease ended (`released` for a completed run,
-   * `failed` for a failed one, `expired` for a cancelled one), when the host
-   * releases a lease at the end of a run or retries that release. A provider
-   * that keeps sandboxes between runs can use it to stop keeping a sandbox in
-   * which run after run fails. Omitted otherwise, and by hosts that predate
-   * this field.
+   * `failed` for a failed one, `expired` for a cancelled one, `interrupted`
+   * for one the host interrupted, for example because the host process went
+   * away), when the host releases a lease at the end of a run or retries that
+   * release. A provider that keeps sandboxes between runs can use it to stop
+   * keeping a sandbox in which run after run fails; a cancelled or interrupted
+   * run says nothing about the sandbox. Omitted otherwise, and by hosts that
+   * predate this field.
    */
-  runStatus?: "released" | "failed" | "expired";
+  runStatus?: "released" | "failed" | "expired" | "interrupted";
 }
 
 /** Returned only after the provider confirms that execution has ended. A queued
