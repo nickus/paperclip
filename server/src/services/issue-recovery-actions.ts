@@ -259,6 +259,36 @@ export function issueRecoveryActionService(db: Db) {
     return result;
   }
 
+  // The most recent settled (resolved/cancelled) action sharing this source
+  // issue, cause and fingerprint. A reconciler escalation must compare its
+  // triggering run against this before opening a new hold: a run that
+  // finished before this resolution is the stale run the resolution already
+  // addressed, and reopening from it would recreate an identical hold that
+  // nothing has retried yet.
+  async function getLatestResolutionForIdentity(input: {
+    companyId: string;
+    sourceIssueId: string;
+    cause: string;
+    fingerprint: string;
+  }): Promise<{ resolvedAt: Date | null } | null> {
+    const row = await db
+      .select({ resolvedAt: issueRecoveryActions.resolvedAt })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, input.companyId),
+          eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId),
+          eq(issueRecoveryActions.cause, input.cause),
+          eq(issueRecoveryActions.fingerprint, input.fingerprint),
+          inArray(issueRecoveryActions.status, ["resolved", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.resolvedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return row ?? null;
+  }
+
   async function retryUpsertSourceScoped(
     input: UpsertIssueRecoveryActionInput,
     retryCount: number,
@@ -570,6 +600,7 @@ export function issueRecoveryActionService(db: Db) {
   return {
     getActiveForIssue,
     listActiveForIssues,
+    getLatestResolutionForIdentity,
     resolveActiveForIssue,
     upsertSourceScoped,
   };
