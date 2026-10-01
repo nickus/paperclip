@@ -72,7 +72,9 @@ The adapter persists Claude Code session IDs between heartbeats. On the next wak
 
 Session resume is cwd-aware: if the agent's working directory changed since the last run, a fresh session starts instead.
 
-If resume fails with an unknown session error, the adapter automatically retries with a fresh session.
+With the CLI engine (`engine: "cli"`), an edit to the agent's instructions or skills keeps the session. Claude Code replays the system prompt a conversation recorded on its first request, so when the instructions file or skills differ from the ones the session recorded, the adapter resumes with `--system-prompt-snapshot off` and the current instructions file; where the installed CLI does not advertise that flag, a fresh session starts instead. With a CLI that advertises the flag, every resume also passes the current instructions file, so the instructions are still there after Claude Code compacts the conversation. A resumed agent is told which parts of its configuration changed since its previous turn. Set `resetSessionOnPromptChange: true` to start a fresh session on every instructions or skills change. The ACP engine starts a fresh session when the instructions or skills change.
+
+If resume fails with an unknown session error, the adapter automatically retries with a fresh session, which gets the full prompt of a new session.
 
 ### Poisoned `previous_message_id` (recovery)
 
