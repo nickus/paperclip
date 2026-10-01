@@ -2997,7 +2997,7 @@ describe("sandbox adapter execution targets", () => {
       .toBe("prefix |suffix\n");
   });
 
-  it("delivers the final batch and a warning when run log polling degrades", async () => {
+  it("keeps retrying (never gives up) when run log polling degrades, and finish() reports it is still degraded", async () => {
     const events: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
     const runner = {
       execute: vi.fn(async () => ({
@@ -3016,6 +3016,7 @@ describe("sandbox adapter execution targets", () => {
       remoteCwd: "/workspace",
       logsDir: "/workspace/.paperclip-runtime/codex/paperclip-bridge/queue/logs",
       pollIntervalMs: 1,
+      maxBackoffMs: 5,
       tickTimeoutMs: 50,
       maxConsecutiveFailures: 1,
     }).create();
@@ -3023,13 +3024,26 @@ describe("sandbox adapter execution targets", () => {
     tail.start(async (stream, chunk) => {
       events.push({ stream, chunk });
     });
-    await waitForCondition(() => runner.execute.mock.calls.length >= 1, "run log tail did not poll before finish");
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    // The old behavior gave up for good after the first failure. Waiting for
+    // several more polls proves the loop keeps retrying instead.
+    await waitForCondition(
+      () => runner.execute.mock.calls.length >= 3,
+      "run log tail stopped retrying after degrading",
+    );
+    expect(tail.health().degraded).toBe(true);
     await tail.finish({ stdout: "final out\n", stderr: "final err\n" });
 
     expect(combinedStream(events, "stdout")).toBe("final out\n");
-    expect(combinedStream(events, "stderr")).toBe(
-      "final err\n[paperclip] Run log streaming degraded during the run; remaining output was delivered at completion.\n",
+    // The degraded/"still retrying" notices were already logged live, before
+    // `finish()` ran, so they precede the final batch's own "final err" line
+    // in the stream rather than the other way around.
+    const stderrText = combinedStream(events, "stderr");
+    expect(stderrText).toContain("final err\n");
+    expect(stderrText).toContain(
+      "[paperclip] Run log streaming degraded (the host could not read the sandbox's log files)",
+    );
+    expect(stderrText).toContain(
+      "[paperclip] Run log streaming was still degraded when the run completed",
     );
   });
 
