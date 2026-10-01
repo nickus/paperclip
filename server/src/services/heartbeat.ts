@@ -683,7 +683,11 @@ import {
   type ProviderResourceDisposition,
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
-import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
+import {
+  environmentRunOrchestrator,
+  EnvironmentRunError,
+  type EnvironmentErrorCode,
+} from "./environment-run-orchestrator.js";
 import {
   isRemoteSessionWorkspaceCwd,
   isUnsafeSessionWorkspaceCwd,
@@ -1327,6 +1331,65 @@ export function parseSandboxProviderPluginNotReadyFailureMessage(
     pluginKey: match[2] ?? "",
     pluginStatus: (match[3] ?? "").toLowerCase(),
   };
+}
+
+// `EnvironmentRunError` codes that originate in the host's own environment
+// plumbing (acquiring/renewing a sandbox lease, realizing its workspace,
+// resolving its execution transport, or probing it) rather than in how the
+// agent itself is configured. Deliberately excludes `environment_not_found`,
+// `environment_inactive`, `unsupported_environment` and
+// `unsupported_adapter_environment`: those mean the agent (or its project)
+// points at an environment selection a human must fix, not a platform outage
+// that clears on its own.
+const PLATFORM_ENVIRONMENT_RUN_ERROR_CODES = new Set<EnvironmentErrorCode>([
+  "lease_acquire_failed",
+  "workspace_realization_failed",
+  "transport_resolution_failed",
+  "probe_failed",
+]);
+
+// Forward-compatible errorCode an adapter or environment driver may report
+// for a reachability failure against the model endpoint itself (DNS/connect/
+// TLS failure to the configured host), as opposed to anything about the
+// agent's own adapter configuration.
+const MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE = "model_endpoint_unreachable";
+
+/**
+ * True when `error` is a platform- or infrastructure-caused setup failure:
+ * the sandbox provider plugin is not ready, lease acquisition/workspace
+ * realization/transport resolution failed against the host environment
+ * (including a setup-stage plugin RPC or exec timeout, which surfaces as one
+ * of these same `EnvironmentRunError` codes), or the model endpoint itself
+ * was unreachable. None of these are something an operator fixes on the
+ * *agent* — they clear on their own once the platform recovers — so a run
+ * that fails this way must fail (and still drive recovery/escalation as
+ * normal), but must not move the agent into `error` status. See
+ * `finalizeAgentStatus`'s `keepIdleOnFailure` at both of its call sites
+ * below. Contrast with an agent-specific failure (a missing secret binding,
+ * an invalid model id), which keeps the existing error-status behavior.
+ */
+function isPlatformInfrastructureSetupFailure(error: unknown): boolean {
+  if (
+    error instanceof EnvironmentRunError &&
+    PLATFORM_ENVIRONMENT_RUN_ERROR_CODES.has(error.code)
+  ) {
+    return true;
+  }
+  if (
+    parseSandboxProviderPluginNotReadyFailureMessage(
+      error instanceof Error ? error.message : null,
+    )
+  ) {
+    return true;
+  }
+  const candidate =
+    error && typeof error === "object"
+      ? (error as { code?: unknown; errorCode?: unknown })
+      : null;
+  return (
+    candidate?.code === MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE ||
+    candidate?.errorCode === MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE
+  );
 }
 
 function isRetryableInteractionContinuationInfrastructureFailure(
@@ -27975,7 +28038,12 @@ export function heartbeatService(
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
           keepIdleOnFailure:
             Boolean(nonRetryablePreflightFailureCode(err)) ||
-            isWorkspaceSyncConflictFailure(message),
+            isWorkspaceSyncConflictFailure(message) ||
+            // A platform/infrastructure failure (sandbox provider plugin not
+            // ready, lease/workspace/transport failure, unreachable model
+            // endpoint) is not evidence that this agent's own configuration
+            // is broken; it clears on its own once the platform recovers.
+            isPlatformInfrastructureSetupFailure(err),
         });
       }
     } catch (outerErr) {
@@ -28234,7 +28302,17 @@ export function heartbeatService(
             // Keep the failed run and its safe provider refusal authoritative,
             // but return the agent to idle so clients do not also announce a
             // misleading agent-wide error for the same rejected chat turn.
-            keepIdleOnFailure: Boolean(nonRetryablePreflightCode),
+            keepIdleOnFailure:
+              Boolean(nonRetryablePreflightCode) ||
+              // Same reasoning for a platform/infrastructure setup failure
+              // (sandbox provider plugin stuck `error`/`disabled`, a lease,
+              // workspace-realization or transport failure against the host
+              // environment, an unreachable model endpoint): the run is
+              // still failed and still blocks the issue for an operator, but
+              // the agent itself did nothing wrong and recovers on its own
+              // once the platform does, so it must not be left in `error`
+              // needing a manual clear-error after the fact.
+              isPlatformInfrastructureSetupFailure(outerErr),
           }).catch(() => undefined);
         }
       }
