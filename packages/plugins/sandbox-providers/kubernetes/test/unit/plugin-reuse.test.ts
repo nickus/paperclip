@@ -538,6 +538,129 @@ describe("release with reuseLease", () => {
   });
 });
 
+describe("stop and keep", () => {
+  function stop(
+    lease: { providerLeaseId: string | null; metadata?: Record<string, unknown> },
+    config: Record<string, unknown> = REUSE_CONFIG,
+  ) {
+    return plugin.definition.onEnvironmentStopLease!({
+      driverKey: "kubernetes",
+      companyId: SCOPE.companyId,
+      environmentId: SCOPE.environmentId,
+      config,
+      providerLeaseId: lease.providerLeaseId,
+      leaseMetadata: lease.metadata,
+      cancelActiveWork: true,
+      resourceDisposition: "stop_and_retain",
+    });
+  }
+
+  it("stops the processes, keeps the sandbox idle and keeps its failure count", async () => {
+    const lease = await acquire();
+    await release(lease, REUSE_CONFIG, { runStatus: "failed" });
+    const resumed = await resume(lease);
+    vi.mocked(execInPod).mockClear();
+
+    await expect(stop(resumed)).resolves.toEqual({ providerLeaseId: lease.providerLeaseId, state: "stopped" });
+
+    expect(vi.mocked(execInPod).mock.calls.map((call) => call[4])).toEqual([
+      ["/bin/sh", "-c", PROCESS_RESET_SCRIPT, "paperclip-process-reset"],
+    ]);
+    const annotations = cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations;
+    expect(annotations[REUSE_ANNOTATIONS.leaseState]).toBe("idle");
+    expect(annotations[REUSE_ANNOTATIONS.consecutiveFailures]).toBe("1");
+    expect(cluster.pods.has(lease.providerLeaseId!)).toBe(true);
+    expect(cluster.clients.custom.deleteNamespacedCustomObject).not.toHaveBeenCalled();
+    // The next run of the task resumes the kept sandbox.
+    await expect(resume(resumed)).resolves.toMatchObject({ providerLeaseId: lease.providerLeaseId });
+  });
+
+  it("keeps the sandbox when reuse was turned off, for the idle reaper to remove", async () => {
+    const lease = await acquire();
+    await expect(stop(lease, { ...REUSE_CONFIG, reuseLease: false })).resolves.toMatchObject({ state: "stopped" });
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations[REUSE_ANNOTATIONS.leaseState]).toBe("idle");
+    expect(cluster.clients.custom.deleteNamespacedCustomObject).not.toHaveBeenCalled();
+  });
+
+  it("takes a release that asks to stop and retain the same way", async () => {
+    const lease = await acquire();
+    await expect(
+      release(lease, { ...REUSE_CONFIG, reuseLease: false }, { resourceDisposition: "stop_and_retain" }),
+    ).resolves.toMatchObject({ state: "stopped" });
+    expect(cluster.sandboxes.has(lease.providerLeaseId!)).toBe(true);
+  });
+
+  it("throws instead of removing the sandbox when the stop cannot be verified", async () => {
+    const lease = await acquire();
+    vi.mocked(execInPod).mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "paperclip-process-reset: failed remaining= 42" });
+
+    await expect(stop(lease)).rejects.toThrow(/Could not verify that the processes .* stopped .*the sandbox was kept/);
+    expect(cluster.sandboxes.has(lease.providerLeaseId!)).toBe(true);
+    expect(cluster.pods.has(lease.providerLeaseId!)).toBe(true);
+    expect(cluster.clients.custom.deleteNamespacedCustomObject).not.toHaveBeenCalled();
+    expect(cluster.clients.core.deleteNamespacedPod).not.toHaveBeenCalled();
+  });
+
+  it("refuses commands after the stop until a run resumes the sandbox", async () => {
+    const lease = await acquire();
+    await stop(lease);
+    await expect(execute(lease, "echo late")).resolves.toMatchObject({ exitCode: null, metadata: { leaseReleased: true } });
+    const resumed = await resume(lease);
+    await expect(execute(resumed, "echo next-run")).resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it("reports a sandbox or pod that is gone as destroyed and deletes nothing", async () => {
+    const withoutSandbox = await acquire();
+    cluster.sandboxes.delete(withoutSandbox.providerLeaseId!);
+    await expect(stop(withoutSandbox)).resolves.toEqual({
+      providerLeaseId: withoutSandbox.providerLeaseId,
+      state: "destroyed",
+    });
+
+    const withoutPod = await acquire(REUSE_CONFIG, { executionWorkspaceId: "workspace-2" });
+    cluster.pods.delete(withoutPod.providerLeaseId!);
+    await expect(stop(withoutPod)).resolves.toMatchObject({ state: "destroyed" });
+    expect(cluster.sandboxes.has(withoutPod.providerLeaseId!)).toBe(true);
+
+    const replaced = await acquire(REUSE_CONFIG, { executionWorkspaceId: "workspace-3" });
+    await execute(replaced, "echo first");
+    cluster.replacePod(replaced.providerLeaseId!);
+    vi.mocked(execInPod).mockClear();
+    await expect(stop(replaced)).resolves.toMatchObject({ state: "destroyed" });
+    expect(execInPod).not.toHaveBeenCalled();
+
+    expect(cluster.clients.custom.deleteNamespacedCustomObject).not.toHaveBeenCalled();
+  });
+
+  it("asks for a retry while the sandbox is being deleted", async () => {
+    const lease = await acquire();
+    cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.deletionTimestamp = new Date().toISOString();
+    await expect(stop(lease)).rejects.toThrow(/is being deleted/);
+  });
+
+  it("stops and keeps a sandbox that is not kept between runs", async () => {
+    const config = { ...REUSE_CONFIG, reuseLease: false };
+    const lease = await acquire(config);
+    expect(lease.metadata?.kubernetesReuse).toBeUndefined();
+
+    await expect(stop(lease, config)).resolves.toMatchObject({ state: "stopped" });
+    expect(execInPod).toHaveBeenCalledTimes(1);
+    expect(cluster.sandboxes.has(lease.providerLeaseId!)).toBe(true);
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations ?? {}).not.toHaveProperty(
+      REUSE_ANNOTATIONS.leaseState,
+    );
+    // An exact resume of the stopped sandbox accepts commands again.
+    const resumed = await resume(lease, config);
+    await expect(execute(resumed, "echo resumed", config)).resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it("refuses to stop a job, which cannot be kept", async () => {
+    await expect(
+      stop({ providerLeaseId: "pc-job", metadata: { backend: "job", namespace: "paperclip-tenant" } }),
+    ).rejects.toThrow(/cannot be stopped without removing it/);
+  });
+});
+
 describe("destroy with reuseLease", () => {
   it("removes the sandbox, its secret and its task-scoped egress policy", async () => {
     const lease = await acquire(REUSE_CONFIG, {
