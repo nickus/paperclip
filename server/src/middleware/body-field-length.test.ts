@@ -1,0 +1,60 @@
+import express from "express";
+import request from "supertest";
+import { describe, expect, it } from "vitest";
+import { errorHandler } from "./error-handler.js";
+import { rejectOversizedBodyField } from "./body-field-length.js";
+
+function createApp(maxLength = 10) {
+  const app = express();
+  app.use(express.json());
+  app.post(
+    "/notes",
+    rejectOversizedBodyField({ payloadName: "Note", field: "body", maxLength }),
+    (req, res) => {
+      res.json({ received: req.body });
+    },
+  );
+  app.use(errorHandler);
+  return app;
+}
+
+describe("rejectOversizedBodyField", () => {
+  it("passes a field at or under the limit through unchanged", async () => {
+    const res = await request(createApp(10)).post("/notes").send({ body: "0123456789" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.received).toEqual({ body: "0123456789" });
+  });
+
+  it("rejects a field over the limit with the field, limit and actual length", async () => {
+    const res = await request(createApp(10)).post("/notes").send({ body: "01234567890" });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({
+      error: "Note body is too long",
+      field: "body",
+      maxLength: 10,
+      actualLength: 11,
+    });
+  });
+
+  it("leaves a non-string field to schema validation", async () => {
+    const res = await request(createApp(10)).post("/notes").send({ body: 12345 });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.received).toEqual({ body: 12345 });
+  });
+
+  it("leaves a missing field to schema validation", async () => {
+    const res = await request(createApp(10)).post("/notes").send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
+  it("leaves a non-object body to schema validation", async () => {
+    const res = await request(createApp(10)).post("/notes").send([{ body: "01234567890" }]);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.received).toEqual([{ body: "01234567890" }]);
+  });
+});

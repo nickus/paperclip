@@ -510,6 +510,25 @@ describe.sequential("issue comment edit routes", () => {
     expect(res.body.error).toBe("Comment not found");
   });
 
+  it("rejects an oversized body with the field, limit and actual length, before unknown-field alias concerns apply", async () => {
+    // 100_000 is ISSUE_COMMENT_MAX_BODY_LENGTH (packages/shared/src/validators/issue.ts),
+    // shared with POST /issues/:id/comments so the two routes never drift.
+    const overLimit = "a".repeat(100_001);
+
+    const res = await request(installActor(createApp(), agentActor(ASSIGNEE_AGENT_ID)))
+      .patch(`/api/issues/${ISSUE_ID}/comments/comment-1`)
+      .send({ body: overLimit });
+
+    expect(res.status, describeResponse(res)).toBe(400);
+    expect(res.body).toEqual({
+      error: "Comment edit body is too long",
+      field: "body",
+      maxLength: 100_000,
+      actualLength: 100_001,
+    });
+    expect(mockIssueService.editComment).not.toHaveBeenCalled();
+  });
+
   it("rejects an empty body", async () => {
     const res = await request(installActor(createApp(), agentActor(ASSIGNEE_AGENT_ID)))
       .patch(`/api/issues/${ISSUE_ID}/comments/comment-1`)
@@ -548,6 +567,26 @@ describe.sequential("issue comment edit routes", () => {
       "Aliased body field",
       expect.anything(),
     );
+  });
+
+  it("rejects an oversized body on comment creation with the same limit and shape as edit", async () => {
+    // Confirms parity with the edit route's equivalent test above: creation
+    // uses the exact same ISSUE_COMMENT_MAX_BODY_LENGTH, and the only
+    // difference in the response is the create-specific message text.
+    const overLimit = "a".repeat(100_001);
+
+    const res = await request(installActor(createApp(), agentActor(ASSIGNEE_AGENT_ID)))
+      .post(`/api/issues/${ISSUE_ID}/comments`)
+      .send({ body: overLimit });
+
+    expect(res.status, describeResponse(res)).toBe(400);
+    expect(res.body).toEqual({
+      error: "Comment body is too long",
+      field: "body",
+      maxLength: 100_000,
+      actualLength: 100_001,
+    });
+    expect(mockIssueService.editComment).not.toHaveBeenCalled();
   });
 
   it("never wakes the assignee agent on an edit", async () => {

@@ -61,6 +61,7 @@ import {
   projectWorkspaces,
 } from "@paperclipai/db";
 import {
+  ISSUE_COMMENT_MAX_BODY_LENGTH,
   addIssueCommentSchema,
   editIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
@@ -151,6 +152,7 @@ import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
 import { rejectUnknownBodyFields } from "../middleware/unknown-body-fields.js";
+import { rejectOversizedBodyField } from "../middleware/body-field-length.js";
 import * as serviceIndex from "../services/index.js";
 import {
   accessService,
@@ -435,6 +437,22 @@ const rejectUnknownIssueCommentEditFields = rejectUnknownBodyFields({
     message: "body",
     content: "body",
   },
+});
+// Runs ahead of `validate(addIssueCommentSchema)` / `validate(editIssueCommentSchema)`
+// (and after the unknown-field middleware above, so a `comment` alias has
+// already been normalized onto `body`) so an oversized comment gets a 400
+// that names the field and the limit instead of a generic Zod "Validation
+// error" issues array. Both routes share the same `maxLength`: see
+// `ISSUE_COMMENT_MAX_BODY_LENGTH`.
+const rejectOversizedIssueCommentBody = rejectOversizedBodyField({
+  payloadName: "Comment",
+  field: "body",
+  maxLength: ISSUE_COMMENT_MAX_BODY_LENGTH,
+});
+const rejectOversizedIssueCommentEditBody = rejectOversizedBodyField({
+  payloadName: "Comment edit",
+  field: "body",
+  maxLength: ISSUE_COMMENT_MAX_BODY_LENGTH,
 });
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -17675,6 +17693,7 @@ export function issueRoutes(
   router.patch(
     "/issues/:id/comments/:commentId",
     rejectUnknownIssueCommentEditFields,
+    rejectOversizedIssueCommentEditBody,
     validate(editIssueCommentSchema),
     async (req, res) => {
       const id = req.params.id as string;
@@ -17881,6 +17900,7 @@ export function issueRoutes(
   router.post(
     "/issues/:id/comments",
     rejectUnknownIssueCommentFields,
+    rejectOversizedIssueCommentBody,
     validate(addIssueCommentSchema),
     async (req, res) => {
       const id = req.params.id as string;
