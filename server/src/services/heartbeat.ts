@@ -722,6 +722,7 @@ import {
   type EffectiveRunConfigSecretManifestEntry,
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import { isPluginActivationRetryPendingForKey } from "./plugin-loader.js";
 import { serverVersion } from "../version.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
@@ -28045,6 +28046,28 @@ export function heartbeatService(
           parseSandboxProviderPluginNotReadyFailureMessage(
             outerErr instanceof Error ? outerErr.message : null,
           );
+        // ...unless the plugin is merely mid-restart: plugin-loader.ts
+        // schedules an automatic, backing-off re-activation retry for a
+        // plugin that landed in `error` from a transient activation failure
+        // (see isTransientPluginActivationFailure there), and that retry is
+        // very likely to land within the next few backoff steps. Routing
+        // every lease failure in that window to the board-owned
+        // configuration_validation hold would hand an operator a config-fix
+        // task that resolves itself before they ever look at it. While a
+        // retry is pending for this exact plugin, treat the failure as
+        // ordinary stranded-issue infrastructure instead — it falls through
+        // to the default "setup_failed" below, which resolveStrandedRecoveryCause
+        // (recovery/service.ts) classifies as a plain `stranded_assigned_issue`
+        // and the issue gets picked back up automatically rather than held.
+        // `disabled`/`upgrade_pending` plugins never get an automatic retry
+        // scheduled, so they always keep the configuration_incomplete
+        // classification.
+        const sandboxProviderPluginActivationRetryPending =
+          sandboxProviderPluginNotReadySetupFailure !== null &&
+          sandboxProviderPluginNotReadySetupFailure.pluginStatus === "error" &&
+          isPluginActivationRetryPendingForKey(
+            sandboxProviderPluginNotReadySetupFailure.pluginKey,
+          );
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(
             (await getRun(runId).catch(() => null))?.errorCode,
@@ -28057,7 +28080,8 @@ export function heartbeatService(
           workspaceValidationSetupFailure?.code ??
           configurationIncompleteSetupFailure?.code ??
           (unresolvedBaseRefSetupFailure ||
-          sandboxProviderPluginNotReadySetupFailure
+          (sandboxProviderPluginNotReadySetupFailure &&
+            !sandboxProviderPluginActivationRetryPending)
             ? CONFIGURATION_INCOMPLETE_FAILURE_CODE
             : null) ??
           recordedResponsibleUserDenialCode ??
@@ -28088,7 +28112,8 @@ export function heartbeatService(
                 unresolvedBaseRefSetupFailure,
               )
             : null) ??
-          (sandboxProviderPluginNotReadySetupFailure
+          (sandboxProviderPluginNotReadySetupFailure &&
+          !sandboxProviderPluginActivationRetryPending
             ? buildSandboxProviderPluginNotReadyResultJson(
                 run,
                 sandboxProviderPluginNotReadySetupFailure,
