@@ -75,6 +75,8 @@ const mockedAppendHeartbeatRunEvent = vi.mocked(appendHeartbeatRunEvent);
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
+const MODEL_ENDPOINT_UNREACHABLE_TEST_ADAPTER = "model_endpoint_unreachable_test";
+const AGENT_CONFIG_FAILURE_TEST_ADAPTER = "agent_config_failure_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -129,6 +131,49 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
+    registerServerAdapter({
+      type: MODEL_ENDPOINT_UNREACHABLE_TEST_ADAPTER,
+      // Mirrors opencode-local's own preflight: the configured model endpoint
+      // is down, so execute() returns a normal failed result (never throws)
+      // with MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE, before ever spawning the
+      // provider process.
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: "dial tcp 10.0.0.1:443: connect: no route to host",
+        errorCode: MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE,
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        resultJson: {
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        },
+      }),
+      testEnvironment: async () => ({
+        adapterType: MODEL_ENDPOINT_UNREACHABLE_TEST_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
+    registerServerAdapter({
+      type: AGENT_CONFIG_FAILURE_TEST_ADAPTER,
+      // An ordinary agent-specific failure (e.g. an invalid model id), with
+      // none of the platform/infrastructure markers above.
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: "model id \"not-a-real-model\" is not configured",
+        errorCode: "model_not_found",
+        resultJson: {},
+      }),
+      testEnvironment: async () => ({
+        adapterType: AGENT_CONFIG_FAILURE_TEST_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
   }, 20_000);
 
   afterEach(async () => {
@@ -145,6 +190,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
   afterAll(async () => {
     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
+    unregisterServerAdapter(MODEL_ENDPOINT_UNREACHABLE_TEST_ADAPTER);
+    unregisterServerAdapter(AGENT_CONFIG_FAILURE_TEST_ADAPTER);
     await tempDb?.cleanup();
   });
 
@@ -391,6 +438,127 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         { timeout: 5_000, interval: 50 },
       )
       .toEqual({ status: "idle", errorReason: null });
+  });
+
+  it("leaves the agent idle and still schedules the deferred retry when a run fails with model_endpoint_unreachable", async () => {
+    // Regression coverage: a mid-run model-endpoint outage arrives as a
+    // normal failed adapter result (never a thrown setup error), so it must
+    // be recognized at the normal adapter-result completion path's own
+    // `keepIdleOnFailure` check, not only at the two setup-stage catches.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Outage Test",
+      role: "engineer",
+      status: "idle",
+      adapterType: MODEL_ENDPOINT_UNREACHABLE_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe(MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE);
+
+    // The run itself still fails and still schedules its deferred outage
+    // retry -- this must keep working exactly as before.
+    await expect
+      .poll(
+        () =>
+          db
+            .select({ id: heartbeatRuns.id, scheduledRetryReason: heartbeatRuns.scheduledRetryReason })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.retryOfRunId, run!.id))
+            .then((rows) => rows[0] ?? null),
+        { timeout: 5_000, interval: 50 },
+      )
+      .toMatchObject({ scheduledRetryReason: MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON });
+
+    // But the agent itself did nothing wrong: it must not be left in
+    // `error` needing a manual clear-error once the endpoint recovers.
+    await expect
+      .poll(
+        () =>
+          db
+            .select({ status: agents.status, errorReason: agents.errorReason })
+            .from(agents)
+            .where(eq(agents.id, agentId))
+            .then((rows) => rows[0] ?? null),
+        { timeout: 5_000, interval: 50 },
+      )
+      .toEqual({ status: "idle", errorReason: null });
+  });
+
+  it("still moves the agent to error on an agent-specific failure (e.g. an invalid model id)", async () => {
+    // Contrast case for the fix above: a failure that is the agent's own
+    // configuration problem, not a platform outage, must keep the existing
+    // error-status behavior so an operator notices and fixes it.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Bad Config Test",
+      role: "engineer",
+      status: "idle",
+      adapterType: AGENT_CONFIG_FAILURE_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("model_not_found");
+
+    await expect
+      .poll(
+        () =>
+          db
+            .select({ status: agents.status, errorReason: agents.errorReason })
+            .from(agents)
+            .where(eq(agents.id, agentId))
+            .then((rows) => rows[0] ?? null),
+        { timeout: 5_000, interval: 50 },
+      )
+      .toMatchObject({ status: "error" });
   });
 
   async function seedMaxTurnFixture(input?: {

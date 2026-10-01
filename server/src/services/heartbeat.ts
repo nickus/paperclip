@@ -1453,9 +1453,16 @@ const PLATFORM_ENVIRONMENT_RUN_ERROR_CODES = new Set<EnvironmentErrorCode>([
  * *agent* — they clear on their own once the platform recovers — so a run
  * that fails this way must fail (and still drive recovery/escalation as
  * normal), but must not move the agent into `error` status. See
- * `finalizeAgentStatus`'s `keepIdleOnFailure` at both of its call sites
- * below. Contrast with an agent-specific failure (a missing secret binding,
- * an invalid model id), which keeps the existing error-status behavior.
+ * `finalizeAgentStatus`'s `keepIdleOnFailure` at both of this function's
+ * call sites below, which cover the two setup-stage catches where the
+ * failure always arrives as a thrown error. A model-endpoint reachability
+ * failure can *also* arrive mid-run as a normal failed adapter result
+ * (opencode-local's own execute() preflight) rather than a thrown setup
+ * error, so the third `keepIdleOnFailure` call site -- the normal
+ * adapter-result completion path -- checks `MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE`
+ * on the run directly instead of calling this function. Contrast with an
+ * agent-specific failure (a missing secret binding, an invalid model id),
+ * which keeps the existing error-status behavior.
  */
 function isPlatformInfrastructureSetupFailure(error: unknown): boolean {
   if (
@@ -27800,7 +27807,17 @@ export function heartbeatService(
               ((finalizedRun
                 ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
                 : runErrorCode === "provider_quota") ||
-                isWorkspaceSyncConflictFailure(adapterResult.errorMessage))),
+                isWorkspaceSyncConflictFailure(adapterResult.errorMessage) ||
+                // The adapter's own model-endpoint preflight (opencode-local's
+                // execute(), before it spawns opencode) reports an unreachable
+                // endpoint as a normal failed result, not a thrown setup
+                // error, so it never reaches isPlatformInfrastructureSetupFailure
+                // below. It is the same platform/infrastructure failure
+                // though: the deferred outage retry scheduled above already
+                // reschedules this run, and the agent did nothing wrong, so
+                // it must not be left in `error` -- it clears on its own once
+                // the endpoint recovers.
+                runErrorCode === MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE)),
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
       } catch (err) {
