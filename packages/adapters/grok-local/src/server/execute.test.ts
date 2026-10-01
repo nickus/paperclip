@@ -71,6 +71,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
     (mocks.runProcessMock as (...args: unknown[]) => unknown)(...args),
 }));
 
+import { withPaperclipWakeSessionConfigChanges } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "./execute.js";
 import { resolveManagedGrokHomeDir } from "./grok-home.js";
 
@@ -358,6 +359,54 @@ describe("grok_local execute", () => {
     expect(await pathExists(path.join(root, "Agents.md"))).toBe(false);
     expect(await pathExists(path.join(root, ".claude", "skills", "paperclip"))).toBe(false);
     expect(logs.map((entry) => entry.chunk)).not.toEqual([]);
+  });
+
+  it("gives the fresh-session retry the prompt of a first turn, without the resumed-session notes", async () => {
+    const root = await makeTempRoot();
+    const ctx = await makeCtx("lost-session", root);
+    ctx.runtime = {
+      sessionId: "sess-gone",
+      sessionParams: { sessionId: "sess-gone", cwd: root },
+      sessionDisplayId: "sess-gone",
+      taskKey: null,
+    };
+    ctx.config = { cwd: root, promptTemplate: "Run the heartbeat." };
+    // The server kept the saved session across an instructions edit.
+    ctx.context = {
+      issueId: "issue-1",
+      paperclipWake: withPaperclipWakeSessionConfigChanges(
+        {
+          reason: "issue_commented",
+          issue: { id: "issue-1", identifier: "T-1", title: "Task", status: "in_progress", priority: "medium" },
+          comments: [{ id: "comment-1", body: "Please continue.", authorType: "user" }],
+          commentIds: ["comment-1"],
+        },
+        ["your instructions"],
+      ),
+    };
+    const prompts: string[] = [];
+    ctx.onMeta = async (meta) => {
+      prompts.push(String(meta.prompt ?? ""));
+    };
+    runProcessMock.mockImplementation(async (_runId, _target, _command, args: string[]) =>
+      args.includes("--resume")
+        ? { ...makeSuccessfulRunResult(), exitCode: 1, stdout: "", stderr: "Error: unknown session sess-gone" }
+        : makeSuccessfulRunResult({ sessionId: "sess-new" }),
+    );
+
+    const result = await execute(ctx);
+
+    const changeNote = "Changed since your previous turn on this task: your instructions.";
+    expect(result).toMatchObject({ exitCode: 0, sessionId: "sess-new" });
+    expect(prompts).toHaveLength(2);
+    const [resumed, retry] = prompts;
+    expect(resumed).toContain(changeNote);
+    expect(resumed).toContain("## Paperclip Resume Delta");
+    expect(resumed).not.toContain("Run the heartbeat.");
+    expect(retry).not.toContain(changeNote);
+    expect(retry).not.toContain("## Paperclip Resume Delta");
+    expect(retry).toContain("Run the heartbeat.");
+    expect(retry).toContain("Please continue.");
   });
 
   it("reports real per-run token usage, marks it as per_run, and only surfaces cost for API billing", async () => {

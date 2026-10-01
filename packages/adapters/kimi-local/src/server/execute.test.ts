@@ -34,6 +34,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   startAdapterExecutionTargetPaperclipBridge: async () => null,
 }));
 
+import { withPaperclipWakeSessionConfigChanges } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "./execute.js";
 
 const tempRoots: string[] = [];
@@ -255,6 +256,59 @@ describe("kimi_local execute", () => {
     expect(seenArgLists[0]).toContain("-r");
     expect(seenArgLists[1]).not.toContain("-r");
     expect(result).toMatchObject({ exitCode: 0, sessionId: "session_abc-123" });
+  });
+
+  it("gives the fresh-session retry the prompt of a first turn, without the resumed-session notes", async () => {
+    const root = await makeTempRoot();
+    runProcessMock.mockImplementation(async (_runId, _target, _command, args: string[]) =>
+      args.includes("-r")
+        ? { exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "Error: unknown session 'session_stale'" }
+        : { exitCode: 0, signal: null, timedOut: false, stdout: KIMI_STDOUT, stderr: "" },
+    );
+    const prompts: string[] = [];
+
+    const result = await execute(makeContext(root, {
+      runtime: {
+        sessionId: "session_stale",
+        sessionParams: { sessionId: "session_stale", cwd: root },
+        sessionDisplayId: "session_stale",
+        taskKey: null,
+      },
+      config: {
+        cwd: root,
+        bootstrapPromptTemplate: "Bootstrap a new session.",
+        promptTemplate: "Run the heartbeat.",
+      },
+      // The server kept the saved session across an instructions edit.
+      context: {
+        issueId: "issue-1",
+        paperclipWake: withPaperclipWakeSessionConfigChanges(
+          {
+            reason: "issue_commented",
+            issue: { id: "issue-1", identifier: "T-1", title: "Task", status: "in_progress", priority: "medium" },
+            comments: [{ id: "comment-1", body: "Please continue.", authorType: "user" }],
+            commentIds: ["comment-1"],
+          },
+          ["your instructions"],
+        ),
+      },
+      onMeta: async (meta) => {
+        prompts.push(String(meta.prompt ?? ""));
+      },
+    }));
+
+    const changeNote = "Changed since your previous turn on this task: your instructions.";
+    expect(result).toMatchObject({ exitCode: 0, sessionId: "session_abc-123" });
+    expect(prompts).toHaveLength(2);
+    const [resumed, retry] = prompts;
+    expect(resumed).toContain(changeNote);
+    expect(resumed).toContain("## Paperclip Resume Delta");
+    expect(resumed).not.toContain("Run the heartbeat.");
+    expect(retry).not.toContain(changeNote);
+    expect(retry).not.toContain("## Paperclip Resume Delta");
+    expect(retry).toContain("Bootstrap a new session.");
+    expect(retry).toContain("Run the heartbeat.");
+    expect(retry).toContain("Please continue.");
   });
 
   it("maps auth failures to the kimi_auth_required error code", async () => {

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "@paperclipai/adapter-codex-local/server";
+import { withPaperclipWakeSessionConfigChanges } from "@paperclipai/adapter-utils/server-utils";
 import { buildPaperclipTaskMarkdown } from "../services/heartbeat.js";
 import { AGENT_CHAT_DIRECTIVE } from "../services/agent-conversations.js";
 
@@ -739,6 +740,84 @@ if (process.argv.includes("resume")) {
       });
       expect((await fs.readFile(attemptsPath, "utf8")).trim().split("\n")).toHaveLength(started ? 1 : 2);
       expect(result.sessionId).toBe(started ? "existing-session" : "fresh-session");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("gives the fresh-session retry after a lost session the prompt of a first turn", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-lost-session-"));
+    const commandPath = path.join(root, "codex");
+    const instructionsPath = path.join(root, "AGENTS.md");
+    await seedSharedCodexAuth(root);
+    await fs.writeFile(instructionsPath, "Agent instructions body.\n", "utf8");
+    await fs.writeFile(commandPath, `#!/usr/bin/env node
+if (process.argv.includes("resume")) {
+  console.error("state db missing rollout path for thread existing-session");
+  process.exitCode = 1;
+} else {
+  console.log(JSON.stringify({ type: "thread.started", thread_id: "fresh-session" }));
+  console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } }));
+}
+`, "utf8");
+    await fs.chmod(commandPath, 0o755);
+    const prompts: string[] = [];
+    const commandNotes: string[][] = [];
+    try {
+      const result = await execute({
+        runId: "run-lost-session",
+        agent: { id: "agent-1", companyId: "company-1", name: "Codex", adapterType: "codex_local", adapterConfig: { engine: "cli" } },
+        runtime: {
+          sessionId: "existing-session",
+          sessionParams: { sessionId: "existing-session", cwd: root },
+          sessionDisplayId: "existing-session",
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: root,
+          instructionsFilePath: instructionsPath,
+          bootstrapPromptTemplate: "Bootstrap a new session.",
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        // The server kept the saved session across an instructions edit.
+        context: {
+          issueId: "issue-1",
+          paperclipWake: withPaperclipWakeSessionConfigChanges(
+            {
+              reason: "issue_commented",
+              issue: { id: "issue-1", identifier: "T-1", title: "Task", status: "in_progress", priority: "medium" },
+              comments: [{ id: "comment-1", body: "Please continue.", authorType: "user" }],
+              commentIds: ["comment-1"],
+            },
+            ["your instructions"],
+          ),
+        },
+        onLog: async () => {},
+        onMeta: async (meta) => {
+          prompts.push(String(meta.prompt ?? ""));
+          commandNotes.push(meta.commandNotes ?? []);
+        },
+      });
+
+      const changeNote = "Changed since your previous turn on this task: your instructions.";
+      expect(result.sessionId).toBe("fresh-session");
+      expect(prompts).toHaveLength(2);
+      const [resumed, retry] = prompts;
+      expect(resumed).toContain(changeNote);
+      expect(resumed).toContain("## Paperclip Resume Delta");
+      expect(resumed).not.toContain("Follow the paperclip heartbeat.");
+      expect(resumed).not.toContain("Agent instructions body.");
+      expect(retry).not.toContain(changeNote);
+      expect(retry).not.toContain("## Paperclip Resume Delta");
+      expect(retry).toContain("Agent instructions body.");
+      expect(retry).toContain("Bootstrap a new session.");
+      expect(retry).toContain("Follow the paperclip heartbeat.");
+      expect(retry).toContain("Please continue.");
+      // The notes describe what each attempt sent.
+      expect(commandNotes[0].join("\n")).toContain("Skipped stdin instruction reinjection");
+      expect(commandNotes[1].join("\n")).toContain("Prepended instructions + path directive to stdin prompt");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

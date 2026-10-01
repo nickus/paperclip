@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "@paperclipai/adapter-cursor-local/server";
+import { withPaperclipWakeSessionConfigChanges } from "@paperclipai/adapter-utils/server-utils";
 
 async function writeFakeCursorCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
@@ -445,6 +446,91 @@ describe("cursor execute", () => {
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("gives the fresh-session retry after a lost session the prompt of a first turn", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-lost-session-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "agent");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(commandPath, `#!/usr/bin/env node
+if (process.argv.includes("--resume")) {
+  console.error("Error: unknown session cursor-session-gone");
+  process.exit(1);
+}
+console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "cursor-session-new", model: "auto" }));
+console.log(JSON.stringify({ type: "result", subtype: "success", session_id: "cursor-session-new", result: "ok" }));
+`, "utf8");
+    await fs.chmod(commandPath, 0o755);
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    const prompts: string[] = [];
+
+    try {
+      const result = await execute({
+        runId: "run-lost-session",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Cursor Coder",
+          adapterType: "cursor",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: "cursor-session-gone",
+          sessionParams: { sessionId: "cursor-session-gone", cwd: workspace },
+          sessionDisplayId: "cursor-session-gone",
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          model: "auto",
+          bootstrapPromptTemplate: "Bootstrap a new session.",
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        // The server kept the saved session across an instructions edit.
+        context: {
+          issueId: "issue-1",
+          paperclipWake: withPaperclipWakeSessionConfigChanges(
+            {
+              reason: "issue_commented",
+              issue: { id: "issue-1", identifier: "T-1", title: "Task", status: "in_progress", priority: "medium" },
+              comments: [{ id: "comment-1", body: "Please continue.", authorType: "user" }],
+              commentIds: ["comment-1"],
+            },
+            ["your instructions"],
+          ),
+        },
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+        onMeta: async (meta) => {
+          prompts.push(String(meta.prompt ?? ""));
+        },
+      });
+
+      const changeNote = "Changed since your previous turn on this task: your instructions.";
+      expect(result.exitCode).toBe(0);
+      expect(result.sessionId).toBe("cursor-session-new");
+      expect(prompts).toHaveLength(2);
+      const [resumed, retry] = prompts;
+      expect(resumed).toContain(changeNote);
+      expect(resumed).toContain("## Paperclip Resume Delta");
+      expect(resumed).not.toContain("Follow the paperclip heartbeat.");
+      expect(retry).not.toContain(changeNote);
+      expect(retry).not.toContain("## Paperclip Resume Delta");
+      expect(retry).toContain("Bootstrap a new session.");
+      expect(retry).toContain("Follow the paperclip heartbeat.");
+      expect(retry).toContain("Please continue.");
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
       await fs.rm(root, { recursive: true, force: true });
     }
   });

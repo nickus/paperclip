@@ -503,39 +503,47 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
       run: { id: runId, source: "on_demand" },
       context,
     };
-    const taskContextNote = context.conversationMode === true
-      ? selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId), includeCommunicationGuidance: false })
-      : "";
-    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
-      conversationMode: context.conversationMode === true,
-      resumedSession: Boolean(sessionId),
-      suppressIssueDescription: taskContextNote.length > 0,
-    });
-    const shouldUseResumeDeltaPrompt =
-      Boolean(sessionId) && wakePrompt.length > 0 &&
-      // A brief-only wake (no issue) orients but keeps the heartbeat prompt.
-      !isPaperclipRunBriefOnlyWake(context.paperclipWake);
-    const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
-      ? ""
-      : renderTemplate(promptTemplate, templateData);
-    const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-    const paperclipEnvNote = renderPaperclipEnvNote(env);
-    const apiAccessNote = renderApiAccessNote(env);
-    const basePrompt = joinPromptSections([
-      wakePrompt,
-      taskContextNote,
-      sessionHandoffNote,
-      paperclipEnvNote,
-      apiAccessNote,
-      renderedPrompt,
-    ]);
-    const promptMetrics = {
-      promptChars: basePrompt.length,
-      wakePromptChars: wakePrompt.length,
-      taskContextChars: taskContextNote.length,
-      sessionHandoffChars: sessionHandoffNote.length,
-      runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length,
-      heartbeatPromptChars: renderedPrompt.length,
+    // The prompt of one attempt. A resumed session gets the wake delta and the
+    // note on what changed since its previous turn; a new session, including
+    // the retry after the saved session turned out to be gone, gets the full
+    // prompt of a first turn and no such note.
+    const buildPrompt = (resumedSession: boolean) => {
+      const taskContextNote = context.conversationMode === true
+        ? selectPaperclipTaskMarkdown(context, { resumedSession, includeCommunicationGuidance: false })
+        : "";
+      const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+        conversationMode: context.conversationMode === true,
+        resumedSession,
+        suppressIssueDescription: taskContextNote.length > 0,
+      });
+      const shouldUseResumeDeltaPrompt =
+        resumedSession && wakePrompt.length > 0 &&
+        // A brief-only wake (no issue) orients but keeps the heartbeat prompt.
+        !isPaperclipRunBriefOnlyWake(context.paperclipWake);
+      const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
+        ? ""
+        : renderTemplate(promptTemplate, templateData);
+      const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+      const paperclipEnvNote = renderPaperclipEnvNote(env);
+      const apiAccessNote = renderApiAccessNote(env);
+      const prompt = joinPromptSections([
+        selectInitialCommunicationGuidance(context, { resumedSession }),
+        wakePrompt,
+        taskContextNote,
+        sessionHandoffNote,
+        paperclipEnvNote,
+        apiAccessNote,
+        renderedPrompt,
+      ]);
+      const promptMetrics = {
+        promptChars: prompt.length,
+        wakePromptChars: wakePrompt.length,
+        taskContextChars: taskContextNote.length,
+        sessionHandoffChars: sessionHandoffNote.length,
+        runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length,
+        heartbeatPromptChars: renderedPrompt.length,
+      };
+      return { prompt, promptMetrics };
     };
 
     const buildArgs = (resumeSessionId: string | null, prompt: string) => {
@@ -560,10 +568,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
 
     const runAttempt = async (resumeSessionId: string | null) => {
       ctx.signal?.throwIfAborted();
-      const prompt = joinPromptSections([
-        selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
-        basePrompt,
-      ]);
+      const { prompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
       const args = buildArgs(resumeSessionId, prompt);
       if (onMeta) {
         await onMeta({
@@ -576,7 +581,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
           )),
           env: loggedEnv,
           prompt,
-          promptMetrics: { ...promptMetrics, promptChars: prompt.length },
+          promptMetrics,
           context,
         });
       }

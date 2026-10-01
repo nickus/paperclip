@@ -10,6 +10,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) =>
 
 import { ensureRemoteOpenCodeModelConfiguredAndAvailable, execute } from "./execute.js";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
+import { withPaperclipWakeSessionConfigChanges } from "@paperclipai/adapter-utils/server-utils";
 
 const runProcessMock = vi.mocked(runAdapterExecutionTargetProcess);
 
@@ -402,6 +403,81 @@ describe("OpenCode runtime MCP servers", () => {
     const args = runProcessMock.mock.calls.at(-1)![3] as string[];
     expect(args).toContain("--session");
     expect(result.sessionParams).not.toHaveProperty("mcpServerIdentity");
+  });
+});
+
+describe("OpenCode retry after a lost session", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-lost-session-"));
+    vi.stubEnv("XDG_CONFIG_HOME", path.join(root, "xdg"));
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it("gives the new session the prompt of a first turn, without the resumed-session notes", async () => {
+    const commandPath = path.join(root, "opencode");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockReset();
+    runProcessMock.mockImplementation(async (_runId, _target, _command, args) =>
+      (args as string[]).includes("--session")
+        ? probeResult({ exitCode: 1, stderr: "Error: session not found: session-gone" })
+        : probeResult({ stdout: JSON.stringify({ type: "text", sessionID: "session-new", part: { text: "done" } }) }),
+    );
+    const prompts: string[] = [];
+    const result = await execute({
+      runId: "run-lost-session",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: {
+        sessionId: "session-gone",
+        sessionParams: { sessionId: "session-gone", cwd: root },
+        sessionDisplayId: "session-gone",
+        taskKey: null,
+      },
+      config: {
+        command: commandPath,
+        cwd: root,
+        model: "openai/gpt-5",
+        env: { HOME: path.join(root, "home"), OPENCODE_ALLOW_ALL_MODELS: "1" },
+        bootstrapPromptTemplate: "Bootstrap a new session.",
+        promptTemplate: "Run the heartbeat.",
+      },
+      // The server kept the saved session across an instructions edit.
+      context: {
+        issueId: "issue-1",
+        paperclipWake: withPaperclipWakeSessionConfigChanges(
+          {
+            reason: "issue_commented",
+            issue: { id: "issue-1", identifier: "T-1", title: "Task", status: "in_progress", priority: "medium" },
+            comments: [{ id: "comment-1", body: "Please continue.", authorType: "user" }],
+            commentIds: ["comment-1"],
+          },
+          ["your instructions"],
+        ),
+      },
+      onLog: async () => {},
+      onMeta: async (meta) => {
+        prompts.push(String(meta.prompt ?? ""));
+      },
+    });
+
+    const changeNote = "Changed since your previous turn on this task: your instructions.";
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe("session-new");
+    expect(prompts).toHaveLength(2);
+    const [resumed, retry] = prompts;
+    expect(resumed).toContain(changeNote);
+    expect(resumed).toContain("## Paperclip Resume Delta");
+    expect(resumed).not.toContain("Run the heartbeat.");
+    expect(retry).not.toContain(changeNote);
+    expect(retry).not.toContain("## Paperclip Resume Delta");
+    expect(retry).toContain("Bootstrap a new session.");
+    expect(retry).toContain("Run the heartbeat.");
+    expect(retry).toContain("Please continue.");
   });
 });
 
