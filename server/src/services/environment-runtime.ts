@@ -4544,10 +4544,9 @@ export function environmentRuntimeService(
 
       const destroyed: EnvironmentRuntimeLeaseRecord[] = [];
       for (const leaseRow of leaseRows) {
-        // An issue may become terminal inside its provider turn. Do not tear
-        // down the sandbox while that run is still exporting its workspace or
-        // polling the callback bridge. The heartbeat finalizer observes the
-        // terminal issue and destroys the resource after those boundaries.
+        // The scope may close while one of its runs is still inside its
+        // provider turn. Do not tear down the sandbox while that run is still
+        // exporting its workspace or polling the callback bridge.
         if (
           leaseRow.heartbeatRunId &&
           liveRunIds.has(leaseRow.heartbeatRunId)
@@ -4583,6 +4582,95 @@ export function environmentRuntimeService(
         });
       }
       return destroyed;
+    },
+
+    /**
+     * Leave the reusable sandboxes of a closed task idle instead of destroying
+     * them. A done or cancelled task can be reopened, or answered, and its
+     * agent should continue the same conversation; the agent CLI's session
+     * store and memory live in the sandbox. So closing the task does not decide
+     * the sandbox's lifetime: the provider's idle lifetime and capacity limits
+     * do. A lease that is already released is idle; a lease kept running for a
+     * warm runner (`retained`) is released through the provider, which stops
+     * the runner and keeps the sandbox. Leases of a live run, parked leases
+     * (the cleanup sweep owns them) and native runner leases (their warm
+     * session has its own retention cleanup) are left alone.
+     */
+    async releaseIdleReusableSandboxLeases(input: {
+      companyId: string;
+      issueId?: string | null;
+      executionWorkspaceId?: string | null;
+    }): Promise<EnvironmentRuntimeLeaseRecord[]> {
+      const scopeConditions = [
+        input.issueId ? eq(environmentLeases.issueId, input.issueId) : undefined,
+        input.executionWorkspaceId ? eq(environmentLeases.executionWorkspaceId, input.executionWorkspaceId) : undefined,
+      ].filter((condition): condition is NonNullable<typeof condition> => Boolean(condition));
+      if (scopeConditions.length === 0) return [];
+
+      const leaseRows = await db
+        .select()
+        .from(environmentLeases)
+        .where(
+          and(
+            eq(environmentLeases.companyId, input.companyId),
+            eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+            eq(environmentLeases.status, "retained"),
+            ...scopeConditions,
+          ),
+        );
+      const holdingRunIds = leaseRows
+        .map((row) => row.heartbeatRunId)
+        .filter((runId): runId is string => Boolean(runId));
+      const liveRunIds = new Set(
+        holdingRunIds.length === 0
+          ? []
+          : (await db
+              .select({ id: heartbeatRuns.id })
+              .from(heartbeatRuns)
+              .where(and(
+                inArray(heartbeatRuns.id, holdingRunIds),
+                inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
+              ))).map((run) => run.id),
+      );
+
+      const released: EnvironmentRuntimeLeaseRecord[] = [];
+      for (const leaseRow of leaseRows) {
+        if (leaseRow.heartbeatRunId && liveRunIds.has(leaseRow.heartbeatRunId)) continue;
+        const scope = leaseRow.metadata?.reusableSandboxLease;
+        if (isRecord(scope) && scope.adapterType === "paperclip_runner") continue;
+        const environment = leaseRow.environmentId
+          ? await environmentsSvc.getById(leaseRow.environmentId)
+          : null;
+        if (!environment) continue;
+        const leaseSnapshot = toEnvironmentLeaseSnapshot(leaseRow);
+        const driver = getDriver(getLeaseDriverKey(leaseSnapshot, environment));
+        if (!driver) continue;
+        let lease: EnvironmentLease | null;
+        try {
+          lease = await driver.releaseRunLease({
+            environment,
+            lease: leaseSnapshot,
+            status: "released",
+            cancelActiveWork: true,
+          });
+        } catch {
+          // The provider error can carry credentials; log the lease only. The
+          // lease stays retained, so a later run still resumes the sandbox.
+          logger.warn({ leaseId: leaseRow.id }, "could not release a kept sandbox of a closed task");
+          continue;
+        }
+        if (!lease) continue;
+        released.push({
+          environment,
+          lease,
+          leaseContext: {
+            executionWorkspaceId: lease.executionWorkspaceId,
+            executionWorkspaceMode:
+              (lease.metadata?.executionWorkspaceMode as ExecutionWorkspace["mode"] | null | undefined) ?? null,
+          },
+        });
+      }
+      return released;
     },
 
     /**

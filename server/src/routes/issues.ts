@@ -7906,18 +7906,24 @@ export function issueRoutes(
     }
   }
 
-  async function destroyReusableSandboxLeasesForTerminalIssue(issue: {
+  // Closing a task does not end its sandbox. A done or cancelled task can be
+  // reopened or answered, and its agent should pick the conversation up where
+  // it left off; the agent's session store and memory live in the sandbox. So
+  // the task's reusable sandboxes are left idle (one kept running for a warm
+  // runner is stopped and kept), and the provider's idle lifetime and capacity
+  // limits decide when they go. Closing the execution workspace still destroys
+  // them.
+  async function releaseReusableSandboxLeasesForTerminalIssue(issue: {
     id: string;
     companyId: string;
     status: string;
     executionWorkspaceId?: string | null;
   }) {
     try {
-      await environmentRuntime.destroyReusableSandboxLeases({
+      await environmentRuntime.releaseIdleReusableSandboxLeases({
         companyId: issue.companyId,
         issueId: issue.id,
         executionWorkspaceId: issue.executionWorkspaceId ?? null,
-        failureReason: `issue_terminal_${issue.status}`,
       });
     } catch (err) {
       logger.warn(
@@ -7926,7 +7932,7 @@ export function issueRoutes(
           issueId: issue.id,
           executionWorkspaceId: issue.executionWorkspaceId ?? null,
         },
-        "failed to destroy reusable sandbox leases for terminal issue",
+        "failed to release reusable sandbox leases for terminal issue",
       );
     }
   }
@@ -15391,7 +15397,7 @@ export function issueRoutes(
             actor,
             source: "issue.status_transition.issue_closed",
           });
-          await destroyReusableSandboxLeasesForTerminalIssue(issue);
+          await releaseReusableSandboxLeasesForTerminalIssue(issue);
         }
         if (becameTerminal && issue.parentId) {
           // Null unless the parent is waiting on its children (see
@@ -18889,7 +18895,7 @@ export function issueRoutes(
             actor,
             source: "issue.status_transition.issue_closed",
           });
-          await destroyReusableSandboxLeasesForTerminalIssue(currentIssue);
+          await releaseReusableSandboxLeasesForTerminalIssue(currentIssue);
         }
         if (becameTerminal && currentIssue.parentId) {
           // Null unless the parent is waiting on its children (see

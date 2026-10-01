@@ -553,4 +553,51 @@ describeEmbeddedPostgres("reusable sandbox leases parked for a release", () => {
       expect(runsAtEachRelease).toEqual([1, 1]);
     });
   });
+
+  describe("closing a task", () => {
+    it("leaves a released sandbox of the task as it is", async () => {
+      const { companyId, issueId, worker, runtime, startRun } = await seed();
+      const { runId, lease } = await startRun();
+      await runtime.releaseRunLeases(runId, "released");
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+      const callsBefore = worker.call.mock.calls.length;
+
+      await runtime.releaseIdleReusableSandboxLeases({ companyId, issueId });
+
+      expect(worker.call.mock.calls).toHaveLength(callsBefore);
+      expect(await leaseRow(lease.id)).toMatchObject({ status: "released" });
+      expect(worker.sandboxes.get(lease.providerLeaseId!)).toBe("idle");
+    });
+
+    it("stops a warm runner's sandbox and keeps it idle", async () => {
+      const { companyId, issueId, worker, runtime, startRun } = await seed();
+      const { runId, lease } = await startRun();
+      await runtime.releaseRunLeases(runId, "released", undefined, "keep_running");
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+      expect(await leaseRow(lease.id)).toMatchObject({ status: "retained" });
+
+      await runtime.releaseIdleReusableSandboxLeases({ companyId, issueId });
+
+      expect(worker.calls("environmentDestroyLease")).toEqual([]);
+      expect(worker.calls("environmentReleaseLease")).toEqual([
+        expect.objectContaining({ providerLeaseId: lease.providerLeaseId, cancelActiveWork: true }),
+      ]);
+      expect(await leaseRow(lease.id)).toMatchObject({ status: "released", cleanupStatus: "success" });
+      expect(worker.sandboxes.get(lease.providerLeaseId!)).toBe("idle");
+    });
+
+    it("leaves the sandbox of a run that is still live alone", async () => {
+      const { companyId, issueId, worker, runtime, startRun } = await seed();
+      const live = await startRun();
+      await runtime.releaseRunLeases(live.runId, "released", undefined, "keep_running");
+
+      await runtime.releaseIdleReusableSandboxLeases({ companyId, issueId });
+
+      expect(worker.calls("environmentReleaseLease")).toEqual([]);
+      expect(worker.calls("environmentDestroyLease")).toEqual([]);
+      expect(await leaseRow(live.lease.id)).toMatchObject({ status: "retained" });
+    });
+  });
 });
