@@ -1217,6 +1217,12 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     async releaseRunLease(input) {
+      // A local lease owns no provider resource. Never close one that names a
+      // resource as bookkeeping only: it stays for the cleanup paths, which
+      // refuse it too (see retryPendingSandboxTeardown).
+      if (input.lease.providerLeaseId) {
+        throw new Error("Local lease release cannot release a provider resource.");
+      }
       return await environmentsSvc.releaseLease(input.lease.id, input.status);
     },
 

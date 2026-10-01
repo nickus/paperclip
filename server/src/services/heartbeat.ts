@@ -792,6 +792,8 @@ const STALE_TERMINAL_RUN_LEASE_PAGE_SIZE = 20;
 // periodic reaper tick passes its own, shorter staleness threshold so this
 // release reaches a legacy run's lease before the orphaned-active-lease sweep.
 export const STALE_TERMINAL_RUN_LEASE_GRACE_MS = 10 * 60 * 1000;
+// The startup reap releases at most this many pages of terminal runs' leases.
+const STARTUP_TERMINAL_RUN_LEASE_MAX_PAGES = 25;
 
 // A provider or plugin destroy rejection can carry a bearer credential, a
 // signed URL, or provider response detail in its name, code, message, cause, or
@@ -11063,6 +11065,49 @@ export function heartbeatService(
     }
   }
 
+  // At startup, release the leases of every legacy run that ended before the
+  // restart, with no grace: a fresh process has no executor left that could
+  // still release them itself. Released through the provider, a reusable
+  // sandbox is kept for the task's next run; the orphaned-lease sweep that
+  // follows would destroy it. One page at a time against a cutoff fixed at the
+  // start of the reap: each page's claim moves the handled leases past it, so
+  // the loop ends once a page releases nothing (or after a bounded number of
+  // pages; the periodic reaper continues from there).
+  async function reconcileTerminalRunLeasesAtStartup(
+    now: Date,
+  ): Promise<{ reconciled: number; runIds: string[] }> {
+    const runIds: string[] = [];
+    for (let page = 0; page < STARTUP_TERMINAL_RUN_LEASE_MAX_PAGES; page += 1) {
+      if (shutdownInProgress) break;
+      const result = await reconcileStaleTerminalRunLeases({ graceMs: 0, now });
+      runIds.push(...result.runIds);
+      if (result.reconciled === 0) break;
+    }
+    return { reconciled: runIds.length, runIds };
+  }
+
+  // Retry, right away, the release of this run's reusable sandbox leases that
+  // were parked because the release could not be confirmed, so the run's
+  // follow-up resumes the same sandbox. Leases parked for a destroy are left to
+  // the periodic sweep, and a provider worker that is not ready defers the
+  // retry without using up an attempt.
+  async function releaseParkedReusableLeasesForRun(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
+  ): Promise<void> {
+    try {
+      await sweepPendingCleanupLeases({
+        forRun: { companyId: run.companyId, runId: run.id, releaseOnly: true },
+      });
+    } catch {
+      // Log a constant errorKind only: the exception can carry a provider
+      // credential in its message, cause, or stack.
+      logger.warn(
+        { errorKind: PENDING_CLEANUP_SWEEP_ERROR_KIND, runId: run.id },
+        "could not retry the release of a parked sandbox lease",
+      );
+    }
+  }
+
   async function reconcileStaleTerminalRunLeasePage(opts?: {
     graceMs?: number;
     now?: Date;
@@ -19734,12 +19779,16 @@ export function heartbeatService(
      * but cannot take over an in-flight cleanup attempt.
      */
     explicitRetry?: { companyId: string; runId: string; actorId: string; reason?: "retry_failed_run" | "queued_comment_interrupt" };
+    /** Only this run's leases, and with `releaseOnly` only the ones parked
+     * for a release: the run's follow-up then resumes the kept sandbox. */
+    forRun?: { companyId: string; runId: string; releaseOnly?: boolean };
   }): Promise<{
     swept: number;
     destroyed: number;
     capped: number;
   }> {
     const backoffMs = opts?.backoffMs ?? 0;
+    const targetRun = opts?.explicitRetry ?? opts?.forRun;
     const now = new Date();
     const cutoff = new Date(now.getTime() - backoffMs);
 
@@ -19749,7 +19798,7 @@ export function heartbeatService(
     // `pending_cleanup` row lands once the database recovers. The flush runs
     // before the read below, so this same tick tears down a freshly-landed row.
     try {
-      const flushed = opts?.explicitRetry ? null : await environmentRuntime.flushDeferredOrphanCleanups?.();
+      const flushed = targetRun ? null : await environmentRuntime.flushDeferredOrphanCleanups?.();
       if (flushed && (flushed.recovered > 0 || flushed.pending > 0)) {
         logger.info(
           { recovered: flushed.recovered, pending: flushed.pending },
@@ -19772,8 +19821,11 @@ export function heartbeatService(
       .where(
         and(
           eq(environmentLeases.status, "pending_cleanup"),
-          opts?.explicitRetry ? eq(environmentLeases.companyId, opts.explicitRetry.companyId) : undefined,
-          opts?.explicitRetry ? eq(environmentLeases.heartbeatRunId, opts.explicitRetry.runId) : undefined,
+          targetRun ? eq(environmentLeases.companyId, targetRun.companyId) : undefined,
+          targetRun ? eq(environmentLeases.heartbeatRunId, targetRun.runId) : undefined,
+          opts?.forRun?.releaseOnly
+            ? sql`${environmentLeases.metadata}->>${PENDING_CLEANUP_INTENT_METADATA_KEY}::text = 'release'`
+            : undefined,
           pendingCleanupRetryDueSql(Boolean(opts?.explicitRetry)),
           backoffMs > 0 ? lte(environmentLeases.updatedAt, cutoff) : undefined,
         ),
@@ -20595,6 +20647,12 @@ export function heartbeatService(
         status: finalizedRun.status,
         failureReason: finalizedRun.error ?? undefined,
       });
+      // A sandbox whose release could not be confirmed was parked for a retry
+      // of the release. Retry it now, before the follow-up below is queued and
+      // started, so the follow-up resumes the same sandbox (and the agent's
+      // session in it) instead of starting over in a new one. A provider
+      // worker that is not ready yet leaves the lease for the periodic sweep.
+      await releaseParkedReusableLeasesForRun(finalizedRun);
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       const retryAgent = await getAgent(run.agentId);
@@ -20655,15 +20713,17 @@ export function heartbeatService(
     // release runs first, and on the periodic tick with a grace no longer than
     // the tick's staleness threshold, so it handles a legacy run's lease once
     // it is stale for the sweep too; its claim moves `updatedAt`, so the sweep
-    // skips what it handled. The startup reap keeps the standalone grace: the
-    // sweep deliberately tears down leases of runs that ended just before the
-    // restart. Native runs are always left to the sweep.
+    // skips what it handled. The startup reap releases with no grace at all: a
+    // fresh process has no executor left to release them, and the sweep, which
+    // runs with no backoff at startup, would otherwise destroy the sandbox of
+    // every run that ended just before the restart. Native runs are always
+    // left to the sweep.
     try {
-      const staleLeases = await reconcileStaleTerminalRunLeases(
-        staleThresholdMs > 0
-          ? { graceMs: Math.min(STALE_TERMINAL_RUN_LEASE_GRACE_MS, staleThresholdMs) }
-          : undefined,
-      );
+      const staleLeases = staleThresholdMs > 0
+        ? await reconcileStaleTerminalRunLeases({
+            graceMs: Math.min(STALE_TERMINAL_RUN_LEASE_GRACE_MS, staleThresholdMs),
+          })
+        : await reconcileTerminalRunLeasesAtStartup(now);
       if (staleLeases.reconciled > 0) {
         logger.warn(
           { reconciled: staleLeases.reconciled, runIds: staleLeases.runIds },

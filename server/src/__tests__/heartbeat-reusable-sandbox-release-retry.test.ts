@@ -477,4 +477,80 @@ describeEmbeddedPostgres("reusable sandbox leases parked for a release", () => {
       expect(await leaseRow(lease.id)).toMatchObject({ status: "expired", cleanupStatus: "success" });
     });
   });
+
+  describe("the startup reap", () => {
+    it("releases the sandbox of a run that ended just before the restart instead of destroying it", async () => {
+      const { worker, heartbeat, startRun } = await seed();
+      const { runId, lease } = await startRun();
+      // The run was cancelled a minute before the restart; its executor died
+      // before it could release the lease.
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(Date.now() - 60_000) })
+        .where(eq(heartbeatRuns.id, runId));
+
+      await heartbeat.reapOrphanedRuns();
+
+      expect(worker.calls("environmentDestroyLease")).toEqual([]);
+      expect(worker.calls("environmentReleaseLease")).toEqual([
+        expect.objectContaining({ providerLeaseId: lease.providerLeaseId, cancelActiveWork: true }),
+      ]);
+      expect(worker.sandboxes.get(lease.providerLeaseId!)).toBe("idle");
+      const row = await leaseRow(lease.id);
+      expect(row).toMatchObject({ status: "released", cleanupStatus: "success" });
+      expect(row?.failureReason).not.toBe("orphaned_active_lease_recovered");
+    });
+
+    it("parks a lost run's sandbox while the plugin worker is down and keeps it once the worker is back", async () => {
+      const { worker, heartbeat, startRun } = await seed({ adapterType: "claude_local" });
+      // A run whose process this restart lost (its pid is gone).
+      const { runId, lease } = await startRun({
+        processPid: 999_999_999,
+        runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } },
+      });
+      worker.state.running = false;
+
+      await heartbeat.reapOrphanedRuns();
+
+      expect(await heartbeat.getRun(runId)).toMatchObject({ status: "failed", errorCode: "process_lost" });
+      const parked = await leaseRow(lease.id);
+      expect(parked).toMatchObject({
+        status: "pending_cleanup",
+        metadata: expect.objectContaining({ pendingCleanupIntent: "release", pendingCleanupReleaseRunStatus: "failed" }),
+      });
+      expect(parked?.metadata?.[ATTEMPTS_KEY] ?? 0).toBe(0);
+      expect(worker.calls("environmentReleaseLease")).toEqual([]);
+
+      worker.state.running = true;
+      await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+      expect(await leaseRow(lease.id)).toMatchObject({ status: "released" });
+      expect(worker.calls("environmentDestroyLease")).toEqual([]);
+      expect(worker.sandboxes.get(lease.providerLeaseId!)).toBe("idle");
+    });
+
+    it("retries a lost run's parked release before it queues the run's retry", async () => {
+      const { agentId, worker, heartbeat, startRun } = await seed({ adapterType: "claude_local" });
+      const { runId, lease } = await startRun({
+        processPid: 999_999_999,
+        runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } },
+      });
+      // The first release times out; the retry goes through.
+      worker.state.releases.push("throw", "stopped");
+      const runsAtEachRelease: number[] = [];
+      worker.state.onRelease = async () => {
+        runsAtEachRelease.push(
+          (await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).length,
+        );
+      };
+
+      await heartbeat.reapOrphanedRuns();
+
+      expect(await leaseRow(lease.id)).toMatchObject({ status: "released" });
+      expect(worker.calls("environmentDestroyLease")).toEqual([]);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const retry = runs.find((run) => run.id !== runId);
+      expect(retry).toBeDefined();
+      // Both releases ran while the lost run was the agent's only run.
+      expect(runsAtEachRelease).toEqual([1, 1]);
+    });
+  });
 });
