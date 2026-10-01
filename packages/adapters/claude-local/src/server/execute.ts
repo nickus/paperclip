@@ -96,7 +96,11 @@ import {
 } from "./cli-capabilities.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
-import { parseClaudeBillingTypeOverride, resolveClaudeBillingTypeWithOverride } from "./billing.js";
+import {
+  applyOverageToBillingType,
+  parseClaudeBillingTypeOverride,
+  resolveClaudeBillingTypeWithOverride,
+} from "./billing.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs, claudeSandboxPermissionEnv } from "./permissions.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -511,7 +515,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const modelEnv = executionTargetIsRemote ? env : effectiveEnv;
   const model = resolveClaudeModel(config.model, modelEnv);
-  const billingType = resolveClaudeBillingType(config, effectiveEnv);
+  // Captured separately from the final billingType (not just via
+  // resolveClaudeBillingType) so toAdapterResult can tell an explicit
+  // "auto" guess apart from an explicit override when it later corrects
+  // for observed overage usage (see ./billing.js).
+  const billingTypeOverride = parseClaudeBillingTypeOverride(config.billingType);
+  const billingType = resolveClaudeBillingTypeWithOverride(billingTypeOverride, resolveClaudeAutoBillingType(effectiveEnv));
   const claudeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = new Set(resolveClaudeDesiredSkillNames(config, claudeSkillEntries));
   // When instructionsFilePath is configured, build a stable content-addressed
@@ -1263,6 +1272,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
           ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
+          ...(parsedStream.claudeRateLimit ? { claudeRateLimit: parsedStream.claudeRateLimit } : {}),
         },
         clearSession: Boolean(opts.clearSessionOnMissingSession),
       };
@@ -1398,6 +1408,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // result event.
     const parsedResultFields: Record<string, unknown> = { ...parsed };
     delete parsedResultFields.unmanagedBackgroundTask;
+    // A run whose own rate-limit telemetry shows it drew on billed "extra
+    // usage" is not really a flat-subscription run even though the adapter's
+    // auth-based guess says "subscription" — see ./billing.js. Only corrects
+    // the "auto" guess; an explicit override already took precedence above.
+    const isUsingOverage = Boolean(
+      parsedStream.claudeRateLimit?.isUsingOverage || parsedStream.claudeRateLimit?.overageInUse,
+    );
+    const effectiveBillingType = applyOverageToBillingType(billingTypeOverride, billingType, isUsingOverage);
     const mergedResultJson: Record<string, unknown> = {
       ...parsedResultFields,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
@@ -1407,6 +1425,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      ...(parsedStream.claudeRateLimit ? { claudeRateLimit: parsedStream.claudeRateLimit } : {}),
       ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
     };
 
@@ -1427,7 +1446,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       provider: "anthropic",
       biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
       model: parsedStream.model || asString(parsed.model, model),
-      billingType,
+      billingType: effectiveBillingType,
       costUsd: parsedStream.costUsd,
       resultJson: mergedResultJson,
       summary: parsedStream.summary || asString(parsed.result, ""),

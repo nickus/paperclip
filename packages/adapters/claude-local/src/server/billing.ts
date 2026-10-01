@@ -16,6 +16,15 @@
  *   - "subscription": always classify the run as included in a flat
  *     subscription (billed cost forced to 0 by the server ledger).
  *   - "auto" (default): keep the existing auth-based guess.
+ *
+ * `applyOverageToBillingType` layers one more signal on top of "auto": the
+ * Claude CLI's own `rate_limit_event` stream can report that a run drew on
+ * "extra usage" after its subscription window was exhausted. Anthropic bills
+ * extra usage at standard API prices, so a run that used it is not really a
+ * flat-subscription run even though the adapter's auth-based guess says
+ * "subscription". Only the "auto" guess is corrected this way — an explicit
+ * "subscription" override still wins (the operator said so on purpose), and
+ * an explicit "api" override was already "api".
  */
 export type ClaudeLocalBillingTypeOverride = "auto" | "api" | "subscription";
 
@@ -54,4 +63,22 @@ export function resolveClaudeBillingTypeWithOverride<T extends string>(
   if (override === "api") return "api";
   if (override === "subscription") return "subscription";
   return autoBillingType;
+}
+
+/**
+ * Correct an "auto"-detected "subscription" classification to "api" when the
+ * run's own rate-limit telemetry showed it drew on billed extra usage (see
+ * the module doc comment above). Has no effect when:
+ *   - the override was not "auto" (an explicit override already won above), or
+ *   - the resolved billing type is not "subscription" (already "api" or
+ *     "metered_api", which already bill correctly), or
+ *   - no overage was observed for this run.
+ */
+export function applyOverageToBillingType<T extends string>(
+  override: ClaudeLocalBillingTypeOverride,
+  billingType: T | "api" | "subscription",
+  isUsingOverage: boolean,
+): T | "api" | "subscription" {
+  if (override === "auto" && isUsingOverage && billingType === "subscription") return "api";
+  return billingType;
 }

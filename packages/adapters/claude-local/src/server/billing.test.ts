@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyOverageToBillingType,
   parseClaudeBillingTypeOverride,
   resolveClaudeBillingTypeWithOverride,
 } from "./billing.js";
@@ -40,5 +41,29 @@ describe("resolveClaudeBillingTypeWithOverride", () => {
   it("forces \"subscription\" regardless of the auto-detected value", () => {
     expect(resolveClaudeBillingTypeWithOverride("subscription", "api")).toBe("subscription");
     expect(resolveClaudeBillingTypeWithOverride("subscription", "metered_api")).toBe("subscription");
+  });
+});
+
+describe("applyOverageToBillingType", () => {
+  it("corrects an auto-detected subscription classification to api when overage was observed", () => {
+    expect(applyOverageToBillingType("auto", "subscription", true)).toBe("api");
+  });
+
+  it("leaves an auto-detected subscription classification alone when no overage was observed", () => {
+    expect(applyOverageToBillingType("auto", "subscription", false)).toBe("subscription");
+  });
+
+  it("leaves an auto-detected api/metered_api classification alone regardless of overage", () => {
+    expect(applyOverageToBillingType("auto", "api", true)).toBe("api");
+    expect(applyOverageToBillingType("auto", "metered_api", true)).toBe("metered_api");
+  });
+
+  it("never overrides an explicit subscription override, even with overage observed", () => {
+    expect(applyOverageToBillingType("subscription", "subscription", true)).toBe("subscription");
+  });
+
+  it("is a no-op for an explicit api override", () => {
+    expect(applyOverageToBillingType("api", "api", true)).toBe("api");
+    expect(applyOverageToBillingType("api", "api", false)).toBe("api");
   });
 });
