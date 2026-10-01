@@ -925,6 +925,63 @@ function isTransientWorkspaceGitScanCode(code: string | null | undefined): boole
 }
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS =
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+
+// A model-endpoint preflight failure (opencode-local's execute(), before it
+// ever spawns opencode: see MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE) means the
+// configured provider itself is down, not a one-off hiccup in a single run.
+// The bounded 30s x2 transient-retry window below is tuned for a process- or
+// connection-level blip that usually clears almost immediately; retrying a
+// genuinely down endpoint that fast just spins. Defer instead, backing off
+// from 5 minutes and doubling on each attempt, capped at 60 minutes, so a
+// short outage still recovers quickly while a long one stops hammering the
+// endpoint.
+const MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE = "model_endpoint_unreachable";
+const MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON = "model_endpoint_unreachable_retry";
+const MODEL_ENDPOINT_UNREACHABLE_RETRY_WAKE_REASON = "model_endpoint_unreachable_retry";
+const MODEL_ENDPOINT_UNREACHABLE_RETRY_BASE_DELAY_MS = 5 * 60_000;
+const MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_DELAY_MS = 60 * 60_000;
+// A safety valve, not an expected outcome: at the 60-minute cap this allows
+// several weeks of retries before the scheduler stops and the run needs a
+// human to intervene. Reaching it should be rare enough that its exact value
+// is not load-bearing.
+const MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_ATTEMPTS = 500;
+
+export function computeModelEndpointUnreachableRetryDelayMs(attempt: number): number {
+  if (!Number.isInteger(attempt) || attempt <= 0) {
+    return MODEL_ENDPOINT_UNREACHABLE_RETRY_BASE_DELAY_MS;
+  }
+  const doubled = MODEL_ENDPOINT_UNREACHABLE_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+  return Math.min(doubled, MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_DELAY_MS);
+}
+
+function isModelEndpointUnreachableRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode">,
+): boolean {
+  return run.errorCode === MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE;
+}
+
+// How many times THIS endpoint outage has already been retried — distinct
+// from executionFailureRetryCount, which (once a run carries
+// MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON) freezes at the failure count from
+// BEFORE the outage began, so repeated outage retries don't trip the
+// legacy-execution reconciliation gate's `>= 2` budget (see
+// execution-recovery-attempt.ts and legacyExecutionNeedsReconciliation).
+// The backoff schedule needs the opposite number: scheduledRetryAttempt IS
+// that per-outage counter for this reason (see the nextAttempt handling in
+// scheduleBoundedRetryForRun), so read it directly here instead.
+function modelEndpointUnreachableOutageAttempt(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "scheduledRetryReason" | "scheduledRetryAttempt">,
+): number {
+  return run.scheduledRetryReason === MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON
+    ? Math.max(0, run.scheduledRetryAttempt ?? 0)
+    : 0;
+}
+export {
+  MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE,
+  MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON,
+  MODEL_ENDPOINT_UNREACHABLE_RETRY_WAKE_REASON,
+  MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_ATTEMPTS,
+};
 export {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
@@ -16557,6 +16614,9 @@ export function heartbeatService(
         ...(retryReason === AI_CONNECTION_BUSY_RETRY_REASON
           ? { failureRetriesBeforeAiConnectionWait: executionFailureRetryCount(run) }
           : {}),
+        ...(retryReason === MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON
+          ? { failureRetriesBeforeModelEndpointWait: executionFailureRetryCount(run) }
+          : {}),
         ...(shouldQuarantineWorkspaceForRetry
           ? {
               workspaceValidationRecovery: {
@@ -27462,6 +27522,21 @@ export function heartbeatService(
                 },
               });
             }
+          } else if (
+            outcome === "failed" &&
+            isModelEndpointUnreachableRun(livenessRun)
+          ) {
+            // A down model endpoint is a deferrable outage, not the quick
+            // process/connection blip the bounded 30s x2 window below is
+            // for — see MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON above.
+            await scheduleBoundedRetryForRun(livenessRun, agent, {
+              retryReason: MODEL_ENDPOINT_UNREACHABLE_RETRY_REASON,
+              wakeReason: MODEL_ENDPOINT_UNREACHABLE_RETRY_WAKE_REASON,
+              maxAttempts: MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_ATTEMPTS,
+              delayMs: computeModelEndpointUnreachableRetryDelayMs(
+                modelEndpointUnreachableOutageAttempt(livenessRun) + 1,
+              ),
+            });
           } else if (
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)

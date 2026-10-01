@@ -68,6 +68,7 @@ import {
   prepareOpenCodeRuntimeConfig,
   renderOpenCodeRuntimeConfigWithMcpServers,
   prepareManagedOpenCodeRemoteHomes,
+  resolveConfiguredOpenCodeProviderBaseUrl,
 } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveOpenCodeSkillsHome } from "./skills.js";
@@ -96,6 +97,89 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
 
 const REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC = 20;
 const REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC = 120;
+
+// Error code returned (without spawning opencode) when the configured
+// provider's baseURL answers the pre-spawn health probe with a network
+// failure or a 5xx. The server treats this code as a deferrable outage
+// rather than the usual quick bounded retry — see heartbeat.ts.
+export const MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE = "model_endpoint_unreachable";
+
+const MODEL_ENDPOINT_PREFLIGHT_TIMEOUT_MS = 3_000;
+
+// Kill switch: set PAPERCLIP_MODEL_ENDPOINT_PREFLIGHT=0 to fully disable the
+// pre-spawn health probe below and always spawn opencode as before. Any other
+// value (including unset) keeps the probe on.
+function isModelEndpointPreflightDisabled(env: Record<string, string>): boolean {
+  const raw = (env.PAPERCLIP_MODEL_ENDPOINT_PREFLIGHT ?? process.env.PAPERCLIP_MODEL_ENDPOINT_PREFLIGHT ?? "").trim();
+  return raw === "0";
+}
+
+function modelsEndpointUrl(baseUrl: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}/models`;
+}
+
+/**
+ * Validate a resolved provider baseURL as something this probe can safely
+ * GET, and return a display form with any credentials stripped for logging.
+ *
+ * Returns null — "not probeable, fail open" — rather than throwing, for any
+ * of:
+ *  - an unresolved `{env:VAR}` placeholder (expandEnvPlaceholders in
+ *    runtime-config.ts deliberately leaves these intact when the server-side
+ *    env does not have the variable, for OpenCode itself to resolve at spawn
+ *    time — a probe here cannot know the real target);
+ *  - a value `new URL()` cannot parse as absolute (fetch() throws
+ *    "Failed to parse URL" for these, which previously made the probe fail
+ *    CLOSED — i.e. block the run — for something that isn't the probe's to
+ *    judge);
+ *  - a non-http(s) protocol;
+ *  - userinfo (`user:pass@host`) embedded in the URL — fetch() itself
+ *    refuses to construct a request to a credentialed URL, and this baseURL
+ *    must never be written to a log or error message unredacted either.
+ */
+function parseModelEndpointProbeUrl(baseUrl: string): { url: URL; safeDisplayUrl: string } | null {
+  if (typeof baseUrl !== "string" || baseUrl.length === 0) return null;
+  if (baseUrl.includes("{env:")) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(modelsEndpointUrl(baseUrl));
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (parsed.username || parsed.password) return null;
+  return { url: parsed, safeDisplayUrl: `${parsed.origin}${parsed.pathname}` };
+}
+
+/**
+ * GET `{baseUrl}/models` with a short timeout, purely to decide whether it is
+ * worth spawning opencode at all. This is a liveness probe, not an
+ * authorization check: a 4xx (auth required, not found, method not allowed —
+ * the endpoint answered, it just didn't like this exact request) is treated
+ * as reachable, same as a 2xx. Only a network failure (DNS, connection
+ * refused, timeout) or a 5xx counts as unreachable.
+ */
+async function probeModelEndpointReachable(
+  url: URL,
+  timeoutMs: number = MODEL_ENDPOINT_PREFLIGHT_TIMEOUT_MS,
+): Promise<{ reachable: boolean; detail: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      signal: controller.signal,
+    });
+    if (response.status >= 500) {
+      return { reachable: false, detail: `HTTP ${response.status}` };
+    }
+    return { reachable: true, detail: `HTTP ${response.status}` };
+  } catch (err) {
+    return { reachable: false, detail: err instanceof Error ? err.message : String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   runId: string;
@@ -359,6 +443,52 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
+
+    // Pre-spawn model-endpoint health check. Only runs when the configured
+    // model resolves to a known gateway provider baseURL (PAPERCLIP_OPENCODE_
+    // PROVIDERS); an unresolvable baseURL, a remote execution target, or the
+    // kill switch, fails open — opencode spawns exactly as it did before
+    // this check existed.
+    //
+    // executionTargetIsRemote is skipped deliberately: this probe runs from
+    // the Paperclip server process itself, which is not necessarily able to
+    // reach a baseURL the way opencode will once it is actually running on a
+    // remote sandbox/SSH target — cluster-internal service DNS, a
+    // target-local sidecar, or target-specific egress can all resolve or
+    // route only from there. Probing from the server in that case would
+    // fail the run on a baseURL that was never actually unreachable.
+    if (!isModelEndpointPreflightDisabled(runtimeEnv) && !executionTargetIsRemote) {
+      const modelEndpointBaseUrl = resolveConfiguredOpenCodeProviderBaseUrl({
+        env: runtimeEnv,
+        config,
+      });
+      const probeUrl = modelEndpointBaseUrl ? parseModelEndpointProbeUrl(modelEndpointBaseUrl) : null;
+      if (probeUrl) {
+        const probe = await probeModelEndpointReachable(probeUrl.url);
+        if (!probe.reachable) {
+          await onLog(
+            "stderr",
+            `[paperclip] Model endpoint ${probeUrl.safeDisplayUrl} failed its pre-spawn health check (${probe.detail}); not spawning opencode.\n`,
+          );
+          return {
+            exitCode: null,
+            signal: null,
+            timedOut: false,
+            errorMessage: `Model endpoint ${probeUrl.safeDisplayUrl} is unreachable: ${probe.detail}`,
+            errorCode: MODEL_ENDPOINT_UNREACHABLE_ERROR_CODE,
+            // Provider work never started (spawn never happened) — the same
+            // shape claude-local's adapter_engine_unavailable uses so the
+            // server's legacy-execution reconciliation gate treats this as
+            // safely retryable instead of requiring a human to reconcile a
+            // run that never touched the provider.
+            resultJson: {
+              executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+            },
+          };
+        }
+      }
+    }
+
     const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
       executionTarget,
       asNumber(config.timeoutSec, 0),

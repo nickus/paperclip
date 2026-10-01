@@ -98,6 +98,30 @@ export function legacyExecutionNeedsReconciliation(
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
   if ((run.errorCode === "workspace_git_scan_timeout" || run.errorCode === "workspace_git_scan_saturated") &&
       evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
+  // A down model endpoint (connection refused / no route to host / timeout
+  // reaching the configured model server) is an infrastructure outage, not an
+  // ambiguous or failed provider turn — regardless of which adapter reported
+  // it. Deliberately keyed on the error code alone, with no evidence-shape
+  // requirement, so a third-party adapter plugin that has never heard of
+  // `executionRecovery` still gets the deferred-backoff retry below instead
+  // of stranding the issue for a human to reconcile.
+  //
+  // This holds only while the dedicated outage backoff
+  // (scheduleBoundedRetryForRun's "model_endpoint_unreachable_retry" reason,
+  // capped at heartbeat.ts's MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_ATTEMPTS —
+  // 500, duplicated here) still has attempts left. A transient outage
+  // resolves long before that cap is reached; a run still carrying this code
+  // once it is exhausted is not transient, so it falls through to the
+  // ordinary reconciliation outcome below instead of being retried forever
+  // (the general stranded-issue sweep would otherwise just queue a fresh
+  // bounded-transient retry for it — exempt from this same error code — and
+  // restart the whole backoff from attempt one on its next failure) with no
+  // human ever notified.
+  if (
+    run.errorCode === "model_endpoint_unreachable" &&
+    !(run.scheduledRetryReason === "model_endpoint_unreachable_retry" &&
+      (run.scheduledRetryAttempt ?? 0) >= 500)
+  ) return false;
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false

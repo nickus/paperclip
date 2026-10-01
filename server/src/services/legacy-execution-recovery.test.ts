@@ -20,6 +20,56 @@ it.each(["workspace_git_scan_timeout", "workspace_git_scan_saturated"])("does no
   expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "setup_failed" })).toBe(true);
 });
 
+it("exempts a model-endpoint outage from reconciliation on the error code alone, for any adapter", () => {
+  // Deliberately no executionRecovery evidence here: a third-party adapter
+  // plugin that reports this error code should not need to know about the
+  // bootstrap-evidence shape to get the deferred-backoff retry below instead
+  // of a stranded-issue hold.
+  const run = {
+    runtimeMode: "legacy", status: "failed", errorCode: "model_endpoint_unreachable",
+    scheduledRetryAttempt: 12, resultJson: {},
+  };
+  expect(legacyExecutionNeedsReconciliation(run)).toBe(false);
+  // Holds even after many outage retries, unlike the generic
+  // executionFailureRetryCount >= 2 budget other error codes fall back to.
+  expect(legacyExecutionNeedsReconciliation({ ...run, scheduledRetryAttempt: 50 })).toBe(false);
+  // Also exempt when an adapter does supply the bootstrap evidence.
+  expect(legacyExecutionNeedsReconciliation({
+    ...run,
+    resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+  })).toBe(false);
+  // A different error code gets no special treatment from this exemption.
+  expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "adapter_failed" })).toBe(true);
+});
+
+it("stops exempting a model-endpoint outage once its own dedicated backoff is exhausted", () => {
+  // Regression coverage: without this cap, a permanently (not just
+  // transiently) unreachable endpoint retries forever with no human ever
+  // notified — the general stranded-issue sweep (enqueueStrandedIssueRecovery)
+  // just queues a fresh bounded-transient retry for an errorCode this
+  // exemption still covers, and the next failure restarts the dedicated
+  // backoff from attempt one again.
+  const outageRun = {
+    runtimeMode: "legacy", status: "failed", errorCode: "model_endpoint_unreachable",
+    scheduledRetryReason: "model_endpoint_unreachable_retry", resultJson: {},
+  };
+  // Still well within the dedicated backoff's own budget: exempt.
+  expect(legacyExecutionNeedsReconciliation({ ...outageRun, scheduledRetryAttempt: 1 })).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...outageRun, scheduledRetryAttempt: 499 })).toBe(false);
+  // The dedicated backoff's own cap (heartbeat.ts's
+  // MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_ATTEMPTS): exhausted, so this is no
+  // longer a transient outage — fall through to the ordinary outcome.
+  expect(legacyExecutionNeedsReconciliation({ ...outageRun, scheduledRetryAttempt: 500 })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...outageRun, scheduledRetryAttempt: 600 })).toBe(true);
+  // A run carrying this error code that was never itself scheduled under the
+  // dedicated outage reason (e.g. the very first failure, or a retry queued
+  // under a different reason by the general sweep) is unaffected by the cap.
+  expect(legacyExecutionNeedsReconciliation({
+    runtimeMode: "legacy", status: "failed", errorCode: "model_endpoint_unreachable",
+    scheduledRetryAttempt: 600, resultJson: {},
+  })).toBe(false);
+});
+
 it("permits subscription waits only with explicit evidence that provider work never started", () => {
   const waiting = {
     runtimeMode: "legacy", status: "cancelled", errorCode: "ai_connection_busy", scheduledRetryAttempt: 12,
