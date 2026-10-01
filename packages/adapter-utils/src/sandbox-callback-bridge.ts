@@ -481,9 +481,9 @@ interface SandboxCallbackBridgeRouteHintEntry {
 }
 
 // Common instance-level route guesses that exist only company-scoped. Each
-// hint is confirmed against the asking policy's own allow rules before it is
-// added to a 403 body (see `sandboxCallbackBridgeRouteHint`), so a hint never
-// names a route the same policy would also refuse.
+// hint is confirmed against the asking policy's own allow AND deny rules
+// before it is added to a 403 body (see `sandboxCallbackBridgeRouteHint`), so
+// a hint never names a route the same policy would also refuse.
 const SANDBOX_CALLBACK_BRIDGE_ROUTE_HINTS: readonly SandboxCallbackBridgeRouteHintEntry[] = [
   {
     method: "GET",
@@ -514,10 +514,11 @@ const SANDBOX_CALLBACK_BRIDGE_ROUTE_HINTS: readonly SandboxCallbackBridgeRouteHi
 /**
  * Look up the hint for one wrong-guess request, or null when there is none or
  * the policy asking would refuse the suggested route too (`isSuggestedRouteAllowed`
- * decides that, bound to the same allow rules the caller just checked `path`
- * against). Matching is exact on method and path: a hint names one specific
- * documented alternative, so it only fires for the bare guess it was written
- * for, not a prefix or a lookalike.
+ * decides that, bound to the same allow AND deny rules the caller just
+ * checked `path` against, mirroring the deny-overrides-allow order the real
+ * authorizer below applies). Matching is exact on method and path: a hint
+ * names one specific documented alternative, so it only fires for the bare
+ * guess it was written for, not a prefix or a lookalike.
  */
 function sandboxCallbackBridgeRouteHint(
   method: string,
@@ -860,12 +861,16 @@ export function authorizeSandboxCallbackBridgeRequestForPolicy(
   }
 
   const steward = policy === "steward";
-  // Bound to this policy's own allow rules, so a hint never names a route
-  // the same policy would also refuse. Reused by every `agentPolicyDenial`
-  // call below.
+  const denyRules = steward ? STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES : AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES;
+  // Bound to this policy's own allow AND deny rules, so a hint never names a
+  // route the same policy would also refuse: the real authorizer below always
+  // runs deny rules before allow rules, and a deny match overrides an allow
+  // match, so the hint check mirrors that rather than consulting allow rules
+  // alone. Reused by every `agentPolicyDenial` call below.
   const isSuggestedRouteAllowed = (candidate: { method: string; path: string }) =>
-    agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, candidate.method, candidate.path) ||
-    (steward && agentPolicyRouteMatches(STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, candidate.method, candidate.path));
+    !agentPolicyRouteMatches(denyRules, candidate.method, candidate.path) &&
+    (agentPolicyRouteMatches(AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, candidate.method, candidate.path) ||
+      (steward && agentPolicyRouteMatches(STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, candidate.method, candidate.path)));
 
   // Percent-encoding could spell a denied segment in a form the rules do not
   // see (the router matches literal routes on the raw path, but decodes
@@ -875,7 +880,6 @@ export function authorizeSandboxCallbackBridgeRequestForPolicy(
   }
   const lowered = request.path.toLowerCase();
   const matchPath = lowered.length > 1 && lowered.endsWith("/") ? lowered.slice(0, -1) : lowered;
-  const denyRules = steward ? STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES : AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES;
   if (agentPolicyRouteMatches(denyRules, method, matchPath)) {
     return agentPolicyDenial(policy, method, request.path, isSuggestedRouteAllowed, matchPath);
   }

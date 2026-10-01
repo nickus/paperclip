@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES,
   authorizeSandboxCallbackBridgeRequestForPolicy,
   createFileSystemSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAuthorizer,
@@ -14,6 +15,7 @@ import {
   sandboxCallbackBridgeDirectories,
   sanitizeSandboxCallbackBridgeHeaders,
   startSandboxCallbackBridgeWorker,
+  STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES,
 } from "./sandbox-callback-bridge.js";
 
 type RouteCase = { method: string; path: string };
@@ -602,6 +604,24 @@ describe("sandbox callback bridge route policies", () => {
       // is close to a hinted family.
       const secretsDenial = agent({ method: "GET", path: "/api/agents/agent-1/secrets" });
       expect(secretsDenial).not.toContain("Instead,");
+    });
+
+    it("confirms every hint's suggested route against deny rules too, not just allow rules", () => {
+      // The hint check must mirror the real authorizer's deny-overrides-allow
+      // order (see `authorizeSandboxCallbackBridgeRequestForPolicy`), so a
+      // hint never points at a route a deny rule would also refuse. None of
+      // the current suggested routes match a deny rule under either policy;
+      // this pins that down so a future deny rule (or hint) that overlaps one
+      // of these company-scoped families is caught here instead of silently
+      // telling a denied agent to retry a route that is itself denied.
+      const suggestedFamilies = ["agents", "issues", "projects", "routines"];
+      for (const denyRules of [AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES, STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES]) {
+        for (const family of suggestedFamilies) {
+          const suggestedPath = `/api/companies/${COMPANY}/${family}`;
+          const matchesDeny = denyRules.some((rule) => rule.methods.includes("GET") && rule.path.test(suggestedPath));
+          expect(matchesDeny, suggestedPath).toBe(false);
+        }
+      }
     });
   });
 
