@@ -5,6 +5,32 @@ interface ClaudeSubscriptionPanelProps {
   windows: QuotaWindow[];
   source?: string | null;
   error?: string | null;
+  /** Non-secret display label for this panel's credential, e.g. a bound
+   *  company secret's name, "Claude login", or "Server login". Replaces the
+   *  generic "Anthropic subscription" heading when set, so multiple panels
+   *  (one per distinct bound token) read distinctly. */
+  label?: string | null;
+  /** When this data was actually observed. Shown as "as of <time>" whenever
+   *  `stale` is true, so a cached or passively-observed read is never
+   *  mistaken for a fresh live read. */
+  observedAt?: string | null;
+  /** True when `windows` is a cached or passively-observed snapshot rather
+   *  than a fresh live poll. */
+  stale?: boolean;
+  /** True when the account is currently drawing on billed "extra usage"
+   *  beyond its subscription window. */
+  overageInUse?: boolean | null;
+}
+
+function formatObservedAt(observedAt: string): string | null {
+  const date = new Date(observedAt);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 const WINDOW_ORDER = [
@@ -55,18 +81,26 @@ export function ClaudeSubscriptionPanel({
   windows,
   source = null,
   error = null,
+  label = null,
+  observedAt = null,
+  stale = false,
+  overageInUse = null,
 }: ClaudeSubscriptionPanelProps) {
   const ordered = orderedWindows(windows);
+  const observedAtText = stale && observedAt ? formatObservedAt(observedAt) : null;
+  const weeklyWindowExhausted = windows.some(
+    (window) => normalizeLabel(window.label) === "currentweekallmodels" && (window.usedPercent ?? 0) >= 100,
+  );
 
   return (
     <div className="border border-border px-4 py-4">
       <div className="flex items-start justify-between gap-3 border-b border-border pb-3">
         <div className="min-w-0">
           <div className="text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-caps) text-muted-foreground">
-            Anthropic subscription
+            {label ?? "Anthropic subscription"}
           </div>
           <div className="mt-1 text-sm text-muted-foreground">
-            Live Claude quota windows.
+            {observedAtText ? `As of ${observedAtText}.` : "Live Claude quota windows."}
           </div>
         </div>
         {source ? (
@@ -75,6 +109,14 @@ export function ClaudeSubscriptionPanel({
           </span>
         ) : null}
       </div>
+
+      {overageInUse ? (
+        <div className="mt-4 border border-(--status-task-blocked)/40 bg-(--status-task-blocked)/10 px-3 py-2 text-sm text-foreground">
+          {weeklyWindowExhausted
+            ? "Weekly window used up — extra usage in use, billed at API rates."
+            : "Extra usage in use — billed at API rates."}
+        </div>
+      ) : null}
 
       {error ? (
         <div className="mt-4 border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">

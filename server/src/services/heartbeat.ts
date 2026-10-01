@@ -5356,7 +5356,7 @@ export function summarizeHeartbeatRunListResultJson(input: {
   return Object.keys(summary).length > 0 ? summary : null;
 }
 
-function normalizeLedgerBillingType(value: unknown): BillingType {
+export function normalizeLedgerBillingType(value: unknown): BillingType {
   const raw = readNonEmptyString(value);
   switch (raw) {
     case "api":
@@ -5384,7 +5384,7 @@ function resolveLedgerBiller(result: AdapterExecutionResult): string {
   );
 }
 
-function normalizeBilledCostCents(
+export function normalizeBilledCostCents(
   costUsd: number | null | undefined,
   billingType: BillingType,
 ): number {

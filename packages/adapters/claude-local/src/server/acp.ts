@@ -57,6 +57,7 @@ import { detectClaudeLoginRequired, extractClaudeRetryNotBefore, isClaudeProvide
 import { buildClaudeProbePermissionArgs, claudeSandboxPermissionEnv } from "./permissions.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./auth-check.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
+import { parseClaudeBillingTypeOverride, resolveClaudeBillingTypeWithOverride } from "./billing.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const packageRootDir = path.resolve(moduleDir, "../..");
@@ -180,11 +181,17 @@ export function resolveClaudeAcpBillingIdentity(
   };
   const bedrockFlag = readEnvValue("CLAUDE_CODE_USE_BEDROCK");
   const bedrock = bedrockFlag === "1" || bedrockFlag === "true" || Boolean(readEnvValue("ANTHROPIC_BEDROCK_BASE_URL"));
-  const billingType: AdapterBillingType = bedrock
+  const autoBillingType: AdapterBillingType = bedrock
     ? "metered_api"
     : readEnvValue("ANTHROPIC_API_KEY")
     ? "api"
     : "subscription";
+  // An explicit `billingType` config override (see ./billing.js) forces the
+  // ledger classification regardless of detected auth — e.g. an OAuth/
+  // long-lived token that is actually billed at API prices rather than a
+  // flat subscription. Already validated upstream in createClaudeAcpExecutor.
+  const billingTypeOverride = parseClaudeBillingTypeOverride(parseObject(ctx.config).billingType);
+  const billingType = resolveClaudeBillingTypeWithOverride(billingTypeOverride, autoBillingType);
   return {
     provider: "anthropic",
     biller: bedrock ? "aws_bedrock" : "anthropic",
@@ -381,6 +388,11 @@ export function mapClaudeAcpAuthErrorCode(
 export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}): ClaudeAcpExecutor {
   let executor: ClaudeAcpExecutor | null = null;
   return async (ctx) => {
+    // Validate `billingType` up front: the shared acpx engine swallows a
+    // throw from `resolveBillingIdentity` into billingType "unknown" (see
+    // `acpx-engine/execute.ts`), which would hide a config typo instead of
+    // failing the run with a clear message.
+    parseClaudeBillingTypeOverride(parseObject(ctx.config).billingType);
     let currentExecutor = executor;
     if (!currentExecutor) {
       const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");

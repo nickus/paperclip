@@ -13,6 +13,7 @@ import {
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
   isClaudeModelNotFoundError,
+  normalizeClaudeRateLimitInfo,
 } from "./parse.js";
 
 describe("detectClaudeLoginRequired", () => {
@@ -567,6 +568,157 @@ describe("parseClaudeStreamJson usage extraction", () => {
       cachedInputTokens: 20,
     });
     expect(parsed.usageBasis).toBe("per_run");
+  });
+});
+
+describe("normalizeClaudeRateLimitInfo", () => {
+  it("returns null for an empty or non-object payload", () => {
+    expect(normalizeClaudeRateLimitInfo(null, "2026-01-01T00:00:00.000Z")).toBeNull();
+    expect(normalizeClaudeRateLimitInfo(undefined, "2026-01-01T00:00:00.000Z")).toBeNull();
+    expect(normalizeClaudeRateLimitInfo({}, "2026-01-01T00:00:00.000Z")).toBeNull();
+    expect(normalizeClaudeRateLimitInfo("not an object", "2026-01-01T00:00:00.000Z")).toBeNull();
+  });
+
+  it("normalizes the current unifiedWindows shape, including overage fields", () => {
+    const snapshot = normalizeClaudeRateLimitInfo(
+      {
+        status: "rejected",
+        resetsAt: 1791043200,
+        rateLimitType: "seven_day",
+        overageStatus: "allowed",
+        overageResetsAt: 1793491200,
+        isUsingOverage: true,
+        overageInUse: true,
+        unifiedWindows: {
+          five_hour: { utilization: 0, resetsAt: 1790880000 },
+          seven_day: { utilization: 1, resetsAt: 1791043200 },
+        },
+      },
+      "2026-01-01T00:00:00.000Z",
+    );
+    expect(snapshot).toEqual({
+      observedAt: "2026-01-01T00:00:00.000Z",
+      status: "rejected",
+      rateLimitType: "seven_day",
+      resetsAt: 1791043200,
+      overageStatus: "allowed",
+      overageResetsAt: 1793491200,
+      isUsingOverage: true,
+      overageInUse: true,
+      windows: {
+        five_hour: { utilization: 0, resetsAt: 1790880000 },
+        seven_day: { utilization: 1, resetsAt: 1791043200 },
+      },
+    });
+  });
+
+  it("normalizes the older flat shape keyed by rateLimitType", () => {
+    const snapshot = normalizeClaudeRateLimitInfo(
+      {
+        status: "allowed_warning",
+        resetsAt: 1791043200,
+        rateLimitType: "seven_day_overage_included",
+        utilization: 0.79,
+        isUsingOverage: false,
+        surpassedThreshold: 0.75,
+      },
+      "2026-01-02T00:00:00.000Z",
+    );
+    expect(snapshot).toEqual({
+      observedAt: "2026-01-02T00:00:00.000Z",
+      status: "allowed_warning",
+      rateLimitType: "seven_day_overage_included",
+      resetsAt: 1791043200,
+      overageStatus: null,
+      overageResetsAt: null,
+      isUsingOverage: false,
+      overageInUse: false,
+      windows: {
+        seven_day: { utilization: 0.79, resetsAt: 1791043200 },
+      },
+    });
+  });
+
+  it("defaults every optional field defensively when fields are missing", () => {
+    const snapshot = normalizeClaudeRateLimitInfo({ status: "allowed" }, "2026-01-03T00:00:00.000Z");
+    expect(snapshot).toEqual({
+      observedAt: "2026-01-03T00:00:00.000Z",
+      status: "allowed",
+      rateLimitType: null,
+      resetsAt: null,
+      overageStatus: null,
+      overageResetsAt: null,
+      isUsingOverage: false,
+      overageInUse: false,
+      windows: {},
+    });
+  });
+
+  it("ignores an unrecognized flat rateLimitType (no five_hour/seven_day bucket)", () => {
+    const snapshot = normalizeClaudeRateLimitInfo(
+      { status: "allowed", rateLimitType: "monthly_credits", utilization: 0.4, resetsAt: 1700000000 },
+      "2026-01-04T00:00:00.000Z",
+    );
+    expect(snapshot?.windows).toEqual({});
+  });
+});
+
+describe("parseClaudeStreamJson rate_limit_event handling", () => {
+  const line = (event: Record<string, unknown>) => `${JSON.stringify(event)}\n`;
+  const resultEvent = line({ type: "result", subtype: "success", session_id: "sess-1", result: "done" });
+
+  it("collects the LAST rate_limit_event's info into claudeRateLimit", () => {
+    const stdout =
+      line({
+        type: "rate_limit_event",
+        rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.1, resetsAt: 1 },
+      }) +
+      line({
+        type: "rate_limit_event",
+        rate_limit_info: { status: "rejected", rateLimitType: "seven_day", utilization: 1, resetsAt: 2 },
+      }) +
+      resultEvent;
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed.claudeRateLimit?.status).toBe("rejected");
+    expect(parsed.claudeRateLimit?.windows.seven_day).toEqual({ utilization: 1, resetsAt: 2 });
+  });
+
+  it("keeps overageInUse true for the run once ANY event reported it, even if the last one did not", () => {
+    const stdout =
+      line({
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "rejected",
+          rateLimitType: "seven_day",
+          utilization: 1,
+          resetsAt: 1,
+          isUsingOverage: true,
+        },
+      }) +
+      line({
+        // window rolled over mid-run; the last event no longer shows overage
+        type: "rate_limit_event",
+        rate_limit_info: { status: "allowed", rateLimitType: "seven_day", utilization: 0, resetsAt: 2 },
+      }) +
+      resultEvent;
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed.claudeRateLimit?.isUsingOverage).toBe(false);
+    expect(parsed.claudeRateLimit?.overageInUse).toBe(true);
+  });
+
+  it("is null when the stream has no rate_limit_event", () => {
+    const parsed = parseClaudeStreamJson(resultEvent);
+    expect(parsed.claudeRateLimit).toBeNull();
+  });
+
+  it("is still populated even when the run never reaches a final result event", () => {
+    const stdout = line({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.5, resetsAt: 1 },
+    });
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed.resultJson).toBeNull();
+    expect(parsed.claudeRateLimit?.windows.five_hour).toEqual({ utilization: 0.5, resetsAt: 1 });
   });
 });
 

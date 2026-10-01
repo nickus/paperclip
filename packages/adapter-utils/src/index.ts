@@ -35,6 +35,8 @@ export type {
   ServerAdapterModule,
   QuotaWindow,
   ProviderQuotaResult,
+  QuotaWindowsCredential,
+  GetQuotaWindowsContext,
   TranscriptEntry,
   PaperclipQuestion,
   PaperclipQuestionOption,
@@ -44,6 +46,7 @@ export type {
   CLIAdapterModule,
   CreateConfigValues,
 } from "./types.js";
+export { HOST_LOGIN_CREDENTIAL_KEY } from "./types.js";
 export type {
   SessionCompactionPolicy,
   NativeContextManagement,

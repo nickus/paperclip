@@ -1368,4 +1368,55 @@ describe("resolveClaudeAcpBillingIdentity", () => {
       } as never).billingType,
     ).toBe("subscription");
   });
+
+  describe("billingType config override", () => {
+    it("leaves auto-detection unchanged when billingType is unset", () => {
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.CLAUDE_CODE_USE_BEDROCK;
+      delete process.env.ANTHROPIC_BEDROCK_BASE_URL;
+      expect(
+        resolveClaudeAcpBillingIdentity({ config: { env: { ANTHROPIC_API_KEY: "sk-ant-test" } } }).billingType,
+      ).toBe("api");
+      expect(
+        resolveClaudeAcpBillingIdentity({ config: { env: { CLAUDE_CODE_USE_BEDROCK: "1" } } }).billingType,
+      ).toBe("metered_api");
+      expect(resolveClaudeAcpBillingIdentity({ config: {} }).billingType).toBe("subscription");
+    });
+
+    it('forces "api" for a run that authenticates with an OAuth/long-lived token read as a subscription', () => {
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.CLAUDE_CODE_USE_BEDROCK;
+      delete process.env.ANTHROPIC_BEDROCK_BASE_URL;
+      const identity = resolveClaudeAcpBillingIdentity({
+        config: { billingType: "api", env: {} },
+      });
+      expect(identity).toEqual({ provider: "anthropic", biller: "anthropic", billingType: "api" });
+    });
+
+    it('forces "subscription" even when an ANTHROPIC_API_KEY is present', () => {
+      const identity = resolveClaudeAcpBillingIdentity({
+        config: { billingType: "subscription", env: { ANTHROPIC_API_KEY: "sk-ant-test" } },
+      });
+      expect(identity.billingType).toBe("subscription");
+    });
+
+    it("rejects an unrecognized billingType value", () => {
+      expect(() =>
+        resolveClaudeAcpBillingIdentity({ config: { billingType: "flat_rate" } }),
+      ).toThrow(/Invalid claude_local config "billingType"/);
+    });
+  });
+});
+
+describe("createClaudeAcpExecutor billingType validation", () => {
+  it("rejects an invalid billingType before dispatching to the ACP engine", async () => {
+    // The shared acpx engine swallows a throw from resolveBillingIdentity into
+    // billingType "unknown" (see acpx-engine/execute.ts), which would hide a
+    // config typo. createClaudeAcpExecutor validates up front instead, so this
+    // must reject without ever reaching the real engine/runtime.
+    const execute = createClaudeAcpExecutor();
+    await expect(execute({ config: { billingType: "flat_rate" } } as never)).rejects.toThrow(
+      /Invalid claude_local config "billingType"/,
+    );
+  });
 });

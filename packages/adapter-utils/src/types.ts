@@ -419,6 +419,66 @@ export interface ProviderQuotaResult {
   /** error message when ok is false */
   error?: string;
   windows: QuotaWindow[];
+  /**
+   * Non-secret display label for the credential this result came from, e.g.
+   * a bound company secret's name, "Claude login", or "Server login". Set it
+   * when returning one result per credential from `ctx.credentials`; omit it
+   * for a single aggregate result.
+   */
+  label?: string | null;
+  /** ISO timestamp when this result's data was actually observed — set when
+   *  `stale` is true, or the data came from a passively-observed run. */
+  observedAt?: string | null;
+  /** True when `windows` is a cached or passively-observed snapshot rather
+   *  than a fresh live poll. */
+  stale?: boolean;
+  /** True when the account is currently drawing on billed "extra usage"
+   *  beyond its subscription window. */
+  overageInUse?: boolean | null;
+}
+
+/**
+ * The `key` the server uses for the one credential that genuinely has no
+ * binding of its own — the "Server login" / host-login fallback entry for
+ * agents with no token binding at all. A credential whose binding exists but
+ * failed to resolve (a deleted secret, a malformed config, ...) also arrives
+ * with an empty `env`, but keeps its own real `key` (e.g. a `secret_ref:...`
+ * or `unsupported:...` dedupe key) — never this one. An adapter's
+ * getQuotaWindows() must branch on this exact key, not merely on whether
+ * `env` is empty, to tell the two cases apart; see HOST_LOGIN_CREDENTIAL_KEY's
+ * use in the claude_local adapter.
+ */
+export const HOST_LOGIN_CREDENTIAL_KEY = "host_login";
+
+/** One distinct bound credential the server resolved for an adapter's
+ *  getQuotaWindows() call — already resolved to env vars, never a secret
+ *  reference. The adapter polls each credential and should return one
+ *  ProviderQuotaResult per entry, labeled with `label`. */
+export interface QuotaWindowsCredential {
+  /** Opaque, non-secret identifier stable across polls (e.g. a binding
+   *  identity or token fingerprint) — never the secret value itself. Equal
+   *  to HOST_LOGIN_CREDENTIAL_KEY only for the genuine no-binding-at-all
+   *  fallback entry; every other credential, including one whose binding
+   *  failed to resolve, keeps its own distinct key. */
+  key: string;
+  /** Non-secret display label, e.g. a company secret's name, "Claude
+   *  login", or "Server login". */
+  label: string;
+  /** Resolved env vars for this one credential, scoped to this poll. */
+  env: Record<string, string>;
+  /**
+   * The most recent passively-observed quota/rate-limit snapshot the server
+   * found for this credential in persisted run data, if any. Shape is
+   * provider-specific (the adapter that produced it also reads it back);
+   * used as a last-resort fallback when a live poll is unavailable.
+   */
+  passiveSnapshot?: Record<string, unknown> | null;
+}
+
+/** Context passed to an adapter's getQuotaWindows() when the server has
+ *  resolved company-scoped credentials for it. See ServerAdapterModule. */
+export interface GetQuotaWindowsContext {
+  credentials?: QuotaWindowsCredential[];
 }
 
 // ---------------------------------------------------------------------------
@@ -540,8 +600,19 @@ export interface ServerAdapterModule {
    * Optional: fetch live provider quota/rate-limit windows for this adapter.
    * Returns a ProviderQuotaResult so the server can aggregate across adapters
    * without knowing provider-specific credential paths or API shapes.
+   *
+   * `ctx.credentials`, when present, lists the distinct bound credentials the
+   * server found across the company's agents for this adapter type (for
+   * example distinct `CLAUDE_CODE_OAUTH_TOKEN` bindings for claude_local),
+   * already resolved to env vars through the audited secret-resolution path —
+   * the adapter never sees a secret reference, only the resolved value. An
+   * adapter that supports this should return one ProviderQuotaResult per
+   * credential, each carrying that credential's `label`; an adapter that
+   * ignores `ctx` (or receives no credentials) keeps returning a single
+   * aggregate ProviderQuotaResult, as before. The server flattens either
+   * shape into a list of panels.
    */
-  getQuotaWindows?: () => Promise<ProviderQuotaResult>;
+  getQuotaWindows?: (ctx?: GetQuotaWindowsContext) => Promise<ProviderQuotaResult | ProviderQuotaResult[]>;
   /**
    * Optional: detect the currently configured model from local config files.
    * Returns the detected model/provider and the config source, or null if

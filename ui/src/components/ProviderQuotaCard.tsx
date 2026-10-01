@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import type { CostByProviderModel, CostWindowSpendRow, QuotaWindow } from "@paperclipai/shared";
+import type { CostByProviderModel, CostWindowSpendRow, ProviderQuotaResult, QuotaWindow } from "@paperclipai/shared";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { QuotaBar } from "./QuotaBar";
@@ -28,10 +28,13 @@ interface ProviderQuotaCardProps {
   /** rolling window rows for this provider: 5h, 24h, 7d */
   windowRows: CostWindowSpendRow[];
   showDeficitNotch: boolean;
-  /** live subscription quota windows from the provider's own api */
-  quotaWindows?: QuotaWindow[];
-  quotaError?: string | null;
-  quotaSource?: string | null;
+  /**
+   * Live subscription quota results for this provider, straight from the
+   * quota-windows endpoint. Usually one entry, but claude_local can return
+   * one distinct result per bound Claude token the company's agents use, so
+   * this renders one subscription-quota panel per entry.
+   */
+  quotaResults?: ProviderQuotaResult[];
   quotaLoading?: boolean;
 }
 
@@ -43,9 +46,7 @@ export function ProviderQuotaCard({
   weekSpendCents,
   windowRows,
   showDeficitNotch,
-  quotaWindows = [],
-  quotaError = null,
-  quotaSource = null,
+  quotaResults = [],
   quotaLoading = false,
 }: ProviderQuotaCardProps) {
   // single-pass aggregation over rows — memoized so the 8 derived values are not
@@ -124,10 +125,18 @@ export function ProviderQuotaCard({
     [windowRows],
   );
   const isClaudeQuotaPanel = provider === "anthropic";
-  const isCodexQuotaPanel = provider === "openai" && quotaSource?.startsWith("codex-");
   const supportsSubscriptionQuota = provider === "anthropic" || provider === "openai";
+  // A result with no windows and no error (e.g. claude_local's host-login
+  // probe under Bedrock auth, which is ok:true with an empty windows array)
+  // has nothing to show — rendering it would be a visible but empty panel.
+  // Keep only results that carry data or an error, same as before this card
+  // took a list instead of a single result per provider.
+  const visibleQuotaResults = useMemo(
+    () => quotaResults.filter((result) => (result.ok && result.windows.length > 0) || (!result.ok && !!result.error)),
+    [quotaResults],
+  );
   const showSubscriptionQuotaSection =
-    supportsSubscriptionQuota && (quotaLoading || quotaWindows.length > 0 || quotaError != null);
+    supportsSubscriptionQuota && (quotaLoading || visibleQuotaResults.length > 0);
 
   return (
     <Card>
@@ -304,83 +313,124 @@ export function ProviderQuotaCard({
           </>
         )}
 
-        {/* subscription quota windows from provider api — shown when data is available */}
+        {/* subscription quota windows from provider api — shown when data is available.
+            Usually one result; claude_local can return one per distinct bound token, in
+            which case this renders one panel per result (see ProviderQuotaCardProps). */}
         {showSubscriptionQuotaSection && (
           <>
             <div className="border-t border-border" />
             <div className="space-y-2">
-              <div className="flex items-center justify-between gap-3">
-                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-                  Subscription quota
-                </p>
-                {quotaSource && !isClaudeQuotaPanel && !isCodexQuotaPanel ? (
-                  <span className="text-(length:--text-nano) uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
-                    {quotaSourceDisplayName(quotaSource)}
-                  </span>
-                ) : null}
-              </div>
+              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+                Subscription quota
+              </p>
               {quotaLoading ? (
                 <QuotaPanelSkeleton />
-              ) : isClaudeQuotaPanel ? (
-                <ClaudeSubscriptionPanel windows={quotaWindows} source={quotaSource} error={quotaError} />
-              ) : isCodexQuotaPanel ? (
-                <CodexSubscriptionPanel windows={quotaWindows} source={quotaSource} error={quotaError} />
               ) : (
-                <>
-                  {quotaError ? (
-                    <p className="text-xs text-destructive">
-                      {quotaError}
-                    </p>
-                  ) : null}
-                  <div className="space-y-2.5">
-                    {quotaWindows.map((qw) => {
-                      const fillColor =
-                        qw.usedPercent == null
-                          ? null
-                          : qw.usedPercent >= 90
-                            ? "bg-(--status-task-blocked)"
-                            : qw.usedPercent >= 70
-                              ? "bg-(--status-task-todo)"
-                              : "bg-(--status-task-done)";
-                      return (
-                        <div key={qw.label} className="space-y-1">
-                          <div className="flex items-center justify-between gap-2 text-xs">
-                            <span className="font-mono text-muted-foreground shrink-0">{qw.label}</span>
-                            <span className="flex-1" />
-                            {qw.valueLabel != null ? (
-                              <span className="font-medium tabular-nums">{qw.valueLabel}</span>
-                            ) : qw.usedPercent != null ? (
-                              <span className="font-medium tabular-nums">{qw.usedPercent}% used</span>
-                            ) : null}
-                          </div>
-                          {qw.usedPercent != null && fillColor != null && (
-                            <div className="h-2 w-full border border-border overflow-hidden">
-                              <div
-                                className={`h-full transition-(--tp-width) duration-150 ${fillColor}`}
-                                style={{ width: `${qw.usedPercent}%` }}
-                              />
-                            </div>
-                          )}
-                          {qw.detail ? (
-                            <p className="text-xs text-muted-foreground">
-                              {qw.detail}
-                            </p>
-                          ) : qw.resetsAt ? (
-                            <p className="text-xs text-muted-foreground">
-                              resets {new Date(qw.resetsAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
-                            </p>
-                          ) : null}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </>
+                <div className="space-y-3">
+                  {visibleQuotaResults.map((result, index) => (
+                    <QuotaResultPanel
+                      key={result.label ?? `${provider}-${index}`}
+                      provider={provider}
+                      isClaudeQuotaPanel={isClaudeQuotaPanel}
+                      result={result}
+                    />
+                  ))}
+                </div>
               )}
             </div>
           </>
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function QuotaResultPanel({
+  provider,
+  isClaudeQuotaPanel,
+  result,
+}: {
+  provider: string;
+  isClaudeQuotaPanel: boolean;
+  result: ProviderQuotaResult;
+}) {
+  const isCodexQuotaPanel = provider === "openai" && result.source?.startsWith("codex-");
+  const windows = result.windows ?? [];
+  const error = result.ok ? null : result.error ?? null;
+
+  if (isClaudeQuotaPanel) {
+    return (
+      <ClaudeSubscriptionPanel
+        windows={windows}
+        source={result.source}
+        error={error}
+        label={result.label}
+        observedAt={result.observedAt}
+        stale={result.stale}
+        overageInUse={result.overageInUse}
+      />
+    );
+  }
+  if (isCodexQuotaPanel) {
+    return <CodexSubscriptionPanel windows={windows} source={result.source} error={error} />;
+  }
+
+  return (
+    <div className="border border-border px-3.5 py-3">
+      {result.label || result.source ? (
+        <div className="flex items-center justify-between gap-3 pb-2">
+          {result.label ? <span className="text-xs font-medium text-foreground">{result.label}</span> : <span />}
+          {result.source ? (
+            <span className="text-(length:--text-nano) uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
+              {quotaSourceDisplayName(result.source)}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+      {error ? <p className="text-xs text-destructive">{error}</p> : null}
+      <div className="space-y-2.5">
+        {windows.map((qw) => {
+          const fillColor =
+            qw.usedPercent == null
+              ? null
+              : qw.usedPercent >= 90
+                ? "bg-(--status-task-blocked)"
+                : qw.usedPercent >= 70
+                  ? "bg-(--status-task-todo)"
+                  : "bg-(--status-task-done)";
+          return (
+            <div key={qw.label} className="space-y-1">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <span className="font-mono text-muted-foreground shrink-0">{qw.label}</span>
+                <span className="flex-1" />
+                {qw.valueLabel != null ? (
+                  <span className="font-medium tabular-nums">{qw.valueLabel}</span>
+                ) : qw.usedPercent != null ? (
+                  <span className="font-medium tabular-nums">{qw.usedPercent}% used</span>
+                ) : null}
+              </div>
+              {qw.usedPercent != null && fillColor != null && (
+                <div className="h-2 w-full border border-border overflow-hidden">
+                  <div
+                    className={`h-full transition-(--tp-width) duration-150 ${fillColor}`}
+                    style={{ width: `${qw.usedPercent}%` }}
+                  />
+                </div>
+              )}
+              {qw.detail ? (
+                <p className="text-xs text-muted-foreground">
+                  {qw.detail}
+                </p>
+              ) : qw.resetsAt ? (
+                <p className="text-xs text-muted-foreground">
+                  resets {new Date(qw.resetsAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                </p>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 

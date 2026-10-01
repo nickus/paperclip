@@ -21,7 +21,7 @@ import {
   logActivity,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
-import { fetchAllQuotaWindows } from "../services/quota-windows.js";
+import { fetchAllQuotaWindows, type QuotaActorContext } from "../services/quota-windows.js";
 import { badRequest } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -281,7 +281,14 @@ export function costRoutes(
       res.status(404).json({ error: "Company not found" });
       return;
     }
-    const results = await fetchAllQuotaWindows();
+    const actorInfo = getActorInfo(req);
+    const actor: QuotaActorContext = {
+      actorType: actorInfo.actorType,
+      actorId: actorInfo.actorId,
+      actorSource: actorInfo.actorSource,
+      responsibleUserId: req.actor.userId ?? req.actor.onBehalfOfUserId ?? null,
+    };
+    const results = await fetchAllQuotaWindows(db, companyId, actor);
     res.json(results);
   });
 
