@@ -663,6 +663,7 @@ import {
   selectPaperclipTaskMarkdown,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+  withPaperclipWakeSessionConfigChanges,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
@@ -5984,6 +5985,8 @@ const SESSION_CONFIG_FINGERPRINT_VERSION_KEY =
 const SESSION_CONFIG_CATEGORIES_KEY = "__paperclipConfigCategories";
 const SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY =
   "__paperclipConfigCategoryFingerprints";
+const SESSION_CONFIG_IDENTITY_FINGERPRINTS_KEY =
+  "__paperclipConfigIdentityFingerprints";
 const PAPERCLIP_SESSION_METADATA_KEYS = new Set([
   SESSION_AI_CREDENTIAL_IDENTITY_KEY,
   SESSION_CONFIGURED_MODEL_KEY,
@@ -5991,7 +5994,24 @@ const PAPERCLIP_SESSION_METADATA_KEYS = new Set([
   SESSION_CONFIG_FINGERPRINT_VERSION_KEY,
   SESSION_CONFIG_CATEGORIES_KEY,
   SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY,
+  SESSION_CONFIG_IDENTITY_FINGERPRINTS_KEY,
 ]);
+/**
+ * Instance switch for when a configuration change starts a new task session.
+ * "breaking" (the default) keeps the saved session unless the adapter type or
+ * the selected environment changed; "any" restores the strict behaviour where
+ * any change to the effective run configuration starts a fresh session.
+ */
+export const SESSION_CONFIG_RESET_ENV = "PAPERCLIP_SESSION_CONFIG_RESET";
+export type TaskSessionConfigResetPolicy = "breaking" | "any";
+/**
+ * The parts of a run's configuration that make a saved task session unusable
+ * when they change. Everything else (instructions, skills, secrets, env,
+ * adapter knobs, workspace and environment settings) is supplied again on
+ * every turn, and adapters check technical resumability (cwd, remote target,
+ * model, session files) themselves.
+ */
+const EFFECTIVE_RUN_SESSION_IDENTITIES = ["adapterType", "environment"] as const;
 const WORKSPACE_CONFIG_FINGERPRINT_METADATA_KEY = "configFingerprint";
 const EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES = [
   "adapter",
@@ -6021,19 +6041,30 @@ type EffectiveRunSessionConfigCategory =
 type EffectiveRunWorkspaceConfigCategory =
   (typeof EFFECTIVE_RUN_WORKSPACE_CONFIG_CATEGORIES)[number];
 
+type EffectiveRunSessionIdentity =
+  (typeof EFFECTIVE_RUN_SESSION_IDENTITIES)[number];
+
 type EffectiveRunSessionConfigMetadata = {
   aiCredentialIdentity?: string;
   version: typeof EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION;
   fingerprint: string;
   categories: EffectiveRunSessionConfigCategory[];
   categoryFingerprints: Record<EffectiveRunSessionConfigCategory, string>;
+  identityFingerprints: Record<EffectiveRunSessionIdentity, string>;
   fingerprints: EffectiveRunConfigFingerprints;
 };
 
 type TaskSessionConfigFreshnessDecision = {
   reset: boolean;
   reasons: string[];
+  /** Every category whose fingerprint changed since the session's last turn. */
   changedCategories: EffectiveRunSessionConfigCategory[];
+  /**
+   * Changed categories the saved session is kept across. Empty when the
+   * session is reset or nothing changed.
+   */
+  carriedOverCategories: EffectiveRunSessionConfigCategory[];
+  resetPolicy: TaskSessionConfigResetPolicy;
   storedFingerprint: string | null;
   nextFingerprint: string | null;
 };
@@ -6278,6 +6309,30 @@ const EFFECTIVE_RUN_SESSION_CONFIG_CATEGORY_LABELS: Record<
   secrets: "secrets",
   runtimeSkills: "runtime skills",
 };
+const EFFECTIVE_RUN_SESSION_IDENTITY_LABELS: Record<
+  EffectiveRunSessionIdentity,
+  string
+> = {
+  adapterType: "adapter type",
+  environment: "selected environment",
+};
+// Wording for the agent itself, used in the note on a resumed session. Several
+// categories describe the same thing from the agent's point of view.
+const EFFECTIVE_RUN_SESSION_CONFIG_CATEGORY_AGENT_LABELS: Record<
+  EffectiveRunSessionConfigCategory,
+  string
+> = {
+  adapter: "your agent configuration",
+  adapterConfig: "your agent configuration",
+  agentRuntimeConfig: "your runtime settings",
+  instructions: "your instructions",
+  issueOverrides: "this task's agent overrides",
+  workspaceConfig: "workspace settings",
+  environment: "environment settings",
+  envBindings: "environment variables",
+  secrets: "secrets",
+  runtimeSkills: "your skills",
+};
 const EFFECTIVE_RUN_WORKSPACE_CONFIG_CATEGORY_LABELS: Record<
   EffectiveRunWorkspaceConfigCategory,
   string
@@ -6307,6 +6362,16 @@ function parseStoredConfigCategoryFingerprints(value: unknown) {
   for (const category of EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES) {
     const fingerprint = readNonEmptyString(parsed[category]);
     if (fingerprint) out[category] = fingerprint;
+  }
+  return out;
+}
+
+function parseStoredConfigIdentityFingerprints(value: unknown) {
+  const parsed = parseObject(value);
+  const out: Partial<Record<EffectiveRunSessionIdentity, string>> = {};
+  for (const identity of EFFECTIVE_RUN_SESSION_IDENTITIES) {
+    const fingerprint = readNonEmptyString(parsed[identity]);
+    if (fingerprint) out[identity] = fingerprint;
   }
   return out;
 }
@@ -6347,7 +6412,67 @@ function readConfigFingerprintFromSessionParams(
     categoryFingerprints: parseStoredConfigCategoryFingerprints(
       sessionParams[SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY],
     ),
+    identityFingerprints: parseStoredConfigIdentityFingerprints(
+      sessionParams[SESSION_CONFIG_IDENTITY_FINGERPRINTS_KEY],
+    ),
   };
+}
+
+export function resolveTaskSessionConfigResetPolicy(
+  env: Record<string, string | undefined> = process.env,
+): TaskSessionConfigResetPolicy {
+  return env[SESSION_CONFIG_RESET_ENV]?.trim().toLowerCase() === "any"
+    ? "any"
+    : "breaking";
+}
+
+/**
+ * Which session identities changed since the saved session's last turn.
+ * Sessions saved before identity fingerprints were recorded carry none; for
+ * those an identity counts as unchanged. Task sessions are stored per adapter
+ * type, so a saved session never comes from another adapter type, and the
+ * adapters' own resume checks (cwd, remote target, session files) still apply.
+ */
+function changedEffectiveRunSessionIdentities(input: {
+  previous: Partial<Record<EffectiveRunSessionIdentity, string>>;
+  next: Record<EffectiveRunSessionIdentity, string>;
+}) {
+  return EFFECTIVE_RUN_SESSION_IDENTITIES.filter((identity) => {
+    const previous = input.previous[identity];
+    return previous !== undefined && previous !== input.next[identity];
+  });
+}
+
+/** Agent-facing names for changed categories, without duplicates. */
+export function describeSessionConfigChangesForAgent(
+  categories: readonly string[],
+): string[] {
+  const labels: string[] = [];
+  for (const category of categories) {
+    const label =
+      EFFECTIVE_RUN_SESSION_CONFIG_CATEGORY_AGENT_LABELS[
+        category as EffectiveRunSessionConfigCategory
+      ];
+    if (label && !labels.includes(label)) labels.push(label);
+  }
+  return labels;
+}
+
+/**
+ * The run-log line for a saved session that is resumed although parts of its
+ * configuration changed since its last turn.
+ */
+export function formatResumedSessionConfigChangesNotice(input: {
+  taskKey: string | null | undefined;
+  carriedOverCategories: readonly EffectiveRunSessionConfigCategory[];
+}) {
+  if (input.carriedOverCategories.length === 0) return null;
+  const changes = describeEffectiveRunConfigCategories(
+    input.carriedOverCategories,
+  );
+  return input.taskKey
+    ? `Resuming saved session for task "${input.taskKey}"; changed since its last turn: ${changes}.`
+    : `Resuming saved session; changed since its last turn: ${changes}.`;
 }
 
 function describeEffectiveRunConfigCategories(
@@ -6773,13 +6898,38 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     subcategories: EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES,
     secretManifest,
   });
+  const identityFingerprints = createEffectiveRunConfigSubcategoryFingerprints({
+    category: "session",
+    value: {
+      adapterType: input.adapterType,
+      environment: readSessionEnvironmentIdentity(input.environment),
+    } satisfies Record<EffectiveRunSessionIdentity, unknown>,
+    subcategories: EFFECTIVE_RUN_SESSION_IDENTITIES,
+  });
   return {
     version: EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION,
     fingerprint: fingerprints.sessionFingerprint.fingerprint,
     categories: [...EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES],
     categoryFingerprints,
+    identityFingerprints,
     fingerprints,
   };
+}
+
+/**
+ * The selected environment's identity (which environment, which driver),
+ * without its settings: a saved session survives edits to an environment but
+ * not a move to another environment.
+ */
+function readSessionEnvironmentIdentity(environment: unknown) {
+  const value = parseObject(environment);
+  const selected = parseObject(value.selectedEnvironment);
+  const id =
+    readNonEmptyString(selected.id) ??
+    readNonEmptyString(value.selectedEnvironmentId);
+  const driver =
+    readNonEmptyString(selected.driver) ?? readNonEmptyString(value.driver);
+  return id || driver ? { id, driver } : null;
 }
 
 function buildWorkspaceConfigCategoryValues(input: {
@@ -7044,6 +7194,8 @@ function attachPaperclipSessionMetadataToSessionParams(
     next[SESSION_CONFIG_CATEGORIES_KEY] = configMetadata.categories;
     next[SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY] =
       configMetadata.categoryFingerprints;
+    next[SESSION_CONFIG_IDENTITY_FINGERPRINTS_KEY] =
+      configMetadata.identityFingerprints;
   }
   return next;
 }
@@ -7091,12 +7243,17 @@ export function resolveTaskSessionConfigFreshness(input: {
   configMetadata: EffectiveRunSessionConfigMetadata | null;
   wakeResetReason?: string | null;
   preserveLegacySessionWithoutConfigMetadata?: boolean;
+  /** Defaults to "breaking"; see SESSION_CONFIG_RESET_ENV. */
+  resetPolicy?: TaskSessionConfigResetPolicy;
 }): TaskSessionConfigFreshnessDecision {
+  const resetPolicy = input.resetPolicy ?? "breaking";
   if (!input.hasTaskSession) {
     return {
       reset: false,
       reasons: [],
       changedCategories: [],
+      carriedOverCategories: [],
+      resetPolicy,
       storedFingerprint: null,
       nextFingerprint: input.configMetadata?.fingerprint ?? null,
     };
@@ -7120,6 +7277,7 @@ export function resolveTaskSessionConfigFreshness(input: {
   }
 
   let changedCategories: EffectiveRunSessionConfigCategory[] = [];
+  let carriedOverCategories: EffectiveRunSessionConfigCategory[] = [];
   if (input.configMetadata) {
     if (!storedConfig && !input.preserveLegacySessionWithoutConfigMetadata) {
       changedCategories = [...input.configMetadata.categories];
@@ -7142,18 +7300,40 @@ export function resolveTaskSessionConfigFreshness(input: {
         previous: storedConfig.categoryFingerprints,
         next: input.configMetadata.categoryFingerprints,
       });
-      reasons.push(
-        `effective run configuration changed: ${describeEffectiveRunConfigCategories(changedCategories)}`,
-      );
+      if (resetPolicy === "any") {
+        reasons.push(
+          `effective run configuration changed: ${describeEffectiveRunConfigCategories(changedCategories)}`,
+        );
+      } else {
+        // Only a change that makes the saved conversation unusable starts a
+        // new one. The current instructions, skills, env and settings are
+        // supplied on the next turn either way.
+        const changedIdentities = changedEffectiveRunSessionIdentities({
+          previous: storedConfig.identityFingerprints,
+          next: input.configMetadata.identityFingerprints,
+        });
+        if (changedIdentities.length > 0) {
+          reasons.push(
+            `effective run configuration changed: ${changedIdentities
+              .map((identity) => EFFECTIVE_RUN_SESSION_IDENTITY_LABELS[identity])
+              .join(", ")}`,
+          );
+        } else {
+          carriedOverCategories = changedCategories;
+        }
+      }
     }
   }
 
   if (input.wakeResetReason) reasons.push(input.wakeResetReason);
 
+  const reset = reasons.length > 0;
   return {
-    reset: reasons.length > 0,
+    reset,
     reasons,
     changedCategories,
+    carriedOverCategories: reset ? [] : carriedOverCategories,
+    resetPolicy,
     storedFingerprint: storedConfig?.fingerprint ?? null,
     nextFingerprint: input.configMetadata?.fingerprint ?? null,
   };
@@ -22619,6 +22799,7 @@ export function heartbeatService(
         wakeResetReason: wakeSessionResetReason,
         preserveLegacySessionWithoutConfigMetadata:
           acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
+        resetPolicy: resolveTaskSessionConfigResetPolicy(),
       });
       const resetTaskSession =
         shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
@@ -23931,6 +24112,28 @@ export function heartbeatService(
       ) {
         delete executionContinuation.resumeDelta;
       }
+      // A saved task session resumed across configuration changes: say so in
+      // the run log, and tell the agent which parts changed so a new
+      // instruction or setting never comes as a surprise mid-conversation.
+      const resumedTaskSessionConfigChanges =
+        runtimeForAdapter.sessionId &&
+        taskSessionForRun &&
+        !explicitResumeSessionParams &&
+        !explicitResumeSessionDisplayId
+          ? sessionConfigFreshness.carriedOverCategories
+          : [];
+      const resumedSessionConfigNotice = formatResumedSessionConfigChangesNotice(
+        { taskKey, carriedOverCategories: resumedTaskSessionConfigChanges },
+      );
+      if (resumedSessionConfigNotice) {
+        runtimeWorkspaceWarnings.push(resumedSessionConfigNotice);
+      }
+      if (context[PAPERCLIP_WAKE_PAYLOAD_KEY]) {
+        context[PAPERCLIP_WAKE_PAYLOAD_KEY] = withPaperclipWakeSessionConfigChanges(
+          context[PAPERCLIP_WAKE_PAYLOAD_KEY],
+          describeSessionConfigChangesForAgent(resumedTaskSessionConfigChanges),
+        );
+      }
       // The wake payload (and its Run Brief) was built before the session and
       // workspace were resolved; fill in the brief's environment line now.
       if (context[PAPERCLIP_WAKE_PAYLOAD_KEY]) {
@@ -23973,7 +24176,9 @@ export function heartbeatService(
           categories: sessionConfigMetadata.categories,
           reset: resetTaskSession,
           resetReasons: sessionConfigFreshness.reasons,
+          resetPolicy: sessionConfigFreshness.resetPolicy,
           changedCategories: sessionConfigFreshness.changedCategories,
+          carriedOverCategories: resumedTaskSessionConfigChanges,
           taskSessionAvailable: taskSession != null,
           taskSessionReused: taskSessionForRun != null,
           storedFingerprintPresent: Boolean(

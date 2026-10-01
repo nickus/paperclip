@@ -23,6 +23,8 @@ import {
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
+  renderPaperclipWakeSessionConfigChanges,
+  withPaperclipWakeSessionConfigChanges,
   resolveLegacyPaperclipDesiredSkillNames,
   resolvePaperclipDesiredSkillNames,
   selectPaperclipTaskMarkdown,
@@ -913,6 +915,50 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  it("tells a resumed agent what changed in its configuration since its previous turn", () => {
+    const payload = {
+      reason: "issue_commented",
+      issue: { id: "issue-1", identifier: "PAP-1", title: "Follow-up", status: "in_progress" },
+      comments: [],
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      fallbackFetchNeeded: false,
+    };
+    const withChanges = withPaperclipWakeSessionConfigChanges(payload, [
+      "your instructions",
+      "environment settings",
+    ]);
+    const note =
+      "Changed since your previous turn on this task: your instructions, environment settings. The current versions are in effect.";
+
+    expect(renderPaperclipWakeSessionConfigChanges(withChanges)).toBe(note);
+    const prompt = renderPaperclipWakePrompt(withChanges, { resumedSession: true });
+    expect(prompt).toContain(note);
+    expect(prompt.indexOf(note)).toBeGreaterThan(prompt.indexOf("## Paperclip"));
+    // The note is runtime-only: it never enters the serialized wake payload.
+    expect(stringifyPaperclipWakePayload(withChanges)).not.toContain("sessionConfigChanges");
+
+    // Clearing the changes removes the field (a retried run reuses its context).
+    const cleared = withPaperclipWakeSessionConfigChanges(withChanges, []);
+    expect(cleared).not.toHaveProperty("sessionConfigChanges");
+    expect(renderPaperclipWakePrompt(cleared, { resumedSession: true })).not.toContain(
+      "Changed since your previous turn",
+    );
+    expect(renderPaperclipWakePrompt(cleared, { resumedSession: true })).toBe(
+      renderPaperclipWakePrompt(payload, { resumedSession: true }),
+    );
+  });
+
+  it("renders the configuration note as one bounded line", () => {
+    expect(
+      renderPaperclipWakeSessionConfigChanges({
+        sessionConfigChanges: ["your\ninstructions", "", 42, "x".repeat(200)],
+      }),
+    ).toMatch(/^Changed since your previous turn on this task: your instructions, x+…\. The current versions are in effect\.$/);
+    expect(renderPaperclipWakeSessionConfigChanges({ sessionConfigChanges: [] })).toBe("");
+    expect(renderPaperclipWakeSessionConfigChanges({ sessionConfigChanges: "secrets" })).toBe("");
+    expect(renderPaperclipWakeSessionConfigChanges(null)).toBe("");
+  });
+
   it("leaves conversation disposition and accepted-plan handoff to the injected chat policy", () => {
     const payload = {
       reason: "issue_commented",

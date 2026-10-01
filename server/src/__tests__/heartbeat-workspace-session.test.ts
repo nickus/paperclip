@@ -32,6 +32,9 @@ import {
   resolveExecutionWorkspaceReuseProvisioningPolicy,
   resolveNextSessionState,
   resolveTaskSessionConfigFreshness,
+  resolveTaskSessionConfigResetPolicy,
+  describeSessionConfigChangesForAgent,
+  formatResumedSessionConfigChangesNotice,
   isWorkspaceSyncConflictFailure,
   requiresPushCapabilityPreflight,
   resolveWorkspaceAfterLowTrustPreflight,
@@ -2207,6 +2210,7 @@ function sessionParamsWithConfigMetadata(
     __paperclipConfigFingerprintVersion: metadata.version,
     __paperclipConfigCategories: metadata.categories,
     __paperclipConfigCategoryFingerprints: metadata.categoryFingerprints,
+    __paperclipConfigIdentityFingerprints: metadata.identityFingerprints,
   };
 }
 
@@ -2251,7 +2255,7 @@ describe("effective run session config freshness", () => {
     expect(unmanagedFirst.fingerprint).not.toBe(unmanagedNext.fingerprint);
   });
 
-  it("resets when effective adapter config changes after model/profile/env resolution", async () => {
+  it("resets when effective adapter config changes after model/profile/env resolution under the strict policy", async () => {
     const base = await buildSessionConfigMetadata();
     const next = await buildSessionConfigMetadata({
       effectiveAdapterConfig: {
@@ -2266,13 +2270,32 @@ describe("effective run session config freshness", () => {
       configuredModel: "gpt-5.4-mini",
       taskSessionParams: sessionParamsWithConfigMetadata(base),
       configMetadata: next,
+      resetPolicy: "any",
     });
 
     expect(decision).toMatchObject({
       reset: true,
       changedCategories: ["adapterConfig"],
+      carriedOverCategories: [],
+      resetPolicy: "any",
     });
     expect(decision.reasons.join("\n")).toContain("adapter config");
+
+    // By default the same change keeps the saved session.
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: next,
+      }),
+    ).toMatchObject({
+      reset: false,
+      reasons: [],
+      changedCategories: ["adapterConfig"],
+      carriedOverCategories: ["adapterConfig"],
+      resetPolicy: "breaking",
+    });
   });
 
   it("does not reset for issue comment timestamps but still resets for workspace settings", async () => {
@@ -2319,6 +2342,7 @@ describe("effective run session config freshness", () => {
         configuredModel: "gpt-5.4-mini",
         taskSessionParams: sessionParamsWithConfigMetadata(base),
         configMetadata: workspaceChanged,
+        resetPolicy: "any",
       }),
     ).toMatchObject({
       reset: true,
@@ -2467,8 +2491,19 @@ describe("effective run session config freshness", () => {
           configuredModel: "gpt-5.4-mini",
           taskSessionParams: sessionParamsWithConfigMetadata(base),
           configMetadata: next,
+          resetPolicy: "any",
         }),
       ).toMatchObject({ reset: true, changedCategories: ["workspaceConfig"] });
+      // The adapters' cwd checks cover a workspace move; the setting change
+      // alone keeps the conversation by default.
+      expect(
+        resolveTaskSessionConfigFreshness({
+          hasTaskSession: true,
+          configuredModel: "gpt-5.4-mini",
+          taskSessionParams: sessionParamsWithConfigMetadata(base),
+          configMetadata: next,
+        }),
+      ).toMatchObject({ reset: false, carriedOverCategories: ["workspaceConfig"] });
     }
   });
 
@@ -2611,10 +2646,20 @@ describe("effective run session config freshness", () => {
         configuredModel: "gpt-5.4-mini",
         taskSessionParams: sessionParamsWithConfigMetadata(base),
         configMetadata: testCase.metadata,
+        resetPolicy: "any",
       });
 
       expect(decision.reset, testCase.name).toBe(true);
       expect(decision.changedCategories, testCase.name).toContain(testCase.category);
+
+      const kept = resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: testCase.metadata,
+      });
+      expect(kept.reset, testCase.name).toBe(false);
+      expect(kept.carriedOverCategories, testCase.name).toContain(testCase.category);
     }
   });
 
@@ -2649,11 +2694,23 @@ describe("effective run session config freshness", () => {
       configuredModel: "gpt-5.4-mini",
       taskSessionParams: sessionParamsWithConfigMetadata(base),
       configMetadata: next,
+      resetPolicy: "any",
     });
 
     expect(decision.reset).toBe(true);
     expect(decision.changedCategories).toContain("instructions");
     expect(next.fingerprints.sessionFingerprint.canonicalJson).not.toContain("Version two instructions");
+
+    // An instructions edit keeps the saved conversation by default; the new
+    // instructions are supplied on the next turn.
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: next,
+      }),
+    ).toMatchObject({ reset: false, reasons: [], carriedOverCategories: ["instructions"] });
   });
 
   it("does not read unbounded legacy instructions paths for config fingerprints", async () => {
@@ -2732,6 +2789,194 @@ describe("effective run session config freshness", () => {
   });
 });
 
+describe("task session continuity across configuration changes", () => {
+  const environmentValue = (overrides: {
+    id?: string;
+    driver?: string;
+    config?: Record<string, unknown>;
+    configRevisionAt?: string;
+    selectionSource?: string;
+  } = {}) => ({
+    selectionSource: overrides.selectionSource ?? "default",
+    selectedEnvironmentId: overrides.id ?? "environment-1",
+    selectedEnvironment: {
+      id: overrides.id ?? "environment-1",
+      driver: overrides.driver ?? "sandbox",
+      config: overrides.config ?? { provider: "kubernetes", reuseLease: true, cpu: "2" },
+      ...(overrides.configRevisionAt ? { configRevisionAt: overrides.configRevisionAt } : {}),
+    },
+  });
+  const decide = (
+    base: SessionConfigMetadata,
+    next: SessionConfigMetadata,
+    extra: Partial<Parameters<typeof resolveTaskSessionConfigFreshness>[0]> = {},
+  ) =>
+    resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      configuredModel: "gpt-5.4-mini",
+      taskSessionParams: sessionParamsWithConfigMetadata(base),
+      configMetadata: next,
+      ...extra,
+    });
+
+  it("keeps the saved session across non-breaking changes and names them", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-continuity-"));
+    const instructionsPath = path.join(root, "AGENTS.md");
+    await fs.writeFile(instructionsPath, "First instructions.\n", "utf8");
+    const adapterConfig = {
+      command: "codex",
+      model: "gpt-5.4-mini",
+      reasoningEffort: "medium",
+      instructionsBundleMode: "managed",
+      instructionsRootPath: root,
+      instructionsEntryFile: "AGENTS.md",
+      instructionsFilePath: instructionsPath,
+    };
+    const base = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: adapterConfig,
+      environment: environmentValue(),
+    });
+    await fs.writeFile(instructionsPath, "Second instructions.\n", "utf8");
+    const next = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: { ...adapterConfig, reasoningEffort: "high" },
+      environment: environmentValue({ config: { provider: "kubernetes", reuseLease: true, cpu: "4" } }),
+      agentRuntimeConfig: { heartbeat: { maxConcurrentRuns: 2 } },
+      environmentEnv: { ENVIRONMENT_FLAG: "changed" },
+      secretManifest: [
+        {
+          configPath: "env.OPENAI_API_KEY",
+          envKey: "OPENAI_API_KEY",
+          secretId: "secret-1",
+          bindingId: "binding-1",
+          secretKey: "openai-api-key",
+          version: 8,
+          provider: "local_encrypted",
+          outcome: "success",
+        },
+      ],
+      runtimeSkills: [],
+      agentConfigRevision: {
+        id: "agent-config-revision-2",
+        changedKeys: ["adapterConfig"],
+        configRevisionAt: "2026-06-02T00:00:00.000Z",
+      },
+    });
+
+    const decision = decide(base, next);
+
+    expect(decision.reset).toBe(false);
+    expect(decision.reasons).toEqual([]);
+    expect(decision.resetPolicy).toBe("breaking");
+    expect(decision.carriedOverCategories).toEqual(decision.changedCategories);
+    expect(decision.carriedOverCategories).toEqual(
+      expect.arrayContaining([
+        "adapter",
+        "adapterConfig",
+        "agentRuntimeConfig",
+        "instructions",
+        "environment",
+        "envBindings",
+        "secrets",
+        "runtimeSkills",
+      ]),
+    );
+    expect(
+      formatResumedSessionConfigChangesNotice({
+        taskKey: "issue-1",
+        carriedOverCategories: ["instructions", "secrets"],
+      }),
+    ).toBe('Resuming saved session for task "issue-1"; changed since its last turn: instructions, secrets.');
+    expect(
+      describeSessionConfigChangesForAgent(["adapter", "adapterConfig", "instructions", "environment"]),
+    ).toEqual(["your agent configuration", "your instructions", "environment settings"]);
+
+    // The strict policy resets on the same changes.
+    expect(decide(base, next, { resetPolicy: "any" })).toMatchObject({
+      reset: true,
+      carriedOverCategories: [],
+    });
+  });
+
+  it("starts a fresh session when the selected environment or its driver changes", async () => {
+    const base = await buildSessionConfigMetadata({ environment: environmentValue() });
+    for (const next of [
+      await buildSessionConfigMetadata({ environment: environmentValue({ id: "environment-2" }) }),
+      await buildSessionConfigMetadata({ environment: environmentValue({ driver: "ssh" }) }),
+      await buildSessionConfigMetadata({ environment: null }),
+    ]) {
+      const decision = decide(base, next);
+      expect(decision.reset).toBe(true);
+      expect(decision.reasons).toEqual(["effective run configuration changed: selected environment"]);
+      expect(decision.changedCategories).toContain("environment");
+      expect(decision.carriedOverCategories).toEqual([]);
+    }
+  });
+
+  it("does not treat the environment's selection source or settings as a different environment", async () => {
+    const base = await buildSessionConfigMetadata({ environment: environmentValue() });
+    const next = await buildSessionConfigMetadata({
+      environment: environmentValue({
+        selectionSource: "instance_default",
+        config: { provider: "kubernetes", reuseLease: false },
+      }),
+    });
+    expect(next.identityFingerprints).toEqual(base.identityFingerprints);
+    expect(decide(base, next)).toMatchObject({ reset: false, carriedOverCategories: ["environment"] });
+  });
+
+  it("starts a fresh session when the adapter type changes", async () => {
+    const base = await buildSessionConfigMetadata();
+    const next = await buildSessionConfigMetadata({ adapterType: "claude_local" });
+    const decision = decide(base, next);
+    expect(decision.reset).toBe(true);
+    expect(decision.reasons).toEqual(["effective run configuration changed: adapter type"]);
+  });
+
+  it("keeps the existing reset checks for model changes and fresh-session wakes", async () => {
+    const base = await buildSessionConfigMetadata();
+    const next = await buildSessionConfigMetadata({ runtimeSkills: [] });
+
+    const modelChanged = resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      configuredModel: "gpt-5.4",
+      taskSessionParams: sessionParamsWithConfigMetadata(base),
+      configMetadata: next,
+    });
+    expect(modelChanged.reset).toBe(true);
+    expect(modelChanged.reasons).toEqual(['configured model changed from "gpt-5.4-mini" to "gpt-5.4"']);
+    expect(modelChanged.carriedOverCategories).toEqual([]);
+
+    const wakeReset = decide(base, next, { wakeResetReason: "forceFreshSession was requested" });
+    expect(wakeReset).toMatchObject({
+      reset: true,
+      reasons: ["forceFreshSession was requested"],
+      carriedOverCategories: [],
+    });
+  });
+
+  it("keeps sessions saved before identity fingerprints were recorded", async () => {
+    const base = await buildSessionConfigMetadata({ environment: environmentValue() });
+    const next = await buildSessionConfigMetadata({ environment: environmentValue({ id: "environment-2" }) });
+    const { __paperclipConfigIdentityFingerprints: _identity, ...legacyParams } =
+      sessionParamsWithConfigMetadata(base);
+
+    const decision = resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      configuredModel: "gpt-5.4-mini",
+      taskSessionParams: legacyParams,
+      configMetadata: next,
+    });
+    expect(decision).toMatchObject({ reset: false, carriedOverCategories: ["environment"] });
+  });
+
+  it("reads the reset policy from the instance environment", () => {
+    expect(resolveTaskSessionConfigResetPolicy({})).toBe("breaking");
+    expect(resolveTaskSessionConfigResetPolicy({ PAPERCLIP_SESSION_CONFIG_RESET: "breaking" })).toBe("breaking");
+    expect(resolveTaskSessionConfigResetPolicy({ PAPERCLIP_SESSION_CONFIG_RESET: " Any " })).toBe("any");
+    expect(resolveTaskSessionConfigResetPolicy({ PAPERCLIP_SESSION_CONFIG_RESET: "sometimes" })).toBe("breaking");
+  });
+});
+
 describe("stripConfiguredModelFromSessionParams", () => {
   it("removes the internal model key from persisted session params", () => {
     expect(
@@ -2777,6 +3022,7 @@ describe("stripPaperclipSessionMetadataFromSessionParams", () => {
         __paperclipConfigFingerprintVersion: 1,
         __paperclipConfigCategories: ["adapterConfig"],
         __paperclipConfigCategoryFingerprints: { adapterConfig: "v1:sha256:def" },
+        __paperclipConfigIdentityFingerprints: { adapterType: "v1:sha256:123" },
       }),
     ).toEqual({
       sessionId: "thread-1",
