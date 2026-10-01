@@ -42,6 +42,34 @@ it("exempts a model-endpoint outage from reconciliation on the error code alone,
   expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "adapter_failed" })).toBe(true);
 });
 
+it("stops exempting a model-endpoint outage once its own dedicated backoff is exhausted", () => {
+  // Regression coverage: without this cap, a permanently (not just
+  // transiently) unreachable endpoint retries forever with no human ever
+  // notified — the general stranded-issue sweep (enqueueStrandedIssueRecovery)
+  // just queues a fresh bounded-transient retry for an errorCode this
+  // exemption still covers, and the next failure restarts the dedicated
+  // backoff from attempt one again.
+  const outageRun = {
+    runtimeMode: "legacy", status: "failed", errorCode: "model_endpoint_unreachable",
+    scheduledRetryReason: "model_endpoint_unreachable_retry", resultJson: {},
+  };
+  // Still well within the dedicated backoff's own budget: exempt.
+  expect(legacyExecutionNeedsReconciliation({ ...outageRun, scheduledRetryAttempt: 1 })).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...outageRun, scheduledRetryAttempt: 499 })).toBe(false);
+  // The dedicated backoff's own cap (heartbeat.ts's
+  // MODEL_ENDPOINT_UNREACHABLE_RETRY_MAX_ATTEMPTS): exhausted, so this is no
+  // longer a transient outage — fall through to the ordinary outcome.
+  expect(legacyExecutionNeedsReconciliation({ ...outageRun, scheduledRetryAttempt: 500 })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...outageRun, scheduledRetryAttempt: 600 })).toBe(true);
+  // A run carrying this error code that was never itself scheduled under the
+  // dedicated outage reason (e.g. the very first failure, or a retry queued
+  // under a different reason by the general sweep) is unaffected by the cap.
+  expect(legacyExecutionNeedsReconciliation({
+    runtimeMode: "legacy", status: "failed", errorCode: "model_endpoint_unreachable",
+    scheduledRetryAttempt: 600, resultJson: {},
+  })).toBe(false);
+});
+
 it("permits subscription waits only with explicit evidence that provider work never started", () => {
   const waiting = {
     runtimeMode: "legacy", status: "cancelled", errorCode: "ai_connection_busy", scheduledRetryAttempt: 12,
