@@ -17,6 +17,7 @@ import {
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  companyMemberships,
   companySecretProposals,
   companies,
   documents,
@@ -71,7 +72,9 @@ import {
   connectionIntentPayloadSchema,
   connectionIntentResultSchema,
   createIssueThreadInteractionSchema,
+  isUuidLike,
   legacyIssueThreadInteractionResolverPolicyAlias,
+  normalizeAgentUrlKey,
   normalizeIssueThreadInteractionResolverPolicy,
   rejectIssueThreadInteractionSchema,
   requestCheckboxConfirmationPayloadSchema,
@@ -95,6 +98,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import { assertAssignableAgent } from "./agent-assignability.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import {
   assertIssueReviewVerdictActorAllowed,
@@ -1523,6 +1527,76 @@ function buildTaskCreationOrder(
   }
 
   return ordered;
+}
+
+export type ResolvedProposedOwnerAssignee =
+  | { assigneeAgentId: string; assigneeUserId: null }
+  | { assigneeAgentId: null; assigneeUserId: string };
+
+/**
+ * Resolves a suggested task's free-text `proposedOwner` hint ("agent id",
+ * agent name key, or user id) to an assignable agent or active company user.
+ * Unlike the explicit `assigneeAgentId`/`assigneeUserId` fields this never
+ * throws: a hint that does not resolve to anything assignable returns null so
+ * the caller can leave the task unassigned with a note instead of failing
+ * the whole accept over a guess that did not pan out.
+ */
+export async function resolveProposedOwnerAssignee(
+  dbOrTx: Db,
+  companyId: string,
+  proposedOwner: string | null | undefined,
+): Promise<ResolvedProposedOwnerAssignee | null> {
+  const raw = proposedOwner?.trim();
+  if (!raw) return null;
+
+  let agentCandidateId: string | null = null;
+  if (isUuidLike(raw)) {
+    agentCandidateId = raw;
+  } else {
+    const urlKey = normalizeAgentUrlKey(raw);
+    if (urlKey) {
+      const companyAgents = await dbOrTx
+        .select({ id: agents.id, name: agents.name })
+        .from(agents)
+        .where(eq(agents.companyId, companyId));
+      const matches = companyAgents.filter(
+        (agent) => normalizeAgentUrlKey(agent.name) === urlKey,
+      );
+      if (matches.length === 1) agentCandidateId = matches[0].id;
+    }
+  }
+  if (agentCandidateId) {
+    try {
+      await assertAssignableAgent(dbOrTx, companyId, agentCandidateId);
+      return { assigneeAgentId: agentCandidateId, assigneeUserId: null };
+    } catch {
+      // Not an assignable agent after all (wrong company, terminated, bad
+      // org chain, ...) -- fall through and try it as a user id instead.
+    }
+  }
+
+  const membership = await dbOrTx
+    .select({ id: companyMemberships.id })
+    .from(companyMemberships)
+    .where(
+      and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, raw),
+        eq(companyMemberships.status, "active"),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
+  if (membership) return { assigneeAgentId: null, assigneeUserId: raw };
+
+  return null;
+}
+
+function proposedOwnerUnresolvedNote(proposedOwner: string) {
+  return (
+    `> Proposed owner "${proposedOwner}" did not resolve to an assignable ` +
+    "agent or user in this company; the task was left unassigned."
+  );
 }
 
 export function resolveSelectedSuggestedTasks(args: {
@@ -3884,16 +3958,41 @@ export function issueThreadInteractionService(
             );
           }
 
+          let effectiveAssigneeAgentId = task.assigneeAgentId ?? null;
+          let effectiveAssigneeUserId = task.assigneeUserId ?? null;
+          let description = task.description ?? null;
+          if (
+            !effectiveAssigneeAgentId &&
+            !effectiveAssigneeUserId &&
+            task.proposedOwner
+          ) {
+            const resolvedOwner = await resolveProposedOwnerAssignee(
+              tx as unknown as Db,
+              issue.companyId,
+              task.proposedOwner,
+            );
+            if (resolvedOwner) {
+              effectiveAssigneeAgentId = resolvedOwner.assigneeAgentId;
+              effectiveAssigneeUserId = resolvedOwner.assigneeUserId;
+            } else {
+              const note = proposedOwnerUnresolvedNote(
+                task.proposedOwner.trim(),
+              );
+              description = description ? `${description}\n\n${note}` : note;
+            }
+          }
+
           const { issue: createdIssue } = await issueService(
             tx as unknown as Db,
           ).createChild(parentIssueId, {
             title: task.title,
-            description: task.description ?? null,
+            description,
             status: "todo",
             workMode: task.workMode ?? "standard",
             priority: task.priority ?? "medium",
-            assigneeAgentId: task.assigneeAgentId ?? null,
-            assigneeUserId: task.assigneeUserId ?? null,
+            assigneeAgentId: effectiveAssigneeAgentId,
+            assigneeUserId: effectiveAssigneeUserId,
+            acceptanceCriteria: task.acceptanceCriteria,
             projectId: task.projectId ?? issue.projectId,
             goalId: task.goalId ?? issue.goalId,
             billingCode: task.billingCode ?? null,

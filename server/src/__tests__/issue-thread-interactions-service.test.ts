@@ -708,6 +708,205 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(childrenAfterDuplicateAccept).toHaveLength(1);
   });
 
+  it("carries acceptanceCriteria into the created issue's description and resolves proposedOwner to an assignable agent", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const ownerAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Richer suggested tasks",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "Automation Owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+      requestDepth: 2,
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [
+          {
+            clientKey: "with-criteria",
+            title: "Ship the fix",
+            description: "Base description",
+            acceptanceCriteria: ["Covers the regression", "Docs updated"],
+            // Matches the agent above by its normalized name key rather
+            // than its id.
+            proposedOwner: "automation-owner",
+          },
+          {
+            clientKey: "unresolved-owner",
+            title: "Follow-up with a bad owner guess",
+            proposedOwner: "nobody-with-this-name",
+          },
+        ],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const accepted = await interactionsSvc.acceptSuggestedTasks({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.createdIssues).toEqual([
+      expect.objectContaining({ assigneeAgentId: ownerAgentId }),
+      expect.objectContaining({ assigneeAgentId: null }),
+    ]);
+
+    const createdIssueRows = await db
+      .select({
+        title: issues.title,
+        description: issues.description,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+      })
+      .from(issues)
+      .where(eq(issues.companyId, companyId));
+
+    const withCriteria = createdIssueRows.find((row) => row.title === "Ship the fix");
+    expect(withCriteria?.assigneeAgentId).toBe(ownerAgentId);
+    expect(withCriteria?.description).toContain("Base description");
+    expect(withCriteria?.description).toContain("## Acceptance Criteria");
+    expect(withCriteria?.description).toContain("- Covers the regression");
+    expect(withCriteria?.description).toContain("- Docs updated");
+
+    const withUnresolvedOwner = createdIssueRows.find(
+      (row) => row.title === "Follow-up with a bad owner guess",
+    );
+    expect(withUnresolvedOwner?.assigneeAgentId).toBeNull();
+    expect(withUnresolvedOwner?.assigneeUserId).toBeNull();
+    expect(withUnresolvedOwner?.description).toContain(
+      "nobody-with-this-name",
+    );
+    expect(withUnresolvedOwner?.description).toContain(
+      "did not resolve to an assignable",
+    );
+  });
+
+  it("prefers an explicit assigneeAgentId over proposedOwner and never consults proposedOwner in that case", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const explicitAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Explicit assignee wins",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: explicitAgentId,
+      companyId,
+      name: "Explicit Assignee",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+      requestDepth: 2,
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [
+          {
+            clientKey: "explicit-wins",
+            title: "Explicit assignee task",
+            assigneeAgentId: explicitAgentId,
+            // Nonsense that would never resolve; must be ignored because an
+            // explicit assignee was already given.
+            proposedOwner: "does-not-matter-here",
+          },
+        ],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const accepted = await interactionsSvc.acceptSuggestedTasks({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.createdIssues).toEqual([
+      expect.objectContaining({ assigneeAgentId: explicitAgentId }),
+    ]);
+    const [createdIssue] = await db
+      .select({ description: issues.description })
+      .from(issues)
+      .where(eq(issues.companyId, companyId));
+    expect(createdIssue?.description ?? "").not.toContain(
+      "does-not-matter-here",
+    );
+  });
+
   it("accepts a selected subset of suggested tasks and records the skipped drafts", async () => {
     const companyId = randomUUID();
     const goalId = randomUUID();

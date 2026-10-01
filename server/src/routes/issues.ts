@@ -340,7 +340,10 @@ import {
   type IssueThreadInteractionResolverAudienceDecision,
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
-import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
+import {
+  resolveProposedOwnerAssignee,
+  resolveSelectedSuggestedTasks,
+} from "../services/issue-thread-interactions.js";
 import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
@@ -5992,18 +5995,33 @@ export function issueRoutes(
             });
           }
         }
+        // A proposedOwner hint that will resolve to a real assignee at accept
+        // time needs the same authorization as an explicit assignee: an
+        // agent accepting its own suggestion must not be able to route work
+        // around tasks:assign just by writing a name instead of an id.
+        const resolvedAssignee =
+          task.assigneeAgentId || task.assigneeUserId
+            ? {
+                assigneeAgentId: task.assigneeAgentId ?? null,
+                assigneeUserId: task.assigneeUserId ?? null,
+              }
+            : await resolveProposedOwnerAssignee(
+                db,
+                issue.companyId,
+                task.proposedOwner,
+              );
         await assertTaskBridgeCreateAllowed(req, issue.companyId, {
           projectId: task.projectId ?? issue.projectId,
           parentIssueId: parent.id,
-          assigneeAgentId: task.assigneeAgentId ?? null,
-          assigneeUserId: task.assigneeUserId ?? null,
+          assigneeAgentId: resolvedAssignee?.assigneeAgentId ?? null,
+          assigneeUserId: resolvedAssignee?.assigneeUserId ?? null,
         });
-        if (task.assigneeAgentId || task.assigneeUserId) {
+        if (resolvedAssignee) {
           await assertCanAssignTasks(req, issue.companyId, {
             projectId: task.projectId ?? issue.projectId,
             parentIssueId: parent.id,
-            assigneeAgentId: task.assigneeAgentId ?? null,
-            assigneeUserId: task.assigneeUserId ?? null,
+            assigneeAgentId: resolvedAssignee.assigneeAgentId ?? null,
+            assigneeUserId: resolvedAssignee.assigneeUserId ?? null,
           });
         }
       } catch (error) {

@@ -612,6 +612,34 @@ describe.sequential("issue thread interaction routes", () => {
     );
   }, 10_000);
 
+  it("rejects a suggested task with an unrecognized field instead of silently dropping it", async () => {
+    const app = await createApp();
+
+    const createRes = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "suggest_tasks",
+        payload: {
+          version: 1,
+          tasks: [
+            {
+              clientKey: "task-1",
+              title: "One",
+              madeUpField: "should not vanish quietly",
+            },
+          ],
+        },
+      });
+
+    expect(createRes.status).toBe(400);
+    expect(mockInteractionService.create).not.toHaveBeenCalled();
+    const unrecognized = (createRes.body.details as Array<Record<string, unknown>>)?.find(
+      (issue) => issue.code === "unrecognized_keys",
+    );
+    expect(unrecognized).toBeDefined();
+    expect(unrecognized?.keys).toContain("madeUpField");
+  });
+
   it("does not run historical-comment catch-up or queue recovery from the interaction read path", async () => {
     mockIssueService.getById.mockResolvedValue(createIssue({
       status: "in_review",
