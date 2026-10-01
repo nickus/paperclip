@@ -13,6 +13,7 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
@@ -23,6 +24,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import {
@@ -474,5 +476,50 @@ describeEmbeddedPostgres("run completion with comments queued during the run", (
     const retried = await request(app).post(`/api/issues/${seeded.issueId}/comments`).send({ body: approval });
     expect(retried.status, JSON.stringify(retried.body)).toBe(201);
     expect((await issueRow(seeded.issueId)).status).toBe("done");
+  });
+
+  it("applies to resolving a recovery action that moves the task to done", async () => {
+    const seeded = await seed();
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId: seeded.companyId,
+      sourceIssueId: seeded.issueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: seeded.builderId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:queued-comments",
+      evidence: { sourceRunId: seeded.runId },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const hold = await queueComment(seeded, { author: "reviewer", body: "Hold: the API contract changed, do not ship this yet." });
+    const app = createApp(agentActor(seeded.companyId, seeded.builderId, seeded.runId));
+    const resolution = {
+      actionId: action.id,
+      outcome: "restored",
+      sourceIssueStatus: "done",
+      resolutionNote: "The change is shipped.",
+    };
+
+    const blocked = await request(app).post(`/api/issues/${seeded.issueId}/recovery-actions/resolve`).send(resolution);
+    expect(blocked.status, JSON.stringify(blocked.body)).toBe(409);
+    expect(blocked.body.code).toBe(ISSUE_COMMENTS_QUEUED_DURING_RUN_CODE);
+    expect(blocked.body.details).toMatchObject({ attemptedStatus: "done", runId: seeded.runId, remainingCount: 0 });
+    expect(blocked.body.details.comments).toEqual([expect.objectContaining({ id: hold.id, body: hold.body })]);
+    // Nothing was written: the task and its recovery action are unchanged.
+    expect((await issueRow(seeded.issueId)).status).toBe("in_progress");
+    const [actionRow] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({ status: "active", outcome: null, resolvedAt: null });
+    const [delivered] = await db.select().from(activityLog).where(eq(activityLog.action, RUN_QUEUED_COMMENTS_DELIVERED_ACTION));
+    expect(delivered).toMatchObject({
+      runId: seeded.runId,
+      details: { commentIds: [hold.id], via: "status_change_conflict", attemptedStatus: "done" },
+    });
+
+    // Having re-checked its work, the run sends the same resolution again.
+    const retried = await request(app).post(`/api/issues/${seeded.issueId}/recovery-actions/resolve`).send(resolution);
+    expect(retried.status, JSON.stringify(retried.body)).toBe(200);
+    expect((await issueRow(seeded.issueId)).status).toBe("done");
+    expect(retried.body.recoveryAction).toMatchObject({ id: action.id, status: "resolved", outcome: "owner_completed" });
   });
 });

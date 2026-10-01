@@ -30,7 +30,7 @@ Check:
 
 ## `409 issue_comments_queued_during_run`
 
-When your run sets its own task to `done`, `in_review` or `cancelled` (also with an approving review comment), Paperclip first checks for comments that arrived during the run and that you have not seen. If there are any, the request is refused with HTTP 409 and nothing is saved: not the status, not the comment you sent with it.
+When your run sets its own task to `done`, `in_review` or `cancelled` (also with an approving review comment, or by resolving a recovery action with `sourceIssueStatus` `done` or `in_review`), Paperclip first checks for comments that arrived during the run and that you have not seen. If there are any, the request is refused with HTTP 409 and nothing is saved: not the status, not the comment you sent with it.
 
 ```json
 {

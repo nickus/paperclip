@@ -9775,6 +9775,13 @@ export function issueRoutes(
             });
           }
 
+          // Resolving a recovery to `done` or `in_review` reports an outcome
+          // like a status update does, so the run holding the task must have
+          // seen the comments posted during it first. A 409 here rolls back
+          // every write of this transaction; the record of the comments it
+          // shows is written outside it and survives, so a retry goes through.
+          await assertRunSawCommentsQueuedDuringRun(req, lockedIssue, sourceIssueStatus);
+
           const updateFields: Record<string, unknown> = {
             status: sourceIssueStatus,
           };
