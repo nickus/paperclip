@@ -814,6 +814,30 @@ function interactionTerminalError(row: { status: string; result?: unknown }) {
   );
 }
 
+// A withdraw request's intent is "this card should stop being pending", which
+// a terminal status already satisfies unless that terminal status is itself
+// a recorded decision. `answered`/`accepted`/`rejected` are decisions that
+// withdrawal would contradict, so those keep conflicting with 409. Every
+// other terminal status (`expired`, `cancelled` — covering already withdrawn,
+// superseded, stale-target, issue-closed, skipped, and addressee-deleted) is
+// not a decision, so re-withdrawing it is idempotent.
+function isDecidedInteractionStatus(status: string) {
+  return status === "answered" || status === "accepted" || status === "rejected";
+}
+
+function interactionWithdrawalConflictError(row: { status: string }) {
+  const nextStep =
+    row.status === "answered"
+      ? "The submitted answers already stand; create a new interaction if more input is needed."
+      : "That decision already stands; create a new interaction if a different decision is needed.";
+  return issueThreadInteractionResolutionError(
+    409,
+    "interaction_already_decided",
+    `Cannot withdraw: this interaction was already resolved with status "${row.status}". ${nextStep}`,
+    { status: row.status },
+  );
+}
+
 function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
   issue: IssueResolutionContext;
   current: IssueThreadInteractionRow;
@@ -4667,7 +4691,16 @@ export function issueThreadInteractionService(
       ) {
         throw interactionNotFoundError();
       }
-      if (current.status !== "pending") throw interactionTerminalError(current);
+      if (current.status !== "pending") {
+        if (isDecidedInteractionStatus(current.status)) {
+          throw interactionWithdrawalConflictError(current);
+        }
+        // Already withdrawn/expired/superseded/etc: the caller's intent is
+        // already satisfied. Report that instead of a surprise 409, and skip
+        // straight back out without touching the row, any linked tool
+        // action/secret proposal, or activity — there is nothing left to do.
+        return { ...hydrateInteraction(current), alreadyClosed: true as const };
+      }
 
       const reason = data.reason?.trim() || null;
       const now = new Date();
@@ -4745,7 +4778,7 @@ export function issueThreadInteractionService(
       await touchIssue(db, issue.id);
       const withdrawn = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, withdrawn);
-      return withdrawn;
+      return { ...withdrawn, alreadyClosed: false as const };
     },
 
     answerQuestions: async (
