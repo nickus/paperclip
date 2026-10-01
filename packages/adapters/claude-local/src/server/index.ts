@@ -16,7 +16,9 @@ export {
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,
+  normalizeClaudeRateLimitInfo,
 } from "./parse.js";
+export type { ClaudeRateLimitSnapshot, ClaudeRateLimitWindowSnapshot } from "./parse.js";
 export {
   getQuotaWindows,
   readClaudeAuthStatus,

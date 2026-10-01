@@ -54,11 +54,122 @@ export function claudeModelUsageTotals(modelUsage: unknown): UsageSummary | null
   return { inputTokens, outputTokens, cachedInputTokens };
 }
 
+/** one normalized rate-limit window, e.g. the "five_hour" or "seven_day" entry */
+export interface ClaudeRateLimitWindowSnapshot {
+  /** fraction of the window consumed, 0-1, null when not reported */
+  utilization: number | null;
+  /** epoch seconds when the window resets, null when not reported */
+  resetsAt: number | null;
+}
+
+/**
+ * A normalized snapshot of the Claude CLI's own `rate_limit_event` stream-json
+ * event. Every field is optional on the wire (see normalizeClaudeRateLimitInfo),
+ * so every field here can be null; only `observedAt` is always set, by the
+ * caller that captured the event.
+ */
+export interface ClaudeRateLimitSnapshot {
+  /** ISO timestamp the caller stamped when this snapshot was captured. */
+  observedAt: string;
+  status: string | null;
+  rateLimitType: string | null;
+  resetsAt: number | null;
+  overageStatus: string | null;
+  overageResetsAt: number | null;
+  /** True when the LAST event of the run reported overage in use. */
+  isUsingOverage: boolean;
+  /** True when ANY event of the run reported overage in use, even if a
+   *  later event in the same run did not (e.g. the window reset mid-run). */
+  overageInUse: boolean;
+  windows: {
+    five_hour?: ClaudeRateLimitWindowSnapshot;
+    seven_day?: ClaudeRateLimitWindowSnapshot;
+  };
+}
+
+function asFiniteNumberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function normalizeClaudeRateLimitWindow(value: unknown): ClaudeRateLimitWindowSnapshot | null {
+  const obj = parseObject(value);
+  if (Object.keys(obj).length === 0) return null;
+  const window = {
+    utilization: asFiniteNumberOrNull(obj.utilization),
+    resetsAt: asFiniteNumberOrNull(obj.resetsAt),
+  };
+  // Both fields missing/non-numeric: nothing usable came through.
+  if (window.utilization == null && window.resetsAt == null) return null;
+  return window;
+}
+
+function rateLimitWindowBucket(rateLimitType: string): "five_hour" | "seven_day" | null {
+  const normalized = rateLimitType.trim().toLowerCase();
+  if (normalized.startsWith("five_hour")) return "five_hour";
+  if (normalized.startsWith("seven_day")) return "seven_day";
+  return null;
+}
+
+/**
+ * Normalize one `rate_limit_event`'s `rate_limit_info` payload into the
+ * shared snapshot shape the server and UI consume. Handles both the current
+ * shape (a `unifiedWindows` object keyed by window name) and the older,
+ * lighter shape some CLI versions emit (one flat window keyed by
+ * `rateLimitType`, e.g. "seven_day_overage_included"). Every field is
+ * optional on the wire, so every read here is defensive: a missing or
+ * malformed field becomes null/false/empty rather than throwing.
+ */
+export function normalizeClaudeRateLimitInfo(
+  rateLimitInfo: unknown,
+  observedAt: string,
+): ClaudeRateLimitSnapshot | null {
+  const info = parseObject(rateLimitInfo);
+  if (Object.keys(info).length === 0) return null;
+
+  const windows: ClaudeRateLimitSnapshot["windows"] = {};
+  const unifiedWindows = parseObject(info.unifiedWindows);
+  const fiveHour = normalizeClaudeRateLimitWindow(unifiedWindows.five_hour);
+  if (fiveHour) windows.five_hour = fiveHour;
+  const sevenDay = normalizeClaudeRateLimitWindow(unifiedWindows.seven_day);
+  if (sevenDay) windows.seven_day = sevenDay;
+
+  // Older/lighter events carry one flat window instead of `unifiedWindows`.
+  if (windows.five_hour == null && windows.seven_day == null) {
+    const rateLimitType = asString(info.rateLimitType, "");
+    const bucket = rateLimitType ? rateLimitWindowBucket(rateLimitType) : null;
+    if (bucket) {
+      const flatWindow = normalizeClaudeRateLimitWindow({
+        utilization: info.utilization,
+        resetsAt: info.resetsAt,
+      });
+      if (flatWindow) windows[bucket] = flatWindow;
+    }
+  }
+
+  return {
+    observedAt,
+    status: asString(info.status, "") || null,
+    rateLimitType: asString(info.rateLimitType, "") || null,
+    resetsAt: asFiniteNumberOrNull(info.resetsAt),
+    overageStatus: asString(info.overageStatus, "") || null,
+    overageResetsAt: asFiniteNumberOrNull(info.overageResetsAt),
+    isUsingOverage: asBoolean(info.isUsingOverage, false),
+    overageInUse: asBoolean(info.overageInUse, false),
+    windows,
+  };
+}
+
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
   let model = "";
   let finalResult: Record<string, unknown> | null = null;
   const assistantTexts: string[] = [];
+  // The LAST rate_limit_event seen wins for the point-in-time snapshot, but
+  // overage state is sticky for the run: once any event reports it in use,
+  // the run billed at least some tokens at API overage prices even if a
+  // later event (e.g. after the window rolled over) no longer shows it.
+  let lastRateLimitInfo: unknown = null;
+  let everOverageInUse = false;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -88,11 +199,28 @@ export function parseClaudeStreamJson(stdout: string) {
       continue;
     }
 
+    if (type === "rate_limit_event") {
+      lastRateLimitInfo = event.rate_limit_info;
+      const info = parseObject(event.rate_limit_info);
+      if (asBoolean(info.isUsingOverage, false) || asBoolean(info.overageInUse, false)) {
+        everOverageInUse = true;
+      }
+      continue;
+    }
+
     if (type === "result") {
       finalResult = event;
       sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
     }
   }
+
+  const claudeRateLimit = (() => {
+    const snapshot = lastRateLimitInfo
+      ? normalizeClaudeRateLimitInfo(lastRateLimitInfo, new Date().toISOString())
+      : null;
+    if (snapshot && everOverageInUse) snapshot.overageInUse = true;
+    return snapshot;
+  })();
 
   if (!finalResult) {
     return {
@@ -103,6 +231,7 @@ export function parseClaudeStreamJson(stdout: string) {
       usageBasis: null as "per_run" | null,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
+      claudeRateLimit,
     };
   }
 
@@ -127,6 +256,7 @@ export function parseClaudeStreamJson(stdout: string) {
     usageBasis: "per_run" as const,
     summary,
     resultJson: finalResult,
+    claudeRateLimit,
   };
 }
 
