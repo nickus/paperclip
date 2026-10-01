@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { and, desc, eq, inArray, isNotNull } from "drizzle-orm";
 import type { ProviderQuotaResult } from "@paperclipai/shared";
+import { HOST_LOGIN_CREDENTIAL_KEY } from "@paperclipai/adapter-utils";
 import type { GetQuotaWindowsContext, QuotaWindowsCredential } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
@@ -258,10 +259,13 @@ async function buildClaudeQuotaContext(
         };
       } catch {
         // Binding exists but could not be resolved (missing secret, revoked
-        // access, etc.) — never throw out of here and never leak why in a
-        // way that could carry secret material; the adapter's own
-        // getQuotaWindows() turns a credential with no token into an
-        // ok:false result, falling back to the passive snapshot if any.
+        // access, malformed binding shape, etc.) — never throw out of here
+        // and never leak why in a way that could carry secret material.
+        // This keeps `pending.dedupeKey` (never HOST_LOGIN_CREDENTIAL_KEY),
+        // so the adapter can tell "a real binding failed to resolve" apart
+        // from the genuine no-binding host-login fallback and falls back to
+        // the passive snapshot (or an honest error) instead of silently
+        // polling the host's own login under this credential's label.
         return { key: pending.dedupeKey, label: pending.label, env: {}, passiveSnapshot };
       }
     }),
@@ -269,7 +273,7 @@ async function buildClaudeQuotaContext(
 
   if (hostLoginAgentIds.length > 0) {
     credentials.push({
-      key: "host_login",
+      key: HOST_LOGIN_CREDENTIAL_KEY,
       label: "Server login",
       env: {},
       passiveSnapshot: await latestClaudeRateLimitSnapshot(db, companyId, hostLoginAgentIds),

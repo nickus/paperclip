@@ -437,13 +437,29 @@ export interface ProviderQuotaResult {
   overageInUse?: boolean | null;
 }
 
+/**
+ * The `key` the server uses for the one credential that genuinely has no
+ * binding of its own — the "Server login" / host-login fallback entry for
+ * agents with no token binding at all. A credential whose binding exists but
+ * failed to resolve (a deleted secret, a malformed config, ...) also arrives
+ * with an empty `env`, but keeps its own real `key` (e.g. a `secret_ref:...`
+ * or `unsupported:...` dedupe key) — never this one. An adapter's
+ * getQuotaWindows() must branch on this exact key, not merely on whether
+ * `env` is empty, to tell the two cases apart; see HOST_LOGIN_CREDENTIAL_KEY's
+ * use in the claude_local adapter.
+ */
+export const HOST_LOGIN_CREDENTIAL_KEY = "host_login";
+
 /** One distinct bound credential the server resolved for an adapter's
  *  getQuotaWindows() call — already resolved to env vars, never a secret
  *  reference. The adapter polls each credential and should return one
  *  ProviderQuotaResult per entry, labeled with `label`. */
 export interface QuotaWindowsCredential {
   /** Opaque, non-secret identifier stable across polls (e.g. a binding
-   *  identity or token fingerprint) — never the secret value itself. */
+   *  identity or token fingerprint) — never the secret value itself. Equal
+   *  to HOST_LOGIN_CREDENTIAL_KEY only for the genuine no-binding-at-all
+   *  fallback entry; every other credential, including one whose binding
+   *  failed to resolve, keeps its own distinct key. */
   key: string;
   /** Non-secret display label, e.g. a company secret's name, "Claude
    *  login", or "Server login". */

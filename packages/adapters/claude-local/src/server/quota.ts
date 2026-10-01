@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { HOST_LOGIN_CREDENTIAL_KEY } from "@paperclipai/adapter-utils";
 import type {
   GetQuotaWindowsContext,
   ProviderQuotaResult,
@@ -749,10 +750,28 @@ function passiveResultFromSnapshot(label: string, raw: unknown): ProviderQuotaRe
 async function pollClaudeQuotaForCredential(credential: QuotaWindowsCredential): Promise<ProviderQuotaResult> {
   const token = credential.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
   if (!token) {
-    // This credential entry carries no token of its own (the "Server login"
-    // fallback entry for agents with no CLAUDE_CODE_OAUTH_TOKEN binding) —
-    // defer to the host-login probe, just labeled like the other panels.
-    return getHostLoginQuotaWindows(credential.label);
+    if (credential.key === HOST_LOGIN_CREDENTIAL_KEY) {
+      // This credential entry carries no token of its own (the "Server
+      // login" fallback entry for agents with no CLAUDE_CODE_OAUTH_TOKEN
+      // binding at all) — defer to the host-login probe, just labeled like
+      // the other panels.
+      return getHostLoginQuotaWindows(credential.label);
+    }
+    // This credential has a real binding (a company secret_ref, an
+    // unsupported/malformed shape, ...) that failed to resolve to a token.
+    // Never fall back to the host's own login here — that would silently
+    // show an unrelated account's quota mislabeled with this credential's
+    // name. Fall back to the passively-observed run snapshot instead, or an
+    // honest per-credential error.
+    const passive = passiveResultFromSnapshot(credential.label, credential.passiveSnapshot);
+    if (passive) return passive;
+    return {
+      provider: "anthropic",
+      ok: false,
+      label: credential.label,
+      error: "This Claude token could not be resolved, and no recent run data is available either.",
+      windows: [],
+    };
   }
 
   const fingerprint = tokenFingerprint(token);

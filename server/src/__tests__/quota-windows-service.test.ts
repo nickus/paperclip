@@ -225,6 +225,51 @@ describe("fetchAllQuotaWindows", () => {
     const ctx = claudeGetQuotaWindows.mock.calls[0][0];
     expect(ctx.credentials).toHaveLength(1);
     expect(ctx.credentials[0].env).toEqual({});
+    // Critically, this credential keeps its own dedupe key — never the
+    // "host_login" key the genuine no-binding fallback uses — so the
+    // adapter can tell a real binding that failed to resolve apart from a
+    // credential that never had one and avoid mislabeling the host's own
+    // login under this secret's name.
+    expect(ctx.credentials[0].key).not.toBe("host_login");
     expect(results).toEqual([{ provider: "anthropic", ok: false, windows: [], error: "no token" }]);
+  });
+
+  it("gives an unrecognized CLAUDE_CODE_OAUTH_TOKEN binding shape its own unresolved credential, never the host-login key", async () => {
+    // claudeOAuthBindingDedupeKey returns null for a shape it doesn't
+    // recognize (e.g. a secret_ref binding missing its secretId), which
+    // takes the "unsupported" branch in buildClaudeQuotaContext instead of
+    // the no-binding-at-all host-login fallback.
+    mockAgentService.list.mockResolvedValue([
+      agentRow({
+        id: "agent-malformed",
+        adapterConfig: { env: { CLAUDE_CODE_OAUTH_TOKEN: { type: "secret_ref" } } },
+      }),
+    ]);
+    // Real resolveEnvBindings() rejects a binding that fails its schema
+    // (envBindingSchema.safeParse) with "Invalid environment binding for
+    // key: ..." (see server/src/services/secrets.ts) — reproduced here as a
+    // rejection, since secretService is stubbed in this test file.
+    mockSecretService.resolveEnvBindings.mockRejectedValue(
+      new Error("Invalid environment binding for key: CLAUDE_CODE_OAUTH_TOKEN"),
+    );
+    const claudeGetQuotaWindows = vi.fn().mockImplementation(async (ctx) =>
+      ctx.credentials.map((c: { key: string; env: Record<string, string> }) => ({
+        provider: "anthropic",
+        ok: Object.keys(c.env).length > 0,
+        windows: [],
+        error: Object.keys(c.env).length > 0 ? undefined : "unresolved",
+      })),
+    );
+    vi.mocked(listServerAdapters).mockReturnValue([
+      { type: "claude_local", getQuotaWindows: claudeGetQuotaWindows },
+    ] as never);
+
+    await fetchAllQuotaWindows(makeDb(), "company-1", actor);
+
+    const ctx = claudeGetQuotaWindows.mock.calls[0][0];
+    expect(ctx.credentials).toHaveLength(1);
+    expect(ctx.credentials[0].key).toBe("unsupported:agent-malformed");
+    expect(ctx.credentials[0].key).not.toBe("host_login");
+    expect(ctx.credentials[0].env).toEqual({});
   });
 });

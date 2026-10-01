@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ProviderQuotaResult } from "@paperclipai/adapter-utils";
 import { getQuotaWindows } from "./quota.js";
 
 // Each test uses its own unique token so the module-level per-fingerprint
@@ -42,7 +43,7 @@ describe("getQuotaWindows company-aware polling (credentials cache/backoff)", ()
     });
 
     expect(Array.isArray(results)).toBe(true);
-    const list = results as Array<Record<string, unknown>>;
+    const list = results as ProviderQuotaResult[];
     expect(list).toHaveLength(2);
     expect(list[0]).toMatchObject({ ok: true, label: "Claude login", stale: false });
     expect(list[1]).toMatchObject({ ok: true, label: "payments-bot token", stale: false });
@@ -67,19 +68,19 @@ describe("getQuotaWindows company-aware polling (credentials cache/backoff)", ()
     mockFetch.mockResolvedValueOnce({ ok: true, json: async () => usageBody() });
     const credential = { key: "d", label: "Claude login", env: { CLAUDE_CODE_OAUTH_TOKEN: token } };
 
-    const first = (await getQuotaWindows({ credentials: [credential] })) as Array<Record<string, unknown>>;
+    const first = (await getQuotaWindows({ credentials: [credential] })) as ProviderQuotaResult[];
     expect(first[0]).toMatchObject({ ok: true, stale: false });
 
     // Move past the ~120s fresh window so the next call attempts a live read.
     vi.advanceTimersByTime(121_000);
     mockFetch.mockResolvedValueOnce({ ok: false, status: 429, json: async () => ({ error: { type: "rate_limit_error" } }) });
 
-    const second = (await getQuotaWindows({ credentials: [credential] })) as Array<Record<string, unknown>>;
+    const second = (await getQuotaWindows({ credentials: [credential] })) as ProviderQuotaResult[];
     expect(second[0]).toMatchObject({ ok: true, stale: true });
     expect(mockFetch).toHaveBeenCalledTimes(2);
 
     // Still backed off: a third call within the backoff window must not hit fetch again.
-    const third = (await getQuotaWindows({ credentials: [credential] })) as Array<Record<string, unknown>>;
+    const third = (await getQuotaWindows({ credentials: [credential] })) as ProviderQuotaResult[];
     expect(third[0]).toMatchObject({ ok: true, stale: true });
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
@@ -104,7 +105,7 @@ describe("getQuotaWindows company-aware polling (credentials cache/backoff)", ()
       },
     };
 
-    const results = (await getQuotaWindows({ credentials: [credential] })) as Array<Record<string, unknown>>;
+    const results = (await getQuotaWindows({ credentials: [credential] })) as ProviderQuotaResult[];
     expect(results[0]).toMatchObject({
       ok: true,
       stale: true,
@@ -118,7 +119,7 @@ describe("getQuotaWindows company-aware polling (credentials cache/backoff)", ()
     (fetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: false, status: 429, json: async () => ({}) });
     const credential = { key: "f", label: "Claude login", env: { CLAUDE_CODE_OAUTH_TOKEN: token } };
 
-    const results = (await getQuotaWindows({ credentials: [credential] })) as Array<Record<string, unknown>>;
+    const results = (await getQuotaWindows({ credentials: [credential] })) as ProviderQuotaResult[];
     expect(results[0]).toMatchObject({ ok: false, label: "Claude login" });
     expect(typeof results[0]!.error).toBe("string");
     expect(String(results[0]!.error)).not.toContain(token);
@@ -129,8 +130,77 @@ describe("getQuotaWindows company-aware polling (credentials cache/backoff)", ()
     (fetch as ReturnType<typeof vi.fn>).mockRejectedValue(new Error(`boom while fetching ${token.slice(0, 3)}`));
     const credential = { key: "g", label: "Claude login", env: { CLAUDE_CODE_OAUTH_TOKEN: token } };
 
-    const results = (await getQuotaWindows({ credentials: [credential] })) as Array<Record<string, unknown>>;
+    const results = (await getQuotaWindows({ credentials: [credential] })) as ProviderQuotaResult[];
     const serialized = JSON.stringify(results);
     expect(serialized).not.toContain(token);
+  });
+
+  describe("a credential with no token in its env", () => {
+    // These use CLAUDE_CODE_USE_BEDROCK as a stand-in for "the host happens
+    // to have some Claude login of its own configured": getHostLoginQuotaWindows
+    // treats it as an immediate ok:true, so if a non-host-login credential
+    // ever reaches that probe, it comes back mislabeled as a live bedrock
+    // result instead of an error or a passive fallback.
+    const ORIGINAL_BEDROCK_ENV = process.env.CLAUDE_CODE_USE_BEDROCK;
+
+    beforeEach(() => {
+      process.env.CLAUDE_CODE_USE_BEDROCK = "1";
+    });
+
+    afterEach(() => {
+      if (ORIGINAL_BEDROCK_ENV === undefined) delete process.env.CLAUDE_CODE_USE_BEDROCK;
+      else process.env.CLAUDE_CODE_USE_BEDROCK = ORIGINAL_BEDROCK_ENV;
+    });
+
+    it("the genuine host-login fallback entry (key: host_login) still defers to the host probe", async () => {
+      const credential = { key: "host_login", label: "Server login", env: {} };
+
+      const results = (await getQuotaWindows({ credentials: [credential] })) as ProviderQuotaResult[];
+      expect(results[0]).toMatchObject({ ok: true, source: "bedrock", label: "Server login", windows: [] });
+    });
+
+    it("a credential whose own binding failed to resolve falls back to its passive snapshot instead of the host probe", async () => {
+      const credential = {
+        key: "secret_ref:11111111-1111-1111-1111-111111111111:latest",
+        label: "payments-bot token",
+        env: {},
+        passiveSnapshot: {
+          observedAt: "2026-01-05T00:00:00.000Z",
+          status: "rejected",
+          rateLimitType: "seven_day",
+          resetsAt: 1,
+          overageStatus: null,
+          overageResetsAt: null,
+          isUsingOverage: true,
+          overageInUse: true,
+          windows: { seven_day: { utilization: 1, resetsAt: 1 } },
+        },
+      };
+
+      const results = (await getQuotaWindows({ credentials: [credential] })) as ProviderQuotaResult[];
+      // Never the host's bedrock login, mislabeled with this secret's name.
+      expect(results[0]?.source).not.toBe("bedrock");
+      expect(results[0]).toMatchObject({
+        ok: true,
+        stale: true,
+        label: "payments-bot token",
+        overageInUse: true,
+        observedAt: "2026-01-05T00:00:00.000Z",
+      });
+    });
+
+    it("a credential whose own binding failed to resolve, with no passive snapshot either, returns an honest error instead of the host probe", async () => {
+      const credential = {
+        key: "unsupported:agent-1",
+        label: "Claude token",
+        env: {},
+      };
+
+      const results = (await getQuotaWindows({ credentials: [credential] })) as ProviderQuotaResult[];
+      // Never the host's bedrock login, mislabeled with this credential's name.
+      expect(results[0]?.source).not.toBe("bedrock");
+      expect(results[0]).toMatchObject({ ok: false, label: "Claude token" });
+      expect(typeof results[0]!.error).toBe("string");
+    });
   });
 });
