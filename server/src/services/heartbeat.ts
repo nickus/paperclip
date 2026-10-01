@@ -1307,13 +1307,19 @@ function isSandboxProviderWorkerUnavailableFailureMessage(value: unknown) {
 // e.g. 'Sandbox provider "kubernetes" is installed via plugin
 // "acme.kubernetes-sandbox-provider", but that plugin is currently error.'
 // The plugin row exists but its status is `error` (a failed activation),
-// `disabled` (an operator switched it off) or `upgrade_pending`. Unlike the
-// worker restart window above, nothing on the run path ever changes that
-// status: only an operator enabling the plugin, or a server boot that
-// re-activates a bundled plugin, does. Re-running the agent produces the
+// `disabled` (an operator switched it off) or `upgrade_pending`. For
+// `disabled`/`upgrade_pending`, nothing on the run path ever changes that
+// status: only an operator acting on the plugin, or a server boot that
+// re-activates a bundled plugin, does — re-running the agent produces the
 // identical failure every time, so the setup catch classifies it as
 // `configuration_incomplete` (routed to a human owner) instead of a retryable
-// `setup_failed` that the scheduler would keep re-dispatching.
+// `setup_failed` that the scheduler would keep re-dispatching. `error` is the
+// one exception: plugin-loader.ts schedules an automatic, backing-off
+// re-activation retry for a transient activation failure (see
+// isTransientPluginActivationFailure / scheduleActivationRetry there), which
+// can flip the status back to `ready` on its own — see
+// sandboxProviderPluginActivationRetryPending below, which keeps this
+// classification from firing while that retry is in flight.
 const SANDBOX_PROVIDER_PLUGIN_NOT_READY_RE =
   /sandbox provider "([^"]*)" is installed via plugin "([^"]*)", but that plugin is currently (error|disabled|upgrade_pending)\b/i;
 

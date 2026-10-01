@@ -4922,6 +4922,207 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(notice?.body).not.toContain("secret/env bindings");
   });
 
+  it("defers to the ordinary retryable path instead of opening a configuration hold while a plugin activation retry is pending", async () => {
+    // Counterpart to "blocks the issue instead of re-dispatching when the
+    // sandbox provider plugin is stuck in error" above. Here, the plugin's
+    // `error` status came from a transient activation failure that
+    // plugin-loader.ts has already scheduled an automatic retry for (see
+    // isTransientPluginActivationFailure / scheduleActivationRetry there).
+    // The lease still fails the same way ("that plugin is currently
+    // error"), but opening a board-owned configuration_validation hold in
+    // that window would hand an operator a config-fix task that resolves
+    // itself within seconds — so the setup catch in heartbeat.ts must fall
+    // through to the ordinary retryable `setup_failed` path instead.
+    //
+    // Drives plugin-loader.ts's real activation-retry machinery (through a
+    // real transient failure, not a hand-set flag) against the SAME `db`
+    // the heartbeat test harness uses, so `isPluginActivationRetryPendingForKey`
+    // reflects a genuinely scheduled retry, exactly like the production
+    // in-process state heartbeat.ts reads.
+    const { pluginLoader } = await import("../services/plugin-loader.js");
+    const pluginKey = "paperclip.kubernetes-sandbox-provider";
+
+    const packageRoot = await fs.mkdtemp(
+      path.join(os.tmpdir(), "heartbeat-plugin-retry-pending-"),
+    );
+    await fs.mkdir(path.join(packageRoot, "dist"), { recursive: true });
+    const manifest = {
+      id: pluginKey,
+      apiVersion: 1,
+      version: "1.0.0",
+      displayName: "Kubernetes Sandbox Provider",
+      description: "Test Kubernetes sandbox provider mid-retry",
+      author: "Paperclip",
+      categories: ["automation"],
+      capabilities: ["environment.drivers.register"],
+      entrypoints: { worker: "dist/worker.js" },
+      environmentDrivers: [
+        {
+          driverKey: "kubernetes",
+          kind: "sandbox_provider",
+          displayName: "Kubernetes Sandbox",
+          configSchema: { type: "object" },
+        },
+      ],
+    };
+    await fs.writeFile(
+      path.join(packageRoot, "package.json"),
+      JSON.stringify({
+        name: "@paperclipai/kubernetes-sandbox-provider",
+        version: "1.0.0",
+        type: "module",
+        paperclipPlugin: { manifest: "dist/manifest.js", worker: "dist/worker.js" },
+      }),
+    );
+    await fs.writeFile(
+      path.join(packageRoot, "dist/manifest.js"),
+      `export default ${JSON.stringify(manifest)};`,
+    );
+    await fs.writeFile(path.join(packageRoot, "dist/worker.js"), "// unused\n");
+
+    const { companyId, agentId, runId, issueId } =
+      await seedQueuedIssueRunFixture();
+    const pluginId = randomUUID();
+    const environmentId = randomUUID();
+
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey,
+      packageName: "@paperclipai/kubernetes-sandbox-provider",
+      packagePath: packageRoot,
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: manifest,
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+    await db.insert(environments).values({
+      id: environmentId,
+      companyId,
+      name: "Kubernetes Sandbox",
+      driver: "sandbox",
+      status: "active",
+      config: {
+        provider: "kubernetes",
+        image: "fake:test",
+        timeoutMs: 1234,
+        reuseLease: false,
+      },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db
+      .update(agents)
+      .set({ defaultEnvironmentId: environmentId })
+      .where(eq(agents.id, agentId));
+
+    // Drive one real transient activation failure for this exact plugin
+    // row, through plugin-loader.ts's own activatePlugin/markError path —
+    // this both leaves the row's DB status at `error` (same precondition
+    // as the sibling "stuck in error" test) and schedules a real pending
+    // retry in plugin-loader.ts's module-scoped bookkeeping.
+    try {
+      const fakeRuntimeServices = {
+        lifecycleManager: {
+          markError: async (id: string, error: string) => {
+            const [row] = await db
+              .update(plugins)
+              .set({ status: "error", lastError: error, updatedAt: new Date() })
+              .where(eq(plugins.id, id))
+              .returning();
+            return row ?? null;
+          },
+        },
+        workerManager: {
+          startWorker: vi.fn(async () => {
+            throw new Error(
+              `Worker initialize failed for "${pluginId}": RPC call "initialize" timed out after 15000ms`,
+            );
+          }),
+          isRunning: () => false,
+          stopWorker: async () => {},
+          getWorker: () => undefined,
+        },
+        eventBus: {
+          forPlugin: () => ({}),
+          subscriptionCount: () => 0,
+          clearPlugin: () => {},
+        },
+        jobScheduler: {
+          registerPlugin: async () => {},
+          unregisterPlugin: async () => {},
+        },
+        jobStore: { syncJobDeclarations: async () => {} },
+        toolDispatcher: {
+          registerPluginTools: () => {},
+          unregisterPluginTools: () => {},
+        },
+        buildHostHandlers: () => ({}),
+        instanceInfo: { instanceId: "instance-1", hostVersion: "0.0.0-test" },
+      } as any;
+
+      const loader = pluginLoader(
+        db,
+        { localPluginDir: "/nonexistent/local-plugins", enableLocalFilesystem: false, enableNpmDiscovery: false },
+        fakeRuntimeServices,
+      );
+      const activation = await loader.loadSingle(pluginId);
+      expect(activation.success).toBe(false);
+
+      const { isPluginActivationRetryPendingForKey } = await import(
+        "../services/plugin-loader.js"
+      );
+      expect(isPluginActivationRetryPendingForKey(pluginKey)).toBe(true);
+
+      const heartbeat = heartbeatService(db);
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, runId, 5_000);
+
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+      const failedRun = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      // Not the board-owned configuration gap this time: the plugin is
+      // mid-retry, so the failure falls through to the ordinary retryable
+      // `setup_failed` path instead of `configuration_incomplete`.
+      expect(failedRun?.errorCode).not.toBe("configuration_incomplete");
+      expect(failedRun?.errorCode).toBe("setup_failed");
+
+      const recoveryAction = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(
+          and(
+            eq(issueRecoveryActions.companyId, companyId),
+            eq(issueRecoveryActions.sourceIssueId, issueId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      // No board-owned configuration_validation hold while the retry is
+      // pending.
+      expect(recoveryAction?.kind).not.toBe("configuration_validation");
+
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      // Not stuck `blocked` the way the sibling "stuck in error" test is.
+      expect(issue?.status).not.toBe("blocked");
+    } finally {
+      const { cancelPluginActivationRetry } = await import(
+        "../services/plugin-loader.js"
+      );
+      cancelPluginActivationRetry(pluginId);
+      await fs.rm(packageRoot, { recursive: true, force: true });
+    }
+  });
+
   it("escalates (does not retry) an accepted-interaction-continuation setup failure whose message matches neither retryable pattern", async () => {
     // Negative-case counterpart to "schedules an infra retry for a setup
     // failure caused by a transient sandbox provider worker restart" above.

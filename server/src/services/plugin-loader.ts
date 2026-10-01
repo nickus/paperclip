@@ -708,6 +708,24 @@ interface PendingActivationRetry {
 const pendingActivationRetries = new Map<string, PendingActivationRetry>();
 const activationRetryAttempts = new Map<string, number>();
 
+// Module-scoped for the same reason as the retry bookkeeping above: a
+// backoff-scheduled automatic retry (runScheduledActivationRetry) and an
+// operator-triggered call (loadSingle, e.g. via POST /api/plugins/:id/enable)
+// can legitimately land for the same plugin at nearly the same moment — the
+// operator sees `error` and clicks enable without knowing a retry is already
+// under way. Without coalescing, the second call's activatePlugin() reaches
+// workerManager.startWorker() while the first is still starting, which
+// throws `Worker already registered for plugin "<id>" (status: ...)`. That
+// message is not a transient-activation-failure (see
+// isTransientPluginActivationFailure), so the loser's catch handler calls
+// lifecycleManager.markError(), which tears the *winner's* just-started
+// worker back down (markError -> deactivatePluginRuntime -> unloadSingle ->
+// teardownPluginRuntime stops any running worker for this pluginId) and
+// leaves the plugin stuck in `error` with no further retry scheduled —
+// turning a successful activation into a self-inflicted outage. Keyed by
+// pluginId, mirroring PluginWorkerManager's own per-plugin startupLocks.
+const activationsInFlight = new Map<string, Promise<PluginLoadResult>>();
+
 /**
  * Whether plugin-loader currently has a backoff-scheduled re-activation
  * retry pending for this plugin id, after a transient activation failure.
@@ -2409,11 +2427,35 @@ export function pluginLoader(
    * Activate a single plugin: spawn its worker, register event subscriptions,
    * sync jobs, register tools.
    *
-   * This is the core orchestration logic shared by `loadAll()` and `loadSingle()`.
-   * Failures are caught and reported in the result. By default the plugin is
-   * marked as `error` in the database when activation fails.
+   * This is the core orchestration logic shared by `loadAll()`, `loadSingle()`
+   * and the automatic activation-retry path. Coalesces concurrent attempts
+   * for the same plugin id onto a single in-flight call — see
+   * `activationsInFlight` above for why that matters — rather than racing
+   * two independent activations against the same worker slot.
    */
   async function activatePlugin(
+    plugin: PluginRecord,
+    options: PluginActivateOptions = { markErrorOnFailure: true },
+  ): Promise<PluginLoadResult> {
+    const pluginId = plugin.id;
+
+    const inFlight = activationsInFlight.get(pluginId);
+    if (inFlight) {
+      log.warn(
+        { pluginId, pluginKey: plugin.pluginKey },
+        "plugin-loader: concurrent activation attempt for this plugin — coalescing onto the one already in flight",
+      );
+      return inFlight;
+    }
+
+    const activation = activatePluginInternal(plugin, options).finally(() => {
+      activationsInFlight.delete(pluginId);
+    });
+    activationsInFlight.set(pluginId, activation);
+    return activation;
+  }
+
+  async function activatePluginInternal(
     plugin: PluginRecord,
     options: PluginActivateOptions = { markErrorOnFailure: true },
   ): Promise<PluginLoadResult> {

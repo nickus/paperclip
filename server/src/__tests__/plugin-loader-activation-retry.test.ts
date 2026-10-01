@@ -22,6 +22,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "nod
 import os from "node:os";
 import path from "node:path";
 
+// Captured before any test mocks `setTimeout` (see installTimerHarness
+// below), so tests can still yield to the real event loop on demand.
+const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
@@ -331,5 +335,66 @@ describe("pluginLoader activation retry after a transient failure", () => {
     expect(runtimeServices.workerManager.startWorker).toHaveBeenCalledTimes(5);
     await timers.fireNext(5 * 60 * 1000);
     expect(runtimeServices.workerManager.startWorker).toHaveBeenCalledTimes(6);
+  });
+
+  it("coalesces a manual activation attempt with an in-flight automatic retry for the same plugin", async () => {
+    // Reproduces a race between the automatic backoff retry and an
+    // operator-triggered manual re-activation (POST /api/plugins/:id/enable)
+    // landing for the same plugin at nearly the same moment. Against a real
+    // PluginWorkerManager, a second, independent activatePlugin() call that
+    // reaches workerManager.startWorker() while the first is still starting
+    // throws `Worker already registered for plugin "<id>" (status: ...)`.
+    // That message does not match isTransientPluginActivationFailure, so the
+    // loser's catch handler calls lifecycleManager.markError(), which tears
+    // the *winner's* just-started worker back down (markError ->
+    // deactivatePluginRuntime -> unloadSingle -> teardownPluginRuntime stops
+    // any running worker for this pluginId) and leaves the plugin stuck in
+    // `error` with no further retry scheduled — turning a successful
+    // activation into a self-inflicted outage. activatePlugin must coalesce
+    // concurrent attempts for the same plugin instead of racing two of them.
+    const loader = createLoader();
+    let releaseRetryStart: (() => void) | undefined;
+    const retryStartGate = new Promise<void>((resolve) => {
+      releaseRetryStart = resolve;
+    });
+
+    (runtimeServices.workerManager.startWorker as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error(TRANSIENT_TIMEOUT_MESSAGE))
+      // The scheduled retry's own call: held open so a concurrent manual
+      // activation attempt can be made while it is still in flight.
+      .mockImplementationOnce(() => retryStartGate)
+      // A second, independent activation attempt would reach this third
+      // call — which must never happen once attempts are coalesced.
+      .mockImplementationOnce(() => {
+        throw new Error(
+          "startWorker must not be called a third time — the manual call should have coalesced onto the in-flight retry",
+        );
+      });
+
+    const initial = await loader.loadSingle(PLUGIN_ID);
+    expect(initial.success).toBe(false);
+    expect(timers.pendingCount()).toBe(1);
+
+    // Fire the 5s backoff step. Its activatePlugin() call reaches
+    // workerManager.startWorker() and blocks there — the retry is now "in
+    // flight".
+    await timers.fireNext(5_000);
+    expect(runtimeServices.workerManager.startWorker).toHaveBeenCalledTimes(2);
+
+    // An operator's manual retry races in while the automatic retry is
+    // still in flight.
+    const manualResultPromise = loader.loadSingle(PLUGIN_ID);
+
+    // Give the manual call's own async chain (getById, cancel, activatePlugin's
+    // pre-startWorker steps) room to run before releasing the gate.
+    await new Promise((resolve) => realSetTimeout(resolve, 25));
+    expect(runtimeServices.workerManager.startWorker).toHaveBeenCalledTimes(2);
+
+    releaseRetryStart!();
+    const manualResult = await manualResultPromise;
+
+    expect(manualResult.success).toBe(true);
+    expect(runtimeServices.workerManager.startWorker).toHaveBeenCalledTimes(2);
+    expect(row.status).toBe("ready");
   });
 });
