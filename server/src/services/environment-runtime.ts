@@ -2790,17 +2790,24 @@ function createSandboxEnvironmentDriver(
         const workerConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
         if (exportResume) {
           const pluginId = pluginProvider.resolved.plugin.id;
-          if (!pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentStopLease")) {
+          const viaRelease = stopOnlyCleanupUsesRelease(input.lease, pluginId);
+          if (!viaRelease && !pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentStopLease")) {
             throw new Error("Workspace export recovery requires verified stop-only cleanup.");
           }
           await assertExportResumeOwnership();
-          const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () => pluginWorkerManager.call(pluginId, "environmentStopLease", {
+          const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () => pluginWorkerManager.call(pluginId, viaRelease ? "environmentReleaseLease" : "environmentStopLease", {
             driverKey: recordedProvider, companyId: input.lease.companyId,
             environmentId: input.lease.environmentId ?? "", issueId: input.lease.issueId,
             config: workerConfig, providerLeaseId: input.lease.providerLeaseId,
-            leaseMetadata: input.lease.metadata ?? {}, cancelActiveWork: true, resourceDisposition: "stop_and_retain",
+            leaseMetadata: input.lease.metadata ?? {}, cancelActiveWork: true,
+            // A provider without a stop method keeps a reusable sandbox on a
+            // verified release; the stop ends the run's work like a cancel.
+            ...(viaRelease ? { runStatus: "expired" as const } : { resourceDisposition: "stop_and_retain" as const }),
           }, Math.min(resolvePluginSandboxRpcTimeoutMs(workerConfig) ?? 60_000, 60_000)));
-          if (remoteTerminationReceipt(input.lease, receipt)?.state !== "stopped") {
+          const state = remoteTerminationReceipt(input.lease, receipt)?.state;
+          // A stop may find the sandbox already gone, which ends the lease. A
+          // saved workspace export needs the sandbox it was stopped in.
+          if (state !== "stopped" && !(state === "destroyed" && !hasNativeWorkspaceExportResume(input.lease))) {
             throw new Error("Workspace export recovery did not confirm the retained sandbox stopped.");
           }
           return receipt;
@@ -2901,7 +2908,8 @@ function createSandboxEnvironmentDriver(
         if (!pinnedPluginId) return true; // Permanent invalid intent, never a by-key fallback.
         const pinned = await resolvePluginSandboxProviderDriverById({ db, pluginId: pinnedPluginId, driverKey: recordedProvider });
         return Boolean(pinned?.plugin.status === "ready" && pluginWorkerManager.isRunning(pinned.plugin.id)
-          && pluginWorkerVerifiesLifecycleMethod(pinned.plugin.id, "environmentStopLease"));
+          && (pluginWorkerVerifiesLifecycleMethod(pinned.plugin.id, "environmentStopLease")
+            || stopOnlyCleanupUsesRelease(input.lease, pinned.plugin.id)));
       }
       // Resolve the installed plugin without a wait. A plugin reload or a plugin
       // reinstall can remove the plugin row for a short window, so a missing
@@ -3393,6 +3401,21 @@ function createSandboxEnvironmentDriver(
   function pluginWorkerVerifiesLifecycleMethod(pluginId: string, method: string): boolean {
     const advertised = pluginWorkerManager?.getWorker(pluginId)?.supportedMethods ?? [];
     return advertised.includes(method);
+  }
+
+  /**
+   * Whether a stop-and-retain of `lease` goes through the provider's release
+   * because its worker has no stop method. Only for a sandbox kept between
+   * runs: its release stops the run's work and keeps the sandbox for the next
+   * run, and a release the provider cannot verify ends in a teardown it
+   * reports. A saved workspace export, or a sandbox that is not kept between
+   * runs, waits for a provider that can stop without removing it.
+   */
+  function stopOnlyCleanupUsesRelease(lease: EnvironmentLease, pluginId: string): boolean {
+    return !hasNativeWorkspaceExportResume(lease) &&
+      isPluginBackedReusableSandboxLease(lease) &&
+      !pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentStopLease") &&
+      pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentReleaseLease");
   }
 
   async function releasePluginBackedSandboxLease(

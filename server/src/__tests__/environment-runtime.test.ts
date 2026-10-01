@@ -629,6 +629,92 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     },
   );
 
+  it.each(["stopped", "destroyed"] as const)(
+    "stops a reusable sandbox through the release of a provider without a stop method (%s receipt)", async (state) => {
+      const seeded = await seedReusablePluginSandboxLease();
+      const lease = seeded.reusableLease;
+      const call = vi.fn(async (_id: string, method: string, params: Record<string, unknown>) => {
+        if (method !== "environmentReleaseLease") throw new Error(`unexpected ${method}`);
+        return { providerLeaseId: params.providerLeaseId, state };
+      });
+      const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+        isRunning: () => true, call,
+        getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+      } as unknown as PluginWorkerManager });
+
+      await runtime.releaseRunLeases(seeded.runId, "released", undefined, "stop_and_retain", true);
+
+      expect(call).toHaveBeenCalledOnce();
+      const params = call.mock.calls[0]![2];
+      expect(params).toMatchObject({ providerLeaseId: lease.providerLeaseId, cancelActiveWork: true });
+      expect(params).not.toHaveProperty("resourceDisposition");
+      const settled = await environmentService(db).getLeaseById(lease.id);
+      expect(settled).toMatchObject(state === "stopped"
+        ? { status: "released", cleanupStatus: "success", failureReason: null }
+        : { status: "expired", cleanupStatus: "success", failureReason: "sandbox_already_destroyed" });
+      expect(settled?.metadata).not.toHaveProperty("sandboxStopAndRetain");
+      expect(settled?.metadata?.remoteExecutionTermination).toMatchObject({ state, providerLeaseId: lease.providerLeaseId });
+      expect(await remoteExecutionHasStopped(db, seeded.companyId, seeded.runId)).toBe(true);
+    },
+  );
+
+  it("ends a stop-and-retain lease whose provider reports the sandbox already gone", async () => {
+    const seeded = await seedReusablePluginSandboxLease();
+    const lease = seeded.reusableLease;
+    const call = vi.fn(async (_id: string, method: string, params: Record<string, unknown>) => {
+      if (method !== "environmentStopLease") throw new Error(`unexpected ${method}`);
+      return { providerLeaseId: params.providerLeaseId, state: "destroyed" };
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentReleaseLease", "environmentStopLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager });
+
+    await runtime.releaseRunLeases(seeded.runId, "released", undefined, "stop_and_retain", true);
+
+    expect(call).toHaveBeenCalledOnce();
+    const settled = await environmentService(db).getLeaseById(lease.id);
+    expect(settled).toMatchObject({ status: "expired", cleanupStatus: "success", failureReason: "sandbox_already_destroyed" });
+    expect(settled?.metadata).not.toHaveProperty("sandboxStopAndRetain");
+    expect(settled?.metadata).not.toHaveProperty("sandboxStopAndRetainReceipt");
+    expect(await remoteExecutionHasStopped(db, seeded.companyId, seeded.runId)).toBe(true);
+    // Settled for good: the cleanup sweep has nothing left to retry.
+    await heartbeatService(db, { environmentRuntime: runtime }).sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(call).toHaveBeenCalledOnce();
+  });
+
+  it("retries a parked stop of a reusable sandbox through the release once the provider can release", async () => {
+    const seeded = await seedReusablePluginSandboxLease();
+    const lease = seeded.reusableLease;
+    let methods = ["environmentDestroyLease"];
+    const call = vi.fn(async (_id: string, method: string, params: Record<string, unknown>) => {
+      if (method !== "environmentReleaseLease") throw new Error(`unexpected ${method}`);
+      return { providerLeaseId: params.providerLeaseId, state: "stopped" };
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call, getWorker: () => ({ supportedMethods: methods }),
+    } as unknown as PluginWorkerManager });
+
+    // A worker that can neither stop nor release: the stop stays parked.
+    await runtime.releaseRunLeases(seeded.runId, "released", undefined, "stop_and_retain", true);
+    expect(call).not.toHaveBeenCalled();
+    expect(await environmentService(db).getLeaseById(lease.id)).toMatchObject({
+      status: "pending_cleanup", metadata: { sandboxStopAndRetain: { providerLeaseId: lease.providerLeaseId } },
+    });
+    const heartbeat = heartbeatService(db, { environmentRuntime: runtime });
+    await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(call).not.toHaveBeenCalled();
+
+    methods = ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"];
+    await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(call).toHaveBeenCalledOnce();
+    expect(call.mock.calls[0]![1]).toBe("environmentReleaseLease");
+    expect(await environmentService(db).getLeaseById(lease.id)).toMatchObject({
+      status: "released", cleanupStatus: "success",
+      metadata: { remoteExecutionTermination: { state: "stopped" } },
+    });
+  });
+
   it("reports an unwired manager separately from a stopped sandbox worker", async () => {
     const { companyId, environment, runId } = await seedReusablePluginSandboxLease();
     const input = {

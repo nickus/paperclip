@@ -62,18 +62,23 @@ export async function prepareSandboxStopAndRetain(db: Db, lease: Lease) {
   return updated ?? null;
 }
 
+/** A stopped sandbox is kept (`released`). A `destroyed` receipt says the
+ * sandbox was already gone, so its work has ended too: the lease ends
+ * (`expired`). Without a receipt the stop stays pending for a retry. */
 export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { attemptId: string; receipt?: unknown }) {
   if (hasNativeWorkspaceExportResume(lease)) return settleNativeWorkspaceExportResume(db, lease, options);
   const intent = readStopOnlyCleanup(lease);
   if (!intent) return null;
   const receipt = remoteTerminationReceipt(lease, options.receipt), stopped = receipt?.state === "stopped";
+  const destroyed = receipt?.state === "destroyed", settled = stopped || destroyed;
   const now = new Date();
-  const removeIntent: SQL = stopped ? sql`- 'sandboxStopAndRetain'` : sql``;
+  const removeIntent: SQL = settled ? sql`- 'sandboxStopAndRetain'` : sql``;
   const [updated] = await db.update(environmentLeases).set({
-    status: stopped ? "released" : "pending_cleanup", cleanupStatus: stopped ? "success" : "failed",
-    failureReason: stopped ? null : "sandbox_stop_pending",
+    status: stopped ? "released" : destroyed ? "expired" : "pending_cleanup", cleanupStatus: settled ? "success" : "failed",
+    failureReason: stopped ? null : destroyed ? "sandbox_already_destroyed" : "sandbox_stop_pending",
     releasedAt: now, lastUsedAt: now, updatedAt: now,
     metadata: sql`(${environmentLeases.metadata} - 'remoteExecutionTermination' ${removeIntent}) || ${JSON.stringify({
+      ...(destroyed ? { remoteExecutionTermination: receipt } : {}),
       ...(stopped ? { remoteExecutionTermination: receipt, sandboxStopAndRetainReceipt: {
         schema: "paperclip.sandbox-stop-and-retain-receipt.v1", requestId: intent.requestId,
         companyId: lease.companyId, runId: lease.heartbeatRunId, leaseId: lease.id,
