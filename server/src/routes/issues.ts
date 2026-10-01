@@ -14020,6 +14020,10 @@ export function issueRoutes(
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        // Only this authenticated-board-actor PATCH route may opt an update
+        // into stepping past all-cancelled blockers; see issues.ts's update
+        // for why this can't be inferred from actorUserId alone.
+        cancelledBlockerOverride: actor.actorType === "user",
       };
       const shouldCollectCompletionPublication =
         actor.actorType === "user" &&

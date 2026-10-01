@@ -1,7 +1,7 @@
-import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests, agents } from "@paperclipai/db";
+import { agentWakeupRequests, agents, heartbeatRuns } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 
 export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
@@ -317,6 +317,62 @@ export async function findExistingIssueBlockersCancelledWake(
     )
     .limit(1);
   return row ?? null;
+}
+
+/** Not-yet-delivered statuses a cancelled-blocker wake can still be closed out from. */
+const RESOLVABLE_DEPENDENCY_WAKE_STATUSES = ["queued", "deferred_issue_execution"] as const;
+
+/**
+ * Closes out any cancelled-blocker decision wake still waiting to be
+ * delivered for a dependent issue. Something other than that wake made the
+ * decision instead — most often a board actor's explicit status change past
+ * blockers that are all cancelled (see `issues.ts`'s `update`) — so the wake
+ * must not later ask someone to decide on blockers that no longer hold the
+ * issue.
+ *
+ * Two not-yet-delivered shapes exist and both are touched:
+ *  - `runId IS NULL` — the `deferred_issue_execution` form, and any crash
+ *    orphan heartbeat.ts's recovery sweep has not yet picked up.
+ *  - `runId` set to a run that is still `queued` — the common case: the
+ *    normal enqueue path (heartbeat.ts) pairs every new wake with a queued
+ *    heartbeat run in the same transaction, so a decision wake waiting in
+ *    the agent's queue has its `runId` set from the moment it is created.
+ * A `claimed` or `running` run already has an agent acting on it and must
+ * run to its own conclusion — neither it nor its wake is touched. Callers
+ * must close out the returned `runId`s (via the heartbeat cancel path,
+ * which re-checks the run is still `queued` at that time) so the run itself
+ * does not go on to execute with the stale wake reason.
+ */
+export async function resolveIssueBlockersCancelledWakeupsForIssue(
+  dbOrTx: Pick<Db, "update">,
+  input: { companyId: string; dependentIssueId: string; reason: string },
+): Promise<Array<{ id: string; agentId: string; runId: string | null }>> {
+  const now = new Date();
+  return dbOrTx
+    .update(agentWakeupRequests)
+    .set({
+      status: "cancelled",
+      finishedAt: now,
+      error: input.reason,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.reason, ISSUE_BLOCKERS_CANCELLED_WAKE_REASON),
+        inArray(agentWakeupRequests.status, [...RESOLVABLE_DEPENDENCY_WAKE_STATUSES]),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.dependentIssueId}`,
+        or(
+          isNull(agentWakeupRequests.runId),
+          sql`${agentWakeupRequests.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.status} = 'queued')`,
+        ),
+      ),
+    )
+    .returning({
+      id: agentWakeupRequests.id,
+      agentId: agentWakeupRequests.agentId,
+      runId: agentWakeupRequests.runId,
+    });
 }
 
 /**
