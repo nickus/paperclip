@@ -87,6 +87,14 @@ describe("activity formatting", () => {
     expect(formatIssueActivityAction("issue.queued_comment_discarded")).toBe("discarded a queued comment");
   });
 
+  it("labels comments shown to a run before it changed the status, and comments a run never saw", () => {
+    expect(formatActivityVerb("issue.queued_comments_delivered")).toBe("was shown comments posted during its run on");
+    expect(formatIssueActivityAction("issue.queued_comments_delivered")).toBe("was shown comments posted during its run");
+    expect(formatActivityVerb("issue.queued_comments_undelivered")).toBe("retired comments its run never saw on");
+    expect(formatIssueActivityAction("issue.queued_comments_undelivered"))
+      .toBe("retired comments its run never saw (the task was cancelled)");
+  });
+
   // PAP-16506 P4: agents can now resolve an interaction, including a review of
   // their own work, so an outcome has to read as an outcome in the timeline
   // instead of leaking the raw action id.

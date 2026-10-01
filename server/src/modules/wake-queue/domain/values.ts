@@ -25,6 +25,14 @@ export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_rev
  */
 export const HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY = "heldForPausedAgent";
 
+/**
+ * Context key a promoted run carries when some of its queued comments
+ * arrived while the previous run on the task was working and that run never
+ * saw them: `{ runId, commentIds }`. The wake payload turns it into a note
+ * that tells the agent to re-check what that run did.
+ */
+export const QUEUED_DURING_PREVIOUS_RUN_CONTEXT_KEY = "queuedDuringPreviousRun";
+
 export function isWorkspaceValidationFailedRun(run: { errorCode: string | null }): boolean {
   return run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE;
 }

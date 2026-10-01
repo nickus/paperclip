@@ -27,6 +27,8 @@ import {
 import type { WakeQueuePostgresAdapterDeps } from "./postgres.js";
 import { createReleaseIssueExecution } from "../application/use-cases.js";
 import { terminalizeLegacyExecution } from "../../../services/legacy-execution-recovery.js";
+import { buildPaperclipWakePayload } from "../../../services/heartbeat.js";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import type { TransactionScope } from "../application/ports.js";
 
 // Proves the atomicity and company-scope properties the security review
@@ -941,6 +943,108 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect(issueRow?.status).toBe("todo");
     expect(issueRow?.executionState).toBeNull();
   });
+
+  // Another agent can ask the assignee to hold while the assignee's run is
+  // working. That comment waits for the assignee's next run; if the run
+  // completes the task without having seen it, the comment must still reach
+  // the assignee instead of being retired with the task.
+  it.each(["unseen", "shown_by_conflict", "posted_before_run_start", "own_comment", "cancelled_task"])(
+    "delivers another agent's comment that the run completing the task never saw (%s)",
+    async (scenario) => {
+      const companyId = await seedCompany();
+      const builderId = await seedAgent({ companyId, name: "Builder" });
+      const reviewerId = await seedAgent({ companyId, name: "Reviewer" });
+      const issueId = await seedIssue({
+        companyId,
+        assigneeAgentId: builderId,
+        status: scenario === "cancelled_task" ? "cancelled" : "done",
+      });
+      const runId = await seedRun({ companyId, agentId: builderId, status: "succeeded", contextSnapshot: { issueId } });
+      const startedAt = new Date(Date.now() - 10 * 60_000);
+      await db.update(heartbeatRuns).set({ startedAt }).where(eq(heartbeatRuns.id, runId));
+      await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+      const [comment] = await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorType: "agent",
+        authorAgentId: scenario === "own_comment" ? builderId : reviewerId,
+        body: "Hold: the API contract changed, do not ship this yet.",
+        createdAt: scenario === "posted_before_run_start" ? new Date(startedAt.getTime() - 60_000) : new Date(),
+      }).returning();
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId: builderId,
+        issueId,
+        requestedByActorType: "agent",
+        requestedByActorId: reviewerId,
+        payload: {
+          commentId: comment!.id,
+          mutation: "comment",
+          _paperclipWakeContext: { issueId, taskId: issueId, wakeReason: "issue_commented", wakeCommentIds: [comment!.id] },
+        },
+      });
+      if (scenario === "shown_by_conflict") {
+        await db.insert(activityLog).values({
+          companyId,
+          actorType: "agent",
+          actorId: builderId,
+          agentId: builderId,
+          runId,
+          action: "issue.queued_comments_delivered",
+          entityType: "issue",
+          entityId: issueId,
+          details: { runId, commentIds: [comment!.id], via: "status_change_conflict" },
+        });
+      }
+      const release = createReleaseIssueExecution({
+        issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+        recovery: { escalateStrandedAssignedIssue: async () => {}, escalateStrandedRecoveryIssueInPlace: async () => {} },
+      });
+
+      const result = await release({ companyId, runId, now: new Date() });
+
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const undelivered = await db.select().from(activityLog)
+        .where(eq(activityLog.action, "issue.queued_comments_undelivered"));
+      if (scenario === "unseen") {
+        expect(result.outcome.kind).toBe("promoted");
+        expect(issue!.status).toBe("todo");
+        expect(wake!.status).toBe("queued");
+        const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake!.runId!));
+        expect(next!.contextSnapshot).toMatchObject({
+          wakeCommentIds: [comment!.id],
+          queuedDuringPreviousRun: { runId, commentIds: [comment!.id] },
+        });
+        expect(undelivered).toHaveLength(0);
+        // The next run's wake prompt says so in one line.
+        const payload = await buildPaperclipWakePayload({
+          db,
+          companyId,
+          agentId: builderId,
+          runId: next!.id,
+          contextSnapshot: next!.contextSnapshot as Record<string, unknown>,
+        });
+        expect(payload).toMatchObject({ queuedDuringPreviousRun: { runId, commentIds: [comment!.id] } });
+        expect(renderPaperclipWakePrompt(payload)).toContain(
+          `1 of these comments arrived while your previous run on this task (${runId}) was working, and it did not see them.`,
+        );
+      } else {
+        expect(result.outcome.kind).toBe("released");
+        expect(issue!.status).toBe(scenario === "cancelled_task" ? "cancelled" : "done");
+        expect(wake!.status).toBe("cancelled");
+        if (scenario === "cancelled_task") {
+          expect(undelivered).toEqual([expect.objectContaining({
+            entityId: issueId,
+            runId,
+            details: expect.objectContaining({ wakeId, commentIds: [comment!.id] }),
+          })]);
+        } else {
+          expect(undelivered).toHaveLength(0);
+        }
+      }
+    },
+  );
 
   // Review test (c): a deferred-status compare-and-set that affects no row
   // claims nothing, and no other write in the promotion path ever runs.

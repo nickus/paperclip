@@ -609,6 +609,7 @@ import {
 import {
   createWakeQueue,
   HELD_FOR_PAUSED_AGENT_PAYLOAD_KEY,
+  QUEUED_DURING_PREVIOUS_RUN_CONTEXT_KEY,
   WakeQueueApplicationError,
   type IssueSnapshot as WakeQueueIssueSnapshot,
   type PostCommitEffect as WakeQueuePostCommitEffect,
@@ -8318,6 +8319,21 @@ export async function buildPaperclipWakePayload(input: {
       readNonEmptyString(input.contextSnapshot.wakeReason) ===
         "source_scoped_recovery_action",
   );
+  // Comments of this wake that arrived while the previous run on the task
+  // was working, and that run never saw. Limited to this wake's own batch so
+  // a later queue edit or discard keeps the note accurate.
+  const queuedDuringPreviousRun = (() => {
+    const value = parseObject(
+      input.contextSnapshot[QUEUED_DURING_PREVIOUS_RUN_CONTEXT_KEY],
+    );
+    const runId = readNonEmptyString(value.runId);
+    const ids = Array.isArray(value.commentIds)
+      ? value.commentIds.filter(
+          (id): id is string => typeof id === "string" && commentIds.includes(id),
+        )
+      : [];
+    return runId && ids.length > 0 ? { runId, commentIds: ids } : null;
+  })();
   // The Run Brief orients issue-scoped task wakes. Chat-shaped turns keep
   // their own contracts, and a failed lookup must never block the wake.
   let runBrief: Awaited<ReturnType<typeof loadRunBrief>> | null = null;
@@ -8554,6 +8570,8 @@ export async function buildPaperclipWakePayload(input: {
     truncated: payloadTruncated,
     fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
     ...(runBrief ? { runBrief } : {}),
+    // Present only when it applies, so other wake payloads keep their shape.
+    ...(queuedDuringPreviousRun ? { queuedDuringPreviousRun } : {}),
   };
   // Every section above has its own limits; this is the ceiling for an issue
   // that hits all of them at once.

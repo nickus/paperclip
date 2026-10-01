@@ -115,6 +115,8 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
       releasePolicy: null,
     })),
     getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false })),
+    getCommentsUnseenByFinishingRun: vi.fn(async () => []),
+    recordUndeliveredQueuedComments: vi.fn(async () => {}),
     isCompletedDelegationMention: vi.fn(async () => false),
     reopenIssue: vi.fn(async () => null),
     claimDeferredWakeForPromotion: vi.fn(async () => true),
@@ -768,6 +770,100 @@ describe("releaseIssueExecution", () => {
       expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
       expect(result.outcome.kind).toBe("released");
     }
+  });
+
+  it.each(["done_unseen", "done_seen", "cancelled_unseen", "cancelled_seen", "in_progress_unseen", "other_agent"])(
+    "handles comments the finishing run never saw: %s",
+    async (scenario) => {
+      const commentIds = ["hold-from-reviewer"];
+      const [issueStatus, seen] = scenario === "other_agent"
+        ? ["done", "unseen"]
+        : [scenario.slice(0, scenario.lastIndexOf("_")), scenario.slice(scenario.lastIndexOf("_") + 1)];
+      const queue = [wakeCandidate({
+        // The finishing run's own agent, which is also the assignee, unless
+        // the wake addresses another agent.
+        agentId: scenario === "other_agent" ? "deferred-agent" : RUN.agentId,
+        requestedByActorType: "agent",
+        requestedByActorId: "reviewing-agent",
+        queuedCommentIds: commentIds,
+        deferredCommentIds: commentIds,
+        deferredContextSeed: { wakeReason: "issue_commented", wakeCommentIds: commentIds },
+      })];
+      const transaction = createFakeTransaction({
+        findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+        getQueuedCommentLiveness: vi.fn(async () => ({ liveNonSelfCommentIds: commentIds, containedSelfAuthoredComment: false })),
+        getCommentsUnseenByFinishingRun: vi.fn(async () => (seen === "unseen" ? commentIds : [])),
+        reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
+      });
+      const issue = scenario === "other_agent"
+        ? { ...ISSUE, status: issueStatus!, assigneeAgentId: "deferred-agent" }
+        : { ...ISSUE, status: issueStatus! };
+      const release = createReleaseIssueExecution({
+        issueLock: createFakeIssueLock(createFakeHost(), transaction, issue),
+        recovery: createFakeRecovery(),
+      });
+
+      const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+      if (scenario === "other_agent") {
+        // Another agent's wake says nothing about what this run saw.
+        expect(transaction.getCommentsUnseenByFinishingRun).not.toHaveBeenCalled();
+      } else {
+        expect(transaction.getCommentsUnseenByFinishingRun).toHaveBeenCalledWith({
+          companyId: RUN.companyId, issueId: ISSUE.id, finishingRunId: RUN.id, commentIds,
+        });
+      }
+      const promotedContext = vi.mocked(transaction.finalizePromotedWake).mock.calls[0]?.[0].contextSnapshot;
+      if (scenario === "done_unseen" || scenario === "in_progress_unseen") {
+        // A completed task is reopened like an explicit resume; either way the
+        // next run is told these comments arrived during the previous run.
+        expect(transaction.reopenIssue).toHaveBeenCalledTimes(scenario === "done_unseen" ? 1 : 0);
+        expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+        expect(result.outcome.kind).toBe("promoted");
+        expect(promotedContext).toMatchObject({ queuedDuringPreviousRun: { runId: RUN.id, commentIds } });
+      } else {
+        // A completed task whose run saw the comments, and a cancelled task,
+        // stay closed; the wake is retired as before.
+        expect(transaction.reopenIssue).not.toHaveBeenCalled();
+        expect(transaction.cancelDeferredWake).toHaveBeenCalledWith(expect.objectContaining({
+          reason: "Deferred execution wake no longer applies to a terminal task",
+        }));
+        expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
+      }
+      if (scenario === "cancelled_unseen") {
+        // Not dropped silently: the issue activity names the comments.
+        expect(transaction.recordUndeliveredQueuedComments).toHaveBeenCalledWith(expect.objectContaining({
+          companyId: RUN.companyId, issueId: ISSUE.id, wakeId: "wake-1", finishingRunId: RUN.id, commentIds,
+        }));
+      } else {
+        expect(transaction.recordUndeliveredQueuedComments).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("does not carry a stale previous-run note into a promoted wake that no longer applies", async () => {
+    const commentIds = ["seen-comment"];
+    const queue = [wakeCandidate({
+      agentId: RUN.agentId,
+      queuedCommentIds: commentIds,
+      deferredCommentIds: commentIds,
+      deferredContextSeed: {
+        wakeCommentIds: commentIds,
+        queuedDuringPreviousRun: { runId: "older-run", commentIds },
+      },
+    })];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      getQueuedCommentLiveness: vi.fn(async () => ({ liveNonSelfCommentIds: commentIds, containedSelfAuthoredComment: false })),
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction),
+      recovery: createFakeRecovery(),
+    });
+
+    expect((await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() })).outcome.kind).toBe("promoted");
+    expect(vi.mocked(transaction.finalizePromotedWake).mock.calls[0]![0].contextSnapshot)
+      .not.toHaveProperty("queuedDuringPreviousRun");
   });
 
   it("never reopens the issue when the promotion claim loses the race, and moves on to the next wake", async () => {

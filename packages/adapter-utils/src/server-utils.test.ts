@@ -913,6 +913,46 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  const commentWake = (extra: Record<string, unknown> = {}) => ({
+    reason: "issue_commented",
+    issue: { id: "issue-1", identifier: "PAP-1", title: "Ship the change", status: "todo" },
+    commentIds: ["comment-1", "comment-2"],
+    latestCommentId: "comment-2",
+    comments: [
+      { id: "comment-1", issueId: "issue-1", body: "Please hold.", author: { type: "user", id: "user-1" } },
+      { id: "comment-2", issueId: "issue-1", body: "Regression found.", author: { type: "agent", id: "agent-2" } },
+    ],
+    commentWindow: { requestedCount: 2, includedCount: 2, missingCount: 0 },
+    fallbackFetchNeeded: false,
+    ...extra,
+  });
+
+  it("tells the run when comments arrived during the previous run, which never saw them", () => {
+    const note = "- comments your previous run did not see: 2 of these comments arrived while your previous run on this task (run-1) was working, and it did not see them. Re-check what that run did, and pause or revert it if they ask for that.";
+    for (const resumedSession of [false, true]) {
+      const prompt = renderPaperclipWakePrompt(
+        commentWake({ queuedDuringPreviousRun: { runId: "run-1", commentIds: ["comment-1", "comment-2"] } }),
+        { resumedSession },
+      );
+      expect(prompt).toContain(note);
+      // One bounded line: the note never repeats comment text.
+      expect(prompt.split("\n").filter((line) => line.includes("previous run did not see"))).toEqual([note]);
+    }
+    expect(renderPaperclipWakePrompt(
+      commentWake({ queuedDuringPreviousRun: { runId: "run-1", commentIds: ["comment-1"] } }),
+    )).toContain("- comments your previous run did not see: 1 of these comments arrived");
+  });
+
+  it("adds no previous-run note, and keeps the serialized payload unchanged, when none applies", () => {
+    for (const extra of [{}, { queuedDuringPreviousRun: { runId: "run-1", commentIds: [] } }, { queuedDuringPreviousRun: { commentIds: ["comment-1"] } }]) {
+      expect(renderPaperclipWakePrompt(commentWake(extra))).not.toContain("previous run did not see");
+    }
+    expect(JSON.parse(stringifyPaperclipWakePayload(commentWake())!)).not.toHaveProperty("queuedDuringPreviousRun");
+    expect(JSON.parse(stringifyPaperclipWakePayload(commentWake({
+      queuedDuringPreviousRun: { runId: "run-1", commentIds: ["comment-1"] },
+    }))!)).toMatchObject({ queuedDuringPreviousRun: { runId: "run-1", commentIds: ["comment-1"] } });
+  });
+
   it("leaves conversation disposition and accepted-plan handoff to the injected chat policy", () => {
     const payload = {
       reason: "issue_commented",

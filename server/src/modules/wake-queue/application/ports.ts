@@ -183,6 +183,31 @@ export interface WakeQueueTransaction {
     finishingRunId: string;
     commentIds: string[];
   }): Promise<{ allSelfAuthored: boolean }>;
+  /**
+   * Of `commentIds`, the comments that arrived while the finishing run was
+   * working and that it never saw: created after it started, not written by
+   * its agent or by the run, not in its prompt, and not shown to it later by
+   * a status-change conflict or a queue read. Empty when the run never
+   * started. Keeps the order of `commentIds`.
+   */
+  getCommentsUnseenByFinishingRun(input: {
+    companyId: string;
+    issueId: string;
+    finishingRunId: string;
+    commentIds: string[];
+  }): Promise<string[]>;
+  /**
+   * Writes an issue activity entry naming queued comments whose wake this
+   * drain retires without delivering them, so the board can see them.
+   */
+  recordUndeliveredQueuedComments(input: {
+    companyId: string;
+    issueId: string;
+    wakeId: string;
+    finishingRunId: string;
+    commentIds: string[];
+    reason: string;
+  }): Promise<void>;
   /** Proves all candidate comments only report completed child work in the finishing parent's own run. */
   isCompletedDelegationMention(input: {
     companyId: string;

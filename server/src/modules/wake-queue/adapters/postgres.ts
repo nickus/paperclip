@@ -44,6 +44,7 @@ import {
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
 import { undeliveredLegacyUserCommentIds } from "../../../services/explicit-native-continuation.js";
+import { filterQueuedCommentIdsUnseenByFinishedRun } from "../../../services/run-queued-comments.js";
 import { extractWakeCommentIds } from "../../run-dispatch/index.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
@@ -515,6 +516,32 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds)));
       return { allSelfAuthored: rows.length > 0 && rows.every((row) => row.createdByRunId === finishingRunId) };
+    },
+
+    async getCommentsUnseenByFinishingRun({ companyId, issueId, finishingRunId, commentIds }) {
+      // Only the run this release locked is known here; any other run id has
+      // no facts to answer with.
+      if (run.companyId !== companyId || run.id !== finishingRunId) return [];
+      return filterQueuedCommentIdsUnseenByFinishedRun(tx, {
+        companyId,
+        issueId,
+        run: { id: run.id, agentId: run.agentId, contextSnapshot: run.contextSnapshot, startedAt: run.startedAt },
+        commentIds,
+      });
+    },
+
+    async recordUndeliveredQueuedComments({ companyId, issueId, wakeId, finishingRunId, commentIds, reason }) {
+      if (commentIds.length === 0) return;
+      await tx.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        action: "issue.queued_comments_undelivered",
+        entityType: "issue",
+        entityId: issueId,
+        runId: finishingRunId,
+        details: { wakeId, commentIds, reason },
+      });
     },
 
     async isCompletedDelegationMention({ companyId, issueId, finishingRunId, wakeAgentId, commentIds }) {
