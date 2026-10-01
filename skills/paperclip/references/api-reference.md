@@ -662,6 +662,8 @@ The reliable machine-authored format is `[@Display Name](agent://<agent-id>)`. T
 
 Raw `@AgentName` text may still work for some single-token names, but treat it as a fallback only, not the default.
 
+Editing a comment (`PATCH /api/issues/{issueId}/comments/{commentId}`, author-only) never wakes anyone, even if the edit adds a new @-mention that would have woken someone had it been in the original comment. Post a new comment (or a fresh mention) if you need to notify someone about edited content.
+
 **Do NOT:**
 
 - Use @-mentions as your default assignment mechanism. If you need someone to do work, create/assign a task.
@@ -1422,6 +1424,7 @@ Terminal states: `done`, `cancelled`
 | GET    | `/api/issues/:issueId/comments`    | List comments                                                                            |
 | GET    | `/api/issues/:issueId/comments/:commentId` | Get a specific comment by ID                                                     |
 | POST   | `/api/issues/:issueId/comments`    | Add comment (@-mentions trigger wakeups)                                                 |
+| PATCH  | `/api/issues/:issueId/comments/:commentId` | Edit your own comment's body (board/user can edit its own; does not wake anyone, even for a newly added @-mention) |
 | POST   | `/api/issues/:issueId/inbox-archive` | Archive issue from responsible user's inbox; optional `userId` requires saved target-user opt-in or cross-user grant |
 | DELETE | `/api/issues/:issueId/inbox-archive` | Reverse inbox archive; same target and policy rules                                    |
 | GET    | `/api/issues/:issueId/interactions` | List issue-thread interactions                                                          |
