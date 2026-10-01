@@ -302,7 +302,7 @@ describeEmbeddedPostgres("reusable sandbox leases carry the harness session to t
     // A new lease row for the new run, on the same provider sandbox.
     expect(second.lease.id).not.toBe(first.lease.id);
     expect(second.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
-    expect(second.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+    expect(second.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", previousRunId: first.runId });
     expect(second.target).toMatchObject({ remoteCwd: "/workspace", leaseId: second.lease.id });
     expect(worker.call.mock.calls.filter(([, method]) => method === "environmentAcquireLease")).toHaveLength(1);
 
@@ -363,7 +363,7 @@ describeEmbeddedPostgres("reusable sandbox leases carry the harness session to t
 
     const second = await startRun();
     expect(second.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
-    expect(second.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+    expect(second.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", previousRunId: first.runId });
   });
 
   it("records a failed run as failed when the provider destroyed the sandbox", async () => {
@@ -408,7 +408,7 @@ describeEmbeddedPostgres("reusable sandbox leases carry the harness session to t
     // still matches it, so the agent CLI continues that session.
     const second = await startRun();
     expect(second.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
-    expect(second.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+    expect(second.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", previousRunId: first.runId });
     expect(adapterExecutionTargetSessionMatches(claudeSession.remoteExecution, second.target)).toBe(true);
   });
 

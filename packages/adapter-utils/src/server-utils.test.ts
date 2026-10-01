@@ -23,7 +23,9 @@ import {
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
+  renderPaperclipWakeInterruptedPreviousRun,
   renderPaperclipWakeSessionConfigChanges,
+  withPaperclipWakeInterruptedPreviousRun,
   withPaperclipWakeSessionConfigChanges,
   resolveLegacyPaperclipDesiredSkillNames,
   resolvePaperclipDesiredSkillNames,
@@ -968,6 +970,45 @@ describe("renderPaperclipWakePrompt", () => {
     expect(renderPaperclipWakeSessionConfigChanges({ sessionConfigChanges: [] })).toBe("");
     expect(renderPaperclipWakeSessionConfigChanges({ sessionConfigChanges: "secrets" })).toBe("");
     expect(renderPaperclipWakeSessionConfigChanges(null)).toBe("");
+  });
+
+  it("tells the agent that an interrupted run's unsynced sandbox changes were discarded", () => {
+    const payload = {
+      reason: "issue_commented",
+      issue: { id: "issue-1", identifier: "PAP-1", title: "Follow-up", status: "in_progress" },
+      comments: [],
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      fallbackFetchNeeded: false,
+    };
+    const noted = withPaperclipWakeInterruptedPreviousRun(payload, "run-41");
+    const note =
+      "Your previous run on this task (run-41) was interrupted. Changes it made inside the sandbox that were not synced back were discarded; re-check the workspace (`git status`) before continuing.";
+
+    expect(renderPaperclipWakeInterruptedPreviousRun(noted)).toBe(note);
+    // It describes the workspace, so a fresh session gets it as well.
+    for (const options of [{ resumedSession: true }, { resumedSession: false }, {}]) {
+      const prompt = renderPaperclipWakePrompt(noted, options);
+      expect(prompt).toContain(note);
+      expect(prompt.indexOf(note)).toBeGreaterThan(prompt.indexOf("## Paperclip"));
+      expect(prompt.split("\n").filter((line) => line.includes("was interrupted"))).toEqual([note]);
+    }
+    // Runtime-only: never part of the serialized wake payload.
+    expect(stringifyPaperclipWakePayload(noted)).not.toContain("interruptedPreviousRun");
+
+    // Clearing it removes the field (a retried run reuses its context).
+    const cleared = withPaperclipWakeInterruptedPreviousRun(noted, null);
+    expect(cleared).not.toHaveProperty("interruptedPreviousRun");
+    expect(renderPaperclipWakePrompt(cleared, { resumedSession: true })).toBe(
+      renderPaperclipWakePrompt(payload, { resumedSession: true }),
+    );
+  });
+
+  it("renders the interrupted-run note only for a well-formed run id", () => {
+    for (const runId of ["", "../x", "run id", "x".repeat(200), 42, null]) {
+      expect(renderPaperclipWakeInterruptedPreviousRun({ interruptedPreviousRun: { runId } })).toBe("");
+    }
+    expect(renderPaperclipWakeInterruptedPreviousRun({ interruptedPreviousRun: "run-1" })).toBe("");
+    expect(renderPaperclipWakeInterruptedPreviousRun(null)).toBe("");
   });
 
   const commentWake = (extra: Record<string, unknown> = {}) => ({

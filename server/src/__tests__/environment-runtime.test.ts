@@ -1161,6 +1161,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(acquired.lease.providerLeaseId).toBe("sandbox-exact-resume");
     expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({
       outcome: "resumed",
+      previousRunId: seeded.runId,
     });
     expect(acquired.lease.metadata?.nativeWorkspaceSync).toEqual(
       workspaceSyncStamp,
@@ -1261,7 +1262,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(leases.map((lease) => lease.providerLeaseId).sort()).toEqual(["sandbox-1", "sandbox-2"]);
     expect(leases.map((lease) => lease.metadata?.sandboxLeaseAcquisition).sort(
       (left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)),
-    )).toEqual([{ outcome: "created" }, { outcome: "resumed" }]);
+    )).toEqual([{ outcome: "created" }, { outcome: "resumed", previousRunId: seeded.runId }]);
     expect(leases.every((lease) => lease.status === "active")).toBe(true);
   });
 

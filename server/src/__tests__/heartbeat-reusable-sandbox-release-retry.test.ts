@@ -292,7 +292,7 @@ describeEmbeddedPostgres("reusable sandbox leases parked for a release", () => {
   describe("the cleanup sweep", () => {
     it("retries the release and keeps the sandbox for the task's next run", async () => {
       const { worker, heartbeat, startRun, parkedLease } = await seed();
-      const { lease } = await parkedLease();
+      const { runId, lease } = await parkedLease();
 
       await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
 
@@ -316,7 +316,7 @@ describeEmbeddedPostgres("reusable sandbox leases parked for a release", () => {
 
       const next = await startRun();
       expect(next.lease.providerLeaseId).toBe(lease.providerLeaseId);
-      expect(next.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+      expect(next.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", previousRunId: runId });
     });
 
     it("defers the release while the plugin worker is down without using up an attempt", async () => {

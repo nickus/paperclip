@@ -618,6 +618,16 @@ describeEmbeddedPostgres("heartbeat keeps a task on one execution workspace for 
         expect(later).toMatchObject({ sessionIdBefore: "session-1", sessionIdAfter: "session-1" });
       }
       expect(sessionsStarted).toBe(1);
+
+      // The workspace of the follow-up was staged from the host copy again, so
+      // its wake tells the agent that the interrupted run's unsynced changes
+      // in the sandbox are gone.
+      const wakes = adapterExecute.mock.calls.map(
+        ([input]) => ((input as { context?: Record<string, unknown> })?.context?.paperclipWake ?? {}) as Record<string, unknown>,
+      );
+      expect(wakes[0]).not.toHaveProperty("interruptedPreviousRun");
+      expect(wakes[1]).toMatchObject({ interruptedPreviousRun: { runId: interrupted!.id } });
+      for (const later of wakes.slice(2)) expect(later).not.toHaveProperty("interruptedPreviousRun");
     } finally {
       restoreDefaultTurn();
     }

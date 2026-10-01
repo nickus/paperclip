@@ -2373,6 +2373,35 @@ export function renderPaperclipWakeSessionConfigChanges(value: unknown): string 
   return `Changed since your previous turn on this task: ${changes.join(", ")}. This turn runs with the updated versions; where they differ from earlier in this conversation, follow the updated ones.`;
 }
 
+const PAPERCLIP_WAKE_INTERRUPTED_PREVIOUS_RUN_KEY = "interruptedPreviousRun";
+const PAPERCLIP_WAKE_RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/**
+ * Return a copy of the wake payload that notes that the previous run on this
+ * task, `runId`, was interrupted, or without that note for null. The server
+ * sets it when the run resumes the sandbox that run used, but the workspace
+ * was staged from the host copy again: what the interrupted run changed in
+ * the sandbox without syncing it back is gone, while a resumed agent session
+ * still remembers it. Runtime-only, like the configuration note.
+ */
+export function withPaperclipWakeInterruptedPreviousRun(
+  wakePayload: unknown,
+  runId: string | null,
+): Record<string, unknown> {
+  const {
+    [PAPERCLIP_WAKE_INTERRUPTED_PREVIOUS_RUN_KEY]: _previous,
+    ...payload
+  } = parseObject(wakePayload);
+  return runId ? { ...payload, [PAPERCLIP_WAKE_INTERRUPTED_PREVIOUS_RUN_KEY]: { runId } } : payload;
+}
+
+/** The one-line note for a run that follows an interrupted run (see above). */
+export function renderPaperclipWakeInterruptedPreviousRun(value: unknown): string {
+  const runId = parseObject(parseObject(value)[PAPERCLIP_WAKE_INTERRUPTED_PREVIOUS_RUN_KEY]).runId;
+  if (typeof runId !== "string" || !PAPERCLIP_WAKE_RUN_ID_PATTERN.test(runId)) return "";
+  return `Your previous run on this task (${runId}) was interrupted. Changes it made inside the sandbox that were not synced back were discarded; re-check the workspace (\`git status\`) before continuing.`;
+}
+
 // One bounded line: the comment count and run id, never comment text.
 function renderQueuedDuringPreviousRunLine(
   value: PaperclipWakeQueuedDuringPreviousRun,
@@ -2388,7 +2417,8 @@ function renderQueuedDuringPreviousRunLine(
 // The session configuration note is runtime-only in the same way. The server
 // sets it before the adapter decides whether it can resume the saved session,
 // so it is rendered only when the adapter passes resumedSession: true; a new
-// session has no previous turn to compare with.
+// session has no previous turn to compare with. The interrupted-run note is
+// runtime-only too; it describes the workspace, so every session gets it.
 export function renderPaperclipWakePrompt(
   value: unknown,
   options: Parameters<typeof renderPaperclipWakePromptBody>[1] = {},
@@ -2396,6 +2426,7 @@ export function renderPaperclipWakePrompt(
   const instructions = asString(parseObject(value).connectorSkillInstructions, "").trim();
   return joinPromptSections([
     renderPaperclipWakePromptBody(value, options),
+    renderPaperclipWakeInterruptedPreviousRun(value),
     options.resumedSession === true ? renderPaperclipWakeSessionConfigChanges(value) : "",
     instructions ? `## Assigned connector skills\n\n${instructions}` : "",
   ]);

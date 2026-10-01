@@ -2331,6 +2331,7 @@ function createSandboxEnvironmentDriver(
           sandboxLeaseAcquisition: providerLease
             ? {
                 outcome: "resumed",
+                ...previousRunOfResumedLease(reusableLease, input.heartbeatRunId),
               }
             : reusableLease?.providerLeaseId
               ? {
@@ -2573,6 +2574,7 @@ function createSandboxEnvironmentDriver(
           reusableLease && providerLease.providerLeaseId === reusableLease.providerLeaseId
             ? {
                 outcome: "resumed",
+                ...previousRunOfResumedLease(reusableLease, input.heartbeatRunId),
               }
             : reusableLease?.providerLeaseId
               ? {
@@ -3773,6 +3775,21 @@ function pluginDriverProviderKey(config: PluginEnvironmentConfig): string {
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * The run that last held a sandbox this run resumes (`previousRunId` on the
+ * resumed lease's acquisition record), so the run can tell what the previous
+ * run in the sandbox left behind. Left out when the run takes its own lease
+ * back.
+ */
+function previousRunOfResumedLease(
+  lease: Pick<EnvironmentLease, "heartbeatRunId"> | null | undefined,
+  heartbeatRunId: string | null,
+): { previousRunId?: string } {
+  return lease?.heartbeatRunId && lease.heartbeatRunId !== heartbeatRunId
+    ? { previousRunId: lease.heartbeatRunId }
+    : {};
 }
 
 /** The `runPrivatePaths` release parameter, left out when there is nothing to remove. */

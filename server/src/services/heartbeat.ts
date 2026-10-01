@@ -6,6 +6,7 @@ import {
   type NativeWorkspaceFinalizationOwnership,
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
+import { interruptedRunBeforeResumedSandbox } from "./interrupted-sandbox-run.js";
 import { PENDING_CLEANUP_INTENT_METADATA_KEY, readPendingCleanupIntent } from "./pending-cleanup-intent.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
@@ -666,6 +667,7 @@ import {
   selectPaperclipTaskMarkdown,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+  withPaperclipWakeInterruptedPreviousRun,
   withPaperclipWakeSessionConfigChanges,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -24277,6 +24279,28 @@ export function heartbeatService(
           ...wakePayloadForWorkspace,
           executionWorkspace: { branchName: executionWorkspace.branchName },
         };
+      }
+      // This run resumed the sandbox of an interrupted run on the task, but a
+      // legacy adapter stages the workspace from the host copy again: what that
+      // run changed in the sandbox without syncing it back is gone, although
+      // the agent session kept in the sandbox remembers it. Set or clear the
+      // note on every run, since a retried run reuses its context.
+      if (context[PAPERCLIP_WAKE_PAYLOAD_KEY]) {
+        const interruptedRunId =
+          executionTarget?.kind === "remote" &&
+          executionTarget.transport === "sandbox" &&
+          agent.adapterType !== "paperclip_runner"
+            ? await interruptedRunBeforeResumedSandbox(db, {
+                companyId: agent.companyId,
+                runId: run.id,
+                issueId: issueId ?? null,
+                lease: activeEnvironmentLease.lease,
+              }).catch(() => null)
+            : null;
+        context[PAPERCLIP_WAKE_PAYLOAD_KEY] = withPaperclipWakeInterruptedPreviousRun(
+          context[PAPERCLIP_WAKE_PAYLOAD_KEY],
+          interruptedRunId,
+        );
       }
       const runtimeServiceIntents = (() => {
         const runtimeConfig = parseObject(
