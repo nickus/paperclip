@@ -1080,6 +1080,15 @@ export const addIssueCommentSchema = z.object({
 
 export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;
 
+// Editing a comment only ever replaces its text. Presentation, metadata and
+// attachments are set once at creation time and are not revisited here, so
+// the accepted shape is intentionally narrower than `addIssueCommentSchema`.
+export const editIssueCommentSchema = z.object({
+  body: multilineTextSchema.pipe(z.string().min(1)),
+});
+
+export type EditIssueComment = z.infer<typeof editIssueCommentSchema>;
+
 export const issueThreadInteractionStatusSchema = z.enum(
   ISSUE_THREAD_INTERACTION_STATUSES,
 );
