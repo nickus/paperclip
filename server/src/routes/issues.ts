@@ -17430,9 +17430,11 @@ export function issueRoutes(
     res.json(deleted);
   });
 
-  // Authorization mirrors DELETE /issues/:id/comments/:commentId exactly
-  // (own-comment ownership, board override via assertAgentIssueMutationAllowed):
-  // whoever may delete a comment may edit it instead. This intentionally
+  // Authorization mirrors DELETE /issues/:id/comments/:commentId exactly:
+  // the same assertAgentIssueMutationAllowed issue-mutation boundary, then
+  // the same own-comment-only check (an agent may act on its own comments;
+  // a board/user actor may act on comments it posted itself). Whoever may
+  // delete a comment may edit it instead. This intentionally
   // skips the queued-comment cancel/legacy-queue branch above, which governs
   // withdrawing an undelivered comment before it wakes anyone — editing only
   // ever applies to an already-posted comment.
