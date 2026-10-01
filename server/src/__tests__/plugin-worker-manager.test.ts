@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   createHostClientHandlers,
@@ -32,11 +32,17 @@ import {
   createDuplexRouteSlotController,
   createPluginWorkerHandle,
   formatWorkerFailureMessage,
+  PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR,
+  resolveInitializeTimeoutMs,
   resolveRpcCallTimeoutMs,
 } from "../services/plugin-worker-manager.js";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const DELAYED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-delayed.cjs");
+const DELAYED_INITIALIZE_WORKER_ENTRYPOINT = path.join(
+  FIXTURES_DIR,
+  "plugin-worker-delayed-initialize.cjs",
+);
 const INVOCATION_SCOPE_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-invocation-scope.cjs",
@@ -103,6 +109,97 @@ describe("resolveRpcCallTimeoutMs", () => {
       expect(resolveRpcCallTimeoutMs(bad, DEFAULT_RPC_TIMEOUT_MS)).toBe(DEFAULT_RPC_TIMEOUT_MS);
     }
     expect(resolveRpcCallTimeoutMs(Number.NaN, 24 * 60 * 60 * 1_000)).toBe(MAX_RPC_TIMEOUT_MS);
+  });
+});
+
+describe("resolveInitializeTimeoutMs", () => {
+  const ENV_VAR = PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR;
+  const DEFAULT_INITIALIZE_TIMEOUT_MS = 60_000;
+  let original: string | undefined;
+
+  beforeEach(() => {
+    original = process.env[ENV_VAR];
+  });
+
+  afterEach(() => {
+    if (original === undefined) delete process.env[ENV_VAR];
+    else process.env[ENV_VAR] = original;
+  });
+
+  it("defaults to 60s when the env var is unset", () => {
+    delete process.env[ENV_VAR];
+    expect(resolveInitializeTimeoutMs()).toBe(DEFAULT_INITIALIZE_TIMEOUT_MS);
+  });
+
+  it("honors a positive integer override", () => {
+    process.env[ENV_VAR] = "120000";
+    expect(resolveInitializeTimeoutMs()).toBe(120_000);
+  });
+
+  it("falls back to the default for an unusable override", () => {
+    for (const bad of ["0", "-1", "not-a-number", ""]) {
+      process.env[ENV_VAR] = bad;
+      expect(resolveInitializeTimeoutMs()).toBe(DEFAULT_INITIALIZE_TIMEOUT_MS);
+    }
+  });
+
+  it("truncates a fractional override", () => {
+    process.env[ENV_VAR] = "1500.9";
+    expect(resolveInitializeTimeoutMs()).toBe(1_500);
+  });
+});
+
+describe("plugin worker manager initialize RPC timeout", () => {
+  it("fails fast when initialize does not answer within the configured timeout", async () => {
+    const original = process.env[PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR];
+    process.env[PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR] = "30";
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_INITIALIZE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: { initializeDelayMs: 500 },
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+    });
+
+    try {
+      await expect(handle.start()).rejects.toMatchObject({
+        message: expect.stringContaining(
+          'RPC call "initialize" timed out after 30ms',
+        ),
+      });
+    } finally {
+      if (original === undefined) delete process.env[PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR];
+      else process.env[PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR] = original;
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("honors a raised timeout override for a slow-but-healthy initialize", async () => {
+    const original = process.env[PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR];
+    process.env[PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR] = "2000";
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_INITIALIZE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: { initializeDelayMs: 200 },
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+    });
+
+    try {
+      await expect(handle.start()).resolves.toBeUndefined();
+    } finally {
+      if (original === undefined) delete process.env[PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR];
+      else process.env[PLUGIN_WORKER_INITIALIZE_TIMEOUT_MS_ENV_VAR] = original;
+      await handle.stop().catch(() => undefined);
+    }
   });
 });
 

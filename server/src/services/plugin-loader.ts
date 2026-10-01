@@ -653,6 +653,117 @@ export interface PluginLoader {
 }
 
 // ---------------------------------------------------------------------------
+// Transient activation-failure retry
+// ---------------------------------------------------------------------------
+
+/**
+ * Matches the message plugin-worker-manager.ts's `startInternal()` wraps
+ * around an initialize failure: `Worker initialize failed for "<id>": <cause>`.
+ * Only two causes are environmental hiccups that a short wait resolves on
+ * its own:
+ *  - the initialize RPC timing out (boot-time contention across every
+ *    installed plugin's worker starting at once);
+ *  - the worker process exiting or crashing before it could answer
+ *    initialize (for example OOM-killed while sibling workers also warm up).
+ *
+ * Anything else — a missing worker entrypoint, an invalid manifest, the
+ * worker's own initialize handler reporting `ok=false` — is deterministic
+ * given the plugin's current code/config and fails identically on every
+ * retry, so it is excluded here and the plugin is left in `error` with no
+ * automatic retry.
+ */
+const TRANSIENT_ACTIVATION_FAILURE_RE =
+  /Worker initialize failed for "[^"]*":\s*(?:RPC call "initialize" timed out after \d+ms|Worker process (?:exited \(code=|failed to start))/i;
+
+export function isTransientPluginActivationFailure(errorMessage: string): boolean {
+  return TRANSIENT_ACTIVATION_FAILURE_RE.test(errorMessage);
+}
+
+/**
+ * Backoff schedule (ms) for automatic re-activation retries after a
+ * transient activation failure: 5s, 15s, 60s, then every 5 minutes.
+ */
+const ACTIVATION_RETRY_BACKOFF_SCHEDULE_MS = [5_000, 15_000, 60_000];
+const ACTIVATION_RETRY_STEADY_STATE_BACKOFF_MS = 5 * 60 * 1_000;
+
+function activationRetryDelayMs(attempt: number): number {
+  const scheduled = ACTIVATION_RETRY_BACKOFF_SCHEDULE_MS[attempt - 1];
+  return scheduled ?? ACTIVATION_RETRY_STEADY_STATE_BACKOFF_MS;
+}
+
+interface PendingActivationRetry {
+  timer: ReturnType<typeof setTimeout>;
+  pluginKey: string;
+}
+
+// Module-scoped: exactly one PluginLoader instance drives real activation
+// retries in a running server process (the one constructed with
+// PluginRuntimeServices at boot), so tracking pending retries here — rather
+// than inside that instance's closure — lets other services (e.g. the
+// sandbox-lease failure classifier in heartbeat.ts) ask "is a retry already
+// pending for this plugin?" without needing a reference to the loader
+// instance itself, matching this codebase's convention of importing a
+// sibling service's functions directly rather than threading every service
+// through every caller's constructor.
+const pendingActivationRetries = new Map<string, PendingActivationRetry>();
+const activationRetryAttempts = new Map<string, number>();
+
+// Module-scoped for the same reason as the retry bookkeeping above: a
+// backoff-scheduled automatic retry (runScheduledActivationRetry) and an
+// operator-triggered call (loadSingle, e.g. via POST /api/plugins/:id/enable)
+// can legitimately land for the same plugin at nearly the same moment — the
+// operator sees `error` and clicks enable without knowing a retry is already
+// under way. Without coalescing, the second call's activatePlugin() reaches
+// workerManager.startWorker() while the first is still starting, which
+// throws `Worker already registered for plugin "<id>" (status: ...)`. That
+// message is not a transient-activation-failure (see
+// isTransientPluginActivationFailure), so the loser's catch handler calls
+// lifecycleManager.markError(), which tears the *winner's* just-started
+// worker back down (markError -> deactivatePluginRuntime -> unloadSingle ->
+// teardownPluginRuntime stops any running worker for this pluginId) and
+// leaves the plugin stuck in `error` with no further retry scheduled —
+// turning a successful activation into a self-inflicted outage. Keyed by
+// pluginId, mirroring PluginWorkerManager's own per-plugin startupLocks.
+const activationsInFlight = new Map<string, Promise<PluginLoadResult>>();
+
+/**
+ * Whether plugin-loader currently has a backoff-scheduled re-activation
+ * retry pending for this plugin id, after a transient activation failure.
+ */
+export function isPluginActivationRetryPending(pluginId: string): boolean {
+  return pendingActivationRetries.has(pluginId);
+}
+
+/**
+ * Same check, keyed by the plugin's manifest id (`pluginKey`) rather than
+ * its database row id. Callers that only have the key — for example a
+ * message parsed out of a thrown Error, like
+ * `parseSandboxProviderPluginNotReadyFailureMessage` in heartbeat.ts — use
+ * this instead of resolving the id first.
+ */
+export function isPluginActivationRetryPendingForKey(pluginKey: string): boolean {
+  for (const pending of pendingActivationRetries.values()) {
+    if (pending.pluginKey === pluginKey) return true;
+  }
+  return false;
+}
+
+/**
+ * Cancel any pending re-activation retry for a plugin. Called whenever the
+ * plugin leaves the retry loop through some other path — disabled, unloaded,
+ * or manually re-enabled — so a stale timer never fires an activation attempt
+ * against a plugin that has moved on.
+ */
+export function cancelPluginActivationRetry(pluginId: string): void {
+  const pending = pendingActivationRetries.get(pluginId);
+  if (pending) {
+    clearTimeout(pending.timer);
+    pendingActivationRetries.delete(pluginId);
+  }
+  activationRetryAttempts.delete(pluginId);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1980,6 +2091,11 @@ export function pluginLoader(
       const erroredPlugins = (await registry.listByStatus("error")) as PluginRecord[];
       const retriedPlugins: PluginRecord[] = [];
       for (const plugin of erroredPlugins) {
+        // A fresh process starts with no in-process retry state, so this is
+        // normally a no-op; it only matters if loadAll() runs more than once
+        // in the same process (e.g. tests), where a leftover backoff timer
+        // for this plugin id must not also fire later.
+        cancelPluginActivationRetry(plugin.id);
         try {
           const flipped = (await registry.updateStatus(plugin.id, { status: "ready" })) as PluginRecord | null;
           if (flipped) retriedPlugins.push(flipped);
@@ -2076,6 +2192,11 @@ export function pluginLoader(
         throw new Error(`Plugin not found: ${pluginId}`);
       }
 
+      // A manual (operator- or lifecycle-triggered) activation attempt
+      // supersedes any backoff-scheduled automatic retry for this plugin —
+      // cancel it so the two never race into a double activation.
+      cancelPluginActivationRetry(pluginId);
+
       // If the plugin is in 'installed' status, transition it to 'ready' first.
       // lifecycleManager.load() transitions the status AND activates the plugin
       // via activateReadyPlugin() → loadSingle() (recursive call with 'ready'
@@ -2119,6 +2240,11 @@ export function pluginLoader(
         { pluginId, pluginKey },
         "plugin-loader: unloading single plugin",
       );
+
+      // Disabling, unloading, or upgrading the plugin (unloadSingle's three
+      // callers) ends the retry loop — a scheduled retry must not reactivate
+      // a plugin the operator just took offline.
+      cancelPluginActivationRetry(pluginId);
 
       await teardownPluginRuntime(pluginId, pluginKey);
 
@@ -2206,6 +2332,94 @@ export function pluginLoader(
   }
 
   // -------------------------------------------------------------------------
+  // Internal: automatic retry after a transient activation failure
+  // -------------------------------------------------------------------------
+
+  /**
+   * Schedule a backoff-delayed re-activation attempt for a plugin that just
+   * failed activation for a transient reason. Replaces any retry already
+   * pending for this plugin (there should never be two in flight at once,
+   * but re-scheduling defensively keeps this idempotent).
+   */
+  function scheduleActivationRetry(
+    pluginId: string,
+    pluginKey: string,
+    attempt: number,
+  ): void {
+    const existing = pendingActivationRetries.get(pluginId);
+    if (existing) clearTimeout(existing.timer);
+
+    const delayMs = activationRetryDelayMs(attempt);
+    log.info(
+      { pluginId, pluginKey, attempt, delayMs },
+      "plugin-loader: scheduling automatic re-activation retry after a transient failure",
+    );
+
+    const timer = setTimeout(() => {
+      pendingActivationRetries.delete(pluginId);
+      void runScheduledActivationRetry(pluginId, pluginKey);
+    }, delayMs);
+    // A pending retry must not keep the process alive on its own — shutdown
+    // (and tests) should not have to wait on it.
+    timer.unref?.();
+
+    pendingActivationRetries.set(pluginId, { timer, pluginKey });
+  }
+
+  /**
+   * Run one scheduled re-activation attempt: flip the plugin back to `ready`
+   * (mirroring loadAll's boot-time error retry — the `error` status cannot
+   * legally re-enter `error`, so a failed retry could not re-mark itself
+   * otherwise) and activate it. A failure re-records the error through
+   * activatePlugin's own catch, which schedules the next backoff step.
+   */
+  async function runScheduledActivationRetry(
+    pluginId: string,
+    pluginKey: string,
+  ): Promise<void> {
+    log.info(
+      { pluginId, pluginKey },
+      "plugin-loader: retrying plugin activation after a transient failure",
+    );
+
+    let plugin: PluginRecord | null;
+    try {
+      plugin = (await registry.getById(pluginId)) as PluginRecord | null;
+    } catch (err) {
+      log.warn(
+        { pluginId, pluginKey, err: err instanceof Error ? err.message : String(err) },
+        "plugin-loader: could not load plugin for a scheduled activation retry",
+      );
+      return;
+    }
+
+    // The plugin moved on since the retry was scheduled — uninstalled,
+    // manually re-enabled, or disabled. cancelPluginActivationRetry normally
+    // pre-empts this by clearing the timer, but a retry already in flight
+    // when one of those happens cannot be un-fired. Nothing to retry.
+    if (!plugin || plugin.status !== "error") return;
+
+    let flipped: PluginRecord | null;
+    try {
+      flipped = (await registry.updateStatus(pluginId, { status: "ready" })) as PluginRecord | null;
+    } catch (err) {
+      log.warn(
+        { pluginId, pluginKey, err: err instanceof Error ? err.message : String(err) },
+        "plugin-loader: could not queue a scheduled activation retry",
+      );
+      // The flip failed (e.g. a transient DB hiccup), not the activation
+      // itself — advance to the next backoff step rather than giving up.
+      const attempt = (activationRetryAttempts.get(pluginId) ?? 0) + 1;
+      activationRetryAttempts.set(pluginId, attempt);
+      scheduleActivationRetry(pluginId, pluginKey, attempt);
+      return;
+    }
+    if (!flipped) return;
+
+    await activatePlugin(flipped);
+  }
+
+  // -------------------------------------------------------------------------
   // Internal: activatePlugin — shared logic for loadAll and loadSingle
   // -------------------------------------------------------------------------
 
@@ -2213,11 +2427,35 @@ export function pluginLoader(
    * Activate a single plugin: spawn its worker, register event subscriptions,
    * sync jobs, register tools.
    *
-   * This is the core orchestration logic shared by `loadAll()` and `loadSingle()`.
-   * Failures are caught and reported in the result. By default the plugin is
-   * marked as `error` in the database when activation fails.
+   * This is the core orchestration logic shared by `loadAll()`, `loadSingle()`
+   * and the automatic activation-retry path. Coalesces concurrent attempts
+   * for the same plugin id onto a single in-flight call — see
+   * `activationsInFlight` above for why that matters — rather than racing
+   * two independent activations against the same worker slot.
    */
   async function activatePlugin(
+    plugin: PluginRecord,
+    options: PluginActivateOptions = { markErrorOnFailure: true },
+  ): Promise<PluginLoadResult> {
+    const pluginId = plugin.id;
+
+    const inFlight = activationsInFlight.get(pluginId);
+    if (inFlight) {
+      log.warn(
+        { pluginId, pluginKey: plugin.pluginKey },
+        "plugin-loader: concurrent activation attempt for this plugin — coalescing onto the one already in flight",
+      );
+      return inFlight;
+    }
+
+    const activation = activatePluginInternal(plugin, options).finally(() => {
+      activationsInFlight.delete(pluginId);
+    });
+    activationsInFlight.set(pluginId, activation);
+    return activation;
+  }
+
+  async function activatePluginInternal(
     plugin: PluginRecord,
     options: PluginActivateOptions = { markErrorOnFailure: true },
   ): Promise<PluginLoadResult> {
@@ -2497,6 +2735,15 @@ export function pluginLoader(
         "plugin-loader: plugin activated successfully",
       );
 
+      // Activation succeeded — drop any transient-failure retry bookkeeping
+      // for this plugin. Normally nothing is pending here (a scheduled retry
+      // only re-enters this function once, via runScheduledActivationRetry,
+      // which already cleared its own timer before calling in), but an
+      // operator-triggered loadSingle/enable() racing ahead of a pending
+      // backoff timer could otherwise leave a stale timer that fires a
+      // redundant activation attempt against an already-ready plugin.
+      cancelPluginActivationRetry(pluginId);
+
       return { plugin: activePlugin, success: true, registered };
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -2521,6 +2768,20 @@ export function pluginLoader(
             },
             "plugin-loader: failed to mark plugin as error after activation failure",
           );
+        }
+
+        // A transient failure (initialize timeout, worker crash/exit during
+        // initialize) gets an automatic, backing-off retry instead of waiting
+        // for an operator to notice and call POST /api/plugins/:id/enable, or
+        // for the next server boot. A deterministic failure (bad manifest,
+        // missing entry point, the worker's own initialize handler reporting
+        // ok=false) is left in `error` with no retry scheduled.
+        if (isTransientPluginActivationFailure(errorMessage)) {
+          const attempt = (activationRetryAttempts.get(pluginId) ?? 0) + 1;
+          activationRetryAttempts.set(pluginId, attempt);
+          scheduleActivationRetry(pluginId, pluginKey, attempt);
+        } else {
+          cancelPluginActivationRetry(pluginId);
         }
       } else if (registered.worker) {
         // The shared plugin row stays untouched, but this process spawned a
