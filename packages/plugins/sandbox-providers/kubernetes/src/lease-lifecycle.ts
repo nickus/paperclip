@@ -28,9 +28,12 @@ import {
 } from "./sandbox-cr-orchestrator.js";
 import {
   REUSE_ANNOTATIONS,
+  REUSE_LABELS,
   annotationPath,
   annotationsJsonPatch,
   busyRefreshJsonPatch,
+  labelPath,
+  stoppedSandboxReaperJsonPatch,
 } from "./reuse.js";
 
 /** True when a Kubernetes API error means "resource not found" (HTTP 404). */
@@ -628,6 +631,90 @@ export async function patchReusableSandboxAnnotations(
   }
   const deleting = Boolean((result?.metadata as { deletionTimestamp?: unknown } | undefined)?.deletionTimestamp);
   return deleting ? { ok: false, reason: "deleting" } : { ok: true, cr: result };
+}
+
+/**
+ * Hand a stopped sandbox that is not kept between runs to the idle reaper (see
+ * stoppedSandboxReaperJsonPatch). `metadata` is the CR's metadata as last read.
+ * A CR the patch finds gone or being deleted is reported, not thrown.
+ */
+export async function markStoppedSandboxForReaper(
+  clients: KubeClients,
+  input: {
+    namespace: string;
+    name: string;
+    metadata: { labels?: unknown; annotations?: unknown } | undefined;
+    idleAnnotations: Record<string, string>;
+    action: string;
+  },
+): Promise<PatchReusableSandboxResult> {
+  let result: Record<string, unknown>;
+  try {
+    result = await clients.custom.patchNamespacedCustomObject({
+      group: SANDBOX_GROUP,
+      version: SANDBOX_VERSION,
+      namespace: input.namespace,
+      plural: SANDBOX_PLURAL,
+      name: input.name,
+      body: stoppedSandboxReaperJsonPatch({ metadata: input.metadata, idleAnnotations: input.idleAnnotations }),
+    }) as Record<string, unknown>;
+  } catch (err) {
+    if (isKubeNotFoundError(err)) return { ok: false, reason: "not_found" };
+    if (isTransientKubeError(err)) {
+      throw new KubernetesTransientError(input.action, errorText(err), err);
+    }
+    throw err;
+  }
+  const deleting = Boolean((result?.metadata as { deletionTimestamp?: unknown } | undefined)?.deletionTimestamp);
+  return deleting ? { ok: false, reason: "deleting" } : { ok: true, cr: result };
+}
+
+/**
+ * Take a sandbox that is not kept between runs back from the idle reaper when
+ * its lease is resumed, so the reaper never removes it, for its idle lifetime
+ * or to make room under the namespace cap, while a run uses it. The patch
+ * bumps the CR's resourceVersion, so a reaper delete decided on the version
+ * before it fails its precondition. Reports a CR that is gone or being deleted.
+ */
+export async function clearStoppedSandboxReaperMark(
+  clients: KubeClients,
+  input: { namespace: string; name: string },
+): Promise<{ ok: true } | { ok: false; reason: "not_found" | "deleting" }> {
+  const read = async () =>
+    (await clients.custom.getNamespacedCustomObject({
+      group: SANDBOX_GROUP,
+      version: SANDBOX_VERSION,
+      namespace: input.namespace,
+      plural: SANDBOX_PLURAL,
+      name: input.name,
+    })) as { metadata?: { labels?: Record<string, unknown>; deletionTimestamp?: unknown } };
+  let cr: Awaited<ReturnType<typeof read>>;
+  try {
+    cr = await read();
+  } catch (err) {
+    if (isKubeNotFoundError(err)) return { ok: false, reason: "not_found" };
+    throw err;
+  }
+  if (cr.metadata?.deletionTimestamp) return { ok: false, reason: "deleting" };
+  if (cr.metadata?.labels?.[REUSE_LABELS.reuse] === undefined) return { ok: true };
+  let patched: { metadata?: { deletionTimestamp?: unknown } };
+  try {
+    patched = (await clients.custom.patchNamespacedCustomObject({
+      group: SANDBOX_GROUP,
+      version: SANDBOX_VERSION,
+      namespace: input.namespace,
+      plural: SANDBOX_PLURAL,
+      name: input.name,
+      body: [{ op: "remove", path: labelPath(REUSE_LABELS.reuse) }],
+    })) as typeof patched;
+  } catch (err) {
+    if (isKubeNotFoundError(err)) return { ok: false, reason: "not_found" };
+    if (isTransientKubeError(err)) {
+      throw new KubernetesTransientError(`resuming sandbox ${input.namespace}/${input.name}`, errorText(err), err);
+    }
+    throw err;
+  }
+  return patched.metadata?.deletionTimestamp ? { ok: false, reason: "deleting" } : { ok: true };
 }
 
 /**

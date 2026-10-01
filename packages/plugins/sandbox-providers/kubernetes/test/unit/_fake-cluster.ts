@@ -94,7 +94,7 @@ export function createFakeCluster() {
         ? [...sandboxes.values()].filter((cr) => matchesSelector(cr.metadata.labels, req.labelSelector)).map((cr) => structuredClone(cr))
         : [],
     })),
-    patchNamespacedCustomObject: vi.fn(async (req: { name: string; body: Array<{ op: string; path: string; value: string }> }) => {
+    patchNamespacedCustomObject: vi.fn(async (req: { name: string; body: Array<{ op: string; path: string; value?: unknown }> }) => {
       const cr = sandboxes.get(req.name);
       if (!cr) throw notFound();
       // JSON Patch is atomic: check every `test` op before applying anything.
@@ -108,13 +108,27 @@ export function createFakeCluster() {
             : (() => { throw new Error(`unsupported test path ${op.path}`); })();
         if (actual !== op.value) throw patchTestFailed();
       }
+      // Validate every op first: a failed op leaves the object unchanged.
+      const writes: Array<() => void> = [];
       for (const op of req.body) {
         if (op.op === "test") continue;
-        if (op.op !== "add" || !op.path.startsWith(annotationPrefix)) throw new Error(`unsupported patch ${op.op} ${op.path}`);
-        const key = unescapePointer(op.path.slice(annotationPrefix.length));
-        if (!cr.metadata.annotations) throw new Error("add to a missing annotations map");
-        cr.metadata.annotations[key] = op.value;
+        const map = ["annotations", "labels"].find((name) => op.path === `/metadata/${name}` || op.path.startsWith(`/metadata/${name}/`));
+        if (!map || (op.op !== "add" && op.op !== "remove")) throw new Error(`unsupported patch ${op.op} ${op.path}`);
+        if (op.path === `/metadata/${map}`) {
+          if (op.op !== "add") throw new Error(`unsupported patch ${op.op} ${op.path}`);
+          writes.push(() => { cr.metadata[map] = structuredClone(op.value); });
+          continue;
+        }
+        const key = unescapePointer(op.path.slice(`/metadata/${map}/`.length));
+        if (!cr.metadata[map]) throw new Error(`${op.op} on a missing ${map} map`);
+        if (op.op === "remove") {
+          if (!(key in cr.metadata[map])) throw patchTestFailed();
+          writes.push(() => { delete cr.metadata[map][key]; });
+        } else {
+          writes.push(() => { cr.metadata[map][key] = op.value; });
+        }
       }
+      for (const write of writes) write();
       cr.metadata.resourceVersion = nextVersion();
       return structuredClone(cr);
     }),

@@ -726,20 +726,89 @@ describe("stop and keep", () => {
     await expect(stop(lease)).rejects.toThrow(/is being deleted/);
   });
 
-  it("stops and keeps a sandbox that is not kept between runs", async () => {
+  it("stops and keeps a sandbox that is not kept between runs, and hands it to the idle reaper", async () => {
     const config = { ...REUSE_CONFIG, reuseLease: false };
     const lease = await acquire(config);
     expect(lease.metadata?.kubernetesReuse).toBeUndefined();
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations).toBeUndefined();
 
     await expect(stop(lease, config)).resolves.toMatchObject({ state: "stopped" });
     expect(execInPod).toHaveBeenCalledTimes(1);
     expect(cluster.sandboxes.has(lease.providerLeaseId!)).toBe(true);
-    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.annotations ?? {}).not.toHaveProperty(
-      REUSE_ANNOTATIONS.leaseState,
-    );
+    const metadata = cluster.sandboxes.get(lease.providerLeaseId!)!.metadata;
+    expect(metadata.labels).toMatchObject({ "paperclip.io/reuse": "true", "paperclip.io/managed-by": "paperclip-k8s-plugin" });
+    expect(metadata.labels).not.toHaveProperty("paperclip.io/reuse-key");
+    expect(metadata.annotations).toMatchObject({
+      [REUSE_ANNOTATIONS.leaseState]: "idle",
+      [REUSE_ANNOTATIONS.idleTtlSeconds]: "86400",
+    });
+    expect(metadata.annotations).not.toHaveProperty(REUSE_ANNOTATIONS.reuseKey);
+    expect(cluster.clients.custom.deleteNamespacedCustomObject).not.toHaveBeenCalled();
+    // Its namespace is swept although reuse is off for the environment.
+    expect(idleReaperState().namespaces).toEqual([{ namespace: "paperclip-company-1", maxSandboxes: null }]);
+  });
+
+  it("removes a stopped sandbox that is not kept between runs once its idle lifetime has passed", async () => {
+    const config = { ...REUSE_CONFIG, reuseLease: false };
+    const lease = await acquire(config);
+    await stop(lease, config);
+    const name = lease.providerLeaseId!;
+
+    await sweepAllRegisteredNamespaces();
+    expect(cluster.sandboxes.has(name)).toBe(true);
+
+    cluster.sandboxes.get(name)!.metadata.annotations[REUSE_ANNOTATIONS.lastUsedAt] =
+      new Date(Date.now() - 25 * 3_600_000).toISOString();
+    await sweepAllRegisteredNamespaces();
+    expect(cluster.sandboxes.has(name)).toBe(false);
+    expect(cluster.pods.has(name)).toBe(false);
+  });
+
+  it("takes a stopped sandbox that is not kept between runs back from the reaper when its lease is resumed", async () => {
+    const config = { ...REUSE_CONFIG, reuseLease: false };
+    const lease = await acquire(config);
+    await stop(lease, config);
+    const name = lease.providerLeaseId!;
+
     // An exact resume of the stopped sandbox accepts commands again.
     const resumed = await resume(lease, config);
+    expect(resumed.providerLeaseId).toBe(name);
     await expect(execute(resumed, "echo resumed", config)).resolves.toMatchObject({ exitCode: 0 });
+    expect(cluster.sandboxes.get(name)!.metadata.labels).not.toHaveProperty("paperclip.io/reuse");
+
+    // However long the resumed run takes, the reaper leaves the sandbox alone.
+    cluster.sandboxes.get(name)!.metadata.annotations[REUSE_ANNOTATIONS.lastUsedAt] =
+      new Date(Date.now() - 25 * 3_600_000).toISOString();
+    await sweepAllRegisteredNamespaces();
+    expect(cluster.sandboxes.has(name)).toBe(true);
+
+    // A later stop hands it to the reaper again.
+    await stop(resumed, config);
+    expect(cluster.sandboxes.get(name)!.metadata.labels).toMatchObject({ "paperclip.io/reuse": "true" });
+  });
+
+  it("reports a stopped sandbox that the reaper removed as expired on resume", async () => {
+    const config = { ...REUSE_CONFIG, reuseLease: false };
+    const lease = await acquire(config);
+    await stop(lease, config);
+    // The reaper's delete lands while the resume checks the pod.
+    cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.deletionTimestamp = new Date().toISOString();
+    await expect(resume(lease, config)).resolves.toMatchObject({ providerLeaseId: null, metadata: { expired: true } });
+  });
+
+  it("asks for the stop again when the stopped sandbox cannot be handed to the idle reaper", async () => {
+    const config = { ...REUSE_CONFIG, reuseLease: false };
+    const lease = await acquire(config);
+    cluster.clients.custom.patchNamespacedCustomObject.mockRejectedValueOnce(
+      Object.assign(new Error("HTTP-Code: 400 Message: bad request"), { code: 400 }),
+    );
+
+    await expect(stop(lease, config)).rejects.toThrow(/stopped, but it could not be handed to the idle reaper/);
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.labels).not.toHaveProperty("paperclip.io/reuse");
+
+    // The repeated stop finds nothing left running and hands the sandbox over.
+    await expect(stop(lease, config)).resolves.toMatchObject({ state: "stopped" });
+    expect(cluster.sandboxes.get(lease.providerLeaseId!)!.metadata.labels).toMatchObject({ "paperclip.io/reuse": "true" });
   });
 
   it("refuses to stop a job, which cannot be kept", async () => {

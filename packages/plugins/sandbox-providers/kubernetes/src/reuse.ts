@@ -344,6 +344,35 @@ export function annotationPath(key: string): string {
   return `/metadata/annotations/${jsonPointerToken(key)}`;
 }
 
+export function labelPath(key: string): string {
+  return `/metadata/labels/${jsonPointerToken(key)}`;
+}
+
+/**
+ * JSON Patch that hands a stopped sandbox that is not kept between runs to the
+ * idle reaper. The reuse labels let the reaper's selector find it, and the idle
+ * annotations give it an idle lifetime, after which the reaper removes it. It
+ * gets no reuse key, so no run takes it as a task's kept sandbox, and the
+ * removal of a task's idle sandboxes (keyed by reuse key) never touches it.
+ * `metadata` is the CR's metadata as read: a missing labels or annotations map
+ * is added whole, since JSON Patch cannot add a key to a map that is not there.
+ */
+export function stoppedSandboxReaperJsonPatch(input: {
+  metadata: { labels?: unknown; annotations?: unknown } | undefined;
+  idleAnnotations: Record<string, string>;
+}): Array<{ op: "add"; path: string; value: string | Record<string, string> }> {
+  const labels = { [MANAGED_BY_LABEL]: MANAGED_BY_VALUE, [REUSE_LABELS.reuse]: "true" };
+  const hasMap = (value: unknown) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  return [
+    ...(hasMap(input.metadata?.labels)
+      ? Object.entries(labels).map(([key, value]) => ({ op: "add" as const, path: labelPath(key), value }))
+      : [{ op: "add" as const, path: "/metadata/labels", value: labels }]),
+    ...(hasMap(input.metadata?.annotations)
+      ? annotationsJsonPatch(input.idleAnnotations)
+      : [{ op: "add" as const, path: "/metadata/annotations", value: { ...input.idleAnnotations } }]),
+  ];
+}
+
 /**
  * JSON Patch that moves busy-since forward only while the sandbox is still
  * busy: the `test` op fails (HTTP 422) once a release marked it idle, so a late
