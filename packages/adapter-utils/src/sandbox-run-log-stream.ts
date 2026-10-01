@@ -19,12 +19,33 @@ const DEFAULT_TAIL_POLL_INTERVAL_MS = 250;
 const DEFAULT_TAIL_MAX_CHUNK_BYTES = 64 * 1024;
 const DEFAULT_TAIL_TICK_TIMEOUT_MS = 15_000;
 const DEFAULT_TAIL_MAX_CONSECUTIVE_FAILURES = 3;
+// Once a run is degraded, back off exponentially from the ordinary poll
+// cadence instead of hammering an overloaded host, but never wait longer than
+// this between retries: the loop must keep trying, not give up.
+const DEFAULT_TAIL_MAX_BACKOFF_MS = 60_000;
+// Every retry while degraded logs a short "still trying" line so the run's
+// idle watchdog (which only sees activity through this same log channel)
+// keeps extending its deadline instead of reading the silence as the run
+// having stopped. That is only safe for so long: past this budget (measured
+// from when the stream first degraded) the loop stops asserting activity,
+// so a host that never recovers still lets the idle timeout do its job
+// instead of being kept alive forever by our own retries.
+const DEFAULT_TAIL_DEGRADED_HEARTBEAT_BUDGET_MS = 30 * 60 * 1000;
 
 const TAIL_MARKER_STDOUT = "__PAPERCLIP_RUN_LOG_STDOUT__";
 const TAIL_MARKER_STDERR = "__PAPERCLIP_RUN_LOG_STDERR__";
 const TAIL_MARKER_END = "__PAPERCLIP_RUN_LOG_END__";
 
 export type SandboxRunLogSink = (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+
+export interface SandboxRunLogStreamHealth {
+  /** Whether the tail loop is currently past its failure threshold. */
+  degraded: boolean;
+  /** When the current degraded spell began, or null while healthy. */
+  degradedSinceMs: number | null;
+  /** Latest tick that read the log files successfully, or null before the first one. */
+  lastSuccessfulTickAtMs: number | null;
+}
 
 export interface SandboxRunLogTailHandle {
   /**
@@ -36,6 +57,8 @@ export interface SandboxRunLogTailHandle {
   wrapCommand(command: string, args: string[]): { command: string; args: string[] };
   /** Start the host-side poll loop that tails the log files via the runner. */
   start(onLog: SandboxRunLogSink): void;
+  /** Current tail-loop health (see `SandboxRunLogStreamHealth`). */
+  health(): SandboxRunLogStreamHealth;
   /**
    * Stop the poll loop and emit any bytes of the final batched output that
    * were not already streamed. Emitting the suffix past the streamed byte
@@ -61,6 +84,12 @@ export interface SandboxRunLogTailFactoryOptions {
   maxChunkBytesPerTick?: number | null;
   tickTimeoutMs?: number | null;
   maxConsecutiveFailures?: number | null;
+  /** Cap on the exponential backoff between retries once degraded. */
+  maxBackoffMs?: number | null;
+  /** How long a degraded stream may keep extending the idle deadline before it stops asserting activity. */
+  degradedHeartbeatBudgetMs?: number | null;
+  /** Injectable clock for deterministic tests. Default `Date.now`. */
+  now?: () => number;
 }
 
 function normalizePositiveInt(value: number | null | undefined, fallback: number): number {
@@ -93,6 +122,12 @@ export function createSandboxRunLogTailFactory(
     options.maxConsecutiveFailures,
     DEFAULT_TAIL_MAX_CONSECUTIVE_FAILURES,
   );
+  const maxBackoffMs = normalizePositiveInt(options.maxBackoffMs, DEFAULT_TAIL_MAX_BACKOFF_MS);
+  const degradedHeartbeatBudgetMs = normalizePositiveInt(
+    options.degradedHeartbeatBudgetMs,
+    DEFAULT_TAIL_DEGRADED_HEARTBEAT_BUDGET_MS,
+  );
+  const now = options.now ?? Date.now;
 
   let sequence = 0;
 
@@ -111,6 +146,8 @@ export function createSandboxRunLogTailFactory(
     let sink: SandboxRunLogSink | null = null;
     let stopped = false;
     let degraded = false;
+    let degradedSinceMs: number | null = null;
+    let lastSuccessfulTickAtMs: number | null = null;
     let loopPromise: Promise<void> | null = null;
     let wakeSleep: (() => void) | null = null;
 
@@ -156,6 +193,21 @@ export function createSandboxRunLogTailFactory(
       };
     }
 
+    /**
+     * Log a status line through the run's own log sink, best-effort: the
+     * tail loop's job is reading the sandbox, not writing the run log, so a
+     * sink failure (e.g. the run already finished persisting its log) must
+     * not stop the loop from retrying.
+     */
+    async function emitStatusLine(stream: "stdout" | "stderr", line: string): Promise<void> {
+      if (!sink) return;
+      try {
+        await sink(stream, line);
+      } catch {
+        // See above: the next tick still gets a chance regardless.
+      }
+    }
+
     async function emitBytes(state: TailStreamState, bytes: Buffer): Promise<void> {
       if (bytes.length === 0) return;
       state.offset += bytes.length;
@@ -189,17 +241,55 @@ export function createSandboxRunLogTailFactory(
     async function loop(): Promise<void> {
       let consecutiveFailures = 0;
       while (!stopped) {
-        await sleep(pollIntervalMs);
+        // Ordinary cadence while healthy; exponential backoff (capped) once
+        // degraded, so an overloaded host is not hammered with retries.
+        const delayMs = degraded
+          ? Math.min(
+              maxBackoffMs,
+              pollIntervalMs * 2 ** (consecutiveFailures - maxConsecutiveFailures + 1),
+            )
+          : pollIntervalMs;
+        await sleep(delayMs);
         if (stopped) break;
         try {
           await tick();
+          lastSuccessfulTickAtMs = now();
+          if (degraded) {
+            const failedTicks = consecutiveFailures;
+            degraded = false;
+            degradedSinceMs = null;
+            // The offsets were never reset on failure, so this tick resumed
+            // exactly where the last successful one left off: nothing
+            // skipped, nothing duplicated.
+            await emitStatusLine(
+              "stderr",
+              `[paperclip] Run log streaming recovered after ${failedTicks} failed tick${failedTicks === 1 ? "" : "s"}; resuming from the last delivered offset.\n`,
+            );
+          }
           consecutiveFailures = 0;
         } catch {
           consecutiveFailures += 1;
-          if (consecutiveFailures >= maxConsecutiveFailures) {
+          if (consecutiveFailures === maxConsecutiveFailures) {
             degraded = true;
-            break;
+            degradedSinceMs = now();
+            await emitStatusLine(
+              "stderr",
+              "[paperclip] Run log streaming degraded (the host could not read the sandbox's log files); " +
+                "retrying with backoff. The run keeps working and no output already produced is lost.\n",
+            );
+          } else if (degraded && now() - degradedSinceMs! <= degradedHeartbeatBudgetMs) {
+            // Still retrying: say so on the same channel the idle watchdog
+            // reads, so it extends its deadline instead of reading this
+            // silence as the run having gone quiet. Past the budget above,
+            // this stops firing and the ordinary idle timeout (if the run
+            // is truly stuck) is left to do its job.
+            await emitStatusLine(
+              "stderr",
+              `[paperclip] Run log streaming still degraded (${consecutiveFailures} failed ticks so far); still retrying.\n`,
+            );
           }
+          // Never give up while the run is active: loop back around and
+          // try again, instead of breaking out for good.
         }
       }
     }
@@ -242,6 +332,9 @@ export function createSandboxRunLogTailFactory(
         sink = onLog;
         loopPromise = loop();
       },
+      health() {
+        return { degraded, degradedSinceMs, lastSuccessfulTickAtMs };
+      },
       async finish(finalBatch) {
         await stopLoop();
         if (!sink) return;
@@ -262,9 +355,12 @@ export function createSandboxRunLogTailFactory(
           }
         }
         if (degraded) {
+          // The loop never gave up, but the stream was still degraded when
+          // the run ended; the lines above fill in whatever the last
+          // successful tick had not yet caught up on.
           await sink(
             "stderr",
-            "[paperclip] Run log streaming degraded during the run; remaining output was delivered at completion.\n",
+            "[paperclip] Run log streaming was still degraded when the run completed; remaining output was delivered at completion.\n",
           );
         }
       },

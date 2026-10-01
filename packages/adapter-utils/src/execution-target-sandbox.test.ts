@@ -7304,6 +7304,7 @@ describe("CLI-lane run-disposition seam", () => {
       create: () => ({
         wrapCommand: (command, args) => ({ command, args }),
         start: () => {},
+        health: () => ({ degraded: false, degradedSinceMs: null, lastSuccessfulTickAtMs: null }),
         finish: async () => {
           broker.emitExit();
           await flushMacrotasks();
