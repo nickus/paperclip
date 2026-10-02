@@ -5091,6 +5091,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const heartbeat = heartbeatService(db);
       await heartbeat.resumeQueuedRuns();
       await waitForRunToSettle(heartbeat, runId, 5_000);
+      // resumeQueuedRuns() dispatches the claimed run without waiting for it:
+      // startNextQueuedRunForAgent registers executeRun's promise for
+      // drainActiveRunExecutions and returns immediately (see its comment on
+      // activeRunExecutionPromises), so the setup-failure tail this test
+      // depends on -- scheduling the bounded retry and, through
+      // releaseIssueExecutionAndPromote, deciding whether to leave the issue
+      // alone or escalate it -- can still be in flight once the run row
+      // itself reaches `failed`. waitForRunToSettle only polls that row, so
+      // without this drain the assertions below can race ahead of the
+      // escalation decision instead of observing its outcome.
+      await heartbeat.waitForRunExecutionDrain(runId);
 
       expect(mockAdapterExecute).not.toHaveBeenCalled();
 
