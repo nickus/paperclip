@@ -1009,6 +1009,33 @@ export {
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
 };
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 2;
+
+// A lease failure against a sandbox provider plugin that is mid-retry (see
+// sandboxProviderPluginActivationRetryPending below, in the setup-stage
+// catch) is not a dead end: plugin-loader.ts's own backoff schedule
+// ([5s, 15s, 60s], then a 5-minute steady state) is already working on
+// clearing it. Without a dedicated bounded retry here, nothing re-dispatches
+// the issue once the setup catch falls through to the generic "setup_failed"
+// errorCode, and the generic immediate-recovery sweep in wake-queue (whose
+// classifyContinuationFailure treats a bare "setup_failed" as non-retryable,
+// by design, for ordinary pre-adapter setup crashes) escalates and blocks
+// the issue on the very first attempt -- exactly the board-owned hold this
+// classification was meant to avoid while the plugin is about to recover on
+// its own. Scheduling a retry here (mirroring MODEL_ENDPOINT_UNREACHABLE's
+// own scheduleBoundedRetryForRun call in the adapter-result completion
+// path) gives the run an existing execution path of its own, which is what
+// actually keeps the generic sweep from blocking it.
+const SANDBOX_PROVIDER_PLUGIN_ACTIVATION_RETRY_RETRY_REASON =
+  "sandbox_provider_plugin_activation_retry";
+const SANDBOX_PROVIDER_PLUGIN_ACTIVATION_RETRY_WAKE_REASON =
+  "sandbox_provider_plugin_activation_retry";
+// A few attempts spanning plugin-loader's own backoff steps: long enough for
+// a transient activation failure to clear on its own, short enough that a
+// plugin that never recovers still reaches a human-owned hold once its
+// activation retry stops being pending (parseSandboxProviderPluginNotReadyFailureMessage
+// then classifies it as configuration_incomplete instead).
+const SANDBOX_PROVIDER_PLUGIN_ACTIVATION_RETRY_MAX_ATTEMPTS = 5;
+const SANDBOX_PROVIDER_PLUGIN_ACTIVATION_RETRY_DELAY_MS = 10_000;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
@@ -28272,12 +28299,18 @@ export function heartbeatService(
         // task that resolves itself before they ever look at it. While a
         // retry is pending for this exact plugin, treat the failure as
         // ordinary stranded-issue infrastructure instead — it falls through
-        // to the default "setup_failed" below, which resolveStrandedRecoveryCause
-        // (recovery/service.ts) classifies as a plain `stranded_assigned_issue`
-        // and the issue gets picked back up automatically rather than held.
-        // `disabled`/`upgrade_pending` plugins never get an automatic retry
-        // scheduled, so they always keep the configuration_incomplete
-        // classification.
+        // to the default "setup_failed" below. That errorCode is also what
+        // the generic immediate-recovery sweep in wake-queue treats as
+        // non-retryable on sight (classifyContinuationFailure's fail-closed
+        // default for pre-adapter setup crashes), so below this also
+        // schedules a dedicated bounded retry
+        // (SANDBOX_PROVIDER_PLUGIN_ACTIVATION_RETRY_RETRY_REASON) the same
+        // way the model-endpoint-unreachable outage retry does: the new
+        // retry run gives the issue an existing execution path, which is
+        // what actually keeps that sweep from blocking it instead of
+        // picking it back up automatically. `disabled`/`upgrade_pending`
+        // plugins never get an automatic retry scheduled, so they always
+        // keep the configuration_incomplete classification.
         const sandboxProviderPluginActivationRetryPending =
           sandboxProviderPluginNotReadySetupFailure !== null &&
           sandboxProviderPluginNotReadySetupFailure.pluginStatus === "error" &&
@@ -28440,16 +28473,25 @@ export function heartbeatService(
                 () => undefined,
               );
             }
-            // No provider work began. Retry temporary host scan failures, and
+            // No provider work began. Retry temporary host scan failures,
             // setup-stage execs that exhausted their own timeout retries
             // (GitHub launcher install/PATH probe, environmentSyncIn — see
-            // isTransientSetupStageExecTimeoutCode), with the existing durable
-            // failure budget, before releasing execution. Generic recovery
-            // must not grant a second budget on exhaustion.
+            // isTransientSetupStageExecTimeoutCode), and a sandbox provider
+            // plugin lease failure while its own activation retry is pending,
+            // with the existing durable failure budget, before releasing
+            // execution. Generic recovery must not grant a second budget on
+            // exhaustion.
             await (isTransientWorkspaceGitScanCode(livenessRun.errorCode) ||
               isTransientSetupStageExecTimeoutCode(livenessRun.errorCode)
               ? scheduleBoundedRetryForRun(livenessRun, failedAgent)
-              : scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent)
+              : sandboxProviderPluginActivationRetryPending
+                ? scheduleBoundedRetryForRun(livenessRun, failedAgent, {
+                    retryReason: SANDBOX_PROVIDER_PLUGIN_ACTIVATION_RETRY_RETRY_REASON,
+                    wakeReason: SANDBOX_PROVIDER_PLUGIN_ACTIVATION_RETRY_WAKE_REASON,
+                    maxAttempts: SANDBOX_PROVIDER_PLUGIN_ACTIVATION_RETRY_MAX_ATTEMPTS,
+                    delayMs: SANDBOX_PROVIDER_PLUGIN_ACTIVATION_RETRY_DELAY_MS,
+                  })
+                : scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent)
             ).catch((retryError) => {
               logger.warn(
                 { err: retryError, runId: livenessRun.id },
