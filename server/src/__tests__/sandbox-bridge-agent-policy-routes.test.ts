@@ -312,6 +312,40 @@ describe("agent bridge policy route inventory", () => {
       expect(decisionOf(route!), key).toBe("allow");
     }
   });
+
+  /**
+   * Native agent memory (implementation spec §8.4): the agent-self routes
+   * are allowed, the governance and board routes are not. A silently
+   * widened snapshot approval would not catch a governance/board route
+   * sliding onto the allow list the way a dedicated assertion does.
+   */
+  it("forwards only the agent-self memory routes, never the governance or board ones", () => {
+    const byKey = new Map(routes.map((route) => [`${route.method} ${route.path}`, route]));
+    const mustAllow = [
+      "GET /api/agents/me/memory",
+      "POST /api/agents/me/memory",
+      "PATCH /api/agent-memory/:id/confirm",
+      "PATCH /api/agent-memory/:id/dispute",
+      "PATCH /api/agent-memory/:id/tombstone",
+    ];
+    for (const key of mustAllow) {
+      const route = byKey.get(key);
+      expect(route, `${key} is registered`).toBeDefined();
+      expect(decisionOf(route!), key).toBe("allow");
+    }
+    const mustDeny = [
+      "GET /api/companies/:companyId/agent-memory",
+      "GET /api/companies/:companyId/agent-memory/promotion-candidates",
+      "PATCH /api/companies/:companyId/agent-memory/:id/tombstone",
+      "PATCH /api/companies/:companyId/agent-memory/:id/promote-quarantined",
+      "PATCH /api/companies/:companyId/agent-memory/:id/hard-purge",
+    ];
+    for (const key of mustDeny) {
+      const route = byKey.get(key);
+      expect(route, `${key} is registered`).toBeDefined();
+      expect(decisionOf(route!), key).toBe("deny");
+    }
+  });
 });
 
 describe("steward bridge policy route inventory", () => {

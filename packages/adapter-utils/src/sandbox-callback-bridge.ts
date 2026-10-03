@@ -767,6 +767,12 @@ export const AGENT_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES: readonly AgentBridgeRout
     methods: ["GET"],
     path: /^\/api\/agents\/[^/]+(?:\/(?:skills|configuration|config-revisions(?:\/[^/]+)?|instructions-bundle(?:\/file)?))?$/,
   },
+
+  // Native agent memory (self routes only -- the governance and board
+  // routes under /api/companies/:companyId/agent-memory/... stay off both
+  // allow lists; see the implementation spec §8.4).
+  { methods: ["GET", "POST"], path: /^\/api\/agents\/me\/memory$/ },
+  { methods: ["PATCH"], path: /^\/api\/agent-memory\/[^/]+\/(?:confirm|dispute|tombstone)$/ },
   { methods: ["POST"], path: /^\/api\/agents\/[^/]+\/wakeup$/ },
   { methods: ["POST"], path: /^\/api\/agents\/[^/]+\/skills\/sync$/ },
   { methods: ["PATCH"], path: /^\/api\/agents\/[^/]+\/instructions-path$/ },
