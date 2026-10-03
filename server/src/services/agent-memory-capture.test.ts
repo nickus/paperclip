@@ -201,6 +201,66 @@ describeEmbeddedPostgres("agent memory capture: run-end write-through (§9.3)", 
     expect(await liveEntries(companyId, agentId)).toHaveLength(1);
   });
 
+  it("33. more Remember: lines than the per-run write cap: capped before any DB work, not one rejected attempt per extra line", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun(companyId, agentId);
+    // AGENT_MEMORY_MAX_WRITES_PER_RUN is 3; six distinct lines in one
+    // summary text must never result in more than 3 attempted writes --
+    // run finalization's work here is bounded by the per-run cap, not by
+    // how many Remember: lines happen to be in the agent's own output.
+    // (Deliberately unrelated subjects, not a shared sentence with a
+    // changing digit: digits are 1 character and dropped by the near-
+    // duplicate tokenizer, which would otherwise collapse every line into
+    // one near-duplicate of the first and defeat the point of this test.)
+    const facts = [
+      "the staging database resets nightly at 2am",
+      "docker builds fail above 32 parallel containers",
+      "the deploy script needs a trailing slash on the branch name",
+      "the CI runner caps builds at four concurrent jobs",
+      "the archive volume alarms past 80 percent full",
+      "the adapter drops its lease on a mid-run restart",
+    ];
+    const summaryText = facts.map((fact) => `Remember: ${fact}`).join("\n");
+
+    // Count DB round trips directly: each *attempted* write (accepted or
+    // rejected by the per-run cap check) issues at least one `db.select`
+    // before anything else. If the extracted lines were not pre-truncated
+    // to the cap, 6 lines would drive at least 6 such round trips (3
+    // accepted + 3 rejected-by-cap); bounding the batch to the cap first
+    // means at most 3 attempts, and therefore at most 3x that per-attempt
+    // floor, regardless of how many Remember: lines the text contains.
+    const originalSelect = db.select.bind(db);
+    let selectCalls = 0;
+    db.select = ((...args: Parameters<typeof originalSelect>) => {
+      selectCalls += 1;
+      return originalSelect(...args);
+    }) as typeof db.select;
+    let result: { captured: number };
+    try {
+      result = await captureRememberLinesForRun(db, {
+        companyId,
+        agentId,
+        runId,
+        sourceIssueId: null,
+        sourceTrust: null,
+        summaryText,
+        commentText: null,
+        effectiveMode: "on",
+      });
+    } finally {
+      db.select = originalSelect;
+    }
+
+    expect(result.captured).toBe(3);
+    const rows = await liveEntries(companyId, agentId);
+    expect(rows).toHaveLength(3);
+    expect(rows.map((row) => row.body).sort()).toEqual(facts.slice(0, 3).sort());
+    // Each attempt's write-cap check alone issues 2 selects (run-count +
+    // day-count); 6 unbounded attempts would be >= 12 on that floor alone.
+    // Bounded to 3 attempts, this must stay under that unbounded floor.
+    expect(selectCalls).toBeLessThan(12);
+  });
+
   it("writes nothing when the text has no Remember: line", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const result = await captureRememberLinesForRun(db, {

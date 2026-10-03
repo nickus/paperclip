@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import type { SourceTrustMetadata } from "@paperclipai/shared";
-import { AGENT_MEMORY_BODY_MAX_CHARS } from "@paperclipai/shared";
+import { AGENT_MEMORY_BODY_MAX_CHARS, AGENT_MEMORY_MAX_WRITES_PER_RUN } from "@paperclipai/shared";
 import type { AgentMemoryMode } from "@paperclipai/adapter-utils/wake-run-brief";
 import { logger } from "../middleware/logger.js";
 import { writeAgentMemoryEntry } from "./agent-memory.js";
@@ -86,13 +86,18 @@ export async function captureRememberLinesForRun(
   if (input.effectiveMode === "off") return { captured: 0 };
 
   // Dedup: the same `Remember:` text appearing in both the summary and the
-  // posted comment is captured once.
+  // posted comment is captured once. Bounded to the per-run write cap before
+  // any DB work: `writeAgentMemoryEntry` itself rejects anything past that
+  // cap anyway (one count query + a thrown error per call), so an agent
+  // whose output contains far more `Remember:` lines than the cap allows
+  // (buggy or adversarial) can never turn run finalization into a loop of
+  // work proportional to its own output size.
   const lines = [
     ...new Set([
       ...extractRememberLines(input.summaryText),
       ...extractRememberLines(input.commentText),
     ]),
-  ];
+  ].slice(0, AGENT_MEMORY_MAX_WRITES_PER_RUN);
   if (lines.length === 0) return { captured: 0 };
 
   let captured = 0;
