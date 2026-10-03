@@ -296,6 +296,14 @@ async function runReleaseDrain(
           issueId: issue.id,
           agentId: candidate.agentId,
           resolvedBlockerIssueId,
+          // Bound to the issue's current blocked episode: the same blocker
+          // issue can resolve more than once across separate blocked cycles
+          // (it can be reopened and redone), and `resolvedBlockerIssueId` is
+          // only the blocker's permanent id, with no cycle of its own. Without
+          // this bound, a run from an earlier, already-settled episode would
+          // be mistaken for one that already answered a later, genuinely
+          // distinct resolution of the same blocker.
+          sinceBlockedAt: issue.status === "blocked" ? issue.blockedTransitionAt : null,
         }),
         ports.transaction.hasExplicitBlockerPath({ companyId: run.companyId, issueId: issue.id }),
       ]);

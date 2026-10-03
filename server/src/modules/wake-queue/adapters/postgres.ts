@@ -2,7 +2,7 @@ import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
-import { and, asc, eq, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { EXECUTION_RECONCILIATION_CAUSES, extractIssueReferenceIdentifiers, isUuidLike } from "@paperclipai/shared";
 import {
@@ -712,7 +712,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       return row !== null;
     },
 
-    async hasRunForResolvedDependencyWake({ companyId, issueId, agentId, resolvedBlockerIssueId }) {
+    async hasRunForResolvedDependencyWake({ companyId, issueId, agentId, resolvedBlockerIssueId, sinceBlockedAt }) {
       const row = await tx
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -722,6 +722,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             eq(heartbeatRuns.agentId, agentId),
             sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
             sql`${heartbeatRuns.contextSnapshot} ->> 'resolvedBlockerIssueId' = ${resolvedBlockerIssueId}`,
+            ...(sinceBlockedAt ? [gte(heartbeatRuns.createdAt, sinceBlockedAt)] : []),
           ),
         )
         .limit(1)

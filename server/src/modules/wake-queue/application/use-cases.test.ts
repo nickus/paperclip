@@ -1136,6 +1136,36 @@ describe("releaseIssueExecution: dependency-resolved wake promotion idempotency"
       issueId: ISSUE.id,
       agentId: candidate.agentId,
       resolvedBlockerIssueId: "blocker-1",
+      sinceBlockedAt: null,
+    });
+  });
+
+  it("bounds the sibling-run lookup to the issue's current blocked episode, so an earlier settled episode cannot suppress a later one", async () => {
+    // Before the default wake candidate's `requestedAt` so this is the
+    // episode the wake itself belongs to, not a later re-block of it.
+    const blockedTransitionAt = new Date("2025-12-01T00:00:00.000Z");
+    const blockedIssue: IssueSnapshot = { ...ISSUE, status: "blocked", blockedTransitionAt };
+    const candidate = dependencyResolvedWakeCandidate({ id: "wake-dep-5" });
+    const hasRunForResolvedDependencyWake = vi.fn(async () => false);
+    const queue = [candidate];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      hasRunForResolvedDependencyWake,
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, blockedIssue),
+      recovery: createFakeRecovery(),
+    });
+
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+    expect(result.outcome.kind).toBe("promoted");
+    expect(hasRunForResolvedDependencyWake).toHaveBeenCalledWith({
+      companyId: RUN.companyId,
+      issueId: ISSUE.id,
+      agentId: candidate.agentId,
+      resolvedBlockerIssueId: "blocker-1",
+      sinceBlockedAt: blockedTransitionAt,
     });
   });
 
