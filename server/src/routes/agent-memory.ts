@@ -1,8 +1,6 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { ZodError } from "zod";
-import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issues } from "@paperclipai/db";
 import {
   AGENT_MEMORY_STATUSES,
   agentMemoryConfirmInputSchema,
@@ -13,7 +11,6 @@ import {
   type AgentMemoryActor,
   type AgentMemoryStatus,
   type AgentMemoryWriteInput,
-  type SourceTrustMetadata,
 } from "@paperclipai/shared";
 import { badRequest, forbidden, unauthorized } from "../errors.js";
 import { validate } from "../middleware/validate.js";
@@ -27,10 +24,10 @@ import {
   listAgentMemoryEntriesForCompany,
   listPromotionCandidates,
   promoteQuarantinedAgentMemoryEntry,
+  resolveAgentMemoryWriteSourceTrust,
   tombstoneAgentMemoryEntry,
   writeAgentMemoryEntry,
 } from "../services/agent-memory.js";
-import { resolveActorSourceTrustForIssue } from "../services/source-trust.js";
 import { authorizationDeniedDetails, authorizationService } from "../services/authorization.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource } from "./authz.js";
 
@@ -97,52 +94,6 @@ function agentMemoryActorFromRequest(req: Request): AgentMemoryActor {
     agentId: null,
     runId: null,
   };
-}
-
-/**
- * Resolves the server-filled `sourceIssueId`/`sourceTrust` for an explicit
- * `POST /api/agents/me/memory` write (§8.1): the run's bound issue (from
- * `heartbeatRuns.contextSnapshot.issueId`, the same field every other
- * run-scoped write resolves it from -- see `routes/pipelines.ts`), fed
- * through `resolveActorSourceTrustForIssue` exactly like an issue comment
- * or feedback-vote write does. A run with no bound issue (or no run at
- * all) writes at standard trust -- there is nothing to quarantine against.
- */
-async function resolveAgentMemoryWriteSourceTrust(
-  db: Db,
-  input: { companyId: string; agentId: string; runId: string | null },
-): Promise<{ sourceIssueId: string | null; sourceTrust: SourceTrustMetadata | null }> {
-  if (!input.runId) return { sourceIssueId: null, sourceTrust: null };
-
-  const [run] = await db
-    .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
-    .from(heartbeatRuns)
-    .where(and(
-      eq(heartbeatRuns.id, input.runId),
-      eq(heartbeatRuns.companyId, input.companyId),
-      eq(heartbeatRuns.agentId, input.agentId),
-    ));
-  const snapshot = (run?.contextSnapshot ?? null) as { issueId?: unknown } | null;
-  const issueId = typeof snapshot?.issueId === "string" ? snapshot.issueId : null;
-  if (!issueId) return { sourceIssueId: null, sourceTrust: null };
-
-  const [issue] = await db
-    .select({
-      id: issues.id,
-      companyId: issues.companyId,
-      projectId: issues.projectId,
-      executionPolicy: issues.executionPolicy,
-    })
-    .from(issues)
-    .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)));
-  if (!issue) return { sourceIssueId: null, sourceTrust: null };
-
-  const sourceTrust = await resolveActorSourceTrustForIssue({
-    db,
-    issue,
-    actor: { actorType: "agent", actorId: input.agentId, agentId: input.agentId, runId: input.runId },
-  });
-  return { sourceIssueId: issue.id, sourceTrust };
 }
 
 /**

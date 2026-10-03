@@ -6,11 +6,14 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
+import type { AgentMemoryEntryRow } from "@paperclipai/shared";
 import {
   AgentMemoryConflictError,
+  computeAgentMemoryScore,
   confirmAgentMemoryEntry,
   jaccardSimilarity,
   normalizeAgentMemoryTokens,
+  rankAgentMemoryEntries,
   writeAgentMemoryEntry,
 } from "./agent-memory.js";
 
@@ -373,5 +376,110 @@ describeEmbeddedPostgres("agent memory: the four-way write decision", () => {
     expect(jaccardSimilarity(normalizeAgentMemoryTokens("aaa bbb ccc ddd"), normalizeAgentMemoryTokens("aaa bbb eee fff"))).toBeCloseTo(2 / 6);
     // "ok", "to", "a" are <= 2 chars and must be dropped before comparison.
     expect(normalizeAgentMemoryTokens("ok to a bbb")).toEqual(new Set(["bbb"]));
+  });
+});
+
+// --- Ranking (§5): pure functions over already-loaded rows, no DB needed. --
+
+const RANK_NOW = new Date("2026-10-01T00:00:00Z");
+
+function rankingFixtureRow(overrides: Partial<AgentMemoryEntryRow> = {}): AgentMemoryEntryRow {
+  return {
+    id: randomUUID(),
+    companyId: randomUUID(),
+    scope: "agent",
+    agentId: randomUUID(),
+    kind: "gotcha",
+    key: "k",
+    body: "body",
+    projectId: null,
+    status: "active",
+    version: 1,
+    sourceRunId: null,
+    sourceIssueId: null,
+    createdByAgentId: randomUUID(),
+    sourceTrust: null,
+    confirmations: 1,
+    confirmingRunIds: [],
+    accessCount: 0,
+    lastUsedAt: null,
+    lastConfirmedAt: RANK_NOW,
+    expiresAt: new Date(RANK_NOW.getTime() + 14 * 24 * 60 * 60 * 1000),
+    tombstoneReason: null,
+    tombstonedByActorType: null,
+    tombstonedByActorId: null,
+    createdAt: RANK_NOW,
+    updatedAt: RANK_NOW,
+    ...overrides,
+  };
+}
+
+describe("agent memory: ranking (§5)", () => {
+  it("17. a higher-confirmation entry outranks a lower one at equal kind/age", () => {
+    const low = rankingFixtureRow({ key: "low", confirmations: 1 });
+    const high = rankingFixtureRow({ key: "high", confirmations: 5 });
+    expect(computeAgentMemoryScore(high, RANK_NOW, null)).toBeGreaterThan(
+      computeAgentMemoryScore(low, RANK_NOW, null),
+    );
+    expect(rankAgentMemoryEntries([low, high], { now: RANK_NOW, issueProjectId: null })).toEqual([
+      high,
+      low,
+    ]);
+  });
+
+  it("18. a project-matching entry outranks a non-matching one at equal confirmations/kind/age", () => {
+    const projectId = randomUUID();
+    const matching = rankingFixtureRow({ key: "matching", projectId });
+    const nonMatching = rankingFixtureRow({ key: "non-matching", projectId: randomUUID() });
+    expect(computeAgentMemoryScore(matching, RANK_NOW, projectId)).toBeGreaterThan(
+      computeAgentMemoryScore(nonMatching, RANK_NOW, projectId),
+    );
+    expect(
+      rankAgentMemoryEntries([nonMatching, matching], { now: RANK_NOW, issueProjectId: projectId }),
+    ).toEqual([matching, nonMatching]);
+  });
+
+  it("19. higher accessCount/recent lastUsedAt outranks an otherwise-equal, unused entry", () => {
+    const unused = rankingFixtureRow({
+      key: "unused",
+      accessCount: 0,
+      lastUsedAt: null,
+      createdAt: RANK_NOW,
+    });
+    const used = rankingFixtureRow({
+      key: "used",
+      accessCount: 10,
+      lastUsedAt: RANK_NOW,
+    });
+    expect(computeAgentMemoryScore(used, RANK_NOW, null)).toBeGreaterThan(
+      computeAgentMemoryScore(unused, RANK_NOW, null),
+    );
+    expect(rankAgentMemoryEntries([unused, used], { now: RANK_NOW, issueProjectId: null })).toEqual([
+      used,
+      unused,
+    ]);
+  });
+
+  it("20. deterministic tie-break: entries equal on every scored term sort by key then id", () => {
+    const a = rankingFixtureRow({ id: "11111111-0000-4000-8000-000000000000", key: "same-key" });
+    const b = rankingFixtureRow({ id: "22222222-0000-4000-8000-000000000000", key: "same-key" });
+    const zebra = rankingFixtureRow({ id: randomUUID(), key: "zzz-key" });
+    const apple = rankingFixtureRow({ id: randomUUID(), key: "aaa-key" });
+    const ranked = rankAgentMemoryEntries([zebra, b, apple, a], { now: RANK_NOW, issueProjectId: null });
+    // Same key: lower id first. Different keys: lower key first.
+    expect(ranked.map((row) => row.id)).toEqual([apple.id, a.id, b.id, zebra.id]);
+    // Order-independent: shuffling the input never changes the result.
+    expect(
+      rankAgentMemoryEntries([a, apple, zebra, b], { now: RANK_NOW, issueProjectId: null }),
+    ).toEqual(ranked);
+  });
+
+  it("respects the limit option, keeping only the top-ranked entries", () => {
+    const rows = Array.from({ length: 5 }, (_, index) =>
+      rankingFixtureRow({ key: `k${index}`, confirmations: index + 1 }),
+    );
+    const ranked = rankAgentMemoryEntries(rows, { now: RANK_NOW, issueProjectId: null, limit: 2 });
+    expect(ranked).toHaveLength(2);
+    expect(ranked.map((row) => row.key)).toEqual(["k4", "k3"]);
   });
 });

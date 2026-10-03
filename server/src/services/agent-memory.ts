@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, gte, inArray, isNotNull, lt, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentMemoryAudit, agentMemoryEntries } from "@paperclipai/db";
+import { agentMemoryAudit, agentMemoryEntries, heartbeatRuns, issues } from "@paperclipai/db";
 import {
   AGENT_MEMORY_AGE_DECAY_DAYS,
   AGENT_MEMORY_CONFIRMATION_WEIGHT,
@@ -29,9 +29,14 @@ import {
   type AgentMemoryWriteResult,
   type SourceTrustMetadata,
 } from "@paperclipai/shared";
+import {
+  PAPERCLIP_RUN_BRIEF_MEMORY_MAX_LINES,
+  type PaperclipRunBriefMemory,
+} from "@paperclipai/adapter-utils/wake-run-brief";
 import { conflict, forbidden, notFound, tooManyRequests, unprocessable } from "../errors.js";
 import { createFeedbackRedactionState, sanitizeFeedbackText } from "./feedback-redaction.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
+import { resolveActorSourceTrustForIssue } from "./source-trust.js";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTx = Db | Tx;
@@ -539,6 +544,54 @@ async function deleteThenAdd(
 }
 
 // --- Public service API (§3.2 of the implementation spec) ------------------
+
+/**
+ * Resolves the server-filled `sourceIssueId`/`sourceTrust` for a run-scoped
+ * memory write: the run's bound issue (from `heartbeatRuns.contextSnapshot.issueId`,
+ * the same field every other run-scoped write resolves it from -- see
+ * `routes/pipelines.ts`), fed through `resolveActorSourceTrustForIssue`
+ * exactly like an issue comment or feedback-vote write does. A run with no
+ * bound issue (or no run at all) writes at standard trust -- there is
+ * nothing to quarantine against. Shared by the explicit
+ * `POST /api/agents/me/memory` route (§8.1) and the run-end `Remember:`
+ * capture point (§9), so both resolve provenance the same way.
+ */
+export async function resolveAgentMemoryWriteSourceTrust(
+  db: Db,
+  input: { companyId: string; agentId: string; runId: string | null },
+): Promise<{ sourceIssueId: string | null; sourceTrust: SourceTrustMetadata | null }> {
+  if (!input.runId) return { sourceIssueId: null, sourceTrust: null };
+
+  const [run] = await db
+    .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.id, input.runId),
+      eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId),
+    ));
+  const snapshot = (run?.contextSnapshot ?? null) as { issueId?: unknown } | null;
+  const issueId = typeof snapshot?.issueId === "string" ? snapshot.issueId : null;
+  if (!issueId) return { sourceIssueId: null, sourceTrust: null };
+
+  const [issue] = await db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      projectId: issues.projectId,
+      executionPolicy: issues.executionPolicy,
+    })
+    .from(issues)
+    .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)));
+  if (!issue) return { sourceIssueId: null, sourceTrust: null };
+
+  const sourceTrust = await resolveActorSourceTrustForIssue({
+    db,
+    issue,
+    actor: { actorType: "agent", actorId: input.agentId, agentId: input.agentId, runId: input.runId },
+  });
+  return { sourceIssueId: issue.id, sourceTrust };
+}
 
 export interface WriteAgentMemoryEntryInput {
   db: Db;
@@ -1172,4 +1225,91 @@ export async function sweepAgentMemory(input: {
   }
 
   return { expired, evicted };
+}
+
+// --- Run Brief support (§9/§10) ---------------------------------------------
+
+/**
+ * Bumps `accessCount`/`lastUsedAt` for entries actually shown in a
+ * non-shadow Run Brief (§6.2): "use" means "was shown to an agent," not
+ * "was merely loaded from the DB." Not an audited mutation -- access
+ * bookkeeping is not one of the AGENT_MEMORY_AUDIT_ACTIONS, the same way a
+ * read is never audited.
+ */
+export async function markAgentMemoryEntriesUsed(db: Db, input: {
+  companyId: string;
+  entryIds: readonly string[];
+  now?: Date;
+}): Promise<void> {
+  if (input.entryIds.length === 0) return;
+  const now = input.now ?? new Date();
+  await db
+    .update(agentMemoryEntries)
+    .set({ accessCount: sql`${agentMemoryEntries.accessCount} + 1`, lastUsedAt: now })
+    .where(and(
+      eq(agentMemoryEntries.companyId, input.companyId),
+      inArray(agentMemoryEntries.id, [...input.entryIds]),
+    ));
+}
+
+/**
+ * Run Brief support (§9/§10): the agent's own top-ranked active memory, in
+ * the shape `renderMemory`/`normalizePaperclipRunBrief` expect. Always
+ * computes the section when called -- the shadow-vs-on branch lives in the
+ * caller (heartbeat.ts, §10.4): shadow mode still needs the rendered text
+ * to log via activity, it just never attaches it to the wake payload.
+ * `recordAccess` (default true) gates the accessCount/lastUsedAt bump;
+ * the caller passes false in shadow mode, since an entry that is only
+ * logged was never actually shown to the agent.
+ */
+export async function loadRunBriefMemory(input: {
+  db: Db;
+  companyId: string;
+  agentId: string;
+  issueProjectId: string | null;
+  now?: Date;
+  recordAccess?: boolean;
+}): Promise<PaperclipRunBriefMemory | null> {
+  const now = input.now ?? new Date();
+  // Only "active" entries are ever injectable (quarantined/disputed never
+  // are, and expired/tombstoned/purged are already hidden by the default
+  // visible-status filter this would otherwise apply).
+  const { entries } = await listAgentMemoryEntries({
+    db: input.db,
+    companyId: input.companyId,
+    agentId: input.agentId,
+    status: ["active"],
+    limit: AGENT_MEMORY_HARD_CAP_PER_AGENT,
+  });
+  if (entries.length === 0) return null;
+  const ranked = rankAgentMemoryEntries(entries, {
+    now,
+    issueProjectId: input.issueProjectId,
+    limit: PAPERCLIP_RUN_BRIEF_MEMORY_MAX_LINES,
+  });
+  if (ranked.length === 0) return null;
+  if (input.recordAccess !== false) {
+    await markAgentMemoryEntriesUsed(input.db, {
+      companyId: input.companyId,
+      entryIds: ranked.map((row) => row.id),
+      now,
+    });
+  }
+  return {
+    companyId: input.companyId,
+    agentId: input.agentId,
+    total: entries.length,
+    entries: ranked.map((row) => ({
+      id: row.id,
+      kind: row.kind,
+      scope: "agent" as const,
+      confirmations: row.confirmations,
+      ageDays: Math.max(
+        0,
+        Math.floor((now.getTime() - row.lastConfirmedAt.getTime()) / DAY_MS),
+      ),
+      key: row.key,
+      body: row.body,
+    })),
+  };
 }
