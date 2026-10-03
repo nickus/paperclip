@@ -593,8 +593,25 @@ export function isResumeReconcilableBlocker(
  */
 export async function reconcileExecutionHoldForResume(
   db: Db,
-  input: { companyId: string; issueId: string; recoveryActionId: string; actorId: string },
+  input: {
+    companyId: string;
+    issueId: string;
+    recoveryActionId: string;
+    actorId: string;
+    /**
+     * Who actually confirmed the continuation, for an accurate audit trail.
+     * Defaults to the original caller, the tree-control resume flow, where a
+     * board operator is shown `RESUME_RECONCILIATION_CONFIRMATION` and must
+     * confirm it before this runs. `explicit_intent` is a different caller
+     * (`releaseExecutionHoldForExplicitIntent`): there a board/user comment or
+     * status change is itself the continuation decision, and no such dialog is
+     * ever shown, so the recorded evidence and activity must say so, not claim
+     * a resume confirmation that never happened.
+     */
+    source?: "tree_resume" | "explicit_intent";
+  },
 ) {
+  const source = input.source ?? "tree_resume";
   const stale = () =>
     conflict("This task's recovery changed while it was being resumed. Refresh the task and try again.");
   return db.transaction(async (tx) => {
@@ -648,7 +665,10 @@ export async function reconcileExecutionHoldForResume(
       runId: run.id,
       providerStopped: true,
       actionOutcome: "mixed",
-      outcomeEvidence: `Confirmed by a board operator while resuming the task: ${RESUME_RECONCILIATION_CONFIRMATION}`,
+      outcomeEvidence:
+        source === "tree_resume"
+          ? `Confirmed by a board operator while resuming the task: ${RESUME_RECONCILIATION_CONFIRMATION}`
+          : `A board/user explicitly continued this task (a comment or a status change) while this hold was active: ${RESUME_RECONCILIATION_CONFIRMATION}`,
     };
     await validateExecutionReconciliation({
       db: tx as unknown as Db,
@@ -661,7 +681,9 @@ export async function reconcileExecutionHoldForResume(
     await markExecutionReconciliation(tx as unknown as Db, action, decision, input.actorId);
     const now = new Date();
     const note =
-      "Reconciled by a board operator while resuming the task. Recorded work stands; the task continues in a new run.";
+      source === "tree_resume"
+        ? "Reconciled by a board operator while resuming the task. Recorded work stands; the task continues in a new run."
+        : "Reconciled because a board/user explicitly continued this task. Recorded work stands; the task continues in a new run.";
     await tx
       .update(issueRecoveryActions)
       .set({
@@ -686,7 +708,7 @@ export async function reconcileExecutionHoldForResume(
         identifier: task.identifier,
         recoveryActionId: action.id,
         outcome: "restored",
-        source: "tree_resume",
+        source,
         sourceRunId: run.id,
         actionOutcome: decision.actionOutcome,
         resolutionNote: note,
@@ -729,6 +751,7 @@ export async function releaseExecutionHoldForExplicitIntent(
       issueId: input.issueId,
       recoveryActionId: blocker.recoveryActionId,
       actorId: input.actorId,
+      source: "explicit_intent",
     });
     return true;
   } catch (err) {

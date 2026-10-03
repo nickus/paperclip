@@ -4,6 +4,7 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   authUsers,
   companies,
@@ -231,6 +232,17 @@ describeEmbeddedPostgres("explicit board/user continuation of a no-replay execut
         executionReconciliation: { runId: seeded.runId, providerStopped: true, actionOutcome: "mixed" },
       },
     });
+    // No board operator saw or confirmed the tree-control resume dialog here:
+    // a plain status PATCH did. The recorded evidence and activity must say
+    // so, never borrow the resume flow's own confirmation claim.
+    const recordedEvidence = (action!.evidence.executionReconciliation as { outcomeEvidence?: string }).outcomeEvidence ?? "";
+    expect(recordedEvidence).not.toContain("Confirmed by a board operator while resuming the task");
+    const [resolvedActivity] = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, seeded.companyId),
+      eq(activityLog.action, "issue.recovery_action_resolved"),
+      sql`${activityLog.details}->>'recoveryActionId' = ${action!.id}`,
+    ));
+    expect(resolvedActivity!.details).toMatchObject({ source: "explicit_intent" });
 
     const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
     await deliverReconciledExecutions(db, wake);
