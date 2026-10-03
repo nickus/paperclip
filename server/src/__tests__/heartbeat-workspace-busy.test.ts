@@ -832,14 +832,27 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
 
     // A comment-mention wake for an agent that is NOT the issue assignee —
     // the interaction-wake shape that legitimately reaches adapter dispatch
-    // without assignee-ship.
+    // without assignee-ship. Dispatch verifies the mention marker against a
+    // stored comment that links the agent, so the wake needs a real one.
+    const mentionComment = await db
+      .insert(issueComments)
+      .values({
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        authorUserId: "user-1",
+        body: `[CommenterCoder](agent://${fixture.nonAssigneeAgentId}) please take a look.`,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
     const run = await heartbeat.invoke(
       fixture.nonAssigneeAgentId,
       "on_demand",
       {
         issueId: fixture.issueId,
         wakeReason: "issue_comment_mentioned",
-        commentId: randomUUID(),
+        commentId: mentionComment.id,
+        mentionCommentId: mentionComment.id,
+        mentionedAgentId: fixture.nonAssigneeAgentId,
       },
       "system",
     );
