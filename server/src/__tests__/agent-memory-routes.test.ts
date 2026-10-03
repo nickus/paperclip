@@ -324,13 +324,18 @@ describeEmbeddedPostgres("agent memory routes (§8 of the implementation spec)",
     expect(purged.body.status).toBe("purged");
     expect(purged.body.body).toBe(AGENT_MEMORY_PURGED_BODY_PLACEHOLDER);
 
-    // The hard-purge audit row never carries the original content (the one
-    // documented exception to "every mutation's own row is non-destructive"
-    // -- earlier add/update rows keep their own before/after text, by design,
-    // since purge's job is to stop *current* exposure, not rewrite history).
+    // A hard purge erases the body everywhere, not just on the current row:
+    // the earlier "add" audit row quoted the original content verbatim
+    // (beforeBody/afterBody) before the purge, and must not go on quoting it
+    // afterward -- otherwise anyone who can read agent_memory_audit reads
+    // straight past the purge.
     const allAudit = await db.select().from(agentMemoryAudit);
     const purgeRow = allAudit.find((row) => row.action === "hard_purge");
     expect(purgeRow?.afterBody).toBe(AGENT_MEMORY_PURGED_BODY_PLACEHOLDER);
+    const addRow = allAudit.find((row) => row.action === "add");
+    expect(addRow?.afterBody).not.toBe("A fact that later turns out to need erasing.");
+    expect(addRow?.beforeBody).toBeNull();
+    expect(addRow?.afterBody).toBeNull();
 
     const [storedRow] = await db.select().from(agentMemoryEntries);
     expect(storedRow?.body).toBe(AGENT_MEMORY_PURGED_BODY_PLACEHOLDER);

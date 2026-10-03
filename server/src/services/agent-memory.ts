@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, gte, inArray, isNotNull, lt, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentMemoryAudit, agentMemoryEntries, heartbeatRuns, issues } from "@paperclipai/db";
+import { activityLog, agentMemoryAudit, agentMemoryEntries, heartbeatRuns, issues } from "@paperclipai/db";
 import {
   AGENT_MEMORY_AGE_DECAY_DAYS,
   AGENT_MEMORY_CONFIRMATION_WEIGHT,
@@ -45,6 +45,15 @@ const AGENT_MEMORY_LONG_QUOTED_TEXT_RE = /["'`][^"'`]{120,}["'`]/;
 const AGENT_MEMORY_KEY_UNIQUE_INDEX = "agent_memory_company_scope_agent_key_active_uq";
 const AGENT_MEMORY_SWEEP_ACTOR_ID = "agent-memory-sweep";
 const DAY_MS = 24 * 60 * 60 * 1000;
+/**
+ * What a hard purge leaves behind in a shadow-mode `agent_memory.shadow_rendered`
+ * activity-log row that quoted the purged entry's body (heartbeat.ts logs the
+ * whole rendered Memory section verbatim, by entryIds). Mirrors
+ * AGENT_MEMORY_PURGED_BODY_PLACEHOLDER's role on the entry/audit rows -- see
+ * the scrub step in hardPurgeAgentMemoryEntry below.
+ */
+const AGENT_MEMORY_PURGED_ACTIVITY_SECTION_PLACEHOLDER =
+  "[redacted: this run's logged Memory section quoted a since hard-purged entry]";
 
 /**
  * Thrown by writeAgentMemoryEntry/confirmAgentMemoryEntry (and the other
@@ -913,6 +922,31 @@ export async function hardPurgeAgentMemoryEntry(input: {
       afterVersion: entry.version,
       reason: input.reason,
     });
+    // "Everywhere" means everywhere: this entry's own earlier add/update
+    // audit rows quote its pre-purge body verbatim (beforeBody/afterBody),
+    // and a shadow-mode wake that rendered it logs the whole Memory section
+    // text into activity_log (heartbeat.ts, "agent_memory.shadow_rendered").
+    // Both are scrubbed here, in the same transaction as the purge itself,
+    // so a hard purge cannot be defeated by reading either table instead of
+    // the entry.
+    await tx
+      .update(agentMemoryAudit)
+      .set({ beforeBody: null, afterBody: null })
+      .where(and(
+        eq(agentMemoryAudit.companyId, entry.companyId),
+        eq(agentMemoryAudit.entryId, entry.id),
+        ne(agentMemoryAudit.action, "hard_purge"),
+      ));
+    await tx
+      .update(activityLog)
+      .set({
+        details: sql`jsonb_set(${activityLog.details}, '{renderedSection}', ${JSON.stringify(AGENT_MEMORY_PURGED_ACTIVITY_SECTION_PLACEHOLDER)}::jsonb)`,
+      })
+      .where(and(
+        eq(activityLog.companyId, entry.companyId),
+        eq(activityLog.action, "agent_memory.shadow_rendered"),
+        sql`${activityLog.details} -> 'entryIds' @> ${JSON.stringify([entry.id])}::jsonb`,
+      ));
     return entry;
   });
 }
