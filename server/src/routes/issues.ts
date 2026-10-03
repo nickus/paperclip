@@ -15590,6 +15590,16 @@ export function issueRoutes(
                 wakeCommentId,
                 wakeReason: "issue_comment_mentioned",
                 source: delegation ? "comment.mention.delegation" : "comment.mention",
+                // Explicit, DB-verifiable marker: this wake targets this one
+                // agent because the comment's structured @-mention names it,
+                // not because it is (or was) the issue's assignee. Dispatch
+                // re-checks this pair against the comment's body rather than
+                // trusting it, so a reassignment never loses this wake and a
+                // stale or forged marker never bypasses ownership. See
+                // `isVerifiedMentionedAgentWake` in the run-dispatch postgres
+                // adapter.
+                mentionCommentId: wakeCommentId,
+                mentionedAgentId: mentionedId,
                 ...(delegation ? { resumeIntent: true, followUpRequested: true } : {}),
               },
             });
@@ -16869,6 +16879,16 @@ export function issueRoutes(
               sourceRunId: interaction.sourceRunId ?? null,
               wakeReason: "interaction_pending",
               source: "issue.interaction.created",
+              // Explicit, DB-verifiable marker: this wake targets this one
+              // agent because it is addressed by a still-pending interaction,
+              // not because it is (or was) the issue's assignee. Dispatch
+              // re-checks this pair against the interaction row rather than
+              // trusting it, so a reassignment never loses this wake and a
+              // stale or forged marker never bypasses ownership. See
+              // `isVerifiedAddresseeInteractionWake` in the run-dispatch
+              // postgres adapter.
+              addressedInteractionId: interaction.id,
+              addresseeAgentId: interaction.addresseeAgentId,
             },
           })
           .catch((err) =>
@@ -19275,6 +19295,10 @@ export function issueRoutes(
               wakeCommentId,
               wakeReason: "issue_comment_mentioned",
               source: delegation ? "comment.mention.delegation" : "comment.mention",
+              // Explicit, DB-verifiable marker: see the matching comment in
+              // the other @-mention wakeup above.
+              mentionCommentId: wakeCommentId,
+              mentionedAgentId: mentionedId,
               ...(delegation ? { resumeIntent: true, followUpRequested: true } : {}),
             },
           });

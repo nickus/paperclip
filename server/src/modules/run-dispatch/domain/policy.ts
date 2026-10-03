@@ -154,6 +154,21 @@ export type QueuedRunFacts = {
   isInteractionWake: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
+  /**
+   * A wake addressed to this agent specifically by a still-pending issue
+   * thread interaction, verified against the database at dispatch time (see
+   * the adapter's `isVerifiedAddresseeInteractionWake`). A forged or stale
+   * marker (the interaction already resolved, or addressed to someone
+   * else) never sets this.
+   */
+  isAddresseeInteractionWake: boolean;
+  /**
+   * A wake delivering a structured @-mention to this agent specifically,
+   * verified against the mentioning comment's body at dispatch time (see
+   * the adapter's `isVerifiedMentionedAgentWake`). A forged or stale marker
+   * never sets this.
+   */
+  isMentionedAgentWake: boolean;
 
   resumeIntent: boolean;
   wakeCommentIdPresent: boolean;
@@ -176,6 +191,17 @@ type OwnershipFacts = {
   isInteractionWake?: boolean;
   isCurrentReviewParticipant?: boolean;
   isAuthorizedSourceScopedRecovery?: boolean;
+  /**
+   * A wake addressed to this agent specifically, verified against a still-pending
+   * issue thread interaction row (not merely claimed in the wake's own context).
+   */
+  isAddresseeInteractionWake?: boolean;
+  /**
+   * A wake delivering a structured @-mention to this agent specifically,
+   * verified against the mentioning comment's body (not merely claimed in
+   * the wake's own context).
+   */
+  isMentionedAgentWake?: boolean;
 };
 
 type OwnershipOutcome = "current_owner" | "reassigned";
@@ -191,6 +217,8 @@ function decideIssueOwnership(facts: OwnershipFacts): OwnershipOutcome {
   if (facts.isInteractionWake) return "current_owner";
   if (facts.isCurrentReviewParticipant) return "current_owner";
   if (facts.isAuthorizedSourceScopedRecovery) return "current_owner";
+  if (facts.isAddresseeInteractionWake) return "current_owner";
+  if (facts.isMentionedAgentWake) return "current_owner";
   return "reassigned";
 }
 
@@ -576,6 +604,8 @@ export function decideQueuedRunStaleness(
       facts.reviewParticipant.participantIsAgent &&
       facts.reviewParticipant.participantAgentId === facts.runAgentId,
     isAuthorizedSourceScopedRecovery: facts.isAuthorizedSourceScopedRecovery,
+    isAddresseeInteractionWake: facts.isAddresseeInteractionWake,
+    isMentionedAgentWake: facts.isMentionedAgentWake,
   });
   if (ownership === "reassigned") {
     return {

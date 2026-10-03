@@ -55,6 +55,8 @@ function baseStalenessFacts(): QueuedRunFacts {
     isResolvedInteractionContinuation: false,
     isInteractionWake: false,
     isAuthorizedSourceScopedRecovery: false,
+    isAddresseeInteractionWake: false,
+    isMentionedAgentWake: false,
     isNonAssigneeWorkspaceBusyRetry: false,
     resumeIntent: false,
     wakeCommentIdPresent: false,
@@ -461,6 +463,43 @@ describe("decideQueuedRunStaleness", () => {
       isAuthorizedSourceScopedRecovery: true,
     };
     expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
+  });
+
+  it("allows a verified addressee-interaction wake to bypass the ownership check", () => {
+    const facts: QueuedRunFacts = {
+      ...baseStalenessFacts(),
+      // The issue's assignee is a different agent; only the verified
+      // addressee marker (checked against the DB by the adapter) grants
+      // this run's agent a bypass.
+      issueAssigneeAgentId: "agent-2",
+      isAddresseeInteractionWake: true,
+    };
+    expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
+  });
+
+  it("allows a verified mentioned-agent wake to bypass the ownership check", () => {
+    const facts: QueuedRunFacts = {
+      ...baseStalenessFacts(),
+      issueAssigneeAgentId: "agent-2",
+      isMentionedAgentWake: true,
+    };
+    expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
+  });
+
+  it("still cancels a non-assignee wake once its addressee/mention bypass is unverified", () => {
+    // The adapter only sets these flags once it has checked the database;
+    // an unset flag (a stale or forged marker that failed verification)
+    // must fall through to the ordinary reassignment cancellation.
+    const facts: QueuedRunFacts = {
+      ...baseStalenessFacts(),
+      issueAssigneeAgentId: "agent-2",
+      isAddresseeInteractionWake: false,
+      isMentionedAgentWake: false,
+    };
+    expect(decideQueuedRunStaleness(facts, NOW)).toMatchObject({
+      stale: true,
+      errorCode: "issue_assignee_changed",
+    });
   });
 });
 
