@@ -13914,6 +13914,48 @@ export function issueRoutes(
       }
       Object.assign(updateFields, transition.patch);
 
+      // An issue defaulted into "backlog" at create() only for lack of an
+      // assignee (see resolveCreateIssueStatusDefault) must get the same
+      // "todo" default once an assignee shows up, or the assignment wake
+      // below never fires (it's skipped whenever the issue is in backlog)
+      // and the new assignee is never woken. Only applies when the issue is
+      // still sitting in that creation default (nobody chose backlog on
+      // purpose since) and this update itself leaves status unset.
+      let statusDefaultedOnAssignment = false;
+      if (existing.status === "backlog" && updateFields.status === undefined) {
+        const nextAssigneeAgentIdForStatusDefault =
+          updateFields.assigneeAgentId === undefined
+            ? existing.assigneeAgentId
+            : (updateFields.assigneeAgentId as string | null);
+        const nextAssigneeUserIdForStatusDefault =
+          updateFields.assigneeUserId === undefined
+            ? existing.assigneeUserId
+            : (updateFields.assigneeUserId as string | null);
+        if (
+          nextAssigneeAgentIdForStatusDefault !== null ||
+          nextAssigneeUserIdForStatusDefault !== null
+        ) {
+          // Best-effort: a lookup failure (or a route test whose service
+          // mock doesn't stub this) must never turn an otherwise-valid
+          // assignment into a failed write. Worst case, the issue keeps the
+          // pre-fix behavior of staying in backlog for this one request.
+          let isCreationDefaultBacklog = false;
+          try {
+            isCreationDefaultBacklog =
+              await svc.isBacklogFromUnassignedCreationDefault(existing.id);
+          } catch (err) {
+            logger.warn(
+              { err, issueId: existing.id },
+              "failed to check backlog creation-default status before assignment",
+            );
+          }
+          if (isCreationDefaultBacklog) {
+            updateFields.status = "todo";
+            statusDefaultedOnAssignment = true;
+          }
+        }
+      }
+
       const nextStatus = updateFields.status ?? existing.status;
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
         throw unprocessable(
@@ -14765,6 +14807,17 @@ export function issueRoutes(
             ...(interruptedRunId ? { interruptedRunId } : {}),
             ...(cancelledStatusRunId ? { cancelledStatusRunId } : {}),
             ...(workspaceChange ? { workspaceChange } : {}),
+            // Marks a caller-chosen status (as opposed to one this route
+            // defaulted, below) so isBacklogFromUnassignedCreationDefault can
+            // tell "someone put this in backlog on purpose" apart from "it's
+            // still sitting where create() left it".
+            ...(req.body.status !== undefined ? { statusExplicit: true } : {}),
+            ...(statusDefaultedOnAssignment
+              ? {
+                  statusDefaulted: true,
+                  statusDefaultReason: "assigned_omitted_status",
+                }
+              : {}),
             _previous: hasFieldChanges ? previous : undefined,
             ...summarizeIssueReferenceActivityDetails(
               updateReferenceDiff
