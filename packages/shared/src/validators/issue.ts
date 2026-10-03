@@ -575,7 +575,11 @@ export const resolveIssueRecoveryActionSchema = z
       .optional(),
     actionId: z.string().guid().optional(),
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-    sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+    // "backlog" resolves the recovery action without un-parking the issue:
+    // the source issue stays exactly where someone parked it (see
+    // sourceStatusChanged below, in the route), it is just no longer silently
+    // held behind a hidden recovery action.
+    sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked", "backlog"]),
     resolutionNote: multilineTextSchema.optional().nullable(),
   })
   .strict()
@@ -584,12 +588,13 @@ export const resolveIssueRecoveryActionSchema = z
       if (
         value.sourceIssueStatus !== "todo" &&
         value.sourceIssueStatus !== "done" &&
-        value.sourceIssueStatus !== "in_review"
+        value.sourceIssueStatus !== "in_review" &&
+        value.sourceIssueStatus !== "backlog"
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message:
-            "Restored recovery actions must move the source issue to todo, done, or in_review",
+            "Restored recovery actions must move the source issue to todo, done, in_review, or leave it in backlog",
           path: ["sourceIssueStatus"],
         });
       }
@@ -611,12 +616,13 @@ export const resolveIssueRecoveryActionSchema = z
     if (value.outcome === "false_positive" || value.outcome === "cancelled") {
       if (
         value.sourceIssueStatus !== "done" &&
-        value.sourceIssueStatus !== "in_review"
+        value.sourceIssueStatus !== "in_review" &&
+        value.sourceIssueStatus !== "backlog"
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message:
-            "This recovery outcome requires sourceIssueStatus to be done or in_review",
+            "This recovery outcome requires sourceIssueStatus to be done, in_review, or (to leave a parked issue parked) backlog",
           path: ["sourceIssueStatus"],
         });
       }

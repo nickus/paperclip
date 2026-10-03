@@ -48,6 +48,7 @@ import {
 import { releaseHeldExecutionWaits, type PromoteDeferredWakesAfterHold } from "./execution-wait-release.js";
 import { withWakeBudget, type ExecutionHoldWakeBudget } from "./execution-hold-wake-budget.js";
 import { issueService } from "./issues.js";
+import { getExecutionBlocker } from "./execution-blocker.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -700,6 +701,47 @@ export async function reconcileExecutionHoldForResume(
 }
 
 /**
+ * A board/user signal that is itself an explicit decision to continue a task
+ * ends a no-replay hold the same way a board operator's confirmed "Resume
+ * work" does: a reopening comment, a comment that @-mentions the assignee, or
+ * a status PATCH back to todo/in_progress all say, in as many words, "keep
+ * going" about a task whose hold the person issuing them may not even know
+ * exists. There is nothing left to confirm (unlike the resume flow, which
+ * warns before acting), so this reconciles immediately through the exact same
+ * machinery (`getExecutionBlocker`, `isResumeReconcilableBlocker`,
+ * `reconcileExecutionHoldForResume`) instead of a parallel path.
+ *
+ * Best-effort: a hold that is not resume-reconcilable (wrong cause, or an
+ * owner-active/workspace-unsafe blocker with no recorded action) or a
+ * reconciliation the stale/owner checks refuse leaves the existing
+ * disposition in place and the wake parks as usual; only an agent-authored
+ * signal is excluded by the caller, never here.
+ */
+export async function releaseExecutionHoldForExplicitIntent(
+  db: Db,
+  input: { companyId: string; issueId: string; actorId: string },
+): Promise<boolean> {
+  const blocker = await getExecutionBlocker(db, input.companyId, input.issueId);
+  if (!isResumeReconcilableBlocker(blocker)) return false;
+  try {
+    await reconcileExecutionHoldForResume(db, {
+      companyId: input.companyId,
+      issueId: input.issueId,
+      recoveryActionId: blocker.recoveryActionId,
+      actorId: input.actorId,
+    });
+    return true;
+  } catch (err) {
+    if (!(err instanceof HttpError)) throw err;
+    logger.info(
+      { err, issueId: input.issueId, recoveryActionId: blocker.recoveryActionId },
+      "Explicit board/user continuation could not reconcile the execution hold; it keeps its disposition",
+    );
+    return false;
+  }
+}
+
+/**
  * Failed execution is a system responsibility, not a user questionnaire. After
  * automatic recovery is ruled out, preserve evidence and stop without replay.
  * This is NOT evidence that an external action succeeded or never happened.
@@ -889,9 +931,20 @@ export async function settleUnrecoverableExecutions(
           !["done", "cancelled"].includes(task.status) &&
           (!task.executionRunId || task.executionRunId === run.id) &&
           (!task.checkoutRunId || task.checkoutRunId === run.id);
-        // Pausing an agent is not a decision to stop its task. A verified
-        // pause stop of the task owner's own conversation turn continues when
-        // the agent is resumed; every other stop keeps the disposition below.
+        // Pausing an agent is not a decision to stop its task, for any
+        // adapter: that is why a verified pause stop is never left as a
+        // *silent* hold (see `getExecutionBlocker`, the attention feed, and
+        // `releaseExecutionHoldForExplicitIntent` below, which end such a
+        // hold the moment a human says to continue). Automatic, unattended
+        // continuation right here, though, stays scoped to a conversation
+        // adapter's own turn: that turn reviews the recorded comments and
+        // documents and decides what remains, so nothing already done is
+        // repeated. An adapter that instead replays a configured command or
+        // webhook on every invocation (see `CONVERSATION_ADAPTER_TYPES`'
+        // module comment) has no such review step, and Paperclip cannot know
+        // whether the run already performed its action before the pause —
+        // continuing it unattended could repeat that action. Such a run keeps
+        // the disposition below until a human explicitly says to continue it.
         if (
           current &&
           action.cause === LEGACY_RECOVERY_CAUSE &&
