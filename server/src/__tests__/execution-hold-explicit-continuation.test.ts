@@ -299,6 +299,65 @@ describeEmbeddedPostgres("explicit board/user continuation of a no-replay execut
     expect(task!.status).toBe("blocked");
   });
 
+  // The dedicated POST /issues/:id/comments route is a separate handler from
+  // PATCH /issues/:id's own comment-carrying path (its own reopen/@-mention/
+  // wake logic), so the explicit-continuation release needs its own wiring
+  // there too - this is the route an API client actually posts a plain
+  // comment to.
+  it("a board/user comment via POST /issues/:id/comments that reopens the issue releases the hold", async () => {
+    const seeded = await seedHeldTask();
+    const app = createApp(boardActor(seeded.companyId));
+
+    const res = await request(app)
+      .post(`/api/issues/${seeded.issueId}/comments`)
+      .send({ body: "Please pick this back up.", reopen: true });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    // The comment-create response says the hold is gone, not queued behind it.
+    expect(res.body.executionHold).toBeNull();
+
+    expect(await getExecutionBlocker(db, seeded.companyId, seeded.issueId)).toBeNull();
+    expect(await legacyAction(seeded.issueId)).toMatchObject({ status: "resolved", outcome: "restored" });
+    const [task] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(task!.status).toBe("todo");
+  });
+
+  it("a board/user comment via POST /issues/:id/comments that @-mentions the assignee releases the hold", async () => {
+    const seeded = await seedHeldTask();
+    const app = createApp(boardActor(seeded.companyId));
+    const [assignee] = await db.select().from(agents).where(eq(agents.id, seeded.assigneeId));
+
+    const res = await request(app)
+      .post(`/api/issues/${seeded.issueId}/comments`)
+      .send({ body: `@${assignee!.name} please pick this back up.` });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.executionHold).toBeNull();
+
+    expect(await getExecutionBlocker(db, seeded.companyId, seeded.issueId)).toBeNull();
+    expect(await legacyAction(seeded.issueId)).toMatchObject({ status: "resolved", outcome: "restored" });
+  });
+
+  it("an agent-authored comment via POST /issues/:id/comments does not release the hold, and the response reports it as still held", async () => {
+    const seeded = await seedHeldTask();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId: seeded.companyId, agentId: seeded.assigneeId,
+      invocationSource: "assignment", status: "running", startedAt: new Date(),
+      contextSnapshot: {},
+    });
+    const app = createApp(agentActor(seeded.companyId, seeded.assigneeId, runId));
+
+    const res = await request(app)
+      .post(`/api/issues/${seeded.issueId}/comments`)
+      .send({ body: "Still working on this." });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.executionHold).toMatchObject({ recoveryActionId: seeded.recoveryActionId });
+
+    expect(await getExecutionBlocker(db, seeded.companyId, seeded.issueId)).not.toBeNull();
+    expect(await legacyAction(seeded.issueId)).toMatchObject({ status: "resolved", outcome: "blocked" });
+    const [task] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(task!.status).toBe("blocked");
+  });
+
   it("GET recovery-actions reports the settled no-replay hold as an effective hold", async () => {
     const seeded = await seedHeldTask();
     const app = createApp(boardActor(seeded.companyId));

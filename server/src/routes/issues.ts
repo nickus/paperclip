@@ -18917,6 +18917,51 @@ export function issueRoutes(
           currentIssue.status === "todo",
       });
 
+      let mentionedIds: string[] = [];
+      try {
+        mentionedIds = await svc.findMentionedAgents(
+          issue.companyId,
+          req.body.body,
+        );
+      } catch (err) {
+        logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
+      }
+
+      // A board/user comment that reopens the issue or @-mentions its
+      // assignee is itself an explicit decision to continue a no-replay
+      // execution hold - the same decision the PATCH /issues/:id handler
+      // spends for its own comment-carrying updates. Spent synchronously,
+      // before the queued wake dispatch below, so the response accurately
+      // reports whether the hold is now gone. Agent-authored comments never
+      // trigger it.
+      let executionHoldReleased = false;
+      if (actor.actorType !== "agent") {
+        const mentionsAssignee =
+          Boolean(currentIssue.assigneeAgentId) &&
+          mentionedIds.includes(currentIssue.assigneeAgentId!);
+        if (reopened || mentionsAssignee) {
+          try {
+            executionHoldReleased = await releaseExecutionHoldForExplicitIntent(db, {
+              companyId: currentIssue.companyId,
+              issueId: currentIssue.id,
+              actorId: actor.actorId,
+            });
+          } catch (err) {
+            logger.warn(
+              { err, issueId: currentIssue.id },
+              "failed to release an execution hold for an explicit continuation",
+            );
+          }
+        }
+      }
+      // Tell this comment's own caller that it is saved but queued behind a
+      // hold, rather than leaving them to discover that only when the
+      // assignee never answers. Checked after any release just above, so a
+      // hold this same request just ended is reported as gone.
+      const executionHold = !executionHoldReleased
+        ? await getExecutionBlocker(db, currentIssue.companyId, currentIssue.id)
+        : null;
+
       // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
       void (async () => {
         type WakeupRequest = NonNullable<
@@ -19109,16 +19154,6 @@ export function issueRoutes(
           }
         }
 
-        let mentionedIds: string[] = [];
-        try {
-          mentionedIds = await svc.findMentionedAgents(
-            issue.companyId,
-            req.body.body,
-          );
-        } catch (err) {
-          logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
-        }
-
         for (const mentionedId of mentionedIds) {
           if (
             (actorIsAgent && actor.actorId === mentionedId) ||
@@ -19286,7 +19321,12 @@ export function issueRoutes(
       })();
 
       await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
-      res.status(201).json(comment);
+      res.status(201).json({
+        ...comment,
+        executionHold: executionHold
+          ? { recoveryActionId: executionHold.recoveryActionId, nextAction: executionHold.nextAction }
+          : null,
+      });
     },
   );
 
