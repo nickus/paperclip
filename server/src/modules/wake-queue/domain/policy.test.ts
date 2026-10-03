@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  decideDependencyResolvedWakePromotion,
   decidePreDrain,
   decideQueuedCommentAction,
   decideQueuedCommentActorOwnsEntry,
@@ -9,6 +10,7 @@ import {
   decideWakeAdmission,
   decideWakeOutcome,
   deriveImmediateRecoveryContextLabels,
+  type DependencyResolvedWakePromotionFacts,
   type DeferredWakeOutcomeFacts,
   type DeferredWakeQueuedCommentFacts,
   type ImmediateRecoveryContextLabels,
@@ -295,6 +297,64 @@ describe("decideWakeOutcome", () => {
   for (const testCase of cases) {
     it(testCase.name, () => {
       expect(decideWakeOutcome(testCase.facts)).toEqual(testCase.expected);
+    });
+  }
+});
+
+const baseDependencyResolvedWakePromotionFacts: DependencyResolvedWakePromotionFacts = {
+  hasRunForSameResolution: false,
+  hasOpenBlockerPath: false,
+  reblockedAfterRequest: false,
+};
+
+describe("decideDependencyResolvedWakePromotion", () => {
+  const cases: Array<{
+    name: string;
+    facts: DependencyResolvedWakePromotionFacts;
+    expected: ReturnType<typeof decideDependencyResolvedWakePromotion>;
+  }> = [
+    {
+      name: "promote: no sibling run, no open blocker, and no later re-block",
+      facts: baseDependencyResolvedWakePromotionFacts,
+      expected: { kind: "promote" },
+    },
+    {
+      name: "skip: a run for this exact blocker resolution already ran",
+      facts: { ...baseDependencyResolvedWakePromotionFacts, hasRunForSameResolution: true },
+      expected: {
+        kind: "skip",
+        reason: "Dependency wake superseded: a run for this exact blocker resolution already ran",
+      },
+    },
+    {
+      name: "skip: the issue still has another unresolved blocker",
+      facts: { ...baseDependencyResolvedWakePromotionFacts, hasOpenBlockerPath: true },
+      expected: {
+        kind: "skip",
+        reason: "Dependency wake superseded: the issue still has an unresolved blocker",
+      },
+    },
+    {
+      name: "skip: the issue was set back to blocked after this wake was requested",
+      facts: { ...baseDependencyResolvedWakePromotionFacts, reblockedAfterRequest: true },
+      expected: {
+        kind: "skip",
+        reason: "Dependency wake superseded: the issue was set back to blocked after this wake was requested",
+      },
+    },
+    {
+      name: "skip: a sibling run takes priority over an also-true open blocker path",
+      facts: { ...baseDependencyResolvedWakePromotionFacts, hasRunForSameResolution: true, hasOpenBlockerPath: true },
+      expected: {
+        kind: "skip",
+        reason: "Dependency wake superseded: a run for this exact blocker resolution already ran",
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    it(testCase.name, () => {
+      expect(decideDependencyResolvedWakePromotion(testCase.facts)).toEqual(testCase.expected);
     });
   }
 });

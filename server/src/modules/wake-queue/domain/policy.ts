@@ -208,6 +208,55 @@ export function decideWakeOutcome(facts: DeferredWakeOutcomeFacts): DeferredWake
   return { kind: "promote" };
 }
 
+export type DependencyResolvedWakePromotionFacts = {
+  /** True when a run for this agent and issue already carries the identical `resolvedBlockerIssueId`, from an earlier promotion of the same blocker resolution. */
+  hasRunForSameResolution: boolean;
+  /** True when the dependent issue still lists an open, non-hidden blocker. */
+  hasOpenBlockerPath: boolean;
+  /** True when the dependent issue is blocked again, and that transition landed after this wake was requested: its own assignee (or another promoted duplicate) already re-blocked it since. */
+  reblockedAfterRequest: boolean;
+};
+
+export type DependencyResolvedWakePromotionDecision =
+  | { kind: "promote" }
+  | { kind: "skip"; reason: string };
+
+/**
+ * Decides whether a deferred `issue_blockers_resolved` wake still represents
+ * unanswered work right before it is promoted into a fresh run. One blocker
+ * resolution can produce several of these deferred wakes behind the same
+ * dependent issue (the periodic backstop, the finalize-time recheck and the
+ * route-time wake can each notice the identical resolved blocker while a
+ * sibling wake for it is already running), and the drain promotes deferred
+ * wakes one at a time as each run finishes. Without this re-check, every
+ * sibling would get its own fresh run for the exact same resolution. This
+ * keeps that promotion idempotent per (dependent issue, blocker resolution):
+ * only the first duplicate still unanswered at promotion time starts a run.
+ */
+export function decideDependencyResolvedWakePromotion(
+  facts: DependencyResolvedWakePromotionFacts,
+): DependencyResolvedWakePromotionDecision {
+  if (facts.hasRunForSameResolution) {
+    return {
+      kind: "skip",
+      reason: "Dependency wake superseded: a run for this exact blocker resolution already ran",
+    };
+  }
+  if (facts.hasOpenBlockerPath) {
+    return {
+      kind: "skip",
+      reason: "Dependency wake superseded: the issue still has an unresolved blocker",
+    };
+  }
+  if (facts.reblockedAfterRequest) {
+    return {
+      kind: "skip",
+      reason: "Dependency wake superseded: the issue was set back to blocked after this wake was requested",
+    };
+  }
+  return { kind: "promote" };
+}
+
 /** Shared between the review-participant and immediate branches; the caller derives every field from the same expression regardless of which branch applies. */
 export type ReleaseRecoverySharedFacts = {
   hasExistingExecutionPath: boolean;

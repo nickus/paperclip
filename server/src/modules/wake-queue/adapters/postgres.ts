@@ -2,7 +2,7 @@ import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
-import { and, asc, eq, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { EXECUTION_RECONCILIATION_CAUSES, extractIssueReferenceIdentifiers, isUuidLike } from "@paperclipai/shared";
 import {
@@ -131,6 +131,7 @@ function toIssueSnapshot(row: IssueRow): IssueSnapshot {
     parentId: row.parentId,
     originId: row.originId,
     originRunId: row.originRunId,
+    blockedTransitionAt: row.blockedTransitionAt,
   };
 }
 
@@ -171,6 +172,7 @@ function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): 
     triggerDetail: row.triggerDetail,
     requestedByActorType: toRequestedByActorType(row.requestedByActorType),
     requestedByActorId: row.requestedByActorId,
+    requestedAt: row.requestedAt,
     payload,
     queuedCommentIds,
     preservesIndependentContinuation,
@@ -703,6 +705,24 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             eq(issues.companyId, companyId),
             notInArray(issues.status, ["done", "cancelled"]),
             isNull(issues.hiddenAt),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      return row !== null;
+    },
+
+    async hasRunForResolvedDependencyWake({ companyId, issueId, agentId, resolvedBlockerIssueId, sinceBlockedAt }) {
+      const row = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            eq(heartbeatRuns.agentId, agentId),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'resolvedBlockerIssueId' = ${resolvedBlockerIssueId}`,
+            ...(sinceBlockedAt ? [gte(heartbeatRuns.createdAt, sinceBlockedAt)] : []),
           ),
         )
         .limit(1)

@@ -71,6 +71,8 @@ export type DeferredWakeCandidate = {
   triggerDetail: string | null;
   requestedByActorType: "user" | "agent" | "system" | null;
   requestedByActorId: string | null;
+  /** When this wake was originally requested, used to tell it apart from a later re-block of the same dependent issue. */
+  requestedAt: Date;
   payload: Record<string, unknown>;
   /** The queued comment ids the wake's queued-comment context carries, already extracted from the payload. */
   queuedCommentIds: string[];
@@ -259,6 +261,32 @@ export interface WakeQueueTransaction {
   }): Promise<boolean>;
   /** An open, non-hidden issue that still lists this issue as a `blocks` predecessor. */
   hasExplicitBlockerPath(input: { companyId: string; issueId: string }): Promise<boolean>;
+  /**
+   * A run for this agent and issue already exists whose context snapshot
+   * carries this exact `resolvedBlockerIssueId`, from an earlier promotion
+   * of the identical blocker resolution. Any run status counts, including a
+   * finished one: once a run has addressed one resolved-blocker event, a
+   * sibling duplicate wake for that same event must not start another.
+   *
+   * `sinceBlockedAt`, when given, excludes a run created before that
+   * instant: the dependent issue can cycle through `blocked` more than
+   * once (the same blocker issue can be reopened and resolved again), and
+   * `resolvedBlockerIssueId` is only the blocker's permanent id, with no
+   * cycle of its own. Without this bound, a run from an earlier, already
+   * fully-settled blocked episode would be mistaken for one that already
+   * answered a later, genuinely distinct resolution of the same blocker,
+   * and that later wake would be skipped instead of promoted. Pass the
+   * dependent issue's current `blockedTransitionAt` (the caller omits it
+   * when the issue is not currently blocked, which only widens this check
+   * back to its unbounded, pre-existing behavior for that edge).
+   */
+  hasRunForResolvedDependencyWake(input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    resolvedBlockerIssueId: string;
+    sinceBlockedAt?: Date | null;
+  }): Promise<boolean>;
   isAutomaticRecoverySuppressedByPauseHold(input: { companyId: string; issueId: string }): Promise<boolean>;
   /** Deny-only facts from the exact finishing run and its durable chat wake owner. */
   isImmediateRecoverySourceBlocked(input: { companyId: string; runId: string }): Promise<boolean>;
