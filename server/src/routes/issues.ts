@@ -3885,6 +3885,17 @@ export function issueRoutes(
     }
   }
 
+  // Linking plain-text @mentions is best-effort: on any failure the comment is
+  // stored exactly as written rather than rejected.
+  async function linkPlainMentionsSafely(companyId: string, body: string): Promise<string> {
+    try {
+      return await svc.normalizePlainAgentMentions(companyId, body);
+    } catch (err) {
+      logger.warn({ err, companyId }, "failed to link plain-text @-mentions");
+      return body;
+    }
+  }
+
   async function routeDelegationMention(
     req: Request,
     parent: { id: string; identifier?: string | null; companyId: string; status: string },
@@ -13529,7 +13540,7 @@ export function issueRoutes(
       // comment is persisted (and before findMentionedAgents reads it below), so the stored
       // body, the UI's mention chip, and the agent wake all agree on the same mentions.
       const commentBody = rawCommentBody
-        ? await svc.normalizePlainAgentMentions(existing.companyId, rawCommentBody)
+        ? await linkPlainMentionsSafely(existing.companyId, rawCommentBody)
         : rawCommentBody;
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
         throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
@@ -18250,7 +18261,7 @@ export function issueRoutes(
       // body, the UI's mention chip, and the agent wake all agree on the same mentions. The
       // conversation-chat branch above is exempt: it delivers straight to the conversation
       // agent via deliverConversationComments and never resolves @-mentions from the body.
-      req.body.body = await svc.normalizePlainAgentMentions(issue.companyId, req.body.body);
+      req.body.body = await linkPlainMentionsSafely(issue.companyId, req.body.body);
       if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
         await auditAgentIssueCommentAttributionSpoof({
           db,
