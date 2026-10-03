@@ -901,6 +901,32 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       .resolves.toEqual([]);
   });
 
+  it("normalizes a plain-text mention into the structured link, excluding terminated agents", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const localAgentId = randomUUID();
+    const terminatedAgentId = randomUUID();
+
+    await db.insert(agents).values([
+      agentRow(companyId, { id: localAgentId, name: "LocalAgent" }),
+      agentRow(companyId, { id: terminatedAgentId, name: "RetiredAgent", status: "terminated" }),
+    ]);
+
+    const normalized = await svc.normalizePlainAgentMentions(
+      companyId,
+      "@LocalAgent please inspect this, cc @RetiredAgent",
+    );
+
+    expect(normalized).toBe(
+      `[@LocalAgent](${buildAgentMentionHref(localAgentId)}) please inspect this, cc @RetiredAgent`,
+    );
+  });
+
+  it("leaves the comment body unchanged when there is no mentionable agent to link", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const body = "@NobodyHere please inspect this";
+    await expect(svc.normalizePlainAgentMentions(companyId, body)).resolves.toBe(body);
+  });
+
   it("returns issues an agent participated in across the supported signals", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

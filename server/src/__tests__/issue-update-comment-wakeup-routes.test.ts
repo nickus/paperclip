@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { buildAgentMentionHref, extractAgentMentionIds, linkPlainAgentMentions } from "@paperclipai/shared";
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const PREVIOUS_AGENT_ID = "22222222-2222-4222-8222-222222222222";
@@ -14,6 +15,7 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
+  normalizePlainAgentMentions: vi.fn(async (_companyId: string, body: string) => body),
   getRelationSummaries: vi.fn(),
   getDependencyReadiness: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
@@ -1014,5 +1016,124 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  it("links a plain-text @mention in a new comment and wakes the mentioned agent", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      status: "in_progress",
+    });
+    const mentionableAgents = [{ id: MENTIONED_AGENT_ID, name: "QA" }];
+    const linkedBody = linkPlainAgentMentions("@QA please take a look", mentionableAgents).markdown;
+    expect(linkedBody).toBe(`[@QA](${buildAgentMentionHref(MENTIONED_AGENT_ID)}) please take a look`);
+
+    mockIssueService.getById.mockResolvedValue(existing);
+    // Exercise the real shared helper (and the real link parser below) rather than a
+    // hand-rolled stand-in, so this test fails if the route stops normalizing before
+    // persisting or before resolving mentions from the persisted body.
+    mockIssueService.normalizePlainAgentMentions.mockImplementation(async (_companyId, body) =>
+      linkPlainAgentMentions(body, mentionableAgents).markdown,
+    );
+    mockIssueService.findMentionedAgents.mockImplementation(async (_companyId, body) =>
+      extractAgentMentionIds(body),
+    );
+    mockIssueService.addComment.mockImplementation(async (_issueId, body) => ({
+      id: "comment-plain-mention-linked",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body,
+    }));
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: "@QA please take a look" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.addComment.mock.calls[0][1]).toBe(linkedBody);
+    await vi.waitFor(() =>
+      expect(mockIssueService.findMentionedAgents).toHaveBeenCalledWith(existing.companyId, linkedBody),
+    );
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({ reason: "issue_comment_mentioned" }),
+    );
+  });
+
+  it("links a plain-text @mention through PATCH /issues/:id and wakes the mentioned agent", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      status: "in_progress",
+    });
+    const mentionableAgents = [{ id: MENTIONED_AGENT_ID, name: "QA" }];
+    const linkedBody = linkPlainAgentMentions("@QA please take a look", mentionableAgents).markdown;
+
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(existing);
+    mockIssueService.normalizePlainAgentMentions.mockImplementation(async (_companyId, body) =>
+      linkPlainAgentMentions(body, mentionableAgents).markdown,
+    );
+    mockIssueService.findMentionedAgents.mockImplementation(async (_companyId, body) =>
+      extractAgentMentionIds(body),
+    );
+    mockIssueService.addComment.mockImplementation(async (_issueId, body) => ({
+      id: "comment-plain-mention-linked-patch",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body,
+    }));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ comment: "@QA please take a look" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.addComment.mock.calls[0][1]).toBe(linkedBody);
+    await vi.waitFor(() =>
+      expect(mockIssueService.findMentionedAgents).toHaveBeenCalledWith(existing.companyId, linkedBody),
+    );
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({ reason: "issue_comment_mentioned" }),
+    );
+  });
+
+  it("does not wake an agent whose name only appears inside a code span", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      status: "in_progress",
+    });
+    const mentionableAgents = [{ id: MENTIONED_AGENT_ID, name: "QA" }];
+    const rawBody = "see `@QA` for the raw syntax, not a real mention";
+
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.normalizePlainAgentMentions.mockImplementation(async (_companyId, body) =>
+      linkPlainAgentMentions(body, mentionableAgents).markdown,
+    );
+    mockIssueService.findMentionedAgents.mockImplementation(async (_companyId, body) =>
+      extractAgentMentionIds(body),
+    );
+    mockIssueService.addComment.mockImplementation(async (_issueId, body) => ({
+      id: "comment-code-span-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body,
+    }));
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: rawBody });
+
+    expect(res.status).toBe(201);
+    // The code span must survive untouched: no structured link is introduced.
+    expect(mockIssueService.addComment.mock.calls[0][1]).toBe(rawBody);
+    await vi.waitFor(() =>
+      expect(mockIssueService.findMentionedAgents).toHaveBeenCalledWith(existing.companyId, rawBody),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 });

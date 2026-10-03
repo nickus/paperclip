@@ -13465,7 +13465,7 @@ export function issueRoutes(
         ? await svc.getRelationSummaries(existing.id)
         : null;
       const {
-        comment: commentBody,
+        comment: rawCommentBody,
         commentClientRequestId,
         attachmentIds: commentAttachmentIds,
         reviewInteractionId: requestedReviewInteractionId,
@@ -13478,6 +13478,12 @@ export function issueRoutes(
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
+      // Normalize any plain-text "@Agent Name" mentions into structured links before the
+      // comment is persisted (and before findMentionedAgents reads it below), so the stored
+      // body, the UI's mention chip, and the agent wake all agree on the same mentions.
+      const commentBody = rawCommentBody
+        ? await svc.normalizePlainAgentMentions(existing.companyId, rawCommentBody)
+        : rawCommentBody;
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
         throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
       }
@@ -18134,6 +18140,12 @@ export function issueRoutes(
         res.status(201).json(comment);
         return;
       }
+      // Normalize any plain-text "@Agent Name" mentions into structured links before the
+      // comment is persisted (and before findMentionedAgents reads it below), so the stored
+      // body, the UI's mention chip, and the agent wake all agree on the same mentions. The
+      // conversation-chat branch above is exempt: it delivers straight to the conversation
+      // agent via deliverConversationComments and never resolves @-mentions from the body.
+      req.body.body = await svc.normalizePlainAgentMentions(issue.companyId, req.body.body);
       if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
         await auditAgentIssueCommentAttributionSpoof({
           db,

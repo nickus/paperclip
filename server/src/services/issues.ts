@@ -100,6 +100,7 @@ import {
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
   isUuidLike,
+  linkPlainAgentMentions,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
@@ -13465,6 +13466,30 @@ export function issueService(db: Db) {
       return explicitAgentMentionIds.filter((agentId) =>
         companyAgentIds.has(agentId),
       );
+    },
+
+    // Rewrites plain-text "@Agent Name" mentions into the structured `[@Name](agent://id)`
+    // link that findMentionedAgents (above) and the UI's mention chip both understand, so a
+    // comment body, once persisted, agrees with the wake it triggers. Agents that can never
+    // run again (terminated) are not offered as mention targets. Loading the company's
+    // agents is the only way this can fail (a bad network blip, a down replica, ...), and a
+    // failed normalization must never fail the comment write itself, so any error here is
+    // logged and swallowed, returning the body unchanged.
+    normalizePlainAgentMentions: async (companyId: string, body: string) => {
+      if (!body) return body;
+      try {
+        const rows = await db
+          .select({ id: agents.id, name: agents.name })
+          .from(agents)
+          .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
+        return linkPlainAgentMentions(body, rows).markdown;
+      } catch (err) {
+        logger.warn(
+          { err, companyId },
+          "failed to load agents for plain @-mention normalization; storing comment body unchanged",
+        );
+        return body;
+      }
     },
 
     findMentionedProjectIds: async (

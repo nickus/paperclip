@@ -254,6 +254,262 @@ export function extractAgentMentionIds(markdown: string): string[] {
   return [...ids];
 }
 
+export interface LinkablePlainMentionAgent {
+  id: string;
+  name: string;
+}
+
+export interface LinkPlainAgentMentionsResult {
+  markdown: string;
+  linkedAgentIds: string[];
+}
+
+// Matches a run of `` ` `` or `~` characters (3+) opening a fenced code block,
+// optionally indented up to 3 spaces, same as CommonMark.
+const FENCE_OPEN_RE = /^[ \t]{0,3}(`{3,}|~{3,})/;
+const HTML_COMMENT_RE = /<!--[\s\S]*?-->/g;
+// `[text](url)` and `![alt](url)` — also matches an already-structured mention link,
+// so its text and href are both left alone.
+const MARKDOWN_LINK_OR_IMAGE_RE = /!?\[[^\]\n]*\]\([^)\n]*\)/g;
+const AUTOLINK_RE = /<[^<>\s]+>/g;
+const BLOCKQUOTE_LINE_RE = /^[ \t]{0,3}>.*$/gm;
+// Preceding/following characters that disqualify a bare "@Name" from being a plain mention:
+// anything that could make it part of an email, URL, path, word or markdown link text.
+const MENTION_PRECEDING_BOUNDARY = "(?<![A-Za-z0-9_./@[`-])";
+const MENTION_FOLLOWING_BOUNDARY = "(?![A-Za-z0-9_-])";
+
+function maskSpan(text: string, start: number, end: number): string {
+  // Replaces everything in [start, end) with a neutral placeholder, except newlines, so
+  // later passes can't match constructs that straddle an already-protected span while
+  // every character offset stays identical to the original string.
+  let out = text.slice(0, start);
+  for (let i = start; i < end; i++) {
+    out += text[i] === "\n" ? "\n" : "\u0000";
+  }
+  return out + text.slice(end);
+}
+
+// Finds fenced code blocks (``` or ~~~, either fence style) as [start, end) ranges. An
+// unterminated fence swallows the rest of the document, which is the safe choice: content
+// we can no longer parse the structure of should not be scanned for mentions either.
+function findFencedCodeRanges(text: string): Array<[number, number]> {
+  const lines = text.split("\n");
+  const lineStarts: number[] = [0];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\n") lineStarts.push(i + 1);
+  }
+
+  const ranges: Array<[number, number]> = [];
+  let i = 0;
+  while (i < lines.length) {
+    const open = FENCE_OPEN_RE.exec(lines[i]);
+    if (!open) {
+      i++;
+      continue;
+    }
+    const fenceChar = open[1][0] === "`" ? "`" : "~";
+    const fenceLen = open[1].length;
+    const closeRe = new RegExp(`^[ \\t]{0,3}${fenceChar}{${fenceLen},}[ \\t]*$`);
+    let closeLine = -1;
+    for (let j = i + 1; j < lines.length; j++) {
+      if (closeRe.test(lines[j])) {
+        closeLine = j;
+        break;
+      }
+    }
+    if (closeLine === -1) {
+      ranges.push([lineStarts[i], text.length]);
+      break;
+    }
+    ranges.push([lineStarts[i], lineStarts[closeLine] + lines[closeLine].length]);
+    i = closeLine + 1;
+  }
+  return ranges;
+}
+
+// Finds backtick-delimited inline code spans of any run length (`` `x` ``, ```` ``x`` ````,
+// ...) as [start, end) ranges, with a hand-rolled scan rather than a backreference regex.
+// A backreference-based pattern (`` /(`+)(?:(?!\1)[\s\S])*?\1/g `` ) re-scans from scratch,
+// and backtracks the opening run length, for every backtick run that never finds a same-
+// length closer later in the text; a comment body with many distinct, never-closing run
+// lengths (e.g. runs of length 1, 2, 3, ... with no duplicate) drove that pattern well past
+// quadratic — seconds on a ~300KB input, timing out past that. This scan instead walks the
+// text once; for an opening run it scans forward only until the first run of the SAME length
+// (a genuine closer) or gives up at end of text, and either way resumes right after what it
+// just scanned, so no suffix of the text is ever rescanned from an earlier start.
+function findInlineCodeSpanRanges(text: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    if (text[i] !== "`") {
+      i++;
+      continue;
+    }
+    const openStart = i;
+    let openEnd = i;
+    while (openEnd < n && text[openEnd] === "`") openEnd++;
+    const runLen = openEnd - openStart;
+
+    let j = openEnd;
+    let closeEnd = -1;
+    while (j < n) {
+      if (text[j] !== "`") {
+        j++;
+        continue;
+      }
+      const runStart2 = j;
+      let runEnd2 = j;
+      while (runEnd2 < n && text[runEnd2] === "`") runEnd2++;
+      if (runEnd2 - runStart2 === runLen) {
+        closeEnd = runEnd2;
+        break;
+      }
+      j = runEnd2;
+    }
+
+    if (closeEnd === -1) {
+      // No same-length run anywhere later: this run can't open a span. Resume right after
+      // it — never re-examine the text we already scanned looking for a closer.
+      i = openEnd;
+      continue;
+    }
+    ranges.push([openStart, closeEnd]);
+    i = closeEnd;
+  }
+  return ranges;
+}
+
+// Collects every span of `markdown` that a plain-text mention must never be read from or
+// written into: fenced/inline code, HTML comments, markdown link and image syntax (which
+// also covers an already-structured mention link), autolinks, and quoted lines. Ranges are
+// found in sequence, masking each newly found span before looking for the next construct,
+// so one category's delimiters can't be "seen" through another (e.g. a stray backtick
+// inside an HTML comment can't start a bogus code span that leaks outside the comment).
+function findProtectedRanges(markdown: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  let masked = markdown;
+
+  const collect = (found: Array<[number, number]>) => {
+    for (const [start, end] of found) {
+      ranges.push([start, end]);
+      masked = maskSpan(masked, start, end);
+    }
+  };
+
+  collect(findFencedCodeRanges(masked));
+  collect([...masked.matchAll(HTML_COMMENT_RE)].map((m) => [m.index, m.index + m[0].length]));
+  collect(findInlineCodeSpanRanges(masked));
+  collect([...masked.matchAll(MARKDOWN_LINK_OR_IMAGE_RE)].map((m) => [m.index, m.index + m[0].length]));
+  collect([...masked.matchAll(AUTOLINK_RE)].map((m) => [m.index, m.index + m[0].length]));
+  collect([...masked.matchAll(BLOCKQUOTE_LINE_RE)].map((m) => [m.index, m.index + m[0].length]));
+
+  ranges.sort((a, b) => a[0] - b[0]);
+  const merged: Array<[number, number]> = [];
+  for (const [start, end] of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && start <= last[1]) {
+      last[1] = Math.max(last[1], end);
+    } else {
+      merged.push([start, end]);
+    }
+  }
+  return merged;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Builds a pattern that matches `name` with any run of whitespace standing in for each
+// internal space, so "QA  Engineer" (extra space) or "QA\nEngineer" still counts as a match
+// of the agent named "QA Engineer".
+function agentNamePattern(name: string): string {
+  return name.trim().split(/\s+/).map(escapeRegExp).join("\\s+");
+}
+
+/**
+ * Rewrites plain-text "@Agent Name" mentions in `markdown` into the canonical structured
+ * link (`[@Agent Name](agent://<id>)`) that {@link extractAgentMentionIds} and the UI's
+ * mention chip both already understand, so a machine (or human) author who forgets the
+ * structured form still wakes the right agent.
+ *
+ * Matching rules:
+ * - The "@" must start the text or be preceded by a character that can't be part of an
+ *   email, URL, path, word or existing link text (letters, digits, "_", ".", "-", "/", "@",
+ *   "[" and backtick are disqualifying; whitespace and other punctuation are fine).
+ * - The name must equal an agent's name case-insensitively (internal whitespace runs count
+ *   as one space), and must not be immediately followed by another letter, digit, "_" or
+ *   "-" (so "@QA Engineer:" matches "QA Engineer" but "@QA Engineers" does not).
+ * - When one candidate name is a prefix of another (e.g. "Architect" / "Architect
+ *   Reviewer"), the longest matching name wins.
+ * - A name shared by two or more agents (case-insensitively) is ambiguous and is left as
+ *   plain text.
+ * - Fenced and inline code, HTML comments, existing markdown links/images (including
+ *   already-structured mentions), autolinks, and blockquote lines are never read from or
+ *   rewritten, so quoting an older comment can't re-wake anyone.
+ *
+ * Pure and idempotent: running it again on its own output returns the same string, because
+ * every mention it writes is itself a markdown link and is therefore left untouched the
+ * next time around.
+ */
+export function linkPlainAgentMentions(
+  markdown: string,
+  agents: LinkablePlainMentionAgent[],
+): LinkPlainAgentMentionsResult {
+  if (!markdown || agents.length === 0) return { markdown, linkedAgentIds: [] };
+
+  // Group agents by case-insensitive, whitespace-normalized name. A name shared by two or
+  // more agents is ambiguous and must resolve to none of them, not an arbitrary one.
+  const byNormalizedName = new Map<string, LinkablePlainMentionAgent>();
+  const ambiguousNames = new Set<string>();
+  for (const agent of agents) {
+    const name = agent.name?.trim();
+    if (!name) continue;
+    const key = name.toLowerCase().replace(/\s+/g, " ");
+    if (ambiguousNames.has(key)) continue;
+    if (byNormalizedName.has(key)) {
+      byNormalizedName.delete(key);
+      ambiguousNames.add(key);
+      continue;
+    }
+    byNormalizedName.set(key, { id: agent.id, name });
+  }
+  if (byNormalizedName.size === 0) return { markdown, linkedAgentIds: [] };
+
+  // Longest name first, so a name that is a prefix of another candidate (e.g. "Architect"
+  // vs. "Architect Reviewer") never shadows the longer, more specific match.
+  const candidates = [...byNormalizedName.values()].sort((a, b) => b.name.length - a.name.length);
+  const alternation = candidates.map((agent) => agentNamePattern(agent.name)).join("|");
+  const mentionRe = new RegExp(
+    `${MENTION_PRECEDING_BOUNDARY}@(${alternation})${MENTION_FOLLOWING_BOUNDARY}`,
+    "giu",
+  );
+
+  const protectedRanges = findProtectedRanges(markdown);
+  const overlapsProtectedRange = (start: number, end: number) =>
+    protectedRanges.some(([rangeStart, rangeEnd]) => start < rangeEnd && end > rangeStart);
+
+  const linkedAgentIds = new Set<string>();
+  let result = "";
+  let lastIndex = 0;
+  for (const match of markdown.matchAll(mentionRe)) {
+    const start = match.index;
+    const end = start + match[0].length;
+    if (overlapsProtectedRange(start, end)) continue;
+    const key = match[1].replace(/\s+/g, " ").toLowerCase();
+    const agent = byNormalizedName.get(key);
+    if (!agent) continue;
+    result += markdown.slice(lastIndex, start);
+    result += `[@${agent.name}](${buildAgentMentionHref(agent.id)})`;
+    linkedAgentIds.add(agent.id);
+    lastIndex = end;
+  }
+  result += markdown.slice(lastIndex);
+
+  return { markdown: result, linkedAgentIds: [...linkedAgentIds] };
+}
+
 export function extractUserMentionIds(markdown: string): string[] {
   if (!markdown) return [];
   const ids = new Set<string>();
