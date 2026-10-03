@@ -18,6 +18,8 @@ import {
   AGENT_MEMORY_NEAR_DUPLICATE_SIMILARITY_MIN,
   AGENT_MEMORY_PROJECT_MATCH_WEIGHT,
   AGENT_MEMORY_PURGED_BODY_PLACEHOLDER,
+  AGENT_MEMORY_SWEEP_EXPIRY_BATCH_SIZE,
+  AGENT_MEMORY_SWEEP_MAX_GROUPS_PER_TICK,
   AGENT_MEMORY_UPDATE_SIMILARITY_MIN,
   AGENT_MEMORY_USE_WEIGHT,
   type AgentMemoryActor,
@@ -1136,20 +1138,33 @@ export async function sweepAgentMemory(input: {
   db: Db;
   now?: Date;
   capPerAgent?: number;
+  /** Per-tick bound on rows flipped to "expired" (default AGENT_MEMORY_SWEEP_EXPIRY_BATCH_SIZE). */
+  expiryBatchSize?: number;
+  /** Per-tick bound on over-cap (company, agent) groups evicted from (default AGENT_MEMORY_SWEEP_MAX_GROUPS_PER_TICK). */
+  maxGroupsPerTick?: number;
 }): Promise<{ expired: number; evicted: number }> {
   const now = input.now ?? new Date();
   const capPerAgent = input.capPerAgent ?? AGENT_MEMORY_HARD_CAP_PER_AGENT;
+  const expiryBatchSize = input.expiryBatchSize ?? AGENT_MEMORY_SWEEP_EXPIRY_BATCH_SIZE;
+  const maxGroupsPerTick = input.maxGroupsPerTick ?? AGENT_MEMORY_SWEEP_MAX_GROUPS_PER_TICK;
   const db = input.db;
 
   // 1. Expiry sweep: flip the stored status of read-time-expired live-ish
   // rows so indexes and the cap sweep below can select on status directly.
+  // Bounded per tick (oldest-expired first) -- on a large backlog (e.g. the
+  // sweep interval was down for a while) this tick does a partial pass and
+  // the next tick, an hour later, picks up where this one left off, rather
+  // than one tick doing an unbounded scan-and-row-by-row-transaction pass
+  // over every company's expired rows at once.
   const toExpire = await db
     .select()
     .from(agentMemoryEntries)
     .where(and(
       inArray(agentMemoryEntries.status, AGENT_MEMORY_LIVE_STATUSES.concat("disputed")),
       lt(agentMemoryEntries.expiresAt, now),
-    ));
+    ))
+    .orderBy(sql`${agentMemoryEntries.expiresAt} asc`)
+    .limit(expiryBatchSize);
 
   let expired = 0;
   for (const dbRow of toExpire) {
@@ -1179,7 +1194,10 @@ export async function sweepAgentMemory(input: {
     if (flipped) expired += 1;
   }
 
-  // 2. Hard cap sweep, per (companyId, agentId).
+  // 2. Hard cap sweep, per (companyId, agentId). Bounded per tick to at most
+  // `maxGroupsPerTick` of the *most* over-cap groups -- an agent still over
+  // cap after its share of this tick's work is picked up again next tick,
+  // the same re-entrant way the expiry pass above is.
   const overCapGroups = await db
     .select({
       companyId: agentMemoryEntries.companyId,
@@ -1189,7 +1207,9 @@ export async function sweepAgentMemory(input: {
     .from(agentMemoryEntries)
     .where(and(isNotNull(agentMemoryEntries.agentId), ne(agentMemoryEntries.status, "purged")))
     .groupBy(agentMemoryEntries.companyId, agentMemoryEntries.agentId)
-    .having(sql`count(*) > ${capPerAgent}`);
+    .having(sql`count(*) > ${capPerAgent}`)
+    .orderBy(sql`count(*) desc`)
+    .limit(maxGroupsPerTick);
 
   let evicted = 0;
   for (const group of overCapGroups) {

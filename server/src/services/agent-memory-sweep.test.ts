@@ -183,6 +183,72 @@ describeEmbeddedPostgres("agent memory: expiry, decay and the hard-cap sweep (§
     expect(remaining2Keys.has("unprotected-higher-score")).toBe(true);
   });
 
+  it("34. the expiry pass is bounded per tick: only expiryBatchSize rows flip per call, the rest wait for the next tick", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const past = new Date(Date.now() - DAY_MS);
+    const rows = Array.from({ length: 5 }, (_, i) => rawEntry({
+      companyId, agentId, key: `expired-${i}`, status: "active", expiresAt: past,
+    }));
+    await db.insert(agentMemoryEntries).values(rows);
+
+    const first = await sweepAgentMemory({ db, expiryBatchSize: 2 });
+    expect(first.expired).toBe(2);
+    const afterFirst = await db.select().from(agentMemoryEntries).where(eq(agentMemoryEntries.agentId, agentId));
+    expect(afterFirst.filter((row) => row.status === "expired")).toHaveLength(2);
+    expect(afterFirst.filter((row) => row.status === "active")).toHaveLength(3);
+
+    // The next tick picks up the remainder -- nothing is skipped or lost,
+    // it is only ever spread across ticks.
+    const second = await sweepAgentMemory({ db, expiryBatchSize: 2 });
+    expect(second.expired).toBe(2);
+    const third = await sweepAgentMemory({ db, expiryBatchSize: 2 });
+    expect(third.expired).toBe(1);
+    const final = await db.select().from(agentMemoryEntries).where(eq(agentMemoryEntries.agentId, agentId));
+    expect(final.every((row) => row.status === "expired")).toBe(true);
+  });
+
+  it("35. the cap-eviction pass is bounded per tick: only maxGroupsPerTick over-cap agents are evicted from per call", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const future = new Date(Date.now() + 30 * DAY_MS);
+    // A deliberately high row count and cap (8 rows, cap 6): every earlier
+    // fixture in this describe block tops out at 5 live rows for one agent,
+    // so a cap of 6 can never make an earlier test's leftover data (this
+    // suite shares one db/table across its `it`s) look over-cap here too --
+    // this test's own 3 groups are the only ones `sweepAgentMemory` can
+    // possibly select from, regardless of what ran before it.
+    const capPerAgent = 6;
+    const rowsPerAgent = 8;
+
+    // Three agents, each with their own over-cap pool of terminal rows, so
+    // three distinct (companyId, agentId) groups are over cap at once.
+    const agentIds = await Promise.all(
+      [0, 1, 2].map(async (i) => {
+        const id = randomUUID();
+        await db.insert(agents).values({ id, companyId, name: `Sweep Cap Fixture Agent ${i}`, adapterType: "codex_local", status: "idle" });
+        const rows = Array.from({ length: rowsPerAgent }, (_, j) => rawEntry({
+          companyId, agentId: id, key: `terminal-${i}-${j}`, status: "expired", expiresAt: future,
+        }));
+        await db.insert(agentMemoryEntries).values(rows);
+        return id;
+      }),
+    );
+
+    // Each agent's pool of 8 is over cap 6 by 2 -- but this tick must touch
+    // at most maxGroupsPerTick=2 of the 3 over-cap groups, never all three.
+    const result = await sweepAgentMemory({ db, capPerAgent, maxGroupsPerTick: 2 });
+    expect(result.evicted).toBe(4); // exactly 2 groups x 2 overflow each
+
+    const remainingCounts = await Promise.all(
+      agentIds.map((id) => db.select().from(agentMemoryEntries).where(eq(agentMemoryEntries.agentId, id))),
+    );
+    const untouchedGroups = remainingCounts.filter((rows) => rows.length === rowsPerAgent).length;
+    const touchedGroups = remainingCounts.filter((rows) => rows.length === capPerAgent).length;
+    // Exactly maxGroupsPerTick groups were brought down to cap; the rest
+    // are untouched this tick, left for a later one.
+    expect(touchedGroups).toBe(2);
+    expect(untouchedGroups).toBe(1);
+  });
+
   it("28. confirmation resets expiresAt forward from now(), not from the stale old expiresAt", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     // Simulate an entry whose expiresAt was somehow set far beyond the

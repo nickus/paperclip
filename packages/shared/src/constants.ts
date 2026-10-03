@@ -1778,6 +1778,14 @@ export const AGENT_MEMORY_MIN_CONFIRMATIONS_PROTECTED = 2; // an entry confirmed
 export const AGENT_MEMORY_MAX_WRITES_PER_RUN = 3;
 export const AGENT_MEMORY_MAX_WRITES_PER_AGENT_PER_DAY = 20;
 export const AGENT_MEMORY_SWEEP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+// Per-tick bounds so a large backlog (e.g. after the sweep interval was down
+// for a while) is worked off gradually across ticks instead of one tick
+// doing an unbounded scan/row-by-row pass over every company's data. A tick
+// that hits either bound leaves the remainder for the next tick -- the sweep
+// is naturally re-entrant since both passes only ever touch rows that still
+// match their own selection criteria.
+export const AGENT_MEMORY_SWEEP_EXPIRY_BATCH_SIZE = 500; // rows flipped to "expired" per tick
+export const AGENT_MEMORY_SWEEP_MAX_GROUPS_PER_TICK = 200; // over-cap (company, agent) groups evicted from per tick
 
 // Ranking formula weights (score(e) = κ(kind) + 1.5·ln(1+confirmations) + ρ(e) + κ_use(e) − d/14 − u/30).
 export const AGENT_MEMORY_KIND_WEIGHTS: Readonly<Record<string, number>> = {
