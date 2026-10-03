@@ -46,6 +46,7 @@ import { attentionService } from "../services/attention.js";
 import { listAttentionExhaustedRuns } from "../services/attention-exhausted-runs.js";
 import { agentService } from "../services/agents.js";
 import { ROUTABLE_BLOCKED_ROLLOUT_AT } from "../services/routable-blocked.js";
+import { LEGACY_RECOVERY_CAUSE } from "../services/legacy-execution-recovery.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -976,6 +977,53 @@ describeEmbeddedPostgres("attention service", () => {
     const failures = feed.items.filter((item) => item.sourceKind === "failed_run");
     expect(failures.map((item) => item.subject.id).sort()).toEqual([failedId, timedOutId].sort());
     expect(failures.find((item) => item.subject.id === timedOutId)?.relatedIssue?.id).toBe(taskId);
+  });
+
+  it("surfaces a settled no-replay execution hold as a recovery item with continue/resolve/cancel verbs", async () => {
+    const { companyId, workerId } = await seedCompany("ATN");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATN-1",
+      title: "Held task",
+      status: "blocked",
+      assigneeAgentId: workerId,
+    });
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "active_run_watchdog",
+      status: "resolved",
+      outcome: "blocked",
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+      returnOwnerAgentId: workerId,
+      cause: LEGACY_RECOVERY_CAUSE,
+      fingerprint: "legacy-execution:held-run",
+      evidence: {
+        runId: randomUUID(),
+        automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" },
+      },
+      nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+      resolvedAt: new Date(),
+    });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const item = feed.items.find((row) => row.sourceKind === "recovery_action" && row.subject.id === actionId);
+    expect(item).toBeDefined();
+    expect(item!.subject.metadata).toMatchObject({ effectiveHold: true, cause: LEGACY_RECOVERY_CAUSE });
+    expect(item!.decisionVerbs.map((verb) => verb.id).sort()).toEqual(["cancel", "continue", "resolve"]);
+    expect(item!.relatedIssue?.id).toBe(issueId);
+
+    // A resolved recovery action of a kind/cause that is not an effective
+    // execution hold (no automaticRecovery.replay = "blocked") stays hidden,
+    // exactly as it did before: only the open-status branch or an effective
+    // hold ever surfaces here.
+    await db.update(issueRecoveryActions).set({ cause: "missing_disposition", fingerprint: "other" }).where(eq(issueRecoveryActions.id, actionId));
+    const afterChange = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(afterChange.items.some((row) => row.subject.id === actionId)).toBe(false);
   });
 
   it("suppresses failed-run attention after a newer run for the same issue", async () => {

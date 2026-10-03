@@ -48,6 +48,7 @@ import {
 import { releaseHeldExecutionWaits, type PromoteDeferredWakesAfterHold } from "./execution-wait-release.js";
 import { withWakeBudget, type ExecutionHoldWakeBudget } from "./execution-hold-wake-budget.js";
 import { issueService } from "./issues.js";
+import { getExecutionBlocker } from "./execution-blocker.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -592,8 +593,25 @@ export function isResumeReconcilableBlocker(
  */
 export async function reconcileExecutionHoldForResume(
   db: Db,
-  input: { companyId: string; issueId: string; recoveryActionId: string; actorId: string },
+  input: {
+    companyId: string;
+    issueId: string;
+    recoveryActionId: string;
+    actorId: string;
+    /**
+     * Who actually confirmed the continuation, for an accurate audit trail.
+     * Defaults to the original caller, the tree-control resume flow, where a
+     * board operator is shown `RESUME_RECONCILIATION_CONFIRMATION` and must
+     * confirm it before this runs. `explicit_intent` is a different caller
+     * (`releaseExecutionHoldForExplicitIntent`): there a board/user comment or
+     * status change is itself the continuation decision, and no such dialog is
+     * ever shown, so the recorded evidence and activity must say so, not claim
+     * a resume confirmation that never happened.
+     */
+    source?: "tree_resume" | "explicit_intent";
+  },
 ) {
+  const source = input.source ?? "tree_resume";
   const stale = () =>
     conflict("This task's recovery changed while it was being resumed. Refresh the task and try again.");
   return db.transaction(async (tx) => {
@@ -647,7 +665,10 @@ export async function reconcileExecutionHoldForResume(
       runId: run.id,
       providerStopped: true,
       actionOutcome: "mixed",
-      outcomeEvidence: `Confirmed by a board operator while resuming the task: ${RESUME_RECONCILIATION_CONFIRMATION}`,
+      outcomeEvidence:
+        source === "tree_resume"
+          ? `Confirmed by a board operator while resuming the task: ${RESUME_RECONCILIATION_CONFIRMATION}`
+          : `A board/user explicitly continued this task (a comment or a status change) while this hold was active: ${RESUME_RECONCILIATION_CONFIRMATION}`,
     };
     await validateExecutionReconciliation({
       db: tx as unknown as Db,
@@ -660,7 +681,9 @@ export async function reconcileExecutionHoldForResume(
     await markExecutionReconciliation(tx as unknown as Db, action, decision, input.actorId);
     const now = new Date();
     const note =
-      "Reconciled by a board operator while resuming the task. Recorded work stands; the task continues in a new run.";
+      source === "tree_resume"
+        ? "Reconciled by a board operator while resuming the task. Recorded work stands; the task continues in a new run."
+        : "Reconciled because a board/user explicitly continued this task. Recorded work stands; the task continues in a new run.";
     await tx
       .update(issueRecoveryActions)
       .set({
@@ -685,7 +708,7 @@ export async function reconcileExecutionHoldForResume(
         identifier: task.identifier,
         recoveryActionId: action.id,
         outcome: "restored",
-        source: "tree_resume",
+        source,
         sourceRunId: run.id,
         actionOutcome: decision.actionOutcome,
         resolutionNote: note,
@@ -697,6 +720,48 @@ export async function reconcileExecutionHoldForResume(
       .where(eq(heartbeatRuns.id, run.id));
     return { recoveryActionId: action.id, runId: run.id };
   });
+}
+
+/**
+ * A board/user signal that is itself an explicit decision to continue a task
+ * ends a no-replay hold the same way a board operator's confirmed "Resume
+ * work" does: a reopening comment, a comment that @-mentions the assignee, or
+ * a status PATCH back to todo/in_progress all say, in as many words, "keep
+ * going" about a task whose hold the person issuing them may not even know
+ * exists. There is nothing left to confirm (unlike the resume flow, which
+ * warns before acting), so this reconciles immediately through the exact same
+ * machinery (`getExecutionBlocker`, `isResumeReconcilableBlocker`,
+ * `reconcileExecutionHoldForResume`) instead of a parallel path.
+ *
+ * Best-effort: a hold that is not resume-reconcilable (wrong cause, or an
+ * owner-active/workspace-unsafe blocker with no recorded action) or a
+ * reconciliation the stale/owner checks refuse leaves the existing
+ * disposition in place and the wake parks as usual; only an agent-authored
+ * signal is excluded by the caller, never here.
+ */
+export async function releaseExecutionHoldForExplicitIntent(
+  db: Db,
+  input: { companyId: string; issueId: string; actorId: string },
+): Promise<boolean> {
+  const blocker = await getExecutionBlocker(db, input.companyId, input.issueId);
+  if (!isResumeReconcilableBlocker(blocker)) return false;
+  try {
+    await reconcileExecutionHoldForResume(db, {
+      companyId: input.companyId,
+      issueId: input.issueId,
+      recoveryActionId: blocker.recoveryActionId,
+      actorId: input.actorId,
+      source: "explicit_intent",
+    });
+    return true;
+  } catch (err) {
+    if (!(err instanceof HttpError)) throw err;
+    logger.info(
+      { err, issueId: input.issueId, recoveryActionId: blocker.recoveryActionId },
+      "Explicit board/user continuation could not reconcile the execution hold; it keeps its disposition",
+    );
+    return false;
+  }
 }
 
 /**
@@ -889,9 +954,20 @@ export async function settleUnrecoverableExecutions(
           !["done", "cancelled"].includes(task.status) &&
           (!task.executionRunId || task.executionRunId === run.id) &&
           (!task.checkoutRunId || task.checkoutRunId === run.id);
-        // Pausing an agent is not a decision to stop its task. A verified
-        // pause stop of the task owner's own conversation turn continues when
-        // the agent is resumed; every other stop keeps the disposition below.
+        // Pausing an agent is not a decision to stop its task, for any
+        // adapter: that is why a verified pause stop is never left as a
+        // *silent* hold (see `getExecutionBlocker`, the attention feed, and
+        // `releaseExecutionHoldForExplicitIntent` below, which end such a
+        // hold the moment a human says to continue). Automatic, unattended
+        // continuation right here, though, stays scoped to a conversation
+        // adapter's own turn: that turn reviews the recorded comments and
+        // documents and decides what remains, so nothing already done is
+        // repeated. An adapter that instead replays a configured command or
+        // webhook on every invocation (see `CONVERSATION_ADAPTER_TYPES`'
+        // module comment) has no such review step, and Paperclip cannot know
+        // whether the run already performed its action before the pause —
+        // continuing it unattended could repeat that action. Such a run keeps
+        // the disposition below until a human explicitly says to continue it.
         if (
           current &&
           action.cause === LEGACY_RECOVERY_CAUSE &&

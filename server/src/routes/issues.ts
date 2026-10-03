@@ -8,6 +8,7 @@ import { extractIssueReferenceIdentifiers, requiresExecutionReconciliation } fro
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
+  releaseExecutionHoldForExplicitIntent,
 } from "../services/execution-recovery-resolution.js";
 import { releaseHeldExecutionWaits } from "../services/execution-wait-release.js";
 import {
@@ -9570,9 +9571,33 @@ export function issueRoutes(
       trigger: "read_projection",
       actor: getActorInfo(req),
     });
+    // `active` only ever holds an open (active/escalated) action. A settled
+    // no-replay disposition still gates execution (the same effective-hold
+    // test `getExecutionBlocker` applies elsewhere), but is otherwise
+    // invisible here: nothing surfaced it before, so an operator could never
+    // find the hidden hold to resolve it. Project it alongside `active`
+    // under its own field instead of overloading `active`'s open-action
+    // meaning.
+    let effectiveHold: ReturnType<typeof issueRecoveryActionReadModel> | null = null;
+    if (!active) {
+      const blocked = await getExecutionBlocker(db, issue.companyId, issue.id);
+      if (blocked?.recoveryActionId) {
+        const [row] = await db
+          .select()
+          .from(issueRecoveryActions)
+          .where(
+            and(
+              eq(issueRecoveryActions.companyId, issue.companyId),
+              eq(issueRecoveryActions.id, blocked.recoveryActionId),
+            ),
+          );
+        if (row) effectiveHold = issueRecoveryActionReadModel(row);
+      }
+    }
     res.json({
       active,
-      actions: active ? [active] : [],
+      actions: active ? [active] : effectiveHold ? [effectiveHold] : [],
+      effectiveHold,
     });
   });
 
@@ -9713,10 +9738,16 @@ export function issueRoutes(
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
               assertBoard(req);
+              // A parked issue (backlog) reconciles without being un-parked:
+              // sourceIssueStatus may repeat its current backlog status, but
+              // may not use this evidence API to move it there from
+              // anywhere else.
+              const staysParkedInBacklog =
+                sourceIssueStatus === "backlog" && lockedIssue.status === "backlog";
               if (
                 activeRecoveryAction ||
-                sourceIssueStatus !== "todo" ||
-                outcome !== "restored"
+                outcome !== "restored" ||
+                (sourceIssueStatus !== "todo" && !staysParkedInBacklog)
               ) {
                 throw conflict(
                   "Verified outcomes must restore this source recovery without replacing another active recovery action.",
@@ -9817,8 +9848,13 @@ export function issueRoutes(
           }
         }
 
+        // A parked issue (backlog) reconciles without being un-parked: see
+        // the matching allowance above, where a settled hold is reopened.
+        const reconciliationTargetsCurrentStatus =
+          sourceIssueStatus === "todo" ||
+          (sourceIssueStatus === "backlog" && lockedIssue.status === "backlog");
         if (
-          sourceIssueStatus === "todo" &&
+          reconciliationTargetsCurrentStatus &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
           assertBoard(req);
@@ -15691,8 +15727,60 @@ export function issueRoutes(
         }
       })();
 
+      // A board/user comment that reopens the issue or @-mentions its
+      // assignee, or a board/user PATCH that moves it back to todo or
+      // in_progress, is itself an explicit decision to continue the task —
+      // the same decision the resume flow asks an operator to confirm. Spend
+      // it now, before the wakeup dispatch above (still in flight; it is
+      // fire-and-forget) would otherwise park behind a hold its caller never
+      // sees. Agent-authored updates never trigger this: only a human's own
+      // action ends a hold this way.
+      let executionHoldReleased = false;
+      if (actor.actorType !== "agent") {
+        const mentionsAssignee =
+          Boolean(commentBody) &&
+          Boolean(comment) &&
+          Boolean(issue.assigneeAgentId) &&
+          (await svc
+            .findMentionedAgents(issue.companyId, commentBody as string)
+            .then((ids) => ids.includes(issue.assigneeAgentId!))
+            .catch((err) => {
+              logger.warn({ err, issueId: issue.id }, "failed to resolve @-mentions for execution hold release");
+              return false;
+            }));
+        const movedToActiveWork =
+          existing.status !== issue.status &&
+          (issue.status === "todo" || issue.status === "in_progress");
+        if (reopened === true || mentionsAssignee || movedToActiveWork) {
+          try {
+            executionHoldReleased = await releaseExecutionHoldForExplicitIntent(db, {
+              companyId: issue.companyId,
+              issueId: issue.id,
+              actorId: actor.actorId,
+            });
+          } catch (err) {
+            // Best-effort: this update already committed. A hold release
+            // failure must not turn its own response into an error; the
+            // hold stays and the periodic sweep or a later explicit signal
+            // retries it.
+            logger.warn({ err, issueId: issue.id }, "failed to release an execution hold for an explicit continuation");
+          }
+        }
+      }
+      // Tell a comment's own caller that their comment is saved but queued
+      // behind a hold, rather than leaving them to discover it only when the
+      // assignee never answers. Checked after any release just above, so a
+      // hold this same request just ended is reported as gone.
+      const executionHold =
+        comment && !executionHoldReleased
+          ? await getExecutionBlocker(db, issue.companyId, issue.id)
+          : null;
+
       await queueTaskWatchdogEvaluation(issue, actor.runId);
       const changes = issueResponse.changes ?? {};
+      const executionHoldField = executionHold
+        ? { recoveryActionId: executionHold.recoveryActionId, nextAction: executionHold.nextAction }
+        : null;
       if (prefersMinimalIssueUpdateResponse(req)) {
         res.setHeader("Preference-Applied", "return=minimal");
         res.json({
@@ -15701,10 +15789,16 @@ export function issueRoutes(
           updatedAt: issueResponse.updatedAt,
           changes,
           comment,
+          ...(comment ? { executionHold: executionHoldField } : {}),
         });
         return;
       }
-      res.json({ ...issueResponse, changes, comment });
+      res.json({
+        ...issueResponse,
+        changes,
+        comment,
+        ...(comment ? { executionHold: executionHoldField } : {}),
+      });
     },
   );
 
@@ -18835,6 +18929,51 @@ export function issueRoutes(
           currentIssue.status === "todo",
       });
 
+      let mentionedIds: string[] = [];
+      try {
+        mentionedIds = await svc.findMentionedAgents(
+          issue.companyId,
+          req.body.body,
+        );
+      } catch (err) {
+        logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
+      }
+
+      // A board/user comment that reopens the issue or @-mentions its
+      // assignee is itself an explicit decision to continue a no-replay
+      // execution hold - the same decision the PATCH /issues/:id handler
+      // spends for its own comment-carrying updates. Spent synchronously,
+      // before the queued wake dispatch below, so the response accurately
+      // reports whether the hold is now gone. Agent-authored comments never
+      // trigger it.
+      let executionHoldReleased = false;
+      if (actor.actorType !== "agent") {
+        const mentionsAssignee =
+          Boolean(currentIssue.assigneeAgentId) &&
+          mentionedIds.includes(currentIssue.assigneeAgentId!);
+        if (reopened || mentionsAssignee) {
+          try {
+            executionHoldReleased = await releaseExecutionHoldForExplicitIntent(db, {
+              companyId: currentIssue.companyId,
+              issueId: currentIssue.id,
+              actorId: actor.actorId,
+            });
+          } catch (err) {
+            logger.warn(
+              { err, issueId: currentIssue.id },
+              "failed to release an execution hold for an explicit continuation",
+            );
+          }
+        }
+      }
+      // Tell this comment's own caller that it is saved but queued behind a
+      // hold, rather than leaving them to discover that only when the
+      // assignee never answers. Checked after any release just above, so a
+      // hold this same request just ended is reported as gone.
+      const executionHold = !executionHoldReleased
+        ? await getExecutionBlocker(db, currentIssue.companyId, currentIssue.id)
+        : null;
+
       // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
       void (async () => {
         type WakeupRequest = NonNullable<
@@ -19027,16 +19166,6 @@ export function issueRoutes(
           }
         }
 
-        let mentionedIds: string[] = [];
-        try {
-          mentionedIds = await svc.findMentionedAgents(
-            issue.companyId,
-            req.body.body,
-          );
-        } catch (err) {
-          logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
-        }
-
         for (const mentionedId of mentionedIds) {
           if (
             (actorIsAgent && actor.actorId === mentionedId) ||
@@ -19204,7 +19333,12 @@ export function issueRoutes(
       })();
 
       await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
-      res.status(201).json(comment);
+      res.status(201).json({
+        ...comment,
+        executionHold: executionHold
+          ? { recoveryActionId: executionHold.recoveryActionId, nextAction: executionHold.nextAction }
+          : null,
+      });
     },
   );
 

@@ -109,7 +109,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
     await tempDb?.cleanup();
   }, 30_000);
 
-  async function seedCompany() {
+  async function seedCompany(options: { adapterType?: string } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -126,7 +126,7 @@ describeEmbeddedPostgres("execution recovery holds", () => {
       name: "Builder",
       role: "engineer",
       status: "idle",
-      adapterType: "codex_local",
+      adapterType: options.adapterType ?? "codex_local",
       adapterConfig: {},
       runtimeConfig: {},
       permissions: {},
@@ -304,6 +304,34 @@ describeEmbeddedPostgres("execution recovery holds", () => {
         idempotencyKey: `execution-reconciliation:${action!.id}`,
         payload: { issueId, recoveryActionId: action!.id },
       }));
+    });
+
+    it("continues a pause-stopped non-conversation adapter's run too, when it never reached the adapter", async () => {
+      // Pausing an agent is not a decision to stop its task, for any
+      // adapter. A conversation adapter's own turn reviews recorded work and
+      // decides what remains (see `continueAfterAgentPause`); a plain
+      // command/webhook adapter has no such review step, but a pause-stopped
+      // run that provably never reached it recorded no action at all, so the
+      // generic inert-run policy (adapter-agnostic) continues it the same
+      // way, with no hold left over.
+      const { companyId, agentId, issueId } = await seedCompany({ adapterType: "process" });
+      const run = await seedStoppedRun({ companyId, agentId, issueId });
+      expect(run.runtimeMode).toBe("legacy");
+      expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+
+      // The regular disposition leaves a possibly-inert run alone during the window.
+      await settleUnrecoverableExecutions(db, new Date());
+      expect((await legacyActions(issueId))[0]).toMatchObject({ status: "active" });
+
+      expect(await reconcileInertLegacyExecutions(db, new Date())).toMatchObject({ reconciled: 1 });
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+      const [reconciled] = await legacyActions(issueId);
+      expect(reconciled).toMatchObject({ status: "resolved", outcome: "restored" });
+
+      const wake = vi.fn(async () => ({ id: randomUUID() }) as never);
+      await deliverReconciledExecutions(db, wake);
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect(wake).toHaveBeenCalledWith(agentId, expect.anything());
     });
 
     it("passes the regular continuation admission with an automatic decision", async () => {
