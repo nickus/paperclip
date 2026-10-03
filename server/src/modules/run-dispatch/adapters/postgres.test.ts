@@ -10,9 +10,11 @@ import {
   documents,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueDocuments,
   issueRelations,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueTreeHolds,
   issues,
 } from "@paperclipai/db";
@@ -189,6 +191,43 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       documentId,
       key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
     });
+  }
+
+  async function seedInteraction(input: {
+    companyId: string;
+    issueId: string;
+    addresseeAgentId: string;
+    status?: string;
+  }) {
+    const id = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id,
+      companyId: input.companyId,
+      issueId: input.issueId,
+      kind: "request_confirmation",
+      status: input.status ?? "pending",
+      addresseeAgentId: input.addresseeAgentId,
+      payload: { version: 1, prompt: "Can you take a look at this before I continue?" },
+    });
+    return id;
+  }
+
+  async function seedMentionComment(input: {
+    companyId: string;
+    issueId: string;
+    mentionedAgentId: string;
+    authorUserId?: string;
+  }) {
+    const id = randomUUID();
+    await db.insert(issueComments).values({
+      id,
+      companyId: input.companyId,
+      issueId: input.issueId,
+      authorType: "user",
+      authorUserId: input.authorUserId ?? "author-user",
+      body: `[MentionedAgent](agent://${input.mentionedAgentId}) can you help with this?`,
+    });
+    return id;
   }
 
   it.each(["executionRunId", "checkoutRunId"] as const)("suppresses delayed native replacement after another run acquires %s", async (lock) => {
@@ -667,6 +706,172 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       },
       15_000,
     );
+
+    it("lets a pending interaction's addressee run even though someone else is the issue's assignee", async () => {
+      const { companyId, agentId: assigneeId } = await seedCompanyAndAgent();
+      const addresseeId = randomUUID();
+      await seedAgent({ id: addresseeId, companyId, name: "Addressee" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: assigneeId });
+      const interactionId = await seedInteraction({ companyId, issueId, addresseeAgentId: addresseeId });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const runId = await seedRun({
+        companyId,
+        agentId: addresseeId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "interaction_pending",
+          addressedInteractionId: interactionId,
+          addresseeAgentId: addresseeId,
+        },
+      });
+      const result = await adapter.cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+
+      expect(result).toMatchObject({ outcome: "not_stale" });
+    });
+
+    it("cancels an addressee wake once its interaction is no longer pending", async () => {
+      const { companyId, agentId: assigneeId } = await seedCompanyAndAgent();
+      const addresseeId = randomUUID();
+      await seedAgent({ id: addresseeId, companyId, name: "Addressee" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: assigneeId });
+      const interactionId = await seedInteraction({
+        companyId,
+        issueId,
+        addresseeAgentId: addresseeId,
+        status: "answered",
+      });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const runId = await seedRun({
+        companyId,
+        agentId: addresseeId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "interaction_pending",
+          addressedInteractionId: interactionId,
+          addresseeAgentId: addresseeId,
+        },
+      });
+      const result = await adapter.cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+    });
+
+    it("cancels an addressee wake whose marker names a different agent than the interaction is actually addressed to", async () => {
+      const { companyId, agentId: assigneeId } = await seedCompanyAndAgent();
+      const addresseeId = randomUUID();
+      const impostorId = randomUUID();
+      await seedAgent({ id: addresseeId, companyId, name: "Addressee" });
+      await seedAgent({ id: impostorId, companyId, name: "Impostor" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: assigneeId });
+      const interactionId = await seedInteraction({ companyId, issueId, addresseeAgentId: addresseeId });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      // The marker claims the impostor is the addressee, but the interaction
+      // row says otherwise; a stale or forged marker must not bypass ownership.
+      const runId = await seedRun({
+        companyId,
+        agentId: impostorId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "interaction_pending",
+          addressedInteractionId: interactionId,
+          addresseeAgentId: impostorId,
+        },
+      });
+      const result = await adapter.cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+    });
+
+    it("lets a structured @-mention's target run even though someone else is the issue's assignee", async () => {
+      const { companyId, agentId: assigneeId } = await seedCompanyAndAgent();
+      const mentionedId = randomUUID();
+      await seedAgent({ id: mentionedId, companyId, name: "Mentioned" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: assigneeId });
+      const commentId = await seedMentionComment({ companyId, issueId, mentionedAgentId: mentionedId });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      // Standing for a wake that was deferred behind the assignee's live run
+      // and then promoted: the promoted context seed keeps the same
+      // wakeReason and marker pair (see `context.test.ts` in the wake-queue
+      // module), so this is exactly what dispatch sees either way.
+      const runId = await seedRun({
+        companyId,
+        agentId: mentionedId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_comment_mentioned",
+          commentId,
+          wakeCommentId: commentId,
+          mentionCommentId: commentId,
+          mentionedAgentId: mentionedId,
+        },
+      });
+      const result = await adapter.cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+
+      expect(result).toMatchObject({ outcome: "not_stale" });
+    });
+
+    it("cancels a comment-mention wake for a non-assignee whose marker is unverified, even though it carries a comment id", async () => {
+      const { companyId, agentId: assigneeId } = await seedCompanyAndAgent();
+      const impostorId = randomUUID();
+      await seedAgent({ id: impostorId, companyId, name: "Impostor" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: assigneeId });
+      // A real comment on the issue, but it never mentions the impostor:
+      // the long-standing unverified comment/mention bypass would have
+      // granted this run ownership on reason + comment id alone, with no
+      // check that the comment actually names this agent. The dedicated
+      // `isMentionedAgentWake` check is the only path that may grant this
+      // bypass for `issue_comment_mentioned`, and it must fail here.
+      const commentId = await seedMentionComment({ companyId, issueId, mentionedAgentId: assigneeId });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const runId = await seedRun({
+        companyId,
+        agentId: impostorId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_comment_mentioned",
+          commentId,
+          wakeCommentId: commentId,
+        },
+      });
+      const result = await adapter.cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+    });
 
     it("maps a review-parking continuation summary into a stale queued-run decision", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();

@@ -1324,7 +1324,12 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           issueId,
           authorAgentId: commentingAgentId,
           createdByRunId: targetAssignee ? null : firstRun?.id ?? null,
-          body: "@Mentioned Agent please review after I finish",
+          // A real @-mention wake is only ever built from a structured
+          // mention link (see `extractAgentMentionIds`), which is what the
+          // dispatch-time `isMentionedAgentWake` check verifies against.
+          body: targetAssignee
+            ? "@Mentioned Agent please review after I finish"
+            : `[Mentioned Agent](agent://${mentionedAgentId}) please review after I finish`,
         })
         .returning()
         .then((rows) => rows[0]);
@@ -1340,6 +1345,10 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           commentId: comment.id,
           wakeCommentId: comment.id,
           wakeReason,
+          // Only a non-assignee mention wake carries the verifiable marker;
+          // the assignee cases above own the issue outright and never need
+          // it (ownership is granted by `issueAssigneeAgentId === runAgentId`).
+          ...(targetAssignee ? {} : { mentionCommentId: comment.id, mentionedAgentId: targetAgentId }),
           ...(explicitResume ? { resumeIntent: true, followUpRequested: true } : {}),
           source: "comment.mention",
         },
@@ -3432,7 +3441,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           companyId,
           issueId,
           authorUserId: "user-1",
-          body: "@Mentioned Agent please inspect this after the current run.",
+          // A real @-mention wake is only ever built from a structured
+          // mention link; dispatch verifies the marker below against it.
+          body: `[Mentioned Agent](agent://${mentionedAgentId}) please inspect this after the current run.`,
         })
         .returning()
         .then((rows) => rows[0]);
@@ -3448,6 +3459,8 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           commentId: mentionComment.id,
           wakeCommentId: mentionComment.id,
           wakeReason: "issue_comment_mentioned",
+          mentionCommentId: mentionComment.id,
+          mentionedAgentId,
           source: "comment.mention",
         },
         requestedByActorType: "user",
@@ -3622,7 +3635,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           companyId,
           issueId,
           authorUserId: "user-1",
-          body: "@Mentioned Agent please inspect this.",
+          // A real @-mention wake is only ever built from a structured
+          // mention link; dispatch verifies the marker below against it.
+          body: `[Mentioned Agent](agent://${mentionedAgentId}) please inspect this.`,
         })
         .returning()
         .then((rows) => rows[0]);
@@ -3638,6 +3653,8 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           commentId: mentionComment.id,
           wakeCommentId: mentionComment.id,
           wakeReason: "issue_comment_mentioned",
+          mentionCommentId: mentionComment.id,
+          mentionedAgentId,
           source: "comment.mention",
         },
         requestedByActorType: "user",

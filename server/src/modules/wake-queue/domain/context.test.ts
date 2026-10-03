@@ -121,4 +121,56 @@ describe("enrichPromotedWakeContext", () => {
     expect(result.contextSnapshot.acceptedPlanWakeRouting).toEqual({ targetAgentId: "agent-1" });
     expect(result.contextSnapshot.workspaceRefreshReason).toBe("accepted_plan_confirmation");
   });
+
+  it("keeps the addressee-interaction marker and original wake reason through promotion", () => {
+    // Deferred while the assignee's run was live, now promoted: the run's
+    // own `reason` column becomes "issue_execution_promoted" (passed in
+    // here), but the deferred context seed's `wakeReason` and the verified
+    // marker pair must survive unchanged so run-dispatch can still tell
+    // this run is legitimately addressed to a non-assignee agent.
+    const contextSnapshot: Record<string, unknown> = {
+      issueId: "issue-1",
+      wakeReason: "interaction_pending",
+      addressedInteractionId: "interaction-1",
+      addresseeAgentId: "agent-2",
+    };
+
+    const result = enrichPromotedWakeContext({
+      contextSnapshot,
+      reason: "issue_execution_promoted",
+      source: "automation",
+      triggerDetail: null,
+      payload: { mutation: "interaction" },
+    });
+
+    expect(result.contextSnapshot.wakeReason).toBe("interaction_pending");
+    expect(result.contextSnapshot.addressedInteractionId).toBe("interaction-1");
+    expect(result.contextSnapshot.addresseeAgentId).toBe("agent-2");
+  });
+
+  it("keeps the mentioned-agent marker and original wake reason through promotion", () => {
+    const contextSnapshot: Record<string, unknown> = {
+      issueId: "issue-1",
+      wakeReason: "issue_comment_mentioned",
+      commentId: "comment-1",
+      wakeCommentId: "comment-1",
+      mentionCommentId: "comment-1",
+      mentionedAgentId: "agent-2",
+    };
+
+    const result = enrichPromotedWakeContext({
+      contextSnapshot,
+      reason: "issue_execution_promoted",
+      source: "automation",
+      triggerDetail: null,
+      payload: {},
+    });
+
+    expect(result.contextSnapshot.wakeReason).toBe("issue_comment_mentioned");
+    expect(result.contextSnapshot.mentionCommentId).toBe("comment-1");
+    expect(result.contextSnapshot.mentionedAgentId).toBe("agent-2");
+    // The canonical comment id this marker is verified against also
+    // survives the derived-projection clear.
+    expect(result.contextSnapshot.commentId).toBe("comment-1");
+  });
 });

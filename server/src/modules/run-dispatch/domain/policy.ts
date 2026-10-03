@@ -154,6 +154,21 @@ export type QueuedRunFacts = {
   isInteractionWake: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
+  /**
+   * A wake addressed to this agent specifically by a still-pending issue
+   * thread interaction, verified against the database at dispatch time (see
+   * the adapter's `isVerifiedAddresseeInteractionWake`). A forged or stale
+   * marker (the interaction already resolved, or addressed to someone
+   * else) never sets this.
+   */
+  isAddresseeInteractionWake: boolean;
+  /**
+   * A wake delivering a structured @-mention to this agent specifically,
+   * verified against the mentioning comment's body at dispatch time (see
+   * the adapter's `isVerifiedMentionedAgentWake`). A forged or stale marker
+   * never sets this.
+   */
+  isMentionedAgentWake: boolean;
 
   resumeIntent: boolean;
   wakeCommentIdPresent: boolean;
@@ -176,6 +191,17 @@ type OwnershipFacts = {
   isInteractionWake?: boolean;
   isCurrentReviewParticipant?: boolean;
   isAuthorizedSourceScopedRecovery?: boolean;
+  /**
+   * A wake addressed to this agent specifically, verified against a still-pending
+   * issue thread interaction row (not merely claimed in the wake's own context).
+   */
+  isAddresseeInteractionWake?: boolean;
+  /**
+   * A wake delivering a structured @-mention to this agent specifically,
+   * verified against the mentioning comment's body (not merely claimed in
+   * the wake's own context).
+   */
+  isMentionedAgentWake?: boolean;
 };
 
 type OwnershipOutcome = "current_owner" | "reassigned";
@@ -191,6 +217,8 @@ function decideIssueOwnership(facts: OwnershipFacts): OwnershipOutcome {
   if (facts.isInteractionWake) return "current_owner";
   if (facts.isCurrentReviewParticipant) return "current_owner";
   if (facts.isAuthorizedSourceScopedRecovery) return "current_owner";
+  if (facts.isAddresseeInteractionWake) return "current_owner";
+  if (facts.isMentionedAgentWake) return "current_owner";
   return "reassigned";
 }
 
@@ -570,12 +598,25 @@ export function decideQueuedRunStaleness(
     runAgentId: facts.runAgentId,
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
-    isInteractionWake: facts.isInteractionWake,
+    // `isInteractionWake` is unverified: it trusts a comment id on the issue
+    // at face value, with no check that the comment actually targets this
+    // agent. For "issue_commented"/"issue_reopened_via_comment" that is an
+    // existing, narrow risk (those reasons only ever wake the assignee, so
+    // this is reachable only through a race, not a forgery that names a
+    // different agent). "issue_comment_mentioned" is different: it is the
+    // one reason in this set that is built to target a specific
+    // non-assignee agent, so an unverified bypass here is exactly the
+    // forgeable marker the ownership check exists to stop. That reason now
+    // has its own DB-verified bypass (`isMentionedAgentWake`), so it must
+    // not also ride this unverified one.
+    isInteractionWake: facts.isInteractionWake && facts.wakeReason !== "issue_comment_mentioned",
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.participantIsAgent &&
       facts.reviewParticipant.participantAgentId === facts.runAgentId,
     isAuthorizedSourceScopedRecovery: facts.isAuthorizedSourceScopedRecovery,
+    isAddresseeInteractionWake: facts.isAddresseeInteractionWake,
+    isMentionedAgentWake: facts.isMentionedAgentWake,
   });
   if (ownership === "reassigned") {
     return {

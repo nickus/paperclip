@@ -14,7 +14,7 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
+import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON, extractAgentMentionIds } from "@paperclipai/shared";
 import { parseObject } from "../../../adapters/utils.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
 import { budgetService } from "../../../services/budgets.js";
@@ -122,6 +122,97 @@ async function readNativeReviewParticipantFacts(db: Db, input: {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+/**
+ * True for a wake that addresses a specific agent through a still-pending
+ * issue thread interaction (e.g. an agent-to-agent `request_confirmation`),
+ * verified against the interaction row rather than trusted from the wake's
+ * own context. The context's `addressedInteractionId`/`addresseeAgentId`
+ * pair is only ever a claim; a reassignment, a resolved interaction, or a
+ * marker addressed to a different agent must not bypass ownership.
+ */
+async function isVerifiedAddresseeInteractionWake(
+  dbOrTx: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    contextSnapshot: Record<string, unknown>;
+  },
+): Promise<boolean> {
+  if (readNonEmptyString(input.contextSnapshot.wakeReason) !== "interaction_pending") {
+    return false;
+  }
+  const interactionId = readNonEmptyString(input.contextSnapshot.addressedInteractionId);
+  const addresseeAgentId = readNonEmptyString(input.contextSnapshot.addresseeAgentId);
+  if (!interactionId || !addresseeAgentId || addresseeAgentId !== input.agentId) return false;
+
+  const interaction = await dbOrTx
+    .select({
+      status: issueThreadInteractions.status,
+      addresseeAgentId: issueThreadInteractions.addresseeAgentId,
+    })
+    .from(issueThreadInteractions)
+    .where(
+      and(
+        eq(issueThreadInteractions.id, interactionId),
+        eq(issueThreadInteractions.companyId, input.companyId),
+        eq(issueThreadInteractions.issueId, input.issueId),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  return Boolean(
+    interaction &&
+      interaction.status === "pending" &&
+      interaction.addresseeAgentId === input.agentId,
+  );
+}
+
+/**
+ * True for a wake that delivers a structured @-mention to a specific agent,
+ * verified against the mentioning comment's body rather than trusted from
+ * the wake's own context. The context's `mentionCommentId`/`mentionedAgentId`
+ * pair is only ever a claim; a deleted comment, a comment that never
+ * mentioned this agent, or a marker naming a different agent must not
+ * bypass ownership.
+ */
+async function isVerifiedMentionedAgentWake(
+  dbOrTx: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    contextSnapshot: Record<string, unknown>;
+  },
+): Promise<boolean> {
+  if (readNonEmptyString(input.contextSnapshot.wakeReason) !== "issue_comment_mentioned") {
+    return false;
+  }
+  const mentionedAgentId = readNonEmptyString(input.contextSnapshot.mentionedAgentId);
+  if (!mentionedAgentId || mentionedAgentId !== input.agentId) return false;
+  const commentId =
+    readNonEmptyString(input.contextSnapshot.mentionCommentId) ??
+    deriveCommentId(input.contextSnapshot);
+  if (!commentId) return false;
+
+  const comment = await dbOrTx
+    .select({ body: issueComments.body, deletedAt: issueComments.deletedAt })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.id, commentId),
+        eq(issueComments.companyId, input.companyId),
+        eq(issueComments.issueId, input.issueId),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (!comment || comment.deletedAt) return false;
+
+  return extractAgentMentionIds(comment.body).includes(input.agentId);
 }
 
 function classifyRetryReasonKind(retryReason: string | null): RetryReasonKind {
@@ -540,10 +631,34 @@ export function createPostgresRunDispatchAdapter(
     );
 
     const wakeCommentId = deriveCommentId(context);
+    // `isInteractionWake` is the long-standing, unverified bypass: any wake
+    // whose context still carries one of these reasons plus a comment id is
+    // trusted at face value, including a wake built outside the issue
+    // routes (e.g. a bare `heartbeat.wakeup()` call) that never set the
+    // newer, DB-verified markers below. `isAddresseeInteractionWake` and
+    // `isMentionedAgentWake` are additional, narrower bypasses for wakes
+    // that do carry a verifiable marker; they never take anything away from
+    // this one.
     const isInteractionWake = allowsIssueInteractionWake(
       context,
       ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
     );
+    const [isAddresseeInteractionWake, isMentionedAgentWake] = issue
+      ? await Promise.all([
+          isVerifiedAddresseeInteractionWake(dbOrTx, {
+            companyId: input.companyId,
+            issueId,
+            agentId: input.agentId,
+            contextSnapshot: context,
+          }),
+          isVerifiedMentionedAgentWake(dbOrTx, {
+            companyId: input.companyId,
+            issueId,
+            agentId: input.agentId,
+            contextSnapshot: context,
+          }),
+        ])
+      : [false, false];
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason =
@@ -618,6 +733,8 @@ export function createPostgresRunDispatchAdapter(
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
       isAuthorizedSourceScopedRecovery,
+      isAddresseeInteractionWake,
+      isMentionedAgentWake,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
       wakeCommentIdPresent: Boolean(wakeCommentId),
