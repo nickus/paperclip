@@ -28,6 +28,7 @@ import {
   projectWorkspaces,
 } from "@paperclipai/db";
 import { deriveProjectUrlKey } from "@paperclipai/shared";
+import { executionBlockerPredicate } from "./execution-blocker.js";
 import type {
   AttentionDecisionVerb,
   AttentionFeed,
@@ -1392,8 +1393,16 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         .from(issueRecoveryActions)
         .where(and(
           eq(issueRecoveryActions.companyId, companyId),
-          inArray(issueRecoveryActions.status, [...OPEN_RECOVERY_STATUSES]),
           inArray(issueRecoveryActions.ownerType, [...HUMAN_RECOVERY_OWNER_TYPES]),
+          // An open recovery action of any kind, plus a resolved execution
+          // hold whose replay is still blocked: `executionBlockerPredicate`
+          // is the same effective-hold test `getExecutionBlocker` uses, so a
+          // settled no-replay disposition that nothing has reconciled yet
+          // surfaces here too, instead of only while it is still active.
+          or(
+            inArray(issueRecoveryActions.status, [...OPEN_RECOVERY_STATUSES]),
+            executionBlockerPredicate(),
+          ),
         ))
         .orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id));
       const [recoveryIssueMap, recoveryImageMap] = await Promise.all([
@@ -1409,6 +1418,11 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         const sourceIssue = recoveryIssueMap.get(recovery.sourceIssueId) ?? null;
         const recoveryIssue = recovery.recoveryIssueId ? recoveryIssueMap.get(recovery.recoveryIssueId) ?? null : null;
         const dedupKey = `recovery:${recovery.kind}:${recovery.sourceIssueId}:${recovery.cause}:${recovery.fingerprint}`;
+        // A row the open-status branch did not select got in through the
+        // execution-hold branch instead: resolved, but still an effective
+        // hold (see `executionBlockerPredicate`). It is settled bookkeeping,
+        // not a pending operator task, so it gets its own verbs and wording.
+        const effectiveHold = !OPEN_RECOVERY_STATUSES.includes(recovery.status as typeof OPEN_RECOVERY_STATUSES[number]);
         add(createItem({
           companyId,
           sourceKind: "recovery_action",
@@ -1427,19 +1441,32 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
               ownerUserId: recovery.ownerUserId,
               sourceIssueId: recovery.sourceIssueId,
               recoveryIssueId: recovery.recoveryIssueId,
+              effectiveHold,
             },
           },
-          whyNow: recovery.status === "escalated"
-            ? "Recovery action escalated to a human owner."
-            : "Recovery action is assigned to a human owner.",
-          decisionVerbs: decisionVerbs(
-            { id: "resolve", label: "Resolve", description: "Record the recovery outcome." },
-            { id: "reassign", label: "Reassign", description: "Move the recovery to another owner." },
-            { id: "cancel", label: "Cancel", description: "Cancel the recovery action." },
-          ),
+          whyNow: effectiveHold
+            ? "Automatic recovery stopped without replaying uncertain work; no agent can run on this task until it is continued or cancelled."
+            : recovery.status === "escalated"
+              ? "Recovery action escalated to a human owner."
+              : "Recovery action is assigned to a human owner.",
+          decisionVerbs: effectiveHold
+            ? decisionVerbs(
+                { id: "continue", label: "Continue", description: "Continue the task without replaying its unverified actions." },
+                { id: "resolve", label: "Resolve", description: "Record the recovery outcome." },
+                { id: "cancel", label: "Cancel", description: "Cancel the recovery action." },
+              )
+            : decisionVerbs(
+                { id: "resolve", label: "Resolve", description: "Record the recovery outcome." },
+                { id: "reassign", label: "Reassign", description: "Move the recovery to another owner." },
+                { id: "cancel", label: "Cancel", description: "Cancel the recovery action." },
+              ),
           inlineResolvable: false,
-          entryRule: "issue_recovery_actions.status in ('active','escalated') and owner_type in ('user','board')",
-          exitRule: "Recovery action resolves, is cancelled, or moves back to an agent/system owner.",
+          entryRule: effectiveHold
+            ? "issue_recovery_actions.status = 'resolved' and evidence->'automaticRecovery'->>'replay' = 'blocked' (executionBlockerPredicate)"
+            : "issue_recovery_actions.status in ('active','escalated') and owner_type in ('user','board')",
+          exitRule: effectiveHold
+            ? "The hold is reconciled (continued), cancelled, or an explicit continuation (comment, mention, or status change) releases it."
+            : "Recovery action resolves, is cancelled, or moves back to an agent/system owner.",
           dedupKey,
           severity: recovery.status === "escalated" ? "high" : "medium",
           activityAt: toIso(recovery.updatedAt),
