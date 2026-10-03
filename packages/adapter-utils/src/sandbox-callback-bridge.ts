@@ -869,12 +869,23 @@ function agentPolicyDenial(
   // The canonicalized (lower-cased, trailing-slash-stripped) path to match a
   // hint against, when it differs from the raw `path` shown in the message.
   hintLookupPath: string = path,
+  // Whether this denial comes from an explicit deny-rule match (secrets,
+  // keys, the agent record, administration, and the rest of
+  // `AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES`/`STEWARD_...`), as opposed to
+  // the request simply matching no allow rule at all. Only the first case is
+  // actually about credentials or administration, so only it gets that
+  // specific wording; a merely-unmatched route gets a generic, truthful one
+  // instead (see the two callers below).
+  deniedByRule: boolean = true,
 ): string {
   const hint = sandboxCallbackBridgeRouteHint(method, hintLookupPath, isSuggestedRouteAllowed);
+  const reason = deniedByRule
+    ? "Secret values, credentials, environment configuration and administration APIs are not reachable " +
+      "from isolated agent runs; retrying this route will not succeed."
+    : "This route is not available to agent runs.";
   return (
-    `Route not allowed (bridge policy "${policy}"): ${method} ${path}. ` +
-    "Secret values, credentials, environment configuration and administration APIs are not reachable " +
-    `from isolated agent runs; retrying this route will not succeed.${hint ? ` Instead, ${hint}.` : ""}`
+    `Route not allowed (bridge policy "${policy}"): ${method} ${path}. ${reason}` +
+    `${hint ? ` Instead, ${hint}.` : ""}`
   );
 }
 
@@ -904,6 +915,17 @@ export interface SandboxCallbackBridgeAuthorizerOptions {
  * runs the same steps with {@link STEWARD_SANDBOX_CALLBACK_BRIDGE_DENY_RULES}
  * and the `agent` allow rules plus
  * {@link STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES}.
+ *
+ * Under `agent` and `steward`, a path that matches neither a deny rule nor an
+ * allow rule gets one more check before the generic denial: if it is missing
+ * the leading "/api" segment and the same request WITH that prefix would be
+ * allowed (checked by recursing into this same function, so deny rules and
+ * the company check still apply), the denial names the missing prefix
+ * instead of claiming the route is unreachable. This only renames an
+ * already-refused request; it never forwards one. The generic denial itself
+ * also only blames "secrets, credentials, environment configuration and
+ * administration" when a deny rule actually matched; a route that is simply
+ * outside the policy's allow families gets a plainer "not available" denial.
  */
 export function authorizeSandboxCallbackBridgeRequestForPolicy(
   request: Pick<SandboxCallbackBridgeRequest, "method" | "path">,
@@ -958,7 +980,26 @@ export function authorizeSandboxCallbackBridgeRequestForPolicy(
   if (steward && agentPolicyRouteMatches(STEWARD_SANDBOX_CALLBACK_BRIDGE_ALLOW_RULES, method, matchPath)) {
     return null;
   }
-  return agentPolicyDenial(policy, method, request.path, isSuggestedRouteAllowed, matchPath);
+  // The request matched no deny rule and no allow rule: it is simply outside
+  // this policy's forwarded surface, not necessarily a credentials or
+  // administration route (that case already returned above). Before falling
+  // back to the generic denial, check the one common shape of caller
+  // mistake this guards against: an in-sandbox client that built its URL
+  // from a base it assumed already ended in "/api", so it sends e.g.
+  // `PATCH /issues/{id}` instead of `PATCH /api/issues/{id}`. Re-running the
+  // full authorizer on the "/api"-prefixed form of the path (not just
+  // testing it against the allow rules) keeps the deny rules and the company
+  // check in force, so a prefix guess that would itself be refused (a
+  // secrets route, another company's route) still falls through to the
+  // normal denial below instead of a misleading "retry with /api" hint.
+  if (request.path !== "/api" && !request.path.startsWith("/api/")) {
+    const prefixedPath = `/api${request.path}`;
+    const prefixedDenial = authorizeSandboxCallbackBridgeRequestForPolicy({ method, path: prefixedPath }, options);
+    if (prefixedDenial === null) {
+      return `Route not allowed: ${method} ${request.path} is missing the /api prefix. Use ${method} ${prefixedPath}.`;
+    }
+  }
+  return agentPolicyDenial(policy, method, request.path, isSuggestedRouteAllowed, matchPath, false);
 }
 
 /** Build a request authorizer bound to one policy and run company. */
