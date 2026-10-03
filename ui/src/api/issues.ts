@@ -279,7 +279,9 @@ export const issuesApi = {
       executionReconciliation?: ExecutionReconciliation;
       actionId?: string;
       outcome: "restored" | "false_positive" | "blocked" | "cancelled";
-      sourceIssueStatus: "todo" | "done" | "in_review" | "blocked";
+      // "backlog" reconciles a parked issue without un-parking it; the
+      // server only accepts it when the issue is already in backlog.
+      sourceIssueStatus: "todo" | "done" | "in_review" | "blocked" | "backlog";
       resolutionNote?: string | null;
     },
   ) =>
