@@ -1761,6 +1761,41 @@ export {
 } from "./types/feedback.js";
 
 export {
+  AGENT_MEMORY_SCOPES,
+  AGENT_MEMORY_KINDS,
+  AGENT_MEMORY_STATUSES,
+  AGENT_MEMORY_LIVE_STATUSES,
+  AGENT_MEMORY_DEFAULT_VISIBLE_STATUSES,
+  AGENT_MEMORY_AUDIT_ACTIONS,
+  AGENT_MEMORY_ACTOR_TYPES,
+  AGENT_MEMORY_PURGED_BODY_PLACEHOLDER,
+  type AgentMemoryScope,
+  type AgentMemoryKind,
+  type AgentMemoryStatus,
+  type AgentMemoryAuditAction,
+  type AgentMemoryActorType,
+  type AgentMemoryActor,
+  type AgentMemoryWriteDecision,
+  type AgentMemoryEntryRow,
+  type AgentMemoryAuditRow,
+  type AgentMemoryWriteResult,
+} from "./types/agent-memory.js";
+export {
+  AGENT_MEMORY_KEY_REGEX,
+  agentMemoryKindSchema,
+  agentMemoryWriteInputSchema,
+  agentMemoryConfirmInputSchema,
+  agentMemoryDisputeInputSchema,
+  agentMemoryTombstoneInputSchema,
+  agentMemoryHardPurgeInputSchema,
+  type AgentMemoryWriteInput,
+  type AgentMemoryConfirmInput,
+  type AgentMemoryDisputeInput,
+  type AgentMemoryTombstoneInput,
+  type AgentMemoryHardPurgeInput,
+} from "./validators/agent-memory.js";
+
+export {
   DAILY_RETENTION_PRESETS,
   WEEKLY_RETENTION_PRESETS,
   MONTHLY_RETENTION_PRESETS,
