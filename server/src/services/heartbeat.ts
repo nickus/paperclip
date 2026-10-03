@@ -67,12 +67,20 @@ import {
   isRunBriefSiblingsEnabled,
   loadRunBrief,
   loadTeamOnlyRunBrief,
+  resolveAgentMemoryEffectiveMode,
+  resolveAgentMemoryInstanceMode,
   resolveRunBriefAuthority,
   resolveRunBriefSessionReason,
   runBriefTimeout,
   runBriefWorkspaceState,
   withRunBriefEnvironment,
 } from "./run-brief.js";
+import { captureRememberLinesForRun } from "./agent-memory-capture.js";
+import { resolveAgentMemoryWriteSourceTrust } from "./agent-memory.js";
+import {
+  PAPERCLIP_RUN_BRIEF_MEMORY_MAX_CHARS,
+  renderMemory,
+} from "@paperclipai/adapter-utils/wake-run-brief";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
@@ -8471,6 +8479,8 @@ export async function buildPaperclipWakePayload(input: {
   // Experimental: agents write user-interaction content in ASD-STE100
   // Simplified Technical English (rendered as a prompt directive downstream).
   simplifiedEnglishInteractions?: boolean;
+  /** `agents.runtimeConfig.agentMemory.mode`, for the Run Brief Memory section (§10). */
+  agentMemoryRuntimeConfigMode?: unknown;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
@@ -8496,6 +8506,7 @@ export async function buildPaperclipWakePayload(input: {
             status: issues.status,
             priority: issues.priority,
             workMode: issues.workMode,
+            projectId: issues.projectId,
             assigneeAgentId: issues.assigneeAgentId,
           })
           .from(issues)
@@ -8893,13 +8904,29 @@ export async function buildPaperclipWakePayload(input: {
     const mayReadOtherWork =
       input.exposeLowTrustRaw !== true &&
       issueSummary.workMode !== "skill_test";
+    // Memory is the woken agent's own history, not other agents' work, but
+    // conservatively excluded for the same readers anyway (§10.4): a
+    // skill_test run's whole point is isolation from the agent's real
+    // operating history, and a low-trust-raw-exposed run gets no other
+    // Run Brief context either.
+    const agentMemoryEffectiveMode = resolveAgentMemoryEffectiveMode({
+      instanceMode: resolveAgentMemoryInstanceMode(),
+      agentRuntimeConfigMode: parseObject(
+        parseObject(input.agentMemoryRuntimeConfigMode).agentMemory,
+      ).mode,
+    });
+    const includeMemory = mayReadOtherWork && agentMemoryEffectiveMode !== "off";
     try {
       runBrief = await loadRunBrief({
         db: input.db,
         companyId: input.companyId,
         agentId: input.agentId,
         runId: input.runId,
-        issue: { id: issueId, identifier: issueSummary.identifier },
+        issue: {
+          id: issueId,
+          identifier: issueSummary.identifier,
+          projectId: issueSummary.projectId,
+        },
         authority: resolveRunBriefAuthority({
           wakeRole: executionStage.wakeRole,
           recoveryScoped,
@@ -8924,7 +8951,31 @@ export async function buildPaperclipWakePayload(input: {
         // The agent's other live runs name issues outside this one, so the
         // same readers go without them.
         includeSiblings: mayReadOtherWork && isRunBriefSiblingsEnabled(),
+        includeMemory,
+        // Access is only ever "real" (counted toward accessCount/lastUsedAt)
+        // when the section actually reaches the agent's prompt.
+        recordMemoryAccess: agentMemoryEffectiveMode === "on",
       });
+      if (runBrief?.memory && agentMemoryEffectiveMode === "shadow") {
+        // Shadow mode (§10.2): compute and log the section, but the wake
+        // payload stays byte-identical to effective mode "off".
+        await logActivity(input.db, {
+          companyId: input.companyId,
+          actorType: "system",
+          actorId: "agent-memory",
+          agentId: input.agentId ?? null,
+          runId: input.runId ?? null,
+          action: "agent_memory.shadow_rendered",
+          entityType: "heartbeat_run",
+          entityId: input.runId ?? issueId,
+          details: {
+            renderedSection: renderMemory(runBrief.memory, PAPERCLIP_RUN_BRIEF_MEMORY_MAX_CHARS),
+            entryIds: runBrief.memory.entries.map((entry) => entry.id),
+          },
+        });
+        const { memory: _shadowMemory, ...withoutMemory } = runBrief;
+        runBrief = withoutMemory;
+      }
     } catch (error) {
       logger.warn(
         { err: error, companyId: input.companyId, issueId, runId: input.runId },
@@ -9166,6 +9217,8 @@ export async function buildTeamOnlyWakePayload(input: {
   runId?: string | null;
   contextSnapshot: Record<string, unknown>;
   exposeLowTrustRaw?: boolean;
+  /** `agents.runtimeConfig.agentMemory.mode`, for the Run Brief Memory section (§10). */
+  agentMemoryRuntimeConfigMode?: unknown;
 }) {
   if (
     !isRunBriefEnabled() ||
@@ -9175,14 +9228,40 @@ export async function buildTeamOnlyWakePayload(input: {
   ) {
     return null;
   }
+  const agentMemoryEffectiveMode = resolveAgentMemoryEffectiveMode({
+    instanceMode: resolveAgentMemoryInstanceMode(),
+    agentRuntimeConfigMode: parseObject(
+      parseObject(input.agentMemoryRuntimeConfigMode).agentMemory,
+    ).mode,
+  });
   try {
-    const runBrief = await loadTeamOnlyRunBrief({
+    let runBrief = await loadTeamOnlyRunBrief({
       db: input.db,
       companyId: input.companyId,
       agentId: input.agentId,
       runId: input.runId,
       includeSiblings: isRunBriefSiblingsEnabled(),
+      includeMemory: agentMemoryEffectiveMode !== "off",
+      recordMemoryAccess: agentMemoryEffectiveMode === "on",
     });
+    if (runBrief?.memory && agentMemoryEffectiveMode === "shadow") {
+      await logActivity(input.db, {
+        companyId: input.companyId,
+        actorType: "system",
+        actorId: "agent-memory",
+        agentId: input.agentId ?? null,
+        runId: input.runId ?? null,
+        action: "agent_memory.shadow_rendered",
+        entityType: "heartbeat_run",
+        entityId: input.runId ?? input.companyId,
+        details: {
+          renderedSection: renderMemory(runBrief.memory, PAPERCLIP_RUN_BRIEF_MEMORY_MAX_CHARS),
+          entryIds: runBrief.memory.entries.map((entry) => entry.id),
+        },
+      });
+      const { memory: _shadowMemory, ...withoutMemory } = runBrief;
+      runBrief = withoutMemory;
+    }
     return runBrief
       ? fitPaperclipWakePayloadToHardCap({
           reason: readNonEmptyString(input.contextSnapshot.wakeReason),
@@ -22632,6 +22711,7 @@ export function heartbeatService(
         simplifiedEnglishInteractions:
           experimentalInstanceSettings.enableSimplifiedEnglishInteractions ===
           true,
+        agentMemoryRuntimeConfigMode: agent.runtimeConfig,
       });
       // A run with no issue gets no wake payload, except the company roster.
       const wakePayloadForRun =
@@ -22643,6 +22723,7 @@ export function heartbeatService(
           runId: run.id,
           contextSnapshot: context,
           exposeLowTrustRaw,
+          agentMemoryRuntimeConfigMode: agent.runtimeConfig,
         }));
       if (wakePayloadForRun) {
         context[PAPERCLIP_WAKE_PAYLOAD_KEY] = wakePayloadForRun;
@@ -27619,6 +27700,44 @@ export function heartbeatService(
               payload: { presentationDecision },
             });
             resolvedPresentationDecision = presentationDecision;
+            // Run-end "Remember:" capture (implementation spec §9),
+            // best-effort and never allowed to delay or fail run
+            // finalization -- its own try/catch-and-log, nested inside this
+            // one so a capture failure never skips the presentation update
+            // or disturbs `resolvedPresentationDecision` above.
+            try {
+              const agentMemoryEffectiveMode = resolveAgentMemoryEffectiveMode({
+                instanceMode: resolveAgentMemoryInstanceMode(),
+                agentRuntimeConfigMode: parseObject(
+                  parseObject(agent.runtimeConfig).agentMemory,
+                ).mode,
+              });
+              if (agentMemoryEffectiveMode !== "off") {
+                const { sourceIssueId, sourceTrust } = await resolveAgentMemoryWriteSourceTrust(db, {
+                  companyId: agent.companyId,
+                  agentId: agent.id,
+                  runId: livenessRun.id,
+                });
+                await captureRememberLinesForRun(db, {
+                  companyId: agent.companyId,
+                  agentId: agent.id,
+                  runId: livenessRun.id,
+                  sourceIssueId,
+                  sourceTrust,
+                  summaryText:
+                    typeof persistedResultJson?.summary === "string"
+                      ? persistedResultJson.summary
+                      : null,
+                  commentText: resolved.text ?? null,
+                  effectiveMode: agentMemoryEffectiveMode,
+                });
+              }
+            } catch (err) {
+              logger.warn(
+                { err, runId: livenessRun.id, agentId: agent.id },
+                "agent memory capture failed; continuing without it",
+              );
+            }
           } catch (err) {
             await onLog(
               "stderr",

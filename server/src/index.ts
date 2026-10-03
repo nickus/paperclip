@@ -68,6 +68,8 @@ import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/e
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import { publishStreamJsonEvent, subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { createRunSecretRedactionRegistry } from "./services/run-secret-redaction.js";
+import { sweepAgentMemory } from "./services/agent-memory.js";
+import { AGENT_MEMORY_SWEEP_INTERVAL_MS } from "@paperclipai/shared";
 import { createRunStreamJsonHub } from "./services/run-stream-json-hub.js";
 import { createStreamJsonStringRedactor, loadRunStreamJsonMeta } from "./services/run-stream-json.js";
 import { setupRunnerPrpWebSocketServer } from "./realtime/runner-prp-ws.js";
@@ -1234,6 +1236,15 @@ async function startServerWithDatabaseTeardown(
   };
   const executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
   executionControlInterval.unref?.();
+  // Native agent memory's own periodic sweep (expiry + hard-cap eviction,
+  // implementation spec §6.6): independent of the execution-control queues
+  // above, so a slow or failing sweep here never blocks them.
+  const agentMemorySweepInterval = setInterval(() => {
+    void sweepAgentMemory({ db }).catch((err) =>
+      logger.error({ err }, "agent memory sweep failed"),
+    );
+  }, AGENT_MEMORY_SWEEP_INTERVAL_MS);
+  agentMemorySweepInterval.unref?.();
   sweepExecutionControl();
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
     heartbeatSchedulerInterval = setInterval(callback, config.heartbeatSchedulerIntervalMs);
@@ -1995,6 +2006,7 @@ async function startServerWithDatabaseTeardown(
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
     clearInterval(executionControlInterval);
+    clearInterval(agentMemorySweepInterval);
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;
