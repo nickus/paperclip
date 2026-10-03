@@ -86,6 +86,41 @@ const MAX_BACKSTOP_WRITE_ATTEMPTS = 3;
 // The delay between two 504 backstop write attempts. It is short, so all retries
 // finish well under the in-sandbox 30s response deadline.
 const BACKSTOP_WRITE_RETRY_MS = 50;
+// Total time the backstop keeps re-arming itself against a transient write
+// failure (every attempt failed, but nothing marks the channel permanently
+// gone) before it gives up for good. Past this bound a channel that never
+// recovers would otherwise retry forever: each re-arm only re-sends the same
+// 504, never a mutation, so giving up here trades a stranded-until-its-own-
+// deadline caller (already true once a handler never settles) for a bounded
+// number of retries instead of an unbounded one. Ten minutes is generously
+// above the in-sandbox 30s response deadline the caller gave up on long ago,
+// so it buys real recovery time for a channel that is merely slow to come
+// back, without logging the same failure forever on one that never will.
+const DEFAULT_BACKSTOP_REARM_BUDGET_MS = 10 * 60_000;
+// Ceiling on the delay between two re-arms of a transiently-failing backstop.
+// Growth below the ceiling is exponential (see `backstopRearmDelayMs`), so a
+// channel that fails fast backs off fast; the ceiling then keeps a single
+// delay from swallowing most of `DEFAULT_BACKSTOP_REARM_BUDGET_MS` in one
+// step, so the budget is spent as several observable retries, not one.
+const MAX_BACKSTOP_REARM_DELAY_MS = 60_000;
+// A write failure this module treats as permanent: the attempt can never
+// succeed again on this channel, so re-arming the backstop only repeats the
+// same failed write (and the same log line) forever. The host's run-lifecycle
+// vocabulary for every terminal cancellation reason it hands down through the
+// sandbox exec channel starts with "Cancelled " (for example "Cancelled by
+// control plane", the control-plane cancellation that motivated this check,
+// or a pause/termination cancelling the same way); a `name: "AbortError"`
+// carries the same meaning for a signal this module did not originate. Either
+// one means the client, the channel, or the sandbox/lease behind it is gone,
+// not merely slow.
+const PERMANENT_BRIDGE_WRITE_FAILURE_PATTERN = /^cancelled\b/i;
+
+function isPermanentBridgeWriteFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.name === "AbortError") return true;
+  return PERMANENT_BRIDGE_WRITE_FAILURE_PATTERN.test(error.message);
+}
+
 // Backoff cap between poll-loop retries after a transient iteration failure.
 // The cap keeps a recovering loop probing often enough to resume before the
 // in-sandbox 30s response deadline strands queued callers, while the
@@ -1307,6 +1342,11 @@ export async function startSandboxCallbackBridgeWorker(input: {
   // own response before the recovery path writes a non-retryable 504 backstop.
   // Defaults to DEFAULT_BRIDGE_ABORTED_HANDLER_GRACE_MS.
   abortedHandlerGraceMs?: number | null;
+  // Total time the backstop keeps re-arming itself against a transient write
+  // failure before it gives up and logs once instead of retrying forever.
+  // Defaults to DEFAULT_BACKSTOP_REARM_BUDGET_MS (ten minutes). Exposed mainly
+  // so a test can shrink it; production callers should rarely need to.
+  backstopRearmBudgetMs?: number | null;
   authorizeRequest?: (request: SandboxCallbackBridgeRequest) => string | null | Promise<string | null>;
   // Handle one bridge request. The worker passes an `AbortSignal` through
   // `options.signal`. The per-iteration timeout, the watchdog, and worker
@@ -1344,6 +1384,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
     input.abortedHandlerGraceMs,
     DEFAULT_BRIDGE_ABORTED_HANDLER_GRACE_MS,
   );
+  const backstopRearmBudgetMs = normalizeTimeoutMs(
+    input.backstopRearmBudgetMs,
+    DEFAULT_BACKSTOP_REARM_BUDGET_MS,
+  );
   const maxBodyBytes = normalizeTimeoutMs(input.maxBodyBytes, DEFAULT_BRIDGE_MAX_BODY_BYTES);
   const maxEnvelopeBytes = sandboxBridgeEnvelopeLimit(maxBodyBytes);
   // Load lazily to avoid the HTTP/2 module's constants depending on this module
@@ -1370,6 +1414,12 @@ export async function startSandboxCallbackBridgeWorker(input: {
   let inFlight = 0;
   let settled = false;
   let stopDeadline = Number.POSITIVE_INFINITY;
+  // Set once `stop()` starts. "The bridge was stopped or disposed" is itself a
+  // permanent reason to give up on a pending backstop: no later poll iteration
+  // or re-arm can ever run after this worker is torn down, so a write that
+  // fails from here on must end the request rather than schedule a timer that
+  // would outlive the bridge.
+  let bridgeStopped = false;
   let settleResolve: (() => void) | null = null;
   const settledPromise = new Promise<void>((resolve) => {
     settleResolve = resolve;
@@ -1438,6 +1488,15 @@ export async function startSandboxCallbackBridgeWorker(input: {
     // (see `processRequestFile`). Its own tool-call budget bounds it, so the
     // recovery path for an unrelated slow or failed request leaves it running.
     detached?: boolean;
+    // Wall-clock time of the backstop's first arm for this request (never
+    // reset by a re-arm). `writeAbortedHandlerBackstop` measures elapsed time
+    // against it to enforce `backstopRearmBudgetMs`.
+    backstopArmedAt?: number;
+    // Count of re-arms after the initial arm (0 until the first transient
+    // write failure re-arms it). `backstopRearmDelayMs` reads it to back off
+    // exponentially, and `writeAbortedHandlerBackstop` increments it right
+    // before each re-arm.
+    backstopRearmAttempt?: number;
   };
   const inFlightRequestGuards = new Map<string, RequestFinalizeGuard>();
   // Settles when a detached tool-call handler has finalized its request and
@@ -1743,6 +1802,44 @@ export async function startSandboxCallbackBridgeWorker(input: {
     }
   };
 
+  // Give up on a request's backstop for good: no write will ever be retried
+  // for it again. Clear the pending timer, so nothing fires later against a
+  // bridge, or a channel, that is no longer there, and log exactly once, so a
+  // channel that is confirmed gone does not repeat the same line forever.
+  // The guard stays in the map on purpose, exactly like a request whose
+  // backstop already delivered successfully: removing it would let a later
+  // poll iteration see this file name as unclaimed and run `processRequestFile`
+  // on it again, re-invoking the handler and re-running a mutation this bridge
+  // already attempted once. One guard staying in the map for the rest of this
+  // worker's life is a bounded, per-request cost; re-running a mutation is not.
+  const giveUpOnBackstop = (
+    fileName: string,
+    guard: RequestFinalizeGuard,
+    requestId: string,
+    reason: string,
+  ) => {
+    if (guard.backstopTimer !== undefined) {
+      clearTimeout(guard.backstopTimer);
+      guard.backstopTimer = undefined;
+    }
+    guard.finalized = true;
+    console.warn(
+      `[paperclip] sandbox callback bridge gave up on the 504 backstop for ${requestId}: ${reason}`,
+    );
+  };
+
+  // The delay before the backstop's next re-arm. The first arm (no re-arm yet)
+  // uses the configured grace unchanged, matching the previous fixed behavior.
+  // Each re-arm after a transient write failure backs off exponentially from
+  // there, capped at `MAX_BACKSTOP_REARM_DELAY_MS`, so a channel that fails
+  // fast does not re-probe at the same fast cadence forever (the production
+  // incident this guards against: a dead channel retried every
+  // `abortedHandlerGraceMs` for hours).
+  const backstopRearmDelayMs = (rearmAttempt: number): number =>
+    rearmAttempt <= 0
+      ? abortedHandlerGraceMs
+      : Math.min(abortedHandlerGraceMs * 2 ** rearmAttempt, MAX_BACKSTOP_REARM_DELAY_MS);
+
   // Write the non-retryable 504 backstop for an aborted handler that did not
   // finalize inside the grace. The `finalized` fence makes this a no-op when the
   // handler already wrote its own response. The request file name is the request
@@ -1784,6 +1881,22 @@ export async function startSandboxCallbackBridgeWorker(input: {
         await input.client.remove(requestPath).catch(() => undefined);
         return;
       } catch (error) {
+        // A permanent failure (the control plane cancelled the run, the client
+        // or channel is closed, the bridge is stopping, the sandbox or its
+        // lease is gone) can never succeed on a retry: every future write on
+        // this dead channel fails the exact same way. Stop here, after this
+        // one attempt, with a single warn — not the usual per-attempt retry
+        // loop below, which exists only for a failure that might clear up on
+        // its own.
+        if (bridgeStopped || isPermanentBridgeWriteFailure(error)) {
+          giveUpOnBackstop(
+            fileName,
+            guard,
+            requestId,
+            `${error instanceof Error ? error.message : String(error)} (permanent failure; the channel cannot deliver a response).`,
+          );
+          return;
+        }
         console.warn(
           `[paperclip] sandbox callback bridge failed to write 504 backstop for ${requestId} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -1792,11 +1905,27 @@ export async function startSandboxCallbackBridgeWorker(input: {
         }
       }
     }
-    // Every backstop write failed. Keep the request file and clear the fence, so a
-    // late handler can still finalize its own 504. The guard stays in the map, so
-    // the poll loop skips the file and does not re-run the mutation. A removed
-    // file plus a set fence would strand the caller until its own deadline and
-    // give it a generic 502 instead of the terminal 504.
+    // Every attempt failed, but transiently (not classified permanent above),
+    // and the bridge has not stopped. Bound how long this keeps re-arming:
+    // past `backstopRearmBudgetMs` since the first arm, give up exactly like a
+    // permanent failure instead of retrying forever against a channel that
+    // never recovers.
+    const armedAt = guard.backstopArmedAt ?? Date.now();
+    guard.backstopArmedAt = armedAt;
+    if (Date.now() - armedAt >= backstopRearmBudgetMs) {
+      giveUpOnBackstop(
+        fileName,
+        guard,
+        requestId,
+        `every retry failed for over ${backstopRearmBudgetMs}ms; giving up instead of re-arming forever.`,
+      );
+      return;
+    }
+    // Keep the request file and clear the fence, so a late handler can still
+    // finalize its own 504. The guard stays in the map, so the poll loop skips
+    // the file and does not re-run the mutation. A removed file plus a set
+    // fence would strand the caller until its own deadline and give it a
+    // generic 502 instead of the terminal 504.
     //
     // Re-arm the backstop directly. A stuck handler never settles, so its
     // `processRequestFile` never runs the `finally` that drops the guard. The
@@ -1805,7 +1934,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
     // so a re-arm here is the only path that retries the 504 write. Clear the
     // fence before the re-arm, because `scheduleAbortedHandlerBackstop` bails on
     // a set fence. The re-arm only re-writes the 504 response; it never re-runs
-    // the mutation, so a retry cannot apply the mutation twice.
+    // the mutation, so a retry cannot apply the mutation twice. The next delay
+    // backs off exponentially from this attempt count, bounded above.
+    guard.backstopRearmAttempt = (guard.backstopRearmAttempt ?? 0) + 1;
     guard.finalized = false;
     scheduleAbortedHandlerBackstop(fileName, guard, message);
   };
@@ -1813,18 +1944,23 @@ export async function startSandboxCallbackBridgeWorker(input: {
   // Arm the backstop timer for a handler the recovery path just aborted. It is
   // idempotent: a second recovery pass (the watchdog and the loop catch both run
   // `failPendingRequests`) does not re-arm a live timer or one that already
-  // finalized.
+  // finalized. Never arms once the bridge itself has stopped: no later pass
+  // could ever write through a stopped bridge, so arming here would only leave
+  // a timer that outlives it.
   const scheduleAbortedHandlerBackstop = (
     fileName: string,
     guard: RequestFinalizeGuard,
     message: string,
   ) => {
-    if (guard.finalized || guard.backstopTimer !== undefined) {
+    if (bridgeStopped || guard.finalized || guard.backstopTimer !== undefined) {
       return;
+    }
+    if (guard.backstopArmedAt === undefined) {
+      guard.backstopArmedAt = Date.now();
     }
     guard.backstopTimer = setTimeout(() => {
       void writeAbortedHandlerBackstop(fileName, guard, message);
-    }, abortedHandlerGraceMs);
+    }, backstopRearmDelayMs(guard.backstopRearmAttempt ?? 0));
     if (typeof guard.backstopTimer.unref === "function") {
       guard.backstopTimer.unref();
     }
@@ -2217,6 +2353,26 @@ export async function startSandboxCallbackBridgeWorker(input: {
         await waitAtMost(detachedHandlersSettled(), abortedHandlerGraceMs);
       }
       await failPendingRequests("Bridge worker stopped before request could be handled.");
+      // From here on the bridge is stopped or disposed: no later poll
+      // iteration, watchdog pass, or re-arm can run after this function
+      // returns, so a write that still fails past this point (checked
+      // alongside `isPermanentBridgeWriteFailure` at every backstop call site)
+      // must end its request rather than schedule a timer this stopped bridge
+      // can never service.
+      bridgeStopped = true;
+      // Every pending backstop re-arm timer must not outlive this bridge. The
+      // drain and grace waits above already gave a cooperating handler its
+      // fair chance to finalize and gave an aborted one its chance at a
+      // backstop write; a guard still holding a pending timer at this point
+      // either never got that chance (a non-detached request this stop never
+      // touched) or is waiting on a re-arm that this bridge will never run.
+      // Cancel it and give up once, so it does not keep retrying the same
+      // write and repeating the same log line long after this run ended —
+      // the production incident this guards against.
+      for (const [fileName, guard] of inFlightRequestGuards.entries()) {
+        if (guard.backstopTimer === undefined) continue;
+        giveUpOnBackstop(fileName, guard, fileName.replace(/\.json$/i, ""), "the bridge stopped.");
+      }
     },
   };
 }
