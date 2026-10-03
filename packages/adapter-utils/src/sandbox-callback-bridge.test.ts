@@ -2457,6 +2457,307 @@ describe("sandbox callback bridge", () => {
     await worker.stop({ drainTimeoutMs: 10 });
   });
 
+  it("gives up the 504 backstop after one pass when the write is cancelled by the control plane, with no re-arm and a single warn", async () => {
+    // A backstop write that fails because the control plane cancelled the run
+    // (or the channel is otherwise permanently gone) can never succeed on a
+    // retry: every future write on the same dead channel fails the exact same
+    // way. Re-arming forever against it is the production incident this fix
+    // closes — the same failed write, and the same log line, repeating every
+    // grace period for hours after the run ended. The backstop must instead
+    // try once, recognize the failure as permanent, and give up with a single
+    // warn.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) {
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/queue";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-control-plane-cancel.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(requestPath, bridgeRequestJson("req-control-plane-cancel"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    let writeAttempts = 0;
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) {
+          throw new Error(`missing request ${remotePath}`);
+        }
+        return body;
+      },
+      writeTextFile: async () => {},
+      // Every write fails exactly the way the control plane's run cancellation
+      // surfaces in production: the channel is gone, so it never recovers.
+      writeResponseFile: async () => {
+        writeAttempts += 1;
+        throw new Error("Cancelled by control plane");
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const worker = await startSandboxCallbackBridgeWorker({
+        client,
+        queueDir,
+        iterationTimeoutMs: 50,
+        watchdogTimeoutMs: 10_000,
+        // A short grace, so the backstop's first (and, here, only) attempt
+        // fires quickly after the abort.
+        abortedHandlerGraceMs: 20,
+        runtimeSpan,
+        authorizeRequest: async () => null,
+        // The handler never settles, so only the backstop can finalize the
+        // request.
+        handleRequest: () => new Promise<{ status: number; body?: string }>(() => {}),
+      });
+
+      const gaveUp = () =>
+        warnSpy.mock.calls.some((call) =>
+          String(call[0]).includes("gave up on the 504 backstop"),
+        );
+      await waitFor(gaveUp, 3_000);
+
+      // Exactly one write was attempted: the permanent classification skips the
+      // usual same-pass retry loop (and its own per-attempt warns), because
+      // retrying a write that cannot ever succeed again buys nothing.
+      expect(writeAttempts).toBe(1);
+      expect(warnSpy.mock.calls.filter((call) => String(call[0]).includes("gave up on the 504 backstop")))
+        .toHaveLength(1);
+      expect(String(warnSpy.mock.calls.find((call) => String(call[0]).includes("gave up"))?.[0]))
+        .toContain("Cancelled by control plane");
+
+      // No response ever lands: the channel the backstop would write through
+      // is gone. The caller strands on its own deadline exactly as it would
+      // for any other channel that cannot be reached at all; that is
+      // unavoidable once delivery is genuinely impossible, and is unrelated to
+      // the storm this fix removes.
+      expect(responseWrites.some((write) => write.path === responsePath)).toBe(false);
+
+      // No re-arm follows. Wait well past the grace and the usual retry delay,
+      // and confirm the attempt count and warn count never move again.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(writeAttempts).toBe(1);
+      expect(warnSpy.mock.calls.filter((call) => String(call[0]).includes("gave up on the 504 backstop")))
+        .toHaveLength(1);
+
+      await worker.stop({ drainTimeoutMs: 10 });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("backs off a transiently-failing backstop and stops re-arming once the bound elapses", async () => {
+    // A write that keeps failing for a reason that does not match the
+    // permanent-failure signature (not a control-plane cancellation, not an
+    // abort, and the bridge itself is not stopping) is treated as merely slow
+    // to recover. The backstop re-arms with a growing delay instead of the
+    // earlier fixed cadence, and — unlike a permanent failure — tries the full
+    // per-pass retry budget each time. Past a bounded total time since the
+    // first arm it gives up exactly once, so a channel that genuinely never
+    // recovers does not retry forever either.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) {
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/queue";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-transient-forever.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(requestPath, bridgeRequestJson("req-transient-forever"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    let writeAttempts = 0;
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) {
+          throw new Error(`missing request ${remotePath}`);
+        }
+        return body;
+      },
+      writeTextFile: async () => {},
+      // A generic failure with no cancellation signature: this is the
+      // "merely slow to recover" case, never classified permanent.
+      writeResponseFile: async () => {
+        writeAttempts += 1;
+        throw new Error("simulated unresponsive channel");
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const worker = await startSandboxCallbackBridgeWorker({
+        client,
+        queueDir,
+        iterationTimeoutMs: 50,
+        watchdogTimeoutMs: 10_000,
+        abortedHandlerGraceMs: 10,
+        // A tiny bound, so the test proves the give-up without waiting
+        // anywhere near the ten-minute production default.
+        backstopRearmBudgetMs: 1_000,
+        runtimeSpan,
+        authorizeRequest: async () => null,
+        handleRequest: () => new Promise<{ status: number; body?: string }>(() => {}),
+      });
+
+      const gaveUp = () =>
+        warnSpy.mock.calls.some((call) => String(call[0]).includes("giving up instead of re-arming forever"));
+      await waitFor(gaveUp, 5_000);
+
+      // More than one pass of the per-attempt retry budget ran before the
+      // bound gave up, proving the backstop re-armed (backed off) at least
+      // once instead of only trying the first pass.
+      expect(writeAttempts).toBeGreaterThan(3);
+      expect(
+        warnSpy.mock.calls.filter((call) => String(call[0]).includes("giving up instead of re-arming forever")),
+      ).toHaveLength(1);
+      expect(responseWrites.some((write) => write.path === responsePath)).toBe(false);
+
+      // No further re-arm follows the give-up.
+      const attemptsAtGiveUp = writeAttempts;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(writeAttempts).toBe(attemptsAtGiveUp);
+
+      await worker.stop({ drainTimeoutMs: 10 });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("stopping the bridge clears every pending backstop re-arm timer", async () => {
+    // A backstop that is mid-retry when the run ends must not keep a timer
+    // alive past `stop()`. Before this fix, `stop()` only cancelled a pending
+    // re-arm for a detached tool-call request; an ordinary request's timer
+    // kept firing (and re-arming) on its original cadence long after the
+    // bridge that owned it was gone.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) {
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/queue";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-stop-clears-rearm.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(requestPath, bridgeRequestJson("req-stop-clears-rearm"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    let writeAttempts = 0;
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) {
+          throw new Error(`missing request ${remotePath}`);
+        }
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async () => {
+        writeAttempts += 1;
+        throw new Error("simulated unresponsive channel");
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const worker = await startSandboxCallbackBridgeWorker({
+        client,
+        queueDir,
+        iterationTimeoutMs: 50,
+        watchdogTimeoutMs: 10_000,
+        abortedHandlerGraceMs: 30,
+        runtimeSpan,
+        authorizeRequest: async () => null,
+        handleRequest: () => new Promise<{ status: number; body?: string }>(() => {}),
+      });
+
+      // Let one full pass (the backstop's first arm, three failed attempts —
+      // the module's own `MAX_BACKSTOP_WRITE_ATTEMPTS`) run and re-arm, so a
+      // pending re-arm timer exists when `stop()` runs.
+      await waitFor(() => writeAttempts >= 3, 3_000);
+
+      await worker.stop({ drainTimeoutMs: 10 });
+      const attemptsAtStop = writeAttempts;
+
+      // Wait well past the re-armed delay and the grace it would have used.
+      // No further write attempt, and no further response, follows stop().
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(writeAttempts).toBe(attemptsAtStop);
+      expect(responseWrites.some((write) => write.path === responsePath)).toBe(false);
+      expect(
+        warnSpy.mock.calls.some((call) => String(call[0]).includes("the bridge stopped.")),
+      ).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("retries a recovery 503 write that fails transiently, delivers the 503, and removes the request", async () => {
     // A request attempt times out (its first read hangs), so the loop's request
     // catch runs the recovery pass, which aborts the queued request with a 503.
