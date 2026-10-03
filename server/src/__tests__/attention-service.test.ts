@@ -1026,6 +1026,76 @@ describeEmbeddedPostgres("attention service", () => {
     expect(afterChange.items.some((row) => row.subject.id === actionId)).toBe(false);
   });
 
+  it("hides a settled no-replay hold once its source issue is done or cancelled, but keeps it while the issue is open", async () => {
+    const { companyId, workerId } = await seedCompany("ATN");
+
+    const openIssueId = await insertIssue({
+      companyId,
+      identifier: "ATN-1",
+      title: "Held task, still open",
+      status: "blocked",
+      assigneeAgentId: workerId,
+    });
+    const openActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: openActionId,
+      companyId,
+      sourceIssueId: openIssueId,
+      kind: "active_run_watchdog",
+      status: "resolved",
+      outcome: "blocked",
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+      returnOwnerAgentId: workerId,
+      cause: LEGACY_RECOVERY_CAUSE,
+      fingerprint: "legacy-execution:held-run-open",
+      evidence: {
+        runId: randomUUID(),
+        automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" },
+      },
+      nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+      resolvedAt: new Date(),
+    });
+
+    const closedIssueId = await insertIssue({
+      companyId,
+      identifier: "ATN-2",
+      title: "Held task, since cancelled",
+      status: "cancelled",
+      assigneeAgentId: workerId,
+    });
+    const closedActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: closedActionId,
+      companyId,
+      sourceIssueId: closedIssueId,
+      kind: "active_run_watchdog",
+      status: "resolved",
+      outcome: "blocked",
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+      returnOwnerAgentId: workerId,
+      cause: LEGACY_RECOVERY_CAUSE,
+      fingerprint: "legacy-execution:held-run-closed",
+      evidence: {
+        runId: randomUUID(),
+        automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" },
+      },
+      nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+      resolvedAt: new Date(),
+    });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    // The hold on the still-open issue blocks replay and is still a task.
+    expect(feed.items.some((row) => row.subject.id === openActionId)).toBe(true);
+    // The hold on the cancelled issue blocks nothing: the issue gets no
+    // wakes, and a human reopen (not acting on the hold) is what would
+    // release it. It must not sit on the board as unresolvable noise.
+    expect(feed.items.some((row) => row.subject.id === closedActionId)).toBe(false);
+  });
+
   it("suppresses failed-run attention after a newer run for the same issue", async () => {
     const { companyId, workerId } = await seedCompany("ATN");
     const issueId = await insertIssue({

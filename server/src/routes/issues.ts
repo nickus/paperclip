@@ -9616,10 +9616,16 @@ export function issueRoutes(
         if (row) effectiveHold = issueRecoveryActionReadModel(row);
       }
     }
+    // The attention feed hides an effective hold once its source issue is
+    // done/cancelled (closed issues get no wakes, so the hold blocks
+    // nothing), but this per-issue read keeps reporting it so an operator
+    // who lands here directly can still see it. Flag it instead of hiding
+    // it, so clients can tell it apart from one that still gates execution.
     res.json({
       active,
       actions: active ? [active] : effectiveHold ? [effectiveHold] : [],
       effectiveHold,
+      sourceIssueClosed: effectiveHold ? issue.status === "done" || issue.status === "cancelled" : false,
     });
   });
 
