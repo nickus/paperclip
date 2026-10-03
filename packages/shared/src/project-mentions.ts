@@ -267,10 +267,6 @@ export interface LinkPlainAgentMentionsResult {
 // Matches a run of `` ` `` or `~` characters (3+) opening a fenced code block,
 // optionally indented up to 3 spaces, same as CommonMark.
 const FENCE_OPEN_RE = /^[ \t]{0,3}(`{3,}|~{3,})/;
-// Backtick-delimited inline code spans of any run length (`` `x` ``, ```` ``x`` ````, ...).
-// The backreference re-requires the SAME run length to close, so a lone backtick inside a
-// double-backtick span is treated as literal content rather than ending the span early.
-const INLINE_CODE_SPAN_RE = /(`+)(?:(?!\1)[\s\S])*?\1/g;
 const HTML_COMMENT_RE = /<!--[\s\S]*?-->/g;
 // `[text](url)` and `![alt](url)` — also matches an already-structured mention link,
 // so its text and href are both left alone.
@@ -331,6 +327,59 @@ function findFencedCodeRanges(text: string): Array<[number, number]> {
   return ranges;
 }
 
+// Finds backtick-delimited inline code spans of any run length (`` `x` ``, ```` ``x`` ````,
+// ...) as [start, end) ranges, with a hand-rolled scan rather than a backreference regex.
+// A backreference-based pattern (`` /(`+)(?:(?!\1)[\s\S])*?\1/g `` ) re-scans from scratch,
+// and backtracks the opening run length, for every backtick run that never finds a same-
+// length closer later in the text; a comment body with many distinct, never-closing run
+// lengths (e.g. runs of length 1, 2, 3, ... with no duplicate) drove that pattern well past
+// quadratic — seconds on a ~300KB input, timing out past that. This scan instead walks the
+// text once; for an opening run it scans forward only until the first run of the SAME length
+// (a genuine closer) or gives up at end of text, and either way resumes right after what it
+// just scanned, so no suffix of the text is ever rescanned from an earlier start.
+function findInlineCodeSpanRanges(text: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    if (text[i] !== "`") {
+      i++;
+      continue;
+    }
+    const openStart = i;
+    let openEnd = i;
+    while (openEnd < n && text[openEnd] === "`") openEnd++;
+    const runLen = openEnd - openStart;
+
+    let j = openEnd;
+    let closeEnd = -1;
+    while (j < n) {
+      if (text[j] !== "`") {
+        j++;
+        continue;
+      }
+      const runStart2 = j;
+      let runEnd2 = j;
+      while (runEnd2 < n && text[runEnd2] === "`") runEnd2++;
+      if (runEnd2 - runStart2 === runLen) {
+        closeEnd = runEnd2;
+        break;
+      }
+      j = runEnd2;
+    }
+
+    if (closeEnd === -1) {
+      // No same-length run anywhere later: this run can't open a span. Resume right after
+      // it — never re-examine the text we already scanned looking for a closer.
+      i = openEnd;
+      continue;
+    }
+    ranges.push([openStart, closeEnd]);
+    i = closeEnd;
+  }
+  return ranges;
+}
+
 // Collects every span of `markdown` that a plain-text mention must never be read from or
 // written into: fenced/inline code, HTML comments, markdown link and image syntax (which
 // also covers an already-structured mention link), autolinks, and quoted lines. Ranges are
@@ -350,7 +399,7 @@ function findProtectedRanges(markdown: string): Array<[number, number]> {
 
   collect(findFencedCodeRanges(masked));
   collect([...masked.matchAll(HTML_COMMENT_RE)].map((m) => [m.index, m.index + m[0].length]));
-  collect([...masked.matchAll(INLINE_CODE_SPAN_RE)].map((m) => [m.index, m.index + m[0].length]));
+  collect(findInlineCodeSpanRanges(masked));
   collect([...masked.matchAll(MARKDOWN_LINK_OR_IMAGE_RE)].map((m) => [m.index, m.index + m[0].length]));
   collect([...masked.matchAll(AUTOLINK_RE)].map((m) => [m.index, m.index + m[0].length]));
   collect([...masked.matchAll(BLOCKQUOTE_LINE_RE)].map((m) => [m.index, m.index + m[0].length]));

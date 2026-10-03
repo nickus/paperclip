@@ -211,4 +211,43 @@ describe("linkPlainAgentMentions", () => {
     expect(result.markdown).toBe(markdown);
     expect(result.linkedAgentIds).toEqual([]);
   });
+
+  it("stays fast on a large body with many '@' characters and ~100 agents", () => {
+    const agents: LinkablePlainMentionAgent[] = Array.from({ length: 100 }, (_, i) => ({
+      id: `agent-${i}`,
+      name: `Agent Number ${i}`,
+    }));
+    // ~200KB of prose sprinkled with plain "@word" tokens that don't match any agent name,
+    // plus a few genuine mentions, to exercise the mention scan itself at scale.
+    const chunk = "lorem ipsum @nobody dolor sit amet user@example.com more-@text-here ";
+    const body = chunk.repeat(Math.ceil(200_000 / chunk.length)) + " cc @Agent Number 42 and @Agent Number 7";
+
+    const start = Date.now();
+    const result = linkPlainAgentMentions(body, agents);
+    const elapsedMs = Date.now() - start;
+
+    expect(result.linkedAgentIds.sort()).toEqual(["agent-42", "agent-7"].sort());
+    expect(elapsedMs).toBeLessThan(2000);
+  });
+
+  it("stays fast on a body with many distinct, never-closing backtick run lengths", () => {
+    // Regression for a catastrophic-backtracking footgun: a backreference-based inline-code
+    // regex (`` /(`+)(?:(?!\1)[\s\S])*?\1/g `` ) rescans the remaining text, and backtracks
+    // the opening run length, for every backtick run that never finds a same-length closer.
+    // A body built from runs of strictly decreasing, pairwise-distinct backtick-run lengths
+    // never closes any of them, which drove that pattern well past quadratic (seconds on a
+    // ~300KB body, timing out past that). This must stay fast regardless of implementation.
+    const parts: string[] = [];
+    for (let len = 700; len >= 1; len--) {
+      parts.push("`".repeat(len), "x");
+    }
+    const body = `@Product Manager ${parts.join("")} @Product Manager`;
+
+    const start = Date.now();
+    const result = linkPlainAgentMentions(body, [PM]);
+    const elapsedMs = Date.now() - start;
+
+    expect(result.linkedAgentIds).toEqual([PM.id]);
+    expect(elapsedMs).toBeLessThan(2000);
+  });
 });
