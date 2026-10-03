@@ -3874,6 +3874,17 @@ export function issueRoutes(
     return memoizeIssueRead(req, id, () => svc.getById(id));
   }
 
+  // The response's `executionHold` field is informational: the comment is
+  // already saved, so a failed lookup omits the field instead of failing it.
+  async function lookupExecutionHoldForResponse(companyId: string, issueId: string) {
+    try {
+      return await getExecutionBlocker(db, companyId, issueId);
+    } catch (err) {
+      logger.warn({ err, issueId }, "failed to look up the execution hold for a comment response");
+      return null;
+    }
+  }
+
   async function routeDelegationMention(
     req: Request,
     parent: { id: string; identifier?: string | null; companyId: string; status: string },
@@ -15741,10 +15752,10 @@ export function issueRoutes(
           Boolean(commentBody) &&
           Boolean(comment) &&
           Boolean(issue.assigneeAgentId) &&
-          (await svc
-            .findMentionedAgents(issue.companyId, commentBody as string)
+          (await (async () => svc.findMentionedAgents(issue.companyId, commentBody as string))()
             .then((ids) => ids.includes(issue.assigneeAgentId!))
             .catch((err) => {
+              // A synchronous throw lands here too, so the committed update never 500s.
               logger.warn({ err, issueId: issue.id }, "failed to resolve @-mentions for execution hold release");
               return false;
             }));
@@ -15773,7 +15784,7 @@ export function issueRoutes(
       // hold this same request just ended is reported as gone.
       const executionHold =
         comment && !executionHoldReleased
-          ? await getExecutionBlocker(db, issue.companyId, issue.id)
+          ? await lookupExecutionHoldForResponse(issue.companyId, issue.id)
           : null;
 
       await queueTaskWatchdogEvaluation(issue, actor.runId);
@@ -18971,7 +18982,7 @@ export function issueRoutes(
       // assignee never answers. Checked after any release just above, so a
       // hold this same request just ended is reported as gone.
       const executionHold = !executionHoldReleased
-        ? await getExecutionBlocker(db, currentIssue.companyId, currentIssue.id)
+        ? await lookupExecutionHoldForResponse(currentIssue.companyId, currentIssue.id)
         : null;
 
       // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
