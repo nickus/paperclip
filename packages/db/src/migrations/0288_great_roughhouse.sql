@@ -1,0 +1,1 @@
+CREATE INDEX "issue_recovery_actions_effective_hold_idx" ON "issue_recovery_actions" USING btree ("company_id","owner_type","cause") WHERE "issue_recovery_actions"."evidence"->'automaticRecovery'->>'replay' = 'blocked';

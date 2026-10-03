@@ -64,5 +64,14 @@ export const issueRecoveryActions = pgTable(
     activeFingerprintIdx: uniqueIndex("issue_recovery_actions_active_fingerprint_uq")
       .on(table.companyId, table.sourceIssueId, table.cause, table.fingerprint)
       .where(sql`${table.status} in ('active', 'escalated')`),
+    // Backs `executionBlockerPredicate`'s settled-no-replay-hold branch (the
+    // board attention feed and GET recovery-actions): a resolved action can
+    // still be an effective hold, and without this the query falls back to
+    // scanning every resolved row the company has ever accumulated. The
+    // predicate mirrors the query's own jsonb condition exactly so Postgres
+    // can use this as a true partial-index scan instead.
+    effectiveHoldIdx: index("issue_recovery_actions_effective_hold_idx")
+      .on(table.companyId, table.ownerType, table.cause)
+      .where(sql`${table.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
   }),
 );
