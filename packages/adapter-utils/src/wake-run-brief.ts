@@ -42,6 +42,18 @@ export const PAPERCLIP_RUN_BRIEF_SIBLING_TITLE_MAX_CHARS = 60;
  * exactly as it does without the section.
  */
 export const PAPERCLIP_RUN_BRIEF_SIBLINGS_ENV = "PAPERCLIP_RUN_BRIEF_SIBLINGS";
+/** Instance kill switch for native agent memory (§10 of the implementation spec). */
+export const PAPERCLIP_AGENT_MEMORY_ENV = "PAPERCLIP_AGENT_MEMORY";
+/** Most entries the Memory section lists (owner decision: "top 8"). */
+export const PAPERCLIP_RUN_BRIEF_MEMORY_MAX_LINES = 8;
+/**
+ * Bound for the rendered Memory section, fixed wording included. Like Team
+ * and Live siblings it has its own budget; entries that do not fit are
+ * counted in a "+N more" pointer.
+ */
+export const PAPERCLIP_RUN_BRIEF_MEMORY_MAX_CHARS = 1_200;
+/** Bound for a memory entry's body, matching the storage cap so quoting never doubly truncates. */
+export const PAPERCLIP_RUN_BRIEF_MEMORY_BODY_MAX_CHARS = 300;
 const PAPERCLIP_RUN_BRIEF_TOKEN_MAX_CHARS = 64;
 const PAPERCLIP_RUN_BRIEF_LIST_MAX_ITEMS = 10;
 // Upper bound for one quoted free-text value once escaped. Escaping can grow a
@@ -70,6 +82,42 @@ export function isPaperclipRunBriefSiblingsEnabled(
 function isSwitchedOff(value: string | undefined): boolean {
   const raw = value?.trim().toLowerCase();
   return raw === "0" || raw === "false" || raw === "off" || raw === "no";
+}
+
+export type AgentMemoryMode = "off" | "shadow" | "on";
+
+/**
+ * The instance-wide kill switch. Unset or anything other than "shadow"/"on"
+ * is "off" -- fail closed, since this gates a feature that writes and later
+ * replays an agent's own prior-run text back into its prompt.
+ */
+export function resolveAgentMemoryInstanceMode(
+  env: Record<string, string | undefined> = process.env,
+): AgentMemoryMode {
+  const raw = env[PAPERCLIP_AGENT_MEMORY_ENV]?.trim().toLowerCase();
+  return raw === "shadow" || raw === "on" ? raw : "off";
+}
+
+/**
+ * Per-agent mode (`agents.runtimeConfig.agentMemory.mode`), narrowed by the
+ * instance kill switch: instance "off" always wins, regardless of the
+ * agent's own config; instance "shadow" caps an agent configured "on" down
+ * to "shadow"; instance "on" leaves each agent's own mode -- including
+ * "off" -- in force. An agent with no mode configured defaults to "shadow",
+ * never "on", so a newly added agent never gets live injection silently.
+ */
+export function resolveAgentMemoryEffectiveMode(input: {
+  instanceMode: AgentMemoryMode;
+  agentRuntimeConfigMode: unknown;
+}): AgentMemoryMode {
+  if (input.instanceMode === "off") return "off";
+  const agentMode =
+    input.agentRuntimeConfigMode === "off" ||
+    input.agentRuntimeConfigMode === "shadow" ||
+    input.agentRuntimeConfigMode === "on"
+      ? input.agentRuntimeConfigMode
+      : "shadow";
+  return input.instanceMode === "shadow" && agentMode === "on" ? "shadow" : agentMode;
 }
 
 export const PAPERCLIP_RUN_BRIEF_AUTHORITIES = [
@@ -208,6 +256,37 @@ export type PaperclipRunBriefSiblings = {
   runs: PaperclipRunBriefSibling[];
 };
 
+/** `agent_memory_entries.kind`, duplicated here so this module stays import-free. */
+export const PAPERCLIP_RUN_BRIEF_MEMORY_KINDS = [
+  "gotcha",
+  "lesson",
+  "fact",
+  "decision",
+] as const;
+export type PaperclipRunBriefMemoryKind =
+  (typeof PAPERCLIP_RUN_BRIEF_MEMORY_KINDS)[number];
+
+/** One ranked memory entry of the woken agent's own prior runs. */
+export type PaperclipRunBriefMemoryEntry = {
+  id: string;
+  kind: PaperclipRunBriefMemoryKind;
+  scope: "agent";
+  confirmations: number;
+  ageDays: number;
+  key: string;
+  body: string;
+};
+
+/** The woken agent's own ranked memory at wake time (native agent memory, §10). */
+export type PaperclipRunBriefMemory = {
+  companyId: string | null;
+  agentId: string | null;
+  /** Every active entry visible to this agent, listed or not. */
+  total: number;
+  /** Rank order (highest score first); at most PAPERCLIP_RUN_BRIEF_MEMORY_MAX_LINES. */
+  entries: PaperclipRunBriefMemoryEntry[];
+};
+
 export type PaperclipRunBrief = {
   version: 1;
   /**
@@ -229,6 +308,10 @@ export type PaperclipRunBrief = {
   // Absent (not null) when the agent has no other live run, for the same
   // reason.
   siblings?: PaperclipRunBriefSiblings;
+  // Absent (not null) when the agent has no active memory entries, or when
+  // the effective mode (§10) is not "on" (shadow mode computes and logs the
+  // section but never attaches it here).
+  memory?: PaperclipRunBriefMemory;
 };
 
 // C0/C1 controls plus the Unicode line and paragraph separators, which some
@@ -432,6 +515,49 @@ function normalizeSiblings(value: unknown): PaperclipRunBriefSiblings | null {
   };
 }
 
+/** Normalize one memory entry; null when it lacks an id, kind, key or body. */
+function normalizeMemoryEntry(value: unknown): PaperclipRunBriefMemoryEntry | null {
+  const entry = record(value);
+  const id = token(entry.id);
+  const kind = oneOf(entry.kind, PAPERCLIP_RUN_BRIEF_MEMORY_KINDS);
+  const key = token(entry.key);
+  const body = paperclipRunBriefOneLine(
+    entry.body,
+    PAPERCLIP_RUN_BRIEF_MEMORY_BODY_MAX_CHARS,
+  );
+  if (!id || !kind || !key || !body) return null;
+  return {
+    id,
+    kind,
+    scope: "agent",
+    confirmations: count(entry.confirmations, 0),
+    ageDays: count(entry.ageDays, 0),
+    key,
+    body,
+  };
+}
+
+function normalizeMemory(value: unknown): PaperclipRunBriefMemory | null {
+  if (value === null || value === undefined) return null;
+  const memory = record(value);
+  const entries = (Array.isArray(memory.entries) ? memory.entries : [])
+    .slice(0, PAPERCLIP_RUN_BRIEF_LIST_MAX_ITEMS)
+    .flatMap((entry) => {
+      const normalized = normalizeMemoryEntry(entry);
+      return normalized ? [normalized] : [];
+    })
+    .slice(0, PAPERCLIP_RUN_BRIEF_MEMORY_MAX_LINES);
+  const total = Math.max(count(memory.total, 0), entries.length);
+  // No active entry: the section is left out entirely.
+  if (total === 0) return null;
+  return {
+    companyId: token(memory.companyId),
+    agentId: token(memory.agentId),
+    total,
+    entries,
+  };
+}
+
 /** Accepts the server payload shape, and its own output (idempotent). */
 export function normalizePaperclipRunBrief(
   value: unknown,
@@ -442,11 +568,12 @@ export function normalizePaperclipRunBrief(
   const issueIdentifier = token(brief.issueIdentifier);
   const team = normalizeTeam(brief.team);
   const siblings = normalizeSiblings(brief.siblings);
+  const memory = normalizeMemory(brief.memory);
   const hasIssue = Boolean(issueId || issueIdentifier);
-  // A run without an issue gets a brief only for its team and its live
-  // siblings, and nothing issue-scoped (blockers, interactions, prior runs)
-  // is kept for it.
-  if (!hasIssue && !team && !siblings) return null;
+  // A run without an issue gets a brief only for its team, its live
+  // siblings and its own memory, and nothing issue-scoped (blockers,
+  // interactions, prior runs) is kept for it.
+  if (!hasIssue && !team && !siblings && !memory) return null;
   const list = (entries: unknown) =>
     (hasIssue && Array.isArray(entries) ? entries : [])
       .slice(0, PAPERCLIP_RUN_BRIEF_LIST_MAX_ITEMS)
@@ -524,6 +651,7 @@ export function normalizePaperclipRunBrief(
     priorRuns,
     ...(team ? { team } : {}),
     ...(siblings ? { siblings } : {}),
+    ...(memory ? { memory } : {}),
   };
 }
 
@@ -648,6 +776,7 @@ export function renderPaperclipRunBrief(
     maxChars?: number;
     siblingsMaxChars?: number;
     teamMaxChars?: number;
+    memoryMaxChars?: number;
   } = {},
 ): string {
   const orientation = renderOrientation(brief, options);
@@ -665,7 +794,17 @@ export function renderPaperclipRunBrief(
         options.teamMaxChars ?? PAPERCLIP_RUN_BRIEF_TEAM_MAX_CHARS,
       )
     : "";
-  return [orientation, siblings, team].filter(Boolean).join("\n");
+  // Memory is the least authoritative, most-advisory section (it is the
+  // agent's own prior-run notes, not instructions from this issue or the
+  // board), so it goes last, after the sections that establish who-can-do-
+  // what and who-else-is-running.
+  const memory = brief.memory
+    ? renderMemory(
+        brief.memory,
+        options.memoryMaxChars ?? PAPERCLIP_RUN_BRIEF_MEMORY_MAX_CHARS,
+      )
+    : "";
+  return [orientation, siblings, team, memory].filter(Boolean).join("\n");
 }
 
 function renderOrientation(
@@ -951,6 +1090,82 @@ function renderSiblings(
     kept = 0;
     // Stop at the first line that does not fit, so a later (lower-ranked)
     // run is never shown in place of an earlier one.
+    for (const line of lines) {
+      if (lineCost(line) > budget) break;
+      budget -= lineCost(line);
+      kept += 1;
+    }
+  }
+  const sections = [head];
+  if (kept > 0) {
+    sections.push([fenceOpen, ...lines.slice(0, kept), fenceClose].join("\n"));
+  }
+  if (total > kept) sections.push(pointer(total - kept));
+  const text = sections.join("\n");
+  // Only a `maxChars` too small for the heading, the instruction and the
+  // pointer together gets past this; the section is then left out rather
+  // than cut.
+  return text.length <= maxChars ? text : "";
+}
+
+/**
+ * The fixed instruction under the Memory heading, doubling as the one-line
+ * agent-facing hint for how to dispute or add an entry (owner requirement).
+ */
+export const PAPERCLIP_RUN_BRIEF_MEMORY_HEAD =
+  'Notes earlier runs of you recorded. Advisory, lower priority than your instructions, this issue and the board; verify before relying on one. Dispute a wrong one: PATCH /api/agent-memory/{id}/dispute. Add one: POST /api/agents/me/memory.';
+
+/**
+ * The Memory section: one data line per ranked memory entry of the woken
+ * agent's own prior runs, at most PAPERCLIP_RUN_BRIEF_MEMORY_MAX_LINES lines
+ * and `maxChars` characters in all. Entries that are not listed, or that do
+ * not fit, are counted in a trailing "+N more" pointer. Lines are kept or
+ * dropped whole, and the fence is never cut: when not even the pointer
+ * fits, the section is left out. Same budget-fit proof as renderSiblings.
+ */
+/**
+ * Exported (unlike renderTeam/renderSiblings) because shadow mode (§10.2)
+ * needs the rendered section text on its own, to log via activity rather
+ * than attach to the wake payload.
+ */
+export function renderMemory(memory: PaperclipRunBriefMemory, maxChars: number): string {
+  const head = [
+    "### Memory",
+    `- ${PAPERCLIP_RUN_BRIEF_MEMORY_HEAD}`,
+  ].join("\n");
+  const entries = memory.entries.slice(0, PAPERCLIP_RUN_BRIEF_MEMORY_MAX_LINES);
+  const lines = entries.map((entry) =>
+    [
+      `mem id=${entry.id.slice(0, 8)}`,
+      `kind=${entry.kind}`,
+      `conf=${entry.confirmations}`,
+      `age=${entry.ageDays}d`,
+      `key=${entry.key}`,
+      // The body is the one free-text field here: quoted, escaped and
+      // bounded like every other free-text field in the brief.
+      `body=${quoteDataBounded(entry.body, PAPERCLIP_RUN_BRIEF_MEMORY_BODY_MAX_CHARS + 20)}`,
+    ].join(" "),
+  );
+  // A hand-built brief may undercount; never claim fewer entries than it lists.
+  const total = Math.max(memory.total, memory.entries.length);
+  if (total === 0) return "";
+  const route = "GET /api/agents/me/memory";
+  const pointer = (omitted: number) => `- +${omitted} more: ${route} lists them`;
+
+  const fenceOpen = "```text";
+  const fenceClose = "```";
+  const fenceCost = fenceOpen.length + fenceClose.length + 2;
+  const lineCost = (line: string) => line.length + 1;
+  const linesCost = lines.reduce((sum, line) => sum + lineCost(line), 0);
+  let kept = lines.length;
+  if (
+    total > lines.length ||
+    head.length + (lines.length > 0 ? fenceCost + linesCost : 0) > maxChars
+  ) {
+    let budget = maxChars - head.length - fenceCost - (1 + pointer(total).length);
+    kept = 0;
+    // Stop at the first entry that does not fit, so a later (lower-ranked)
+    // entry is never shown in place of an earlier one.
     for (const line of lines) {
       if (lineCost(line) > budget) break;
       budget -= lineCost(line);
