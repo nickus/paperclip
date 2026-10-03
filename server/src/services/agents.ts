@@ -7,6 +7,8 @@ import {
   toolConnectionInstalls,
   agentConfigRevisions,
   agentApiKeys,
+  agentMemoryAudit,
+  agentMemoryEntries,
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
@@ -1069,6 +1071,12 @@ export function agentService(db: Db) {
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
           .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
+        // The agent's memory entries go with it (FK cascade). Their audit
+        // rows keep before/after text and have no FK to the entry, so they
+        // are removed explicitly rather than left behind.
+        await tx.delete(agentMemoryAudit).where(
+          sql`${agentMemoryAudit.entryId} in (select ${agentMemoryEntries.id} from ${agentMemoryEntries} where ${agentMemoryEntries.agentId} = ${id} or ${agentMemoryEntries.createdByAgentId} = ${id})`,
+        );
         await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
         await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
         await tx.delete(activityLog).where(

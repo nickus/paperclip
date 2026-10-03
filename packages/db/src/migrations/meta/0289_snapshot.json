@@ -1,5 +1,5 @@
 {
-  "id": "1a404b26-dc21-4c9b-920f-4af18bb093f9",
+  "id": "03d4f6a0-8e94-43c8-a4c1-445acf0bfb58",
   "prevId": "4713ff42-3031-46aa-81ee-b23a3eaa46b9",
   "version": "7",
   "dialect": "postgresql",
@@ -1152,7 +1152,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
+          "onDelete": "cascade",
           "onUpdate": "no action"
         },
         "agent_memory_audit_run_id_heartbeat_runs_id_fk": {
@@ -1165,7 +1165,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
+          "onDelete": "set null",
           "onUpdate": "no action"
         }
       },
@@ -1472,7 +1472,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
+          "onDelete": "cascade",
           "onUpdate": "no action"
         },
         "agent_memory_entries_agent_id_agents_id_fk": {
@@ -1485,7 +1485,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
+          "onDelete": "cascade",
           "onUpdate": "no action"
         },
         "agent_memory_entries_source_run_id_heartbeat_runs_id_fk": {
@@ -1498,7 +1498,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
+          "onDelete": "set null",
           "onUpdate": "no action"
         },
         "agent_memory_entries_source_issue_id_issues_id_fk": {
@@ -1511,7 +1511,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
+          "onDelete": "set null",
           "onUpdate": "no action"
         },
         "agent_memory_entries_created_by_agent_id_agents_id_fk": {
@@ -1524,7 +1524,7 @@
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
+          "onDelete": "cascade",
           "onUpdate": "no action"
         }
       },

@@ -3,6 +3,8 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentMemoryAudit,
+  agentMemoryEntries,
   agents,
   companies,
   companySkills,
@@ -44,6 +46,8 @@ describeEmbeddedPostgres("cleanup removal services", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(agentMemoryAudit);
+    await db.delete(agentMemoryEntries);
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
     await db.delete(issueReadStates);
@@ -153,6 +157,97 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(0);
     await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(0);
+  });
+
+  async function seedMemoryEntry(input: { companyId: string; agentId: string; runId: string; issueId?: string | null; key: string }) {
+    const entryId = randomUUID();
+    await db.insert(agentMemoryEntries).values({
+      id: entryId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      createdByAgentId: input.agentId,
+      kind: "gotcha",
+      key: input.key,
+      body: "The build host caps concurrent docker builds at 2.",
+      sourceRunId: input.runId,
+      sourceIssueId: input.issueId ?? null,
+      expiresAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
+    });
+    await db.insert(agentMemoryAudit).values({
+      companyId: input.companyId,
+      entryId,
+      action: "add",
+      actorType: "agent",
+      actorId: input.agentId,
+      runId: input.runId,
+      afterBody: "The build host caps concurrent docker builds at 2.",
+      afterVersion: 1,
+    });
+    return entryId;
+  }
+
+  it("removes an agent's memory entries and their audit history, and memory rows never block removal", async () => {
+    const { agentId, companyId, issueId, runId } = await seedFixture();
+    const reviewerId = randomUUID();
+    const reviewerRunId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerId,
+      companyId,
+      name: "Reviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({ id: reviewerRunId, companyId, agentId: reviewerId, invocationSource: "assignment", status: "completed" });
+
+    const entryId = await seedMemoryEntry({ companyId, agentId, runId, issueId, key: "build-limit" });
+    const reviewerEntryId = await seedMemoryEntry({ companyId, agentId: reviewerId, runId: reviewerRunId, key: "review-rule" });
+    // The reviewer's run acted on the first agent's entry.
+    await db.insert(agentMemoryAudit).values({
+      companyId,
+      entryId,
+      action: "confirm",
+      actorType: "agent",
+      actorId: reviewerId,
+      runId: reviewerRunId,
+    });
+
+    // Removing the reviewer deletes its own entry and audit, and only detaches
+    // its run from the audit row it left on another agent's entry.
+    await expect(agentService(db).remove(reviewerId)).resolves.toMatchObject({ id: reviewerId });
+    await expect(db.select().from(agentMemoryEntries).where(eq(agentMemoryEntries.id, reviewerEntryId))).resolves.toHaveLength(0);
+    await expect(db.select().from(agentMemoryAudit).where(eq(agentMemoryAudit.entryId, reviewerEntryId))).resolves.toHaveLength(0);
+    const remaining = await db.select().from(agentMemoryAudit).where(eq(agentMemoryAudit.entryId, entryId));
+    expect(remaining).toHaveLength(2);
+    expect(remaining.find((row) => row.action === "confirm")?.runId).toBeNull();
+
+    // Removing the owner deletes its entry and the entry's whole audit history.
+    await expect(agentService(db).remove(agentId)).resolves.toMatchObject({ id: agentId });
+    await expect(db.select().from(agentMemoryEntries).where(eq(agentMemoryEntries.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(agentMemoryAudit).where(eq(agentMemoryAudit.companyId, companyId))).resolves.toHaveLength(0);
+  });
+
+  it("detaches memory entries from a deleted issue instead of blocking the delete", async () => {
+    const { agentId, companyId, issueId, runId } = await seedFixture();
+    const entryId = await seedMemoryEntry({ companyId, agentId, runId, issueId, key: "issue-linked" });
+
+    await db.delete(issueComments).where(eq(issueComments.issueId, issueId));
+    await db.delete(issues).where(eq(issues.id, issueId));
+
+    const [entry] = await db.select().from(agentMemoryEntries).where(eq(agentMemoryEntries.id, entryId));
+    expect(entry?.sourceIssueId).toBeNull();
+  });
+
+  it("removes memory entries and their audit rows with the company", async () => {
+    const { agentId, companyId, runId } = await seedFixture();
+    await seedMemoryEntry({ companyId, agentId, runId, key: "company-scoped" });
+
+    await expect(companyService(db).remove(companyId)).resolves.toBeTruthy();
+    await expect(db.select().from(agentMemoryEntries).where(eq(agentMemoryEntries.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(agentMemoryAudit).where(eq(agentMemoryAudit.companyId, companyId))).resolves.toHaveLength(0);
   });
 
   it("removes issue read states and activity rows before deleting the company", async () => {

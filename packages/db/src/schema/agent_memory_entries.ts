@@ -13,9 +13,9 @@ export const agentMemoryEntries = pgTable(
   "agent_memory_entries",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    companyId: uuid("company_id").notNull().references(() => companies.id),
+    companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
     scope: text("scope").notNull().default("agent"), // "agent" | "company" (company disabled in v1 at the service layer)
-    agentId: uuid("agent_id").references(() => agents.id), // null only for scope="company" (disabled)
+    agentId: uuid("agent_id").references(() => agents.id, { onDelete: "cascade" }), // null only for scope="company" (disabled)
 
     kind: text("kind").notNull(), // "gotcha" | "lesson" | "fact" | "decision"
     key: text("key").notNull(), // slug, <= 64 chars, caller-chosen or derived from content
@@ -26,9 +26,9 @@ export const agentMemoryEntries = pgTable(
     version: integer("version").notNull().default(1), // CAS token; bumped on every UPDATE/confirm
 
     // Provenance (server-filled from the run token; never client-supplied).
-    sourceRunId: uuid("source_run_id").references(() => heartbeatRuns.id),
-    sourceIssueId: uuid("source_issue_id").references(() => issues.id),
-    createdByAgentId: uuid("created_by_agent_id").notNull().references(() => agents.id),
+    sourceRunId: uuid("source_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
+    sourceIssueId: uuid("source_issue_id").references(() => issues.id, { onDelete: "set null" }),
+    createdByAgentId: uuid("created_by_agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
     sourceTrust: jsonb("source_trust").$type<Record<string, unknown> | null>(), // SourceTrustMetadata | null; non-null => quarantined on insert
 
     // Confirmations / use (ADD-vs-UPDATE decision input and decay-by-disuse ranking input).
@@ -65,7 +65,7 @@ export const agentMemoryAudit = pgTable(
   "agent_memory_audit",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    companyId: uuid("company_id").notNull().references(() => companies.id),
+    companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
     // No FK to agentMemoryEntries.id: the hard-cap sweep (§6.3) physically
     // DELETEs expired/tombstoned entry rows, and this audit trail must
     // outlive that delete the same way activity_log.entityId outlives a
@@ -76,7 +76,7 @@ export const agentMemoryAudit = pgTable(
     action: text("action").notNull(), // "add" | "update" | "noop_confirm" | "dispute" | "tombstone" | "quarantine_promote" | "hard_purge" | "evict_cap" | "expire_sweep"
     actorType: text("actor_type").notNull(), // "agent" | "user" | "system"
     actorId: text("actor_id").notNull(),
-    runId: uuid("run_id").references(() => heartbeatRuns.id),
+    runId: uuid("run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     beforeBody: text("before_body"), // null on "add"
     afterBody: text("after_body"), // null on "tombstone"/"hard_purge" terminal state cleanup
     beforeVersion: integer("before_version"),
