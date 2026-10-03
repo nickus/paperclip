@@ -1,5 +1,6 @@
 import { enrichPromotedWakeContext } from "../domain/context.js";
 import {
+  decideDependencyResolvedWakePromotion,
   decideQueuedCommentAction,
   decideReleaseRecovery,
   decideWakeAdmission,
@@ -56,6 +57,23 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = new Set([
   "cancelled",
 ]);
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = "stranded_issue_recovery";
+// Mirrors `ISSUE_BLOCKERS_RESOLVED_WAKE_REASON` in `services/issue-dependency-wakeups.ts`,
+// kept as a local literal here the same way this file already inlines other
+// wake reasons (e.g. "issue_assigned", "issue_commented") instead of
+// importing them from the services layer.
+const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
+
+/**
+ * The `resolvedBlockerIssueId` a deferred wake's payload carries when it is
+ * a dependency-resolved wake, or `null` for every other kind of wake. Reads
+ * `wakeReason` first: the deferred-wake context seed keeps the wake's
+ * original reason even after promotion overwrites the row's own `reason`
+ * column to `issue_execution_promoted`.
+ */
+function readDependencyResolvedWakeResolution(candidate: DeferredWakeCandidate): string | null {
+  if ((candidate.wakeReason ?? candidate.reason) !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) return null;
+  return readNonEmptyString(candidate.payload.resolvedBlockerIssueId);
+}
 
 function isExecutionReviewParticipantRecoveryRun(run: Pick<RunSnapshot, "contextSnapshot">): boolean {
   return readNonEmptyString(run.contextSnapshot.retryReason) === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON;
@@ -262,6 +280,42 @@ async function runReleaseDrain(
         });
       }
       continue;
+    }
+
+    // A dependency-resolved wake fires once per blocker resolution for the
+    // dependent's assignee. Several triggers can notice the same resolution
+    // while an earlier one is already running against this same issue (the
+    // periodic backstop, the finalize-time recheck, and the route-time wake
+    // can all land here as separate deferred wakes), so re-check right
+    // before promotion that this exact resolution is still unanswered.
+    const resolvedBlockerIssueId = readDependencyResolvedWakeResolution(candidate);
+    if (resolvedBlockerIssueId) {
+      const [hasRunForSameResolution, hasOpenBlockerPath] = await Promise.all([
+        ports.transaction.hasRunForResolvedDependencyWake({
+          companyId: run.companyId,
+          issueId: issue.id,
+          agentId: candidate.agentId,
+          resolvedBlockerIssueId,
+        }),
+        ports.transaction.hasExplicitBlockerPath({ companyId: run.companyId, issueId: issue.id }),
+      ]);
+      const promotionDecision = decideDependencyResolvedWakePromotion({
+        hasRunForSameResolution,
+        hasOpenBlockerPath,
+        reblockedAfterRequest:
+          issue.status === "blocked" &&
+          issue.blockedTransitionAt !== null &&
+          issue.blockedTransitionAt.getTime() > candidate.requestedAt.getTime(),
+      });
+      if (promotionDecision.kind === "skip") {
+        await ports.transaction.cancelDeferredWake({
+          companyId: run.companyId,
+          wakeId: candidate.id,
+          reason: promotionDecision.reason,
+          now: input.now,
+        });
+        continue;
+      }
     }
 
     let liveness = { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false };

@@ -71,6 +71,8 @@ export type DeferredWakeCandidate = {
   triggerDetail: string | null;
   requestedByActorType: "user" | "agent" | "system" | null;
   requestedByActorId: string | null;
+  /** When this wake was originally requested, used to tell it apart from a later re-block of the same dependent issue. */
+  requestedAt: Date;
   payload: Record<string, unknown>;
   /** The queued comment ids the wake's queued-comment context carries, already extracted from the payload. */
   queuedCommentIds: string[];
@@ -259,6 +261,19 @@ export interface WakeQueueTransaction {
   }): Promise<boolean>;
   /** An open, non-hidden issue that still lists this issue as a `blocks` predecessor. */
   hasExplicitBlockerPath(input: { companyId: string; issueId: string }): Promise<boolean>;
+  /**
+   * A run for this agent and issue already exists whose context snapshot
+   * carries this exact `resolvedBlockerIssueId`, from an earlier promotion
+   * of the identical blocker resolution. Any run status counts, including a
+   * finished one: once a run has addressed one resolved-blocker event, a
+   * sibling duplicate wake for that same event must not start another.
+   */
+  hasRunForResolvedDependencyWake(input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    resolvedBlockerIssueId: string;
+  }): Promise<boolean>;
   isAutomaticRecoverySuppressedByPauseHold(input: { companyId: string; issueId: string }): Promise<boolean>;
   /** Deny-only facts from the exact finishing run and its durable chat wake owner. */
   isImmediateRecoverySourceBlocked(input: { companyId: string; runId: string }): Promise<boolean>;

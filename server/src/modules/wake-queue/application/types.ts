@@ -45,6 +45,8 @@ export type IssueSnapshot = {
   parentId: string | null;
   originId: string | null;
   originRunId: string | null;
+  /** When the issue most recently transitioned into `blocked`, or null if it never has (or the column was cleared on leaving blocked). Used to tell a dependency wake's own blocked cycle apart from a later one. */
+  blockedTransitionAt: Date | null;
 };
 
 export type InvokableAgentSnapshot = {

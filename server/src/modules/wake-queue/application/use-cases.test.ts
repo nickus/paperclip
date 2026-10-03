@@ -47,6 +47,7 @@ const ISSUE: IssueSnapshot = {
   parentId: null,
   originId: null,
   originRunId: null,
+  blockedTransitionAt: null,
 };
 
 const AGENT: InvokableAgentSnapshot = {
@@ -66,6 +67,7 @@ function wakeCandidate(overrides: Partial<DeferredWakeCandidate> = {}): Deferred
     triggerDetail: null,
     requestedByActorType: "user",
     requestedByActorId: "actor-1",
+    requestedAt: new Date("2026-01-01T00:00:00.000Z"),
     payload: {},
     queuedCommentIds: [],
     preservesIndependentContinuation: false,
@@ -125,6 +127,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     carryHandoffQueuedComments: vi.fn(async () => []),
     hasExistingExecutionPath: vi.fn(async () => false),
     hasExplicitBlockerPath: vi.fn(async () => false),
+    hasRunForResolvedDependencyWake: vi.fn(async () => false),
     isAutomaticRecoverySuppressedByPauseHold: vi.fn(async () => false),
     isImmediateRecoverySourceBlocked: vi.fn(async () => false),
     queueReviewParticipantRecoveryRun: vi.fn(async () => runSummary("review-recovery")),
@@ -1089,6 +1092,180 @@ function createFakeAdmissionHelpers(
     ...overrides,
   };
 }
+
+// A deferred `issue_blockers_resolved` wake, as the route-time wake, the
+// finalize-time recheck, and the periodic backstop each build one: the
+// payload and the deferred context seed both carry `resolvedBlockerIssueId`,
+// the context seed keeps `wakeReason` across a later promotion that
+// overwrites the row's own `reason` column.
+function dependencyResolvedWakeCandidate(
+  options: Partial<DeferredWakeCandidate> & { resolvedBlockerIssueId?: string } = {},
+): DeferredWakeCandidate {
+  const { resolvedBlockerIssueId = "blocker-1", ...overrides } = options;
+  return wakeCandidate({
+    reason: "issue_blockers_resolved",
+    wakeReason: "issue_blockers_resolved",
+    requestedByActorType: "system",
+    requestedByActorId: "issue_graph_liveness_backstop",
+    payload: { issueId: ISSUE.id, resolvedBlockerIssueId, blockerIssueIds: [resolvedBlockerIssueId] },
+    deferredContextSeed: { wakeReason: "issue_blockers_resolved", issueId: ISSUE.id, resolvedBlockerIssueId },
+    ...overrides,
+  });
+}
+
+describe("releaseIssueExecution: dependency-resolved wake promotion idempotency", () => {
+  it("promotes a dependency-resolved wake when no earlier run addressed the same resolution", async () => {
+    const candidate = dependencyResolvedWakeCandidate({ id: "wake-dep-1" });
+    const hasRunForResolvedDependencyWake = vi.fn(async () => false);
+    const queue = [candidate];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      hasRunForResolvedDependencyWake,
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction),
+      recovery: createFakeRecovery(),
+    });
+
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+    expect(result.outcome.kind).toBe("promoted");
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({ wakeId: "wake-dep-1" }));
+    expect(hasRunForResolvedDependencyWake).toHaveBeenCalledWith({
+      companyId: RUN.companyId,
+      issueId: ISSUE.id,
+      agentId: candidate.agentId,
+      resolvedBlockerIssueId: "blocker-1",
+    });
+  });
+
+  it("coalesces every duplicate wake for one blocker resolution instead of starting a run for each", async () => {
+    // Two separate triggers (for example the periodic backstop and the
+    // finalize-time recheck) both noticed the identical blocker resolution
+    // while an earlier run for it was already live, so both landed here as
+    // deferred wakes. A run for that exact resolution already exists by the
+    // time this drain runs, so neither one may start another.
+    const queue = [
+      dependencyResolvedWakeCandidate({ id: "wake-dep-a" }),
+      dependencyResolvedWakeCandidate({ id: "wake-dep-b" }),
+    ];
+    const hasRunForResolvedDependencyWake = vi.fn(async () => true);
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      hasRunForResolvedDependencyWake,
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction),
+      recovery: createFakeRecovery(),
+    });
+
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+    expect(transaction.claimDeferredWakeForPromotion).not.toHaveBeenCalled();
+    expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
+    expect(transaction.cancelDeferredWake).toHaveBeenCalledTimes(2);
+    expect(transaction.cancelDeferredWake).toHaveBeenCalledWith(expect.objectContaining({
+      wakeId: "wake-dep-a",
+      reason: "Dependency wake superseded: a run for this exact blocker resolution already ran",
+    }));
+    expect(transaction.cancelDeferredWake).toHaveBeenCalledWith(expect.objectContaining({
+      wakeId: "wake-dep-b",
+      reason: "Dependency wake superseded: a run for this exact blocker resolution already ran",
+    }));
+    // The queue drained to empty without a promotion, so release falls through
+    // to its ordinary immediate-recovery decision for the finishing run.
+    expect(result.outcome.kind).toBe("queued_recovery");
+  });
+
+  it("still promotes a wake for a second, later and distinct blocker resolution", async () => {
+    const candidate = dependencyResolvedWakeCandidate({ id: "wake-dep-2", resolvedBlockerIssueId: "blocker-2" });
+    const hasRunForResolvedDependencyWake = vi.fn(
+      async (input: { resolvedBlockerIssueId: string }) => input.resolvedBlockerIssueId === "blocker-1",
+    );
+    const queue = [candidate];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      hasRunForResolvedDependencyWake,
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction),
+      recovery: createFakeRecovery(),
+    });
+
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+    expect(result.outcome.kind).toBe("promoted");
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({ wakeId: "wake-dep-2" }));
+    expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+  });
+
+  it("skips promotion while the dependent issue still has another unresolved blocker", async () => {
+    const candidate = dependencyResolvedWakeCandidate({ id: "wake-dep-3" });
+    const queue = [candidate];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      hasExplicitBlockerPath: vi.fn(async () => true),
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction),
+      recovery: createFakeRecovery(),
+    });
+
+    await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+    expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
+    expect(transaction.cancelDeferredWake).toHaveBeenCalledWith(expect.objectContaining({
+      wakeId: "wake-dep-3",
+      reason: "Dependency wake superseded: the issue still has an unresolved blocker",
+    }));
+  });
+
+  it("skips promotion when the issue was set back to blocked after this wake was requested", async () => {
+    const requestedAt = new Date("2026-01-01T00:00:00.000Z");
+    const candidate = dependencyResolvedWakeCandidate({ id: "wake-dep-4", requestedAt });
+    const reblockedIssue: IssueSnapshot = {
+      ...ISSUE,
+      status: "blocked",
+      blockedTransitionAt: new Date(requestedAt.getTime() + 60_000),
+    };
+    const queue = [candidate];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, reblockedIssue),
+      recovery: createFakeRecovery(),
+    });
+
+    await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+    expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
+    expect(transaction.cancelDeferredWake).toHaveBeenCalledWith(expect.objectContaining({
+      wakeId: "wake-dep-4",
+      reason: "Dependency wake superseded: the issue was set back to blocked after this wake was requested",
+    }));
+  });
+
+  it("does not run the dependency-resolution check against an ordinary (non-dependency) wake", async () => {
+    const candidate = wakeCandidate({ id: "wake-ordinary", reason: "issue_commented", wakeReason: "issue_commented" });
+    const hasRunForResolvedDependencyWake = vi.fn(async () => true);
+    const queue = [candidate];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      hasRunForResolvedDependencyWake,
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction),
+      recovery: createFakeRecovery(),
+    });
+
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+    expect(hasRunForResolvedDependencyWake).not.toHaveBeenCalled();
+    expect(result.outcome.kind).toBe("promoted");
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({ wakeId: "wake-ordinary" }));
+  });
+});
 
 describe("admitWakeBehindIssueExecution", () => {
   it.each(["running", "queued"])(
