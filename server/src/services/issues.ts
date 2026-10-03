@@ -9168,6 +9168,55 @@ export function issueService(db: Db) {
       return readiness.get(issueId) ?? createIssueDependencyReadiness(issueId);
     },
 
+    // True when `issueId` is still sitting in the "backlog" status that
+    // create() picked automatically because the issue had no assignee yet
+    // (resolveCreateIssueStatusDefault's "unassigned_omitted_status" reason),
+    // and nobody has explicitly chosen a status for it since. The PATCH route
+    // uses this to decide whether assigning the issue should also move it to
+    // "todo" the way create() would have if the assignee had been known up
+    // front — an issue created or later moved into backlog on purpose must
+    // stay there. Two small indexed (entity_type, entity_id) lookups rather
+    // than a new column: the create default is only ever recorded in the
+    // issue.created activity, and "issue.updated" activity rows only ever get
+    // an explicit status marker (see the PATCH route's issue.updated logging)
+    // when the caller's request body itself set a status.
+    isBacklogFromUnassignedCreationDefault: async (
+      issueId: string,
+      dbOrTx: any = db,
+    ): Promise<boolean> => {
+      const created = await dbOrTx
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, issueId),
+            eq(activityLog.action, "issue.created"),
+          ),
+        )
+        .limit(1)
+        .then(
+          (rows: Array<{ details: Record<string, unknown> | null }>) =>
+            rows[0]?.details ?? null,
+        );
+      if (created?.statusDefaultReason !== "unassigned_omitted_status")
+        return false;
+
+      const explicitStatusSinceCreation = await dbOrTx
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, issueId),
+            eq(activityLog.action, "issue.updated"),
+            sql`${activityLog.details} ->> 'statusExplicit' = 'true'`,
+          ),
+        )
+        .limit(1);
+      return explicitStatusSinceCreation.length === 0;
+    },
+
     listDependencyReadiness: async (
       companyId: string,
       issueIds: string[],
