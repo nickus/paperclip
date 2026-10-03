@@ -35,6 +35,19 @@ function steward(request: RouteCase) {
   return authorizeSandboxCallbackBridgeRequestForPolicy(request, { policy: "steward", companyId: COMPANY });
 }
 
+// Mirrors the case-insensitive, trailing-slash-stripped matching the real
+// authorizer applies before testing deny rules, so these tests can tell
+// which denial wording a fixture request should get: the detailed
+// secrets/credentials/administration wording when a deny rule actually
+// matches, or the plain "not available" wording when the request is simply
+// outside the policy's allow families.
+function matchesDenyRule(rules: readonly { methods: readonly string[]; path: RegExp }[], request: RouteCase): boolean {
+  const method = request.method.toUpperCase();
+  const lowered = request.path.toLowerCase();
+  const matchPath = lowered.length > 1 && lowered.endsWith("/") ? lowered.slice(0, -1) : lowered;
+  return rules.some((rule) => rule.methods.includes(method) && rule.path.test(matchPath));
+}
+
 // The REST tool gateway routes every policy forwards: create a session for
 // the calling run, list its tools, call one, revoke the session.
 const TOOL_GATEWAY_ALLOWED: RouteCase[] = [
@@ -402,7 +415,10 @@ const AGENT_DENIED: RouteCase[] = [
   // Unknown families fail closed.
   { method: "GET", path: "/api/new-thing" },
   { method: "GET", path: "/api/runs/run-1" },
-  { method: "GET", path: "/openapi.json" },
+  // `/` has no "/api"-prefixed form that any policy allows, so it stays a
+  // plain unmatched-route denial; `/openapi.json` does (`GET /api/openapi.json`
+  // is itself allowed), so it moved to the "missing /api prefix" cases below
+  // instead of this fixture.
   { method: "GET", path: "/" },
   // Methods outside the listed ones.
   { method: "OPTIONS", path: "/api/issues/issue-1" },
@@ -581,7 +597,9 @@ describe("sandbox callback bridge route policies", () => {
           const denial = authorize(request);
           expect(denial, `${request.method} ${request.path}`).not.toBeNull();
           expect(denial).toContain(`${request.method} ${request.path}`);
-          expect(denial).toContain("retrying this route will not succeed.");
+          // None of these instance-level guesses match a deny rule, so they
+          // get the plain "not available" wording, not the secrets/admin one.
+          expect(denial).toContain("This route is not available to agent runs.");
           expect(denial).toContain(`Instead, ${suggestion}.`);
           // The suggested route is one the same policy actually forwards.
           const suggestedRoute = suggestion.match(/GET (\/api\/\S+)/)![1]!.replace("{companyId}", COMPANY);
@@ -626,6 +644,61 @@ describe("sandbox callback bridge route policies", () => {
     });
   });
 
+  describe("missing /api prefix", () => {
+    // A sandbox client that built its request URL from a base it assumed
+    // already ended in "/api" sends e.g. `PATCH /issues/{id}` instead of
+    // `PATCH /api/issues/{id}`. `agent` and `steward` recognize that specific
+    // shape and name the fix instead of claiming the route is unreachable.
+    it("agent and steward: names the missing prefix when the /api form would be allowed", () => {
+      for (const authorize of [agent, steward]) {
+        expect(authorize({ method: "PATCH", path: "/issues/issue-1" })).toBe(
+          "Route not allowed: PATCH /issues/issue-1 is missing the /api prefix. Use PATCH /api/issues/issue-1.",
+        );
+        expect(authorize({ method: "POST", path: "/issues/issue-1/comments" })).toBe(
+          "Route not allowed: POST /issues/issue-1/comments is missing the /api prefix. Use POST /api/issues/issue-1/comments.",
+        );
+        // Also covers the one non-issue example moved out of AGENT_DENIED
+        // above: `GET /api/openapi.json` is itself allowed.
+        expect(authorize({ method: "GET", path: "/openapi.json" })).toBe(
+          "Route not allowed: GET /openapi.json is missing the /api prefix. Use GET /api/openapi.json.",
+        );
+      }
+    });
+
+    it("agent and steward: keeps the normal denial when the /api form is itself refused", () => {
+      for (const authorize of [agent, steward]) {
+        // A bare secrets path matches the secrets deny rule with or without
+        // the prefix (the rule is not anchored to "/api"), so it is denied
+        // the ordinary way and never told to retry with /api.
+        const secretsDenial = authorize({ method: "GET", path: "/agents/agent-1/secrets" });
+        expect(secretsDenial, "GET /agents/agent-1/secrets").not.toBeNull();
+        expect(secretsDenial).not.toContain("is missing the /api prefix");
+        expect(secretsDenial).toContain("retrying this route will not succeed");
+
+        // A path whose deny rule only matches once it carries the "/api"
+        // prefix (the agent record write below is anchored to "/api") is
+        // refused as a plain unmatched route, not with a prefix hint either,
+        // because the prefixed form is itself denied.
+        const agentRecordDenial = authorize({ method: "PATCH", path: "/agents/agent-1" });
+        expect(agentRecordDenial, "PATCH /agents/agent-1").not.toBeNull();
+        expect(agentRecordDenial).not.toContain("is missing the /api prefix");
+      }
+    });
+
+    it("leaves an already-prefixed, allowed route unaffected", () => {
+      for (const authorize of [agent, steward]) {
+        expect(authorize({ method: "PATCH", path: "/api/issues/issue-1" })).toBeNull();
+      }
+    });
+
+    it("restricted: never rewrites a missing-prefix denial", () => {
+      expect(restricted({ method: "PATCH", path: "/issues/issue-1" })).toBe(
+        "Route not allowed: PATCH /issues/issue-1",
+      );
+      expect(restricted({ method: "GET", path: "/openapi.json" })).toBe("Route not allowed: GET /openapi.json");
+    });
+  });
+
   describe("agent", () => {
     it("forwards everything the restricted allowlist forwards", () => {
       for (const request of RESTRICTED_ALLOWED) {
@@ -645,7 +718,15 @@ describe("sandbox callback bridge route policies", () => {
         expect(denial, `${request.method} ${request.path}`).not.toBeNull();
         expect(denial).toContain('bridge policy "agent"');
         expect(denial).toContain(`${request.method.toUpperCase()} ${request.path}`);
-        expect(denial).toContain("retrying this route will not succeed");
+        // The detailed secrets/credentials/administration wording is truthful
+        // only for an actual deny-rule match; a request that simply matches
+        // no allow rule either (e.g. the OPTIONS/HEAD/TRACE methods here, or
+        // an unlisted family) gets the plain "not available" wording instead.
+        if (matchesDenyRule(AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES, request)) {
+          expect(denial, `${request.method} ${request.path}`).toContain("retrying this route will not succeed");
+        } else {
+          expect(denial, `${request.method} ${request.path}`).toContain("This route is not available to agent runs.");
+        }
       }
     });
 
@@ -653,7 +734,14 @@ describe("sandbox callback bridge route policies", () => {
       for (const request of STEWARD_ONLY_ALLOWED) {
         const denial = agent(request);
         expect(denial, `${request.method} ${request.path}`).toContain('bridge policy "agent"');
-        expect(denial).toContain("retrying this route will not succeed");
+        // The instruction-bundle writes hit the agent deny rule directly; the
+        // skill writes match no agent deny rule (skills are a steward-only
+        // allowance, not a denied family), so they get the plain wording.
+        if (matchesDenyRule(AGENT_SANDBOX_CALLBACK_BRIDGE_DENY_RULES, request)) {
+          expect(denial, `${request.method} ${request.path}`).toContain("retrying this route will not succeed");
+        } else {
+          expect(denial, `${request.method} ${request.path}`).toContain("This route is not available to agent runs.");
+        }
       }
     });
 
