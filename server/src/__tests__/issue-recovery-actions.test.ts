@@ -35,6 +35,7 @@ import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbe
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { LEGACY_RECOVERY_CAUSE } from "../services/legacy-execution-recovery.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
@@ -1913,6 +1914,60 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const list = await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).expect(200);
     expect(list.body.active).toMatchObject({ id: action.id });
     expect(list.body.actions).toHaveLength(1);
+  });
+
+  it("flags sourceIssueClosed on an effective hold whose source issue is done or cancelled, but not on an open issue's hold", async () => {
+    const { companyId, coderId, sourceIssueId: openIssueId, prefix } = await seedCompany();
+    const closedIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: closedIssueId,
+      companyId,
+      title: "Cancelled while a no-replay hold was pending",
+      status: "cancelled",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+
+    const makeEffectiveHold = (sourceIssueId: string, fingerprint: string) =>
+      db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId,
+        kind: "active_run_watchdog",
+        status: "resolved",
+        outcome: "blocked",
+        ownerType: "board",
+        returnOwnerAgentId: coderId,
+        cause: LEGACY_RECOVERY_CAUSE,
+        fingerprint,
+        evidence: {
+          runId: randomUUID(),
+          automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" },
+        },
+        nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+        resolvedAt: new Date(),
+      }).returning();
+
+    const [openAction] = await makeEffectiveHold(openIssueId, "legacy-execution:open-issue");
+    const [closedAction] = await makeEffectiveHold(closedIssueId, "legacy-execution:closed-issue");
+
+    const app = createApp();
+
+    // Still open: the hold still gates execution, and the route reports it
+    // exactly as it always has, unflagged.
+    const openList = await request(app).get(`/api/issues/${openIssueId}/recovery-actions`).expect(200);
+    expect(openList.body.active).toBeNull();
+    expect(openList.body.effectiveHold).toMatchObject({ id: openAction!.id });
+    expect(openList.body.sourceIssueClosed).toBe(false);
+
+    // Done/cancelled: a closed issue gets no wakes, so the hold blocks
+    // nothing, but it is still surfaced here (unlike the board attention
+    // feed) with a flag clients can use to tell the two cases apart.
+    const closedList = await request(app).get(`/api/issues/${closedIssueId}/recovery-actions`).expect(200);
+    expect(closedList.body.active).toBeNull();
+    expect(closedList.body.effectiveHold).toMatchObject({ id: closedAction!.id });
+    expect(closedList.body.sourceIssueClosed).toBe(true);
   });
 
   it("projects recovery action metadata into the structured wake payload", async () => {

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -106,6 +106,11 @@ const SOURCE_RANK: Record<AttentionSourceKind, number> = {
 const PENDING_INTERACTION_STATUSES = ["pending"] as const;
 const OPEN_RECOVERY_STATUSES = ["active", "escalated"] as const;
 const HUMAN_RECOVERY_OWNER_TYPES = ["user", "board"] as const;
+// A closed source issue gets no wakes, and a human reopen already releases a
+// no-replay hold (see `getExecutionBlocker`), so an effective hold whose
+// source issue already reached one of these statuses blocks nothing and
+// cannot be resolved by acting on the hold itself: it is noise, not a task.
+const CLOSED_ISSUE_STATUSES = ["done", "cancelled"] as const;
 const DETAIL_EXCERPT_LENGTH = 160;
 const DETAIL_IMAGE_LIMIT = 3;
 const OPEN_DECISION_DEFAULT_LIMIT = 500;
@@ -1389,8 +1394,13 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       }
 
       const recoveryRows = await db
-        .select()
+        .select(getTableColumns(issueRecoveryActions))
         .from(issueRecoveryActions)
+        // The FK on `sourceIssueId` guarantees a matching row (cascade
+        // delete), so this join never drops an active/escalated row; it
+        // only lets the effective-hold branch below read the source
+        // issue's status without a second round trip.
+        .innerJoin(issues, and(eq(issues.companyId, companyId), eq(issues.id, issueRecoveryActions.sourceIssueId)))
         .where(and(
           eq(issueRecoveryActions.companyId, companyId),
           inArray(issueRecoveryActions.ownerType, [...HUMAN_RECOVERY_OWNER_TYPES]),
@@ -1399,9 +1409,15 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           // is the same effective-hold test `getExecutionBlocker` uses, so a
           // settled no-replay disposition that nothing has reconciled yet
           // surfaces here too, instead of only while it is still active.
+          // That branch alone is further restricted to issues that are not
+          // already done/cancelled: a closed issue gets no wakes and a
+          // human reopen already releases the hold, so it blocks nothing
+          // and would otherwise sit on the board unresolvable. Active and
+          // escalated holds are untouched and keep today's behaviour
+          // regardless of the source issue's status.
           or(
             inArray(issueRecoveryActions.status, [...OPEN_RECOVERY_STATUSES]),
-            executionBlockerPredicate(),
+            and(executionBlockerPredicate(), notInArray(issues.status, [...CLOSED_ISSUE_STATUSES])),
           ),
         ))
         .orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id));
