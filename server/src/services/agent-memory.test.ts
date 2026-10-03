@@ -379,6 +379,99 @@ describeEmbeddedPostgres("agent memory: the four-way write decision", () => {
     // "ok", "to", "a" are <= 2 chars and must be dropped before comparison.
     expect(normalizeAgentMemoryTokens("ok to a bbb")).toEqual(new Set(["bbb"]));
   });
+
+  // Table-driven: realistic (not synthetic token-soup) entry pairs, chosen to
+  // land in each side of both thresholds (AGENT_MEMORY_UPDATE_SIMILARITY_MIN
+  // = 0.35 on a same-key match, AGENT_MEMORY_NEAR_DUPLICATE_SIMILARITY_MIN =
+  // 0.6 on a different-key match), to pin the decision algorithm's behavior
+  // on ordinary sentences rather than only on hand-picked token sets.
+  it.each([
+    {
+      label: "same key, close rewording (similarity well above 0.35, below 1): UPDATE",
+      firstBody: "The nightly backup job times out when the archive volume is above 80 percent full",
+      secondBody: "The nightly backup job times out once the archive volume passes 80 percent full",
+      sameKey: true,
+      expectDecision: "update",
+    },
+    {
+      label: "same key, just above the 0.35 update floor: UPDATE, not DELETE-then-ADD",
+      firstBody: "The nightly backup job times out when the archive volume is above 80 percent full",
+      secondBody: "Nightly backup archive volume over eighty percent causes a timeout during the job",
+      sameKey: true,
+      expectDecision: "update",
+    },
+    {
+      label: "same key, unrelated contradicting content (similarity below 0.35): DELETE-then-ADD",
+      firstBody: "The nightly backup job times out when the archive volume is above 80 percent full",
+      secondBody: "The nightly backup job silently skips files larger than 2GB on slow network mounts",
+      sameKey: true,
+      expectDecision: "delete_then_add",
+    },
+    {
+      label: "same key, same sentence modulo punctuation/case (similarity 1): NOOP confirm",
+      firstBody: "Restarting the adapter mid run drops the active heartbeat lease",
+      secondBody: "restarting the adapter mid run drops the active heartbeat lease!!",
+      sameKey: true,
+      expectDecision: "noop",
+    },
+    {
+      label: "different key, below the 0.6 near-duplicate floor: ADD a second row",
+      firstBody: "The staging database connection pool caps out at twenty concurrent clients",
+      secondBody: "Staging db connection pool maxes out around twenty simultaneous clients",
+      sameKey: false,
+      expectDecision: "add",
+    },
+    {
+      label: "different key, at/above the 0.6 near-duplicate floor: NOOP confirm of the existing row",
+      firstBody: "The deploy script fails when the release branch name contains a slash",
+      secondBody: "Deploy script fails whenever the release branch name has a slash in it",
+      sameKey: false,
+      expectDecision: "noop",
+    },
+  ])("11. decision thresholds on realistic entries: $label", async ({ firstBody, secondBody, sameKey, expectDecision }) => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId1 = await seedRun(companyId, agentId);
+    const runId2 = await seedRun(companyId, agentId);
+    const firstKey = "threshold-fixture-a";
+    const secondKey = sameKey ? firstKey : "threshold-fixture-b";
+
+    const first = await writeAgentMemoryEntry({
+      db, companyId, agentId,
+      actor: { type: "agent", id: agentId, agentId, runId: runId1 },
+      sourceIssueId: null, sourceTrust: null,
+      candidate: { kind: "lesson", key: firstKey, body: firstBody },
+      hints: {},
+    });
+    expect(first.decision).toBe("add");
+
+    const second = await writeAgentMemoryEntry({
+      db, companyId, agentId,
+      actor: { type: "agent", id: agentId, agentId, runId: runId2 },
+      sourceIssueId: null, sourceTrust: null,
+      candidate: { kind: "lesson", key: secondKey, body: secondBody },
+      hints: {},
+    });
+
+    expect(second.decision).toBe(expectDecision);
+    if (expectDecision === "delete_then_add") {
+      // DELETE-then-ADD is observed as a fresh row (confirmations=1, a new
+      // id) plus the old row tombstoned, not a distinct decision tag.
+      expect(second.entry.id).not.toBe(first.entry.id);
+      expect(second.entry.confirmations).toBe(1);
+      const [oldRow] = await db.select().from(agentMemoryEntries).where(eq(agentMemoryEntries.id, first.entry.id));
+      expect(oldRow?.status).toBe("tombstoned");
+    } else if (expectDecision === "update") {
+      expect(second.entry.id).toBe(first.entry.id);
+      expect(second.entry.body).toBe(secondBody);
+    } else if (expectDecision === "noop") {
+      expect(second.entry.confirmations).toBe(2);
+      if (sameKey) expect(second.entry.body).toBe(firstBody); // NOOP never rewrites the body
+    } else if (expectDecision === "add") {
+      expect(second.entry.id).not.toBe(first.entry.id);
+      const rows = await liveRowsForKey(companyId, agentId, secondKey);
+      expect(rows).toHaveLength(1);
+    }
+  });
 });
 
 describeEmbeddedPostgres("agent memory: hard purge erases stored content everywhere (privacy)", () => {
