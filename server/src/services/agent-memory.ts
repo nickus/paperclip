@@ -238,6 +238,19 @@ async function selectEntryById(db: DbOrTx, companyId: string, id: string): Promi
   return row ? mapAgentMemoryEntryRow(row) : null;
 }
 
+/**
+ * Route-layer support for the `/api/agent-memory/:id/...` family (§8.1),
+ * which has no `companyId` path segment to scope by. Deliberately
+ * unscoped by company -- callers must run the same fetch-then-check-tenant
+ * pattern `getAccessibleResource` (`server/src/routes/authz.ts`) uses
+ * elsewhere, so a cross-company id returns the same 404 a missing one
+ * would, never a 403 that would leak existence across tenants.
+ */
+export async function getAgentMemoryEntryById(db: Db, id: string): Promise<AgentMemoryEntryRow | null> {
+  const [row] = await db.select().from(agentMemoryEntries).where(eq(agentMemoryEntries.id, id));
+  return row ? mapAgentMemoryEntryRow(row) : null;
+}
+
 async function selectLiveEntryById(
   db: DbOrTx,
   input: { companyId: string; agentId: string; scope: AgentMemoryScope; id: string },
@@ -907,6 +920,51 @@ export async function listAgentMemoryEntries(input: {
     eq(agentMemoryEntries.agentId, input.agentId),
     agentMemoryVisibilityCondition(requestedStatuses, now),
   ];
+  if (cursor) {
+    conditions.push(sql`(${agentMemoryEntries.createdAt}, ${agentMemoryEntries.id}) < (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)`);
+  }
+
+  const rows = await input.db
+    .select()
+    .from(agentMemoryEntries)
+    .where(and(...conditions))
+    .orderBy(sql`${agentMemoryEntries.createdAt} desc`, sql`${agentMemoryEntries.id} desc`)
+    .limit(limit + 1);
+
+  const page = rows.slice(0, limit);
+  const entries = page.map(mapAgentMemoryEntryRow);
+  const last = entries.at(-1);
+  const nextCursor = rows.length > limit && last
+    ? encodeAgentMemoryCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
+    : null;
+  return { entries, nextCursor };
+}
+
+/**
+ * Board read route support (§8.2): the same keyset-paginated listing as
+ * `listAgentMemoryEntries`, but `agentId` is optional so a board actor can
+ * list/filter across every agent in the company. Additive -- does not
+ * change `listAgentMemoryEntries`'s own (agent-mandatory) contract, which
+ * the agent-self route keeps using unchanged.
+ */
+export async function listAgentMemoryEntriesForCompany(input: {
+  db: Db;
+  companyId: string;
+  agentId?: string | null;
+  status?: AgentMemoryStatus[];
+  limit?: number;
+  cursor?: string;
+}): Promise<{ entries: AgentMemoryEntryRow[]; nextCursor: string | null }> {
+  const now = new Date();
+  const limit = input.limit ?? 50;
+  const requestedStatuses = input.status ?? [...AGENT_MEMORY_DEFAULT_VISIBLE_STATUSES];
+  const cursor = decodeAgentMemoryCursor(input.cursor);
+
+  const conditions = [
+    eq(agentMemoryEntries.companyId, input.companyId),
+    agentMemoryVisibilityCondition(requestedStatuses, now),
+  ];
+  if (input.agentId) conditions.push(eq(agentMemoryEntries.agentId, input.agentId));
   if (cursor) {
     conditions.push(sql`(${agentMemoryEntries.createdAt}, ${agentMemoryEntries.id}) < (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)`);
   }
