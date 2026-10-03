@@ -1,5 +1,5 @@
 {
-  "id": "11798f30-f550-4192-81b1-b176392d3273",
+  "id": "1a404b26-dc21-4c9b-920f-4af18bb093f9",
   "prevId": "4713ff42-3031-46aa-81ee-b23a3eaa46b9",
   "version": "7",
   "dialect": "postgresql",
@@ -1148,19 +1148,6 @@
           "tableTo": "companies",
           "columnsFrom": [
             "company_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "agent_memory_audit_entry_id_agent_memory_entries_id_fk": {
-          "name": "agent_memory_audit_entry_id_agent_memory_entries_id_fk",
-          "tableFrom": "agent_memory_audit",
-          "tableTo": "agent_memory_entries",
-          "columnsFrom": [
-            "entry_id"
           ],
           "columnsTo": [
             "id"

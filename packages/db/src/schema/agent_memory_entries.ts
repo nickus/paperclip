@@ -66,7 +66,13 @@ export const agentMemoryAudit = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id),
-    entryId: uuid("entry_id").notNull().references(() => agentMemoryEntries.id),
+    // No FK to agentMemoryEntries.id: the hard-cap sweep (§6.3) physically
+    // DELETEs expired/tombstoned entry rows, and this audit trail must
+    // outlive that delete the same way activity_log.entityId outlives a
+    // deleted entity — a RESTRICT/NO ACTION FK here would make the sweep's
+    // own prior "add"/"noop_confirm" audit rows block the delete it needs to
+    // do.
+    entryId: uuid("entry_id").notNull(),
     action: text("action").notNull(), // "add" | "update" | "noop_confirm" | "dispute" | "tombstone" | "quarantine_promote" | "hard_purge" | "evict_cap" | "expire_sweep"
     actorType: text("actor_type").notNull(), // "agent" | "user" | "system"
     actorId: text("actor_id").notNull(),
