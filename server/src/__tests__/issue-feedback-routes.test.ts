@@ -16,6 +16,7 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
+  normalizePlainAgentMentions: vi.fn(async (_companyId: string, body: string) => body),
 }));
 
 const mockFeedbackExportService = vi.hoisted(() => ({

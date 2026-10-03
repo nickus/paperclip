@@ -7,6 +7,7 @@ const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
   create: vi.fn(),
   findMentionedAgents: vi.fn(),
+  normalizePlainAgentMentions: vi.fn(async (_companyId: string, body: string) => body),
   getByIdentifier: vi.fn(),
   getById: vi.fn(),
   getRelationSummaries: vi.fn(),

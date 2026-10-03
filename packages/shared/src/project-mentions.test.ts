@@ -10,11 +10,13 @@ import {
   extractRoutineMentionIds,
   extractSkillMentionIds,
   extractUserMentionIds,
+  linkPlainAgentMentions,
   parseAgentMentionHref,
   parseProjectMentionHref,
   parseRoutineMentionHref,
   parseSkillMentionHref,
   parseUserMentionHref,
+  type LinkablePlainMentionAgent,
 } from "./project-mentions.js";
 
 describe("project-mentions", () => {
@@ -59,5 +61,154 @@ describe("project-mentions", () => {
       routineId: "routine-123",
     });
     expect(extractRoutineMentionIds(`[/routine:Weekly review](${href})`)).toEqual(["routine-123"]);
+  });
+});
+
+describe("linkPlainAgentMentions", () => {
+  const PM: LinkablePlainMentionAgent = { id: "agent-pm", name: "Product Manager" };
+  const QA: LinkablePlainMentionAgent = { id: "agent-qa", name: "QA Engineer" };
+  const QA_HARNESS: LinkablePlainMentionAgent = { id: "agent-qa-harness", name: "QA Harness Engineer" };
+  const ARCHITECT: LinkablePlainMentionAgent = { id: "agent-architect", name: "Architect" };
+  const ARCHITECT_REVIEWER: LinkablePlainMentionAgent = { id: "agent-architect-reviewer", name: "Architect Reviewer" };
+
+  function pmLink(): string {
+    return `[@Product Manager](${buildAgentMentionHref(PM.id)})`;
+  }
+
+  it("links a plain-text mention of an agent's exact name", () => {
+    const result = linkPlainAgentMentions("please file this with @Product Manager", [PM]);
+    expect(result.markdown).toBe(`please file this with ${pmLink()}`);
+    expect(result.linkedAgentIds).toEqual([PM.id]);
+  });
+
+  it.each([":", ",", ".", ")"])("links a mention followed by trailing %j punctuation", (punct) => {
+    const result = linkPlainAgentMentions(`@Product Manager${punct} thanks`, [PM]);
+    expect(result.markdown).toBe(`${pmLink()}${punct} thanks`);
+  });
+
+  it("matches agent names case-insensitively", () => {
+    const result = linkPlainAgentMentions("ping @product MANAGER please", [PM]);
+    expect(result.markdown).toBe(`ping ${pmLink()} please`);
+  });
+
+  it("does not match a longer word that merely starts with the agent name", () => {
+    const result = linkPlainAgentMentions("@QA Engineers should look at this", [QA]);
+    expect(result.markdown).toBe("@QA Engineers should look at this");
+    expect(result.linkedAgentIds).toEqual([]);
+  });
+
+  it("prefers the longest matching name when one name prefixes another", () => {
+    const harnessResult = linkPlainAgentMentions("@QA Harness Engineer, please check", [QA, QA_HARNESS]);
+    expect(harnessResult.markdown).toBe(
+      `[@QA Harness Engineer](${buildAgentMentionHref(QA_HARNESS.id)}), please check`,
+    );
+    expect(harnessResult.linkedAgentIds).toEqual([QA_HARNESS.id]);
+
+    const reviewerResult = linkPlainAgentMentions(
+      "@Architect Reviewer approved, cc @Architect",
+      [ARCHITECT, ARCHITECT_REVIEWER],
+    );
+    expect(reviewerResult.markdown).toBe(
+      `[@Architect Reviewer](${buildAgentMentionHref(ARCHITECT_REVIEWER.id)}) approved, cc [@Architect](${buildAgentMentionHref(ARCHITECT.id)})`,
+    );
+    expect(reviewerResult.linkedAgentIds.sort()).toEqual([ARCHITECT.id, ARCHITECT_REVIEWER.id].sort());
+  });
+
+  it("leaves a name shared by two or more agents as plain text", () => {
+    const duplicate: LinkablePlainMentionAgent = { id: "agent-other-qa", name: "qa engineer" };
+    const result = linkPlainAgentMentions("@QA Engineer please pick this up", [QA, duplicate]);
+    expect(result.markdown).toBe("@QA Engineer please pick this up");
+    expect(result.linkedAgentIds).toEqual([]);
+  });
+
+  it("does not match an '@' that is part of an email address", () => {
+    const result = linkPlainAgentMentions(
+      "contact pm@Product Manager or user@example.com for details",
+      [PM],
+    );
+    expect(result.markdown).toBe("contact pm@Product Manager or user@example.com for details");
+    expect(result.linkedAgentIds).toEqual([]);
+  });
+
+  it("does not match inside an inline code span", () => {
+    const result = linkPlainAgentMentions("run `@Product Manager` as a literal example", [PM]);
+    expect(result.markdown).toBe("run `@Product Manager` as a literal example");
+    expect(result.linkedAgentIds).toEqual([]);
+  });
+
+  it.each(["```", "~~~"])("does not match inside a %s fenced code block", (fence) => {
+    const markdown = `before\n${fence}\n@Product Manager\n${fence}\nafter @Product Manager`;
+    const result = linkPlainAgentMentions(markdown, [PM]);
+    expect(result.markdown).toBe(`before\n${fence}\n@Product Manager\n${fence}\nafter ${pmLink()}`);
+    expect(result.linkedAgentIds).toEqual([PM.id]);
+  });
+
+  it("does not re-link an already-structured mention link", () => {
+    const already = pmLink();
+    const result = linkPlainAgentMentions(already, [PM]);
+    expect(result.markdown).toBe(already);
+    expect(result.linkedAgentIds).toEqual([]);
+  });
+
+  it("does not match inside the text of a regular markdown link", () => {
+    const result = linkPlainAgentMentions("[ask @Product Manager](https://example.com/issues/1)", [PM]);
+    expect(result.markdown).toBe("[ask @Product Manager](https://example.com/issues/1)");
+    expect(result.linkedAgentIds).toEqual([]);
+  });
+
+  it("does not match inside image alt text", () => {
+    const result = linkPlainAgentMentions("![@Product Manager avatar](https://example.com/a.png)", [PM]);
+    expect(result.markdown).toBe("![@Product Manager avatar](https://example.com/a.png)");
+    expect(result.linkedAgentIds).toEqual([]);
+  });
+
+  it("does not match inside an autolink", () => {
+    const scout: LinkablePlainMentionAgent = { id: "agent-scout", name: "Scout" };
+    const result = linkPlainAgentMentions("see <@Scout> for the raw reference", [scout]);
+    expect(result.markdown).toBe("see <@Scout> for the raw reference");
+    expect(result.linkedAgentIds).toEqual([]);
+  });
+
+  it("does not match on a blockquote line", () => {
+    const markdown = "> earlier, @Product Manager said this\nnew reply to @Product Manager";
+    const result = linkPlainAgentMentions(markdown, [PM]);
+    expect(result.markdown).toBe(`> earlier, @Product Manager said this\nnew reply to ${pmLink()}`);
+    expect(result.linkedAgentIds).toEqual([PM.id]);
+  });
+
+  it("escapes regex metacharacters in an agent name", () => {
+    const weird: LinkablePlainMentionAgent = { id: "agent-weird", name: "Q&A (Lead)" };
+    const result = linkPlainAgentMentions("ping @Q&A (Lead) about this", [weird]);
+    expect(result.markdown).toBe(`ping [@Q&A (Lead)](${buildAgentMentionHref(weird.id)}) about this`);
+    expect(result.linkedAgentIds).toEqual([weird.id]);
+  });
+
+  it("matches a unicode agent name", () => {
+    const unicode: LinkablePlainMentionAgent = { id: "agent-unicode", name: "Ágéntö 文档" };
+    const result = linkPlainAgentMentions("cc @Ágéntö 文档 for review", [unicode]);
+    expect(result.markdown).toBe(`cc [@Ágéntö 文档](${buildAgentMentionHref(unicode.id)}) for review`);
+    expect(result.linkedAgentIds).toEqual([unicode.id]);
+  });
+
+  it("links multiple distinct mentions in one body", () => {
+    const result = linkPlainAgentMentions("@Product Manager and @QA Engineer, please sync", [PM, QA]);
+    expect(result.markdown).toBe(
+      `${pmLink()} and [@QA Engineer](${buildAgentMentionHref(QA.id)}), please sync`,
+    );
+    expect(result.linkedAgentIds.sort()).toEqual([PM.id, QA.id].sort());
+  });
+
+  it("is idempotent", () => {
+    const once = linkPlainAgentMentions("@Product Manager please file @QA Engineer too", [PM, QA]);
+    const twice = linkPlainAgentMentions(once.markdown, [PM, QA]);
+    expect(twice.markdown).toBe(once.markdown);
+    expect(twice.linkedAgentIds).toEqual([]);
+  });
+
+  it("returns the body unchanged when there are no agents", () => {
+    const markdown = "@Product Manager please take a look";
+    const result = linkPlainAgentMentions(markdown, []);
+    expect(result.markdown).toBe(markdown);
+    expect(result.linkedAgentIds).toEqual([]);
   });
 });

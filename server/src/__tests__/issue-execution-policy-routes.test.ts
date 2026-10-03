@@ -12,6 +12,7 @@ const mockIssueService = vi.hoisted(() => ({
   createChild: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
+  normalizePlainAgentMentions: vi.fn(async (_companyId: string, body: string) => body),
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
