@@ -1296,8 +1296,11 @@ describe("Run Brief memory mode", () => {
       resolveAgentMemoryEffectiveMode({ instanceMode: "shadow", agentRuntimeConfigMode: "off" }),
     ).toBe("off");
     expect(
-      resolveAgentMemoryEffectiveMode({ instanceMode: "shadow", agentRuntimeConfigMode: undefined }),
+      resolveAgentMemoryEffectiveMode({ instanceMode: "shadow", agentRuntimeConfigMode: "shadow" }),
     ).toBe("shadow");
+    expect(
+      resolveAgentMemoryEffectiveMode({ instanceMode: "shadow", agentRuntimeConfigMode: undefined }),
+    ).toBe("off");
   });
 
   it("instance on lets the agent's own mode -- including off -- still apply", () => {
@@ -1307,11 +1310,13 @@ describe("Run Brief memory mode", () => {
     expect(
       resolveAgentMemoryEffectiveMode({ instanceMode: "on", agentRuntimeConfigMode: "on" }),
     ).toBe("on");
-    // Unset per-agent default is shadow, never on: a new agent never gets
-    // live injection silently.
-    expect(
-      resolveAgentMemoryEffectiveMode({ instanceMode: "on", agentRuntimeConfigMode: undefined }),
-    ).toBe("shadow");
+    // Memory is opt-in per agent: an agent with no mode, or an unknown one,
+    // gets nothing even when the instance is on.
+    for (const agentRuntimeConfigMode of [undefined, "garbage"]) {
+      expect(
+        resolveAgentMemoryEffectiveMode({ instanceMode: "on", agentRuntimeConfigMode }),
+      ).toBe("off");
+    }
   });
 });
 

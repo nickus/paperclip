@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentMemoryAudit,
   agentMemoryEntries,
@@ -33,6 +33,8 @@ describeEmbeddedPostgres("agent memory routes (§8 of the implementation spec)",
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
+    // Memory is opt-in: the instance switch and each seeded agent enable it.
+    vi.stubEnv("PAPERCLIP_AGENT_MEMORY", "shadow");
     tempDb = await startEmbeddedPostgresTestDatabase("agent-memory-routes-");
     db = createDb(tempDb.connectionString);
   }, 30_000);
@@ -49,6 +51,7 @@ describeEmbeddedPostgres("agent memory routes (§8 of the implementation spec)",
   });
 
   afterAll(async () => {
+    vi.unstubAllEnvs();
     await tempDb?.cleanup();
   });
 
@@ -82,10 +85,10 @@ describeEmbeddedPostgres("agent memory routes (§8 of the implementation spec)",
       .then((rows) => rows[0]!);
   }
 
-  async function seedAgent(companyId: string) {
+  async function seedAgent(companyId: string, runtimeConfig: Record<string, unknown> = { agentMemory: { mode: "shadow" } }) {
     return db
       .insert(agents)
-      .values({ companyId, name: `Agent ${randomUUID()}`, role: "engineer", adapterType: "process", adapterConfig: {}, runtimeConfig: {} })
+      .values({ companyId, name: `Agent ${randomUUID()}`, role: "engineer", adapterType: "process", adapterConfig: {}, runtimeConfig })
       .returning()
       .then((rows) => rows[0]!);
   }
@@ -150,6 +153,32 @@ describeEmbeddedPostgres("agent memory routes (§8 of the implementation spec)",
     // Tombstoned entries drop out of the default listing.
     const afterTombstone = await request(app).get("/api/agents/me/memory");
     expect(afterTombstone.body.entries).toHaveLength(0);
+  });
+
+  it("refuses a write with a plain reason when memory is off for the agent, and stores nothing", async () => {
+    const company = await seedCompany();
+    const unconfigured = await seedAgent(company.id, {});
+    const optedOut = await seedAgent(company.id, { agentMemory: { mode: "off" } });
+    for (const agent of [unconfigured, optedOut]) {
+      const res = await request(createApp({ type: "agent", agentId: agent.id, companyId: company.id }))
+        .post("/api/agents/me/memory")
+        .send({ kind: "fact", key: "build-cmd", body: "Run pnpm build before the tests." });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toContain("Agent memory is off for you");
+    }
+
+    // The instance kill switch wins over an agent that opted in.
+    const optedIn = await seedAgent(company.id);
+    vi.stubEnv("PAPERCLIP_AGENT_MEMORY", "off");
+    try {
+      const res = await request(createApp({ type: "agent", agentId: optedIn.id, companyId: company.id }))
+        .post("/api/agents/me/memory")
+        .send({ kind: "fact", key: "build-cmd", body: "Run pnpm build before the tests." });
+      expect(res.status).toBe(409);
+    } finally {
+      vi.stubEnv("PAPERCLIP_AGENT_MEMORY", "shadow");
+    }
+    expect(await db.select().from(agentMemoryEntries)).toHaveLength(0);
   });
 
   it("rejects an over-length body with the spec's agent-facing message, before redaction runs", async () => {

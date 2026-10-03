@@ -1,6 +1,11 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { ZodError } from "zod";
-import type { Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { agents, type Db } from "@paperclipai/db";
+import {
+  resolveAgentMemoryEffectiveMode,
+  resolveAgentMemoryInstanceMode,
+} from "@paperclipai/adapter-utils/wake-run-brief";
 import {
   AGENT_MEMORY_STATUSES,
   agentMemoryConfirmInputSchema,
@@ -12,7 +17,7 @@ import {
   type AgentMemoryStatus,
   type AgentMemoryWriteInput,
 } from "@paperclipai/shared";
-import { badRequest, forbidden, unauthorized } from "../errors.js";
+import { badRequest, conflict, forbidden, unauthorized } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import {
   AgentMemoryConflictError,
@@ -121,6 +126,24 @@ function respondToAgentMemoryConflict(res: Response, error: AgentMemoryConflictE
   res.status(409).json({ error: error.message, currentEntry: error.currentEntry });
 }
 
+/**
+ * The writing agent's effective memory mode (instance kill switch narrowed by
+ * the agent's own `runtimeConfig.agentMemory.mode`, opt-in per agent).
+ */
+async function loadAgentMemoryEffectiveMode(db: Db, companyId: string, agentId: string) {
+  const runtimeConfig = await db
+    .select({ runtimeConfig: agents.runtimeConfig })
+    .from(agents)
+    .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
+    .then((rows) => rows[0]?.runtimeConfig ?? null);
+  const agentMemory = (runtimeConfig as Record<string, unknown> | null)?.agentMemory;
+  return resolveAgentMemoryEffectiveMode({
+    instanceMode: resolveAgentMemoryInstanceMode(),
+    agentRuntimeConfigMode:
+      agentMemory && typeof agentMemory === "object" ? (agentMemory as Record<string, unknown>).mode : undefined,
+  });
+}
+
 export function agentMemoryRoutes(db: Db) {
   const router = Router();
 
@@ -152,6 +175,15 @@ export function agentMemoryRoutes(db: Db) {
     const agentId = req.actor.agentId;
     const runId = req.actor.runId ?? null;
     const body = req.body as AgentMemoryWriteInput;
+
+    // A write that would never be shown or kept in use is refused with a
+    // plain reason instead of being stored silently.
+    if ((await loadAgentMemoryEffectiveMode(db, companyId, agentId)) === "off") {
+      throw conflict(
+        "Agent memory is off for you, so nothing was stored. This is not an error in your work: carry on without it, and do not retry.",
+        { code: "agent_memory_off" },
+      );
+    }
 
     const { sourceIssueId, sourceTrust } = await resolveAgentMemoryWriteSourceTrust(db, { companyId, agentId, runId });
 

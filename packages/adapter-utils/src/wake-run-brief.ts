@@ -103,8 +103,9 @@ export function resolveAgentMemoryInstanceMode(
  * instance kill switch: instance "off" always wins, regardless of the
  * agent's own config; instance "shadow" caps an agent configured "on" down
  * to "shadow"; instance "on" leaves each agent's own mode -- including
- * "off" -- in force. An agent with no mode configured defaults to "shadow",
- * never "on", so a newly added agent never gets live injection silently.
+ * "off" -- in force. An agent with no mode configured is "off": memory is
+ * opt-in per agent, so a newly added agent never starts capturing or
+ * receiving memory silently.
  */
 export function resolveAgentMemoryEffectiveMode(input: {
   instanceMode: AgentMemoryMode;
@@ -116,7 +117,7 @@ export function resolveAgentMemoryEffectiveMode(input: {
     input.agentRuntimeConfigMode === "shadow" ||
     input.agentRuntimeConfigMode === "on"
       ? input.agentRuntimeConfigMode
-      : "shadow";
+      : "off";
   return input.instanceMode === "shadow" && agentMode === "on" ? "shadow" : agentMode;
 }
 
