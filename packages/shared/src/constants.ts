@@ -1755,3 +1755,48 @@ export const PLUGIN_BRIDGE_ERROR_CODES = [
   "UNKNOWN",
 ] as const;
 export type PluginBridgeErrorCode = (typeof PLUGIN_BRIDGE_ERROR_CODES)[number];
+
+/**
+ * Native agent memory (see packages/db/src/schema/agent_memory_entries.ts
+ * and server/src/services/agent-memory.ts). Caps and thresholds the
+ * four-way ADD/UPDATE/DELETE-then-ADD/NOOP decision, the ranking formula and
+ * the forgetting sweep are built from.
+ */
+export const AGENT_MEMORY_KEY_MAX_CHARS = 64;
+export const AGENT_MEMORY_BODY_MAX_CHARS = 300;
+
+// Normalized token-Jaccard similarity thresholds (no LLM, no embeddings).
+export const AGENT_MEMORY_UPDATE_SIMILARITY_MIN = 0.35; // below this on the same key: contradiction (delete-then-add)
+export const AGENT_MEMORY_NEAR_DUPLICATE_SIMILARITY_MIN = 0.6; // at/above this across different keys: confirm, don't add
+
+export const AGENT_MEMORY_MAX_CONFIRMATIONS_TRACKED = 10; // confirmingRunIds array cap; the `confirmations` counter itself is unbounded
+
+// Expiry / decay / caps.
+export const AGENT_MEMORY_DEFAULT_EXPIRY_DAYS = 14;
+export const AGENT_MEMORY_HARD_CAP_PER_AGENT = 200;
+export const AGENT_MEMORY_MIN_CONFIRMATIONS_PROTECTED = 2; // an entry confirmed this many times+ is never cap-evicted
+export const AGENT_MEMORY_MAX_WRITES_PER_RUN = 3;
+export const AGENT_MEMORY_MAX_WRITES_PER_AGENT_PER_DAY = 20;
+export const AGENT_MEMORY_SWEEP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+// Per-tick bounds so a large backlog (e.g. after the sweep interval was down
+// for a while) is worked off gradually across ticks instead of one tick
+// doing an unbounded scan/row-by-row pass over every company's data. A tick
+// that hits either bound leaves the remainder for the next tick -- the sweep
+// is naturally re-entrant since both passes only ever touch rows that still
+// match their own selection criteria.
+export const AGENT_MEMORY_SWEEP_EXPIRY_BATCH_SIZE = 500; // rows flipped to "expired" per tick
+export const AGENT_MEMORY_SWEEP_MAX_GROUPS_PER_TICK = 200; // over-cap (company, agent) groups evicted from per tick
+
+// Ranking formula weights (score(e) = κ(kind) + 1.5·ln(1+confirmations) + ρ(e) + κ_use(e) − d/14 − u/30).
+export const AGENT_MEMORY_KIND_WEIGHTS: Readonly<Record<string, number>> = {
+  gotcha: 1.0,
+  lesson: 0.8,
+  fact: 0.6,
+  decision: 0.4,
+};
+export const AGENT_MEMORY_CONFIRMATION_WEIGHT = 1.5;
+export const AGENT_MEMORY_PROJECT_MATCH_WEIGHT = 1.0;
+export const AGENT_MEMORY_USE_WEIGHT = 0.3;
+export const AGENT_MEMORY_AGE_DECAY_DAYS = 14;
+export const AGENT_MEMORY_DISUSE_DECAY_DAYS = 30;
+export const AGENT_MEMORY_KEYWORD_MATCH_WEIGHT = 0.5; // pg_trgm similarity() term, 0 when unavailable

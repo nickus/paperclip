@@ -28,6 +28,12 @@ export const agents = pgTable(
     capabilities: text("capabilities"),
     adapterType: text("adapter_type").notNull().default("process"),
     adapterConfig: jsonb("adapter_config").$type<Record<string, unknown>>().notNull().default({}),
+    // Known shapes include `heartbeat`, `env`, `aiConnection`, and
+    // `agentMemory: { mode: "off" | "shadow" | "on" }` -- the per-agent
+    // override for native agent memory's Run Brief injection, resolved
+    // together with the instance kill switch by
+    // `resolveAgentMemoryEffectiveMode` (@paperclipai/adapter-utils/wake-run-brief).
+    // Unset defaults to "shadow", never "on" (see that function's doc comment).
     runtimeConfig: jsonb("runtime_config").$type<Record<string, unknown>>().notNull().default({}),
     defaultEnvironmentId: uuid("default_environment_id").references(() => environments.id, { onDelete: "set null" }),
     budgetMonthlyCents: integer("budget_monthly_cents").notNull().default(0),

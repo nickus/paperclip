@@ -42,7 +42,15 @@ import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 export {
   isPaperclipWakeRunBriefEnabled as isRunBriefEnabled,
   isPaperclipRunBriefSiblingsEnabled as isRunBriefSiblingsEnabled,
+  resolveAgentMemoryEffectiveMode,
+  resolveAgentMemoryInstanceMode,
+  type AgentMemoryMode,
 } from "@paperclipai/adapter-utils/wake-run-brief";
+// Native agent memory's own Run Brief loader lives with the rest of the
+// service (writes, decision algorithm, sweep): re-exported here so it sits
+// in this file's import graph exactly like loadRunBriefSiblings does.
+export { loadRunBriefMemory } from "./agent-memory.js";
+import { loadRunBriefMemory } from "./agent-memory.js";
 
 export const RUN_BRIEF_PRIOR_RUN_LIMIT = 3;
 // Enough rows to report an honest count; the renderer shows fewer.
@@ -603,6 +611,10 @@ export async function loadTeamOnlyRunBrief(input: {
   runId?: string | null;
   /** Attach the agent's other live runs (see `loadRunBriefSiblings`). */
   includeSiblings?: boolean;
+  /** Attach the agent's own ranked memory (see `loadRunBriefMemory`). */
+  includeMemory?: boolean;
+  /** False in shadow mode: compute the section, but never count it as shown. */
+  recordMemoryAccess?: boolean;
 }): Promise<PaperclipRunBrief | null> {
   const team = await loadRunBriefTeam(input);
   const siblings =
@@ -614,7 +626,18 @@ export async function loadTeamOnlyRunBrief(input: {
           runId: input.runId,
         })
       : null;
-  if (!team && !siblings) return null;
+  // A run without an issue has no project to rank "project matches" against.
+  const memory =
+    input.includeMemory && input.agentId
+      ? await loadRunBriefMemory({
+          db: input.db,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          issueProjectId: null,
+          recordAccess: input.recordMemoryAccess,
+        })
+      : null;
+  if (!team && !siblings && !memory) return null;
   return {
     version: 1,
     issueId: null,
@@ -628,6 +651,7 @@ export async function loadTeamOnlyRunBrief(input: {
     priorRuns: [],
     ...(team ? { team } : {}),
     ...(siblings ? { siblings } : {}),
+    ...(memory ? { memory } : {}),
   };
 }
 
@@ -641,7 +665,7 @@ export async function loadRunBrief(input: {
   companyId: string;
   agentId?: string | null;
   runId?: string | null;
-  issue: { id: string; identifier: string | null };
+  issue: { id: string; identifier: string | null; projectId?: string | null };
   authority: PaperclipRunBriefAuthority;
   /** `priorRuns` of the execution continuation built for this run, if any. */
   priorRuns?: unknown;
@@ -651,6 +675,10 @@ export async function loadRunBrief(input: {
   includeTeam?: boolean;
   /** Attach the agent's other live runs (see `loadRunBriefSiblings`). */
   includeSiblings?: boolean;
+  /** Attach the agent's own ranked memory (see `loadRunBriefMemory`). */
+  includeMemory?: boolean;
+  /** False in shadow mode: compute the section, but never count it as shown. */
+  recordMemoryAccess?: boolean;
 }): Promise<PaperclipRunBrief> {
   const { db, companyId } = input;
   const issueId = input.issue.id;
@@ -759,6 +787,16 @@ export async function loadRunBrief(input: {
           excludeIssueId: issueId,
         })
       : null;
+  const memory =
+    input.includeMemory && input.agentId
+      ? await loadRunBriefMemory({
+          db,
+          companyId,
+          agentId: input.agentId,
+          issueProjectId: input.issue.projectId ?? null,
+          recordAccess: input.recordMemoryAccess,
+        })
+      : null;
   return {
     version: 1,
     issueId,
@@ -785,6 +823,7 @@ export async function loadRunBrief(input: {
     // After the issue orientation; absent when not requested or empty.
     ...(team ? { team } : {}),
     ...(siblings ? { siblings } : {}),
+    ...(memory ? { memory } : {}),
   };
 }
 

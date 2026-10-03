@@ -2010,6 +2010,13 @@
       "when": 1790993723561,
       "tag": "0288_great_roughhouse",
       "breakpoints": true
+    },
+    {
+      "idx": 289,
+      "version": "7",
+      "when": 1791039774685,
+      "tag": "0289_lush_firedrake",
+      "breakpoints": true
     }
   ]
 }

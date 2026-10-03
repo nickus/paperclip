@@ -729,6 +729,26 @@ export {
   type PluginApiRouteCheckoutPolicy,
   type PluginEventType,
   type PluginBridgeErrorCode,
+  AGENT_MEMORY_KEY_MAX_CHARS,
+  AGENT_MEMORY_BODY_MAX_CHARS,
+  AGENT_MEMORY_UPDATE_SIMILARITY_MIN,
+  AGENT_MEMORY_NEAR_DUPLICATE_SIMILARITY_MIN,
+  AGENT_MEMORY_MAX_CONFIRMATIONS_TRACKED,
+  AGENT_MEMORY_DEFAULT_EXPIRY_DAYS,
+  AGENT_MEMORY_HARD_CAP_PER_AGENT,
+  AGENT_MEMORY_MIN_CONFIRMATIONS_PROTECTED,
+  AGENT_MEMORY_MAX_WRITES_PER_RUN,
+  AGENT_MEMORY_MAX_WRITES_PER_AGENT_PER_DAY,
+  AGENT_MEMORY_SWEEP_INTERVAL_MS,
+  AGENT_MEMORY_SWEEP_EXPIRY_BATCH_SIZE,
+  AGENT_MEMORY_SWEEP_MAX_GROUPS_PER_TICK,
+  AGENT_MEMORY_KIND_WEIGHTS,
+  AGENT_MEMORY_CONFIRMATION_WEIGHT,
+  AGENT_MEMORY_PROJECT_MATCH_WEIGHT,
+  AGENT_MEMORY_USE_WEIGHT,
+  AGENT_MEMORY_AGE_DECAY_DAYS,
+  AGENT_MEMORY_DISUSE_DECAY_DAYS,
+  AGENT_MEMORY_KEYWORD_MATCH_WEIGHT,
 } from "./constants.js";
 
 export {
@@ -1759,6 +1779,41 @@ export {
   FEEDBACK_VOTE_VALUES,
   DEFAULT_FEEDBACK_DATA_SHARING_TERMS_VERSION,
 } from "./types/feedback.js";
+
+export {
+  AGENT_MEMORY_SCOPES,
+  AGENT_MEMORY_KINDS,
+  AGENT_MEMORY_STATUSES,
+  AGENT_MEMORY_LIVE_STATUSES,
+  AGENT_MEMORY_DEFAULT_VISIBLE_STATUSES,
+  AGENT_MEMORY_AUDIT_ACTIONS,
+  AGENT_MEMORY_ACTOR_TYPES,
+  AGENT_MEMORY_PURGED_BODY_PLACEHOLDER,
+  type AgentMemoryScope,
+  type AgentMemoryKind,
+  type AgentMemoryStatus,
+  type AgentMemoryAuditAction,
+  type AgentMemoryActorType,
+  type AgentMemoryActor,
+  type AgentMemoryWriteDecision,
+  type AgentMemoryEntryRow,
+  type AgentMemoryAuditRow,
+  type AgentMemoryWriteResult,
+} from "./types/agent-memory.js";
+export {
+  AGENT_MEMORY_KEY_REGEX,
+  agentMemoryKindSchema,
+  agentMemoryWriteInputSchema,
+  agentMemoryConfirmInputSchema,
+  agentMemoryDisputeInputSchema,
+  agentMemoryTombstoneInputSchema,
+  agentMemoryHardPurgeInputSchema,
+  type AgentMemoryWriteInput,
+  type AgentMemoryConfirmInput,
+  type AgentMemoryDisputeInput,
+  type AgentMemoryTombstoneInput,
+  type AgentMemoryHardPurgeInput,
+} from "./validators/agent-memory.js";
 
 export {
   DAILY_RETENTION_PRESETS,

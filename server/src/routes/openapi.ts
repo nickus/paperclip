@@ -81,6 +81,16 @@ import {
   updateDecisionQueueSchema,
   updateDecisionTriageSchema,
   updateDecisionRetentionSchema,
+  // Agent memory
+  AGENT_MEMORY_ACTOR_TYPES,
+  AGENT_MEMORY_KINDS,
+  AGENT_MEMORY_SCOPES,
+  AGENT_MEMORY_STATUSES,
+  agentMemoryConfirmInputSchema,
+  agentMemoryDisputeInputSchema,
+  agentMemoryHardPurgeInputSchema,
+  agentMemoryTombstoneInputSchema,
+  agentMemoryWriteInputSchema,
   // Routine
   createRoutineSchema,
   updateRoutineSchema,
@@ -5739,6 +5749,219 @@ registerCurrentRoute({
     403: r.forbidden,
     409: r.conflict,
     422: r.unprocessable,
+  },
+});
+
+// Agent memory
+
+const agentMemoryEntrySchema = z
+  .object({
+    id: z.string(),
+    companyId: z.string(),
+    scope: z.enum(AGENT_MEMORY_SCOPES),
+    agentId: z.string().nullable(),
+    kind: z.enum(AGENT_MEMORY_KINDS),
+    key: z.string(),
+    body: z.string(),
+    projectId: z.string().nullable(),
+    status: z.enum(AGENT_MEMORY_STATUSES),
+    version: z.number().int().positive(),
+    sourceRunId: z.string().nullable(),
+    sourceIssueId: z.string().nullable(),
+    createdByAgentId: z.string(),
+    sourceTrust: z.record(z.string(), z.unknown()).nullable(),
+    confirmations: z.number().int().nonnegative(),
+    confirmingRunIds: z.array(z.string()),
+    accessCount: z.number().int().nonnegative(),
+    lastUsedAt: z.string().datetime().nullable(),
+    lastConfirmedAt: z.string().datetime(),
+    expiresAt: z.string().datetime(),
+    tombstoneReason: z.string().nullable(),
+    tombstonedByActorType: z.enum(AGENT_MEMORY_ACTOR_TYPES).nullable(),
+    tombstonedByActorId: z.string().nullable(),
+    createdAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+  })
+  .strict();
+
+const agentMemoryWriteResultSchema = z
+  .object({
+    decision: z.enum(["add", "update", "delete_then_add", "noop"]),
+    entry: agentMemoryEntrySchema,
+  })
+  .strict();
+
+const agentMemoryListResponseSchema = z
+  .object({
+    entries: z.array(agentMemoryEntrySchema),
+    nextCursor: z.string().nullable(),
+  })
+  .strict();
+
+const agentMemoryConflictResponseSchema = z
+  .object({
+    error: z.string(),
+    currentEntry: agentMemoryEntrySchema,
+  })
+  .strict();
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/agents/me/memory",
+  tags: ["agent-memory"],
+  summary: "List the calling agent's own memory entries",
+  query: z.object({
+    status: z.string().optional().describe("Comma-separated status filter, e.g. active,disputed"),
+    limit: z.string().optional(),
+    cursor: z.string().optional(),
+  }),
+  responses: {
+    200: r.ok(agentMemoryListResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+  },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/agents/me/memory",
+  tags: ["agent-memory"],
+  summary: "Write (add, confirm, update, or contradict) one of the calling agent's own memory entries",
+  body: agentMemoryWriteInputSchema,
+  responses: {
+    200: r.ok(agentMemoryWriteResultSchema),
+    201: r.ok(agentMemoryWriteResultSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    409: { description: "Conflict", content: { "application/json": { schema: agentMemoryConflictResponseSchema } } },
+    422: r.unprocessable,
+    429: r.tooManyRequests,
+  },
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/agent-memory/{id}/confirm",
+  tags: ["agent-memory"],
+  summary: "Re-confirm a memory entry (compare-and-swap)",
+  body: agentMemoryConfirmInputSchema,
+  responses: {
+    200: r.ok(agentMemoryEntrySchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: { description: "Conflict", content: { "application/json": { schema: agentMemoryConflictResponseSchema } } },
+  },
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/agent-memory/{id}/dispute",
+  tags: ["agent-memory"],
+  summary: "Dispute a memory entry (any agent in the company)",
+  body: agentMemoryDisputeInputSchema,
+  responses: {
+    200: r.ok(agentMemoryEntrySchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/agent-memory/{id}/tombstone",
+  tags: ["agent-memory"],
+  summary: "Forget (tombstone) a memory entry -- the owning agent, or an agent holding agents:configure",
+  body: agentMemoryTombstoneInputSchema,
+  responses: {
+    200: r.ok(agentMemoryEntrySchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/agent-memory",
+  tags: ["agent-memory"],
+  summary: "Board: list/filter memory entries across agents in a company",
+  query: z.object({
+    agentId: z.string().optional(),
+    status: z.string().optional(),
+    limit: z.string().optional(),
+    cursor: z.string().optional(),
+  }),
+  responses: {
+    200: r.ok(agentMemoryListResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/companies/{companyId}/agent-memory/{id}/tombstone",
+  tags: ["agent-memory"],
+  summary: "Board: forget (tombstone) another agent's memory entry",
+  body: agentMemoryTombstoneInputSchema,
+  responses: {
+    200: r.ok(agentMemoryEntrySchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/agent-memory/promotion-candidates",
+  tags: ["agent-memory"],
+  summary: "Governance: list active entries confirmed often enough to be promotion candidates",
+  query: z.object({ minConfirmations: z.string().optional() }),
+  responses: {
+    200: r.ok(z.object({ entries: z.array(agentMemoryEntrySchema) }).strict()),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/companies/{companyId}/agent-memory/{id}/promote-quarantined",
+  tags: ["agent-memory"],
+  summary: "Governance: promote a quarantined memory entry to active",
+  responses: {
+    200: r.ok(agentMemoryEntrySchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/companies/{companyId}/agent-memory/{id}/hard-purge",
+  tags: ["agent-memory"],
+  summary: "Governance: irreversibly overwrite a memory entry's content in place",
+  body: agentMemoryHardPurgeInputSchema,
+  responses: {
+    200: r.ok(agentMemoryEntrySchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
   },
 });
 

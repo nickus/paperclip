@@ -11,6 +11,9 @@ DENY PATCH /api/cases/:id
 DENY PATCH /api/cases/:id/documents/:key/annotations/:threadId
 DENY PATCH /api/chat-endpoints/:endpointId
 DENY PATCH /api/companies/:companyId
+DENY PATCH /api/companies/:companyId/agent-memory/:id/hard-purge
+DENY PATCH /api/companies/:companyId/agent-memory/:id/promote-quarantined
+DENY PATCH /api/companies/:companyId/agent-memory/:id/tombstone
 DENY PATCH /api/companies/:companyId/branding
 DENY PATCH /api/companies/:companyId/budgets
 DENY PATCH /api/companies/:companyId/decision-queues/:key
@@ -163,6 +166,8 @@ DENY GET /api/companies/:companyId/adapters/:type/detect-model
 DENY GET /api/companies/:companyId/adapters/:type/login-sessions/:sessionId
 DENY GET /api/companies/:companyId/adapters/:type/login-sessions/active
 DENY GET /api/companies/:companyId/adapters/:type/models
+DENY GET /api/companies/:companyId/agent-memory
+DENY GET /api/companies/:companyId/agent-memory/promotion-candidates
 DENY GET /api/companies/:companyId/ai-connections
 DENY GET /api/companies/:companyId/ai-connections/:connectionId/active-runs
 DENY GET /api/companies/:companyId/ai-connections/login/:sessionId
@@ -351,6 +356,7 @@ ALLOW GET /api/agents/:id/skills
 ALLOW GET /api/agents/me
 ALLOW GET /api/agents/me/inbox-lite
 ALLOW GET /api/agents/me/inbox/mine
+ALLOW GET /api/agents/me/memory
 ALLOW GET /api/approvals/:id
 ALLOW GET /api/approvals/:id/comments
 ALLOW GET /api/approvals/:id/issues
@@ -769,6 +775,9 @@ DENY POST /mcp/gateways/:gatewayPublicId
 DENY POST /mcp/runtime-tools
 DENY POST /runtime-tools/connections/request
 DENY POST /runtime-tools/connections/search
+ALLOW PATCH /api/agent-memory/:id/confirm
+ALLOW PATCH /api/agent-memory/:id/dispute
+ALLOW PATCH /api/agent-memory/:id/tombstone
 ALLOW PATCH /api/agents/:id/instructions-path
 ALLOW PATCH /api/issues/:id
 ALLOW PATCH /api/issues/:id/comments/:commentId
@@ -780,6 +789,7 @@ ALLOW PATCH /api/routines/:id/description/annotations/:threadId
 ALLOW PATCH /api/work-products/:id
 ALLOW POST /api/agents/:id/skills/sync
 ALLOW POST /api/agents/:id/wakeup
+ALLOW POST /api/agents/me/memory
 ALLOW POST /api/approvals/:id/comments
 ALLOW POST /api/approvals/:id/resubmit
 ALLOW POST /api/companies/:companyId/agent-hires

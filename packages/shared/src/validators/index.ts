@@ -345,6 +345,21 @@ export {
 } from "./trust-policy.js";
 
 export {
+  AGENT_MEMORY_KEY_REGEX,
+  agentMemoryKindSchema,
+  agentMemoryWriteInputSchema,
+  agentMemoryConfirmInputSchema,
+  agentMemoryDisputeInputSchema,
+  agentMemoryTombstoneInputSchema,
+  agentMemoryHardPurgeInputSchema,
+  type AgentMemoryWriteInput,
+  type AgentMemoryConfirmInput,
+  type AgentMemoryDisputeInput,
+  type AgentMemoryTombstoneInput,
+  type AgentMemoryHardPurgeInput,
+} from "./agent-memory.js";
+
+export {
   createAgentSchema,
   builtInAgentEmptyMutationSchema,
   builtInAgentProvisionSchema,
