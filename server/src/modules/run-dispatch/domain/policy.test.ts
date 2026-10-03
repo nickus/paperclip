@@ -501,6 +501,29 @@ describe("decideQueuedRunStaleness", () => {
       errorCode: "issue_assignee_changed",
     });
   });
+
+  it("does not let the unverified comment/mention bypass stand in for a verified mentioned-agent wake", () => {
+    // `isInteractionWake` is the long-standing bypass that only checks for a
+    // wake reason plus any comment id on the issue - it never checks that
+    // the comment actually mentions this agent. For every other reason in
+    // its set that is an existing, narrow risk because those reasons only
+    // ever target the assignee; for "issue_comment_mentioned" it would be a
+    // live forgery vector, since that reason exists specifically to wake a
+    // non-assignee agent. A forged or stale mention marker (no verified
+    // `isMentionedAgentWake`) must not ride this unverified bypass instead.
+    const facts: QueuedRunFacts = {
+      ...baseStalenessFacts(),
+      issueAssigneeAgentId: "agent-2",
+      wakeReason: "issue_comment_mentioned",
+      wakeCommentIdPresent: true,
+      isInteractionWake: true,
+      isMentionedAgentWake: false,
+    };
+    expect(decideQueuedRunStaleness(facts, NOW)).toMatchObject({
+      stale: true,
+      errorCode: "issue_assignee_changed",
+    });
+  });
 });
 
 describe("native replacement execution authority", () => {

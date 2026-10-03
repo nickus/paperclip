@@ -838,6 +838,41 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       expect(result).toMatchObject({ outcome: "not_stale" });
     });
 
+    it("cancels a comment-mention wake for a non-assignee whose marker is unverified, even though it carries a comment id", async () => {
+      const { companyId, agentId: assigneeId } = await seedCompanyAndAgent();
+      const impostorId = randomUUID();
+      await seedAgent({ id: impostorId, companyId, name: "Impostor" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: assigneeId });
+      // A real comment on the issue, but it never mentions the impostor:
+      // the long-standing unverified comment/mention bypass would have
+      // granted this run ownership on reason + comment id alone, with no
+      // check that the comment actually names this agent. The dedicated
+      // `isMentionedAgentWake` check is the only path that may grant this
+      // bypass for `issue_comment_mentioned`, and it must fail here.
+      const commentId = await seedMentionComment({ companyId, issueId, mentionedAgentId: assigneeId });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const runId = await seedRun({
+        companyId,
+        agentId: impostorId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_comment_mentioned",
+          commentId,
+          wakeCommentId: commentId,
+        },
+      });
+      const result = await adapter.cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+    });
+
     it("maps a review-parking continuation summary into a stale queued-run decision", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const issueId = randomUUID();

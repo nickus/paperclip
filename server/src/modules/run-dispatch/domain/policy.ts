@@ -598,7 +598,18 @@ export function decideQueuedRunStaleness(
     runAgentId: facts.runAgentId,
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
-    isInteractionWake: facts.isInteractionWake,
+    // `isInteractionWake` is unverified: it trusts a comment id on the issue
+    // at face value, with no check that the comment actually targets this
+    // agent. For "issue_commented"/"issue_reopened_via_comment" that is an
+    // existing, narrow risk (those reasons only ever wake the assignee, so
+    // this is reachable only through a race, not a forgery that names a
+    // different agent). "issue_comment_mentioned" is different: it is the
+    // one reason in this set that is built to target a specific
+    // non-assignee agent, so an unverified bypass here is exactly the
+    // forgeable marker the ownership check exists to stop. That reason now
+    // has its own DB-verified bypass (`isMentionedAgentWake`), so it must
+    // not also ride this unverified one.
+    isInteractionWake: facts.isInteractionWake && facts.wakeReason !== "issue_comment_mentioned",
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.participantIsAgent &&
